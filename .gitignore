@@ -1,0 +1,12 @@
+/target
+.DS_Store
+*.swp
+*.swo
+/tasks
+config.toml
+topics/
+logs/
+data.db
+data.db-shm
+data.db-wal
+.nvim.lua

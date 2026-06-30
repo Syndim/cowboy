@@ -1,0 +1,16 @@
+[package]
+name = "cowboy-workflow-catalog"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Built-in and filesystem workflow catalog loading for Cowboy"
+
+[dependencies]
+cowboy-workflow-core = { path = "../core" }
+cowboy-workflow-lua = { path = "../lua" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

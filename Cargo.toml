@@ -1,0 +1,9 @@
+[workspace]
+members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui"]
+default-members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"

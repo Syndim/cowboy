@@ -1,0 +1,17 @@
+# Demo Cowboy config for running from the project root.
+# Use with: cargo run -p cowboy -- --config demo-config.toml <command>
+
+state_dir = ".cowboy/demo-state"
+workflow_store = ".cowboy/demo-state/workflow.redb"
+workflow_dirs = ["crates/workflow/engine/test_files"]
+max_steps_per_run = 100
+max_visits_per_step = 20
+
+[agent]
+# Switch to "copilot" + ["--acp"] if you prefer GitHub Copilot's ACP backend.
+command = "omp"
+args = ["acp"]
+
+[agent.model]
+id = "claude-sonnet-4.5"
+provider = "anthropic"

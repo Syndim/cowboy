@@ -1,0 +1,569 @@
+use std::path::Path;
+use std::sync::Arc;
+
+use cowboy_workflow_core::{
+    ObjectHash, ObjectKind, RoleSession, RunHead, RunId, RunStore, TurnRecord, WorkflowRun,
+};
+use redb::{Database, ReadableDatabase, ReadableTable};
+use serde::{Serialize, de::DeserializeOwned};
+
+use crate::hash::{canonical_object_bytes, object_hash};
+use crate::tables::{OBJECTS, ROLE_SESSIONS, RUN_HEADS, RUN_TURNS, RUNS};
+use crate::{Error, Result};
+
+/// redb-backed implementation of workflow run storage.
+///
+/// The store keeps immutable content-addressed objects in `OBJECTS` and mutable
+/// run state in dedicated tables. Public inherent methods return store-local
+/// errors; the `RunStore` trait implementation maps them into workflow-core
+/// errors for consumers that depend on the trait.
+#[derive(Clone)]
+pub struct RedbRunStore {
+    /// Open redb database handle.
+    db: Arc<Database>,
+}
+
+impl RedbRunStore {
+    /// Create a new database at `path`.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            db: Arc::new(Database::create(path)?),
+        })
+    }
+
+    /// Open an existing database at `path`.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            db: Arc::new(Database::open(path)?),
+        })
+    }
+
+    /// Save the mutable workflow run snapshot by run id.
+    pub fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let bytes = serde_json::to_vec(run)?;
+            let mut runs = write.open_table(RUNS)?;
+            runs.insert(run.id.as_str(), bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Load a workflow run snapshot by run id.
+    pub fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(RUNS)?;
+        let Some(bytes) = table.get(run_id.as_str())? else {
+            return Err(Error::RunNotFound(run_id.clone()));
+        };
+        decode_json(bytes.value())
+    }
+
+    /// List all run heads known to the store.
+    pub fn list_runs(&self) -> Result<Vec<RunHead>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(RUN_HEADS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (_, value) = item?;
+            out.push(decode_json(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Store an immutable object and return its content hash.
+    pub fn put_object<T: Serialize>(&self, kind: ObjectKind, value: &T) -> Result<ObjectHash> {
+        let write = self.db.begin_write()?;
+        let hash = Self::put_object_in_tx(&write, kind, value)?;
+        write.commit()?;
+        Ok(hash)
+    }
+
+    /// Load an immutable object by content hash.
+    pub fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> Result<T> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(OBJECTS)?;
+        let Some(bytes) = table.get(hash.as_str())? else {
+            return Err(Error::ObjectNotFound(hash.clone()));
+        };
+        decode_object(bytes.value())
+    }
+
+    /// Save or replace the mutable head for a run.
+    pub fn update_run_head(&self, run_id: &str, head: RunHead) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let bytes = serde_json::to_vec(&head)?;
+            let mut table = write.open_table(RUN_HEADS)?;
+            table.insert(run_id, bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Load the mutable head for a run.
+    pub fn load_run_head(&self, run_id: &str) -> Result<RunHead> {
+        let read = self.db.begin_read()?;
+        let table = read.open_table(RUN_HEADS)?;
+        let Some(bytes) = table.get(run_id)? else {
+            return Err(Error::RunNotFound(run_id.to_string()));
+        };
+        decode_json(bytes.value())
+    }
+
+    /// Save or replace a backend session for one `(run_id, role_id)` pair.
+    pub fn save_role_session(&self, session: RoleSession) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let key = role_session_key(&session.run_id, &session.role_id);
+            let bytes = serde_json::to_vec(&session)?;
+            let mut table = write.open_table(ROLE_SESSIONS)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Load a backend session for one `(run_id, role_id)` pair.
+    pub fn load_role_session(&self, run_id: &str, role_id: &str) -> Result<Option<RoleSession>> {
+        let read = self.db.begin_read()?;
+        let table = match read.open_table(ROLE_SESSIONS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(err) => return Err(err.into()),
+        };
+        let key = role_session_key(run_id, role_id);
+        table
+            .get(key.as_str())?
+            .map(|value| decode_json(value.value()))
+            .transpose()
+    }
+
+    /// Delete all backend sessions associated with a run.
+    pub fn delete_role_sessions(&self, run_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            let mut table = write.open_table(ROLE_SESSIONS)?;
+            let prefix = format!("{run_id}:");
+            let keys = table
+                .range::<&str>(run_id..)?
+                .filter_map(|item| item.ok().map(|(key, _)| key.value().to_string()))
+                .take_while(|key| key.starts_with(&prefix))
+                .collect::<Vec<_>>();
+            for key in keys {
+                table.remove(key.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Store a turn record and append its hash to the run/step turn index.
+    pub fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash> {
+        let write = self.db.begin_write()?;
+        let hash = Self::put_object_in_tx(&write, ObjectKind::TurnRecord, &turn)?;
+        {
+            let key = format!("{run_id}:{}", turn.step_id);
+            let mut table = write.open_table(RUN_TURNS)?;
+            let mut turns = table
+                .get(key.as_str())?
+                .map(|bytes| serde_json::from_slice::<Vec<ObjectHash>>(bytes.value()))
+                .transpose()?
+                .unwrap_or_default();
+            turns.push(hash.clone());
+            let bytes = serde_json::to_vec(&turns)?;
+            table.insert(key.as_str(), bytes.as_slice())?;
+        }
+        write.commit()?;
+        Ok(hash)
+    }
+
+    /// Delete a run snapshot, run head, and indexed turn lists for the run.
+    ///
+    /// Immutable objects are intentionally left in `OBJECTS`; later garbage
+    /// collection can remove unreferenced objects once we track reachability.
+    pub fn delete_run(&self, run_id: &str) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            write.open_table(RUNS)?.remove(run_id)?;
+            write.open_table(RUN_HEADS)?.remove(run_id)?;
+            let mut role_sessions = write.open_table(ROLE_SESSIONS)?;
+            let session_prefix = format!("{run_id}:");
+            let session_keys = role_sessions
+                .range::<&str>(run_id..)?
+                .filter_map(|item| item.ok().map(|(key, _)| key.value().to_string()))
+                .take_while(|key| key.starts_with(&session_prefix))
+                .collect::<Vec<_>>();
+            for key in session_keys {
+                role_sessions.remove(key.as_str())?;
+            }
+            let mut turns = write.open_table(RUN_TURNS)?;
+            let keys = turns
+                .range::<&str>(run_id..)?
+                .filter_map(|item| item.ok().map(|(key, _)| key.value().to_string()))
+                .take_while(|key| key.starts_with(&format!("{run_id}:")))
+                .collect::<Vec<_>>();
+            for key in keys {
+                turns.remove(key.as_str())?;
+            }
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Delete an immutable object by hash.
+    ///
+    /// This is a low-level cleanup API. Callers must ensure no run head, step,
+    /// turn list, or future index still references the object.
+    pub fn delete_object(&self, hash: &ObjectHash) -> Result<()> {
+        let write = self.db.begin_write()?;
+        {
+            write.open_table(OBJECTS)?.remove(hash.as_str())?;
+        }
+        write.commit()?;
+        Ok(())
+    }
+
+    /// Store an immutable object inside an existing write transaction.
+    fn put_object_in_tx<T: Serialize>(
+        write: &redb::WriteTransaction,
+        kind: ObjectKind,
+        value: &T,
+    ) -> Result<ObjectHash> {
+        let hash = object_hash(kind, value)?;
+        let bytes = canonical_object_bytes(kind, value)?;
+        let mut table = write.open_table(OBJECTS)?;
+        table.insert(hash.as_str(), bytes.as_slice())?;
+        Ok(hash)
+    }
+}
+
+/// Decode a plain JSON value from table bytes.
+fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Decode the payload of a content-addressed object envelope.
+fn decode_object<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let envelope: serde_json::Value = serde_json::from_slice(bytes)?;
+    let payload = envelope
+        .get("payload")
+        .cloned()
+        .ok_or(Error::MissingPayload)?;
+    Ok(serde_json::from_value(payload)?)
+}
+
+fn role_session_key(run_id: &str, role_id: &str) -> String {
+    format!("{run_id}:{role_id}")
+}
+
+impl RunStore for RedbRunStore {
+    fn save_run(&self, run: &WorkflowRun) -> cowboy_workflow_core::Result<()> {
+        RedbRunStore::save_run(self, run).map_err(Into::into)
+    }
+
+    fn load_run(&self, run_id: &RunId) -> cowboy_workflow_core::Result<WorkflowRun> {
+        RedbRunStore::load_run(self, run_id).map_err(Into::into)
+    }
+
+    fn list_runs(&self) -> cowboy_workflow_core::Result<Vec<RunHead>> {
+        RedbRunStore::list_runs(self).map_err(Into::into)
+    }
+
+    fn put_object<T: Serialize>(
+        &self,
+        kind: ObjectKind,
+        value: &T,
+    ) -> cowboy_workflow_core::Result<ObjectHash> {
+        RedbRunStore::put_object(self, kind, value).map_err(Into::into)
+    }
+
+    fn get_object<T: DeserializeOwned>(
+        &self,
+        hash: &ObjectHash,
+    ) -> cowboy_workflow_core::Result<T> {
+        RedbRunStore::get_object(self, hash).map_err(Into::into)
+    }
+
+    fn update_run_head(&self, run_id: &str, head: RunHead) -> cowboy_workflow_core::Result<()> {
+        RedbRunStore::update_run_head(self, run_id, head).map_err(Into::into)
+    }
+
+    fn load_run_head(&self, run_id: &str) -> cowboy_workflow_core::Result<RunHead> {
+        RedbRunStore::load_run_head(self, run_id).map_err(Into::into)
+    }
+
+    fn save_role_session(&self, session: RoleSession) -> cowboy_workflow_core::Result<()> {
+        RedbRunStore::save_role_session(self, session).map_err(Into::into)
+    }
+
+    fn load_role_session(
+        &self,
+        run_id: &str,
+        role_id: &str,
+    ) -> cowboy_workflow_core::Result<Option<RoleSession>> {
+        RedbRunStore::load_role_session(self, run_id, role_id).map_err(Into::into)
+    }
+
+    fn delete_role_sessions(&self, run_id: &str) -> cowboy_workflow_core::Result<()> {
+        RedbRunStore::delete_role_sessions(self, run_id).map_err(Into::into)
+    }
+
+    fn append_turn(
+        &self,
+        run_id: &str,
+        turn: TurnRecord,
+    ) -> cowboy_workflow_core::Result<ObjectHash> {
+        RedbRunStore::append_turn(self, run_id, turn).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use cowboy_workflow_core::{
+        RoleSession, RunStatus, StepDetail, StepInput, StepOutput, StepRecord,
+        WorkflowSourceSnapshot,
+    };
+    use serde_json::Value;
+
+    use super::*;
+
+    fn store() -> (tempfile::NamedTempFile, RedbRunStore) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = RedbRunStore::create(file.path()).unwrap();
+        (file, store)
+    }
+
+    fn run() -> WorkflowRun {
+        let now = Utc::now();
+        WorkflowRun {
+            id: "run-1".into(),
+            workflow_name: "wf".into(),
+            workflow_api_version: 1,
+            workflow_hash: "hash".into(),
+            workflow_sources: Default::default(),
+            original_request: "do it".into(),
+            status: RunStatus::Running,
+            current_step: "step-1".into(),
+            head: None,
+            resume: Value::Null,
+            steps_executed: 0,
+            step_visits: Default::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn step_record() -> StepRecord {
+        let now = Utc::now();
+        StepRecord {
+            id: "record-1".into(),
+            prev: None,
+            step: "step-1".into(),
+            action: "status".into(),
+            input: StepInput {
+                prompt: None,
+                context: Value::Null,
+            },
+            output: Some(StepOutput {
+                status: "success".into(),
+                fields: Value::Null,
+                body: String::new(),
+                raw: Value::Null,
+            }),
+            detail: StepDetail {
+                backend: None,
+                session_id: None,
+                duration_ms: 0,
+                turn_count: 0,
+                usage: None,
+            },
+            started_at: now,
+            completed_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn stores_and_loads_run() {
+        let (_file, store) = store();
+        let run = run();
+        store.save_run(&run).unwrap();
+        assert_eq!(store.load_run(&run.id).unwrap(), run);
+    }
+
+    #[test]
+    fn stores_and_loads_objects_by_hash() {
+        let (_file, store) = store();
+        let record = step_record();
+        let hash = store.put_object(ObjectKind::StepRecord, &record).unwrap();
+        assert_eq!(store.get_object::<StepRecord>(&hash).unwrap(), record);
+    }
+
+    #[test]
+    fn persists_run_heads() {
+        let (_file, store) = store();
+        let now = Utc::now();
+        let head = RunHead {
+            run_id: "run-1".into(),
+            workflow_hash: "wf-hash".into(),
+            head_step: Some("step-hash".into()),
+            status: RunStatus::Completed,
+            updated_at: now,
+        };
+        store.update_run_head("run-1", head.clone()).unwrap();
+        assert_eq!(store.load_run_head("run-1").unwrap(), head);
+        assert_eq!(store.list_runs().unwrap(), vec![head]);
+    }
+
+    #[test]
+    fn persists_role_sessions_by_run_and_role() {
+        let (_file, store) = store();
+        let now = Utc::now();
+        let session = RoleSession {
+            run_id: "run-1".into(),
+            role_id: "developer".into(),
+            backend: "acp".into(),
+            session_id: "session-1".into(),
+            updated_at: now,
+        };
+
+        store.save_role_session(session.clone()).unwrap();
+
+        assert_eq!(
+            store.load_role_session("run-1", "developer").unwrap(),
+            Some(session)
+        );
+        assert_eq!(store.load_role_session("run-1", "reviewer").unwrap(), None);
+    }
+
+    #[test]
+    fn deletes_role_sessions_for_run() {
+        let (_file, store) = store();
+        let now = Utc::now();
+        let session = RoleSession {
+            run_id: "run-1".into(),
+            role_id: "developer".into(),
+            backend: "acp".into(),
+            session_id: "session-1".into(),
+            updated_at: now,
+        };
+        store.save_role_session(session).unwrap();
+
+        store.delete_role_sessions("run-1").unwrap();
+
+        assert_eq!(store.load_role_session("run-1", "developer").unwrap(), None);
+    }
+
+    #[test]
+    fn appends_turns_and_stores_turn_objects() {
+        let (_file, store) = store();
+        let now = Utc::now();
+        let turn = TurnRecord {
+            id: "turn-1".into(),
+            step_id: "record-1".into(),
+            role: "assistant".into(),
+            content: "hello".into(),
+            timestamp: now,
+            prev: None,
+        };
+        let hash = store.append_turn("run-1", turn.clone()).unwrap();
+        assert_eq!(store.get_object::<TurnRecord>(&hash).unwrap(), turn);
+    }
+
+    #[test]
+    fn stores_workflow_source_snapshot() {
+        let (_file, store) = store();
+        let bundle = WorkflowSourceSnapshot {
+            root: None,
+            entry: "main.lua".into(),
+            files: [("main.lua".into(), "return workflow('x', step('s'))".into())]
+                .into_iter()
+                .collect(),
+        };
+        let hash = store
+            .put_object(ObjectKind::WorkflowSourceSnapshot, &bundle)
+            .unwrap();
+        assert_eq!(
+            store.get_object::<WorkflowSourceSnapshot>(&hash).unwrap(),
+            bundle
+        );
+    }
+
+    #[test]
+    fn committed_data_survives_reopen() {
+        let (file, store) = store();
+        let run = run();
+        let record = step_record();
+        let record_hash = store.put_object(ObjectKind::StepRecord, &record).unwrap();
+        let head = RunHead {
+            run_id: run.id.clone(),
+            workflow_hash: run.workflow_hash.clone(),
+            head_step: Some(record_hash.clone()),
+            status: RunStatus::Completed,
+            updated_at: Utc::now(),
+        };
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, head.clone()).unwrap();
+        drop(store);
+
+        let reopened = RedbRunStore::open(file.path()).unwrap();
+        assert_eq!(reopened.load_run(&run.id).unwrap(), run);
+        assert_eq!(reopened.load_run_head(&head.run_id).unwrap(), head);
+        assert_eq!(
+            reopened.get_object::<StepRecord>(&record_hash).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn deletes_run_but_leaves_immutable_objects() {
+        let (_file, store) = store();
+        let run = run();
+        let record = step_record();
+        let record_hash = store.put_object(ObjectKind::StepRecord, &record).unwrap();
+        let head = RunHead {
+            run_id: run.id.clone(),
+            workflow_hash: run.workflow_hash.clone(),
+            head_step: Some(record_hash.clone()),
+            status: RunStatus::Completed,
+            updated_at: Utc::now(),
+        };
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, head).unwrap();
+
+        store.delete_run(&run.id).unwrap();
+
+        assert!(matches!(
+            store.load_run(&run.id),
+            Err(Error::RunNotFound(_))
+        ));
+        assert!(matches!(
+            store.load_run_head(&run.id),
+            Err(Error::RunNotFound(_))
+        ));
+        assert_eq!(
+            store.get_object::<StepRecord>(&record_hash).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn deletes_object() {
+        let (_file, store) = store();
+        let record = step_record();
+        let hash = store.put_object(ObjectKind::StepRecord, &record).unwrap();
+
+        store.delete_object(&hash).unwrap();
+
+        assert!(matches!(
+            store.get_object::<StepRecord>(&hash),
+            Err(Error::ObjectNotFound(_))
+        ));
+    }
+}
