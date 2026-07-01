@@ -5,19 +5,24 @@ return function(id)
   confirm.run = function(ctx)
     local answered_prompt_id = "plan_confirmation_" .. tostring((ctx.steps_executed or 1) - 1)
     local answer = ctx.resume and ctx.resume[answered_prompt_id]
+    local fields = (ctx.prev and ctx.prev.fields) or {}
     if answer and tostring(answer) ~= "" then
       local normalized = string.lower(tostring(answer))
       if normalized == "yes" or normalized == "y" or normalized == "approve" or normalized == "approved" then
-        return action.status { status = "confirmed", body = "user approved plan" }
+        local reviewed_plan = fields.plan or context.previous_step_context(ctx, "Reviewed plan:")
+        return action.status {
+          status = "confirmed",
+          fields = { plan = reviewed_plan, plan_doc = fields.plan_doc },
+          body = tostring(reviewed_plan),
+        }
       end
       return action.status {
         status = "changes_requested",
-        fields = { feedback = tostring(answer) },
+        fields = { feedback = tostring(answer), plan_doc = fields.plan_doc },
         body = "user requested plan changes",
       }
     end
 
-    local fields = (ctx.prev and ctx.prev.fields) or {}
     local reviewed_plan = fields.plan or context.previous_step_context(ctx, "Reviewed plan:")
     local prompt_id = "plan_confirmation_" .. tostring(ctx.steps_executed or 0)
     return action.ask_user {

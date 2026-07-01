@@ -29,6 +29,7 @@ function M.previous_step_context(ctx, heading)
   local fields = prev.fields or {}
   if fields.summary then table.insert(lines, "Summary: " .. tostring(fields.summary)) end
   if fields.feedback then table.insert(lines, "Feedback: " .. tostring(fields.feedback)) end
+  if fields.plan_doc then table.insert(lines, "Plan doc: " .. tostring(fields.plan_doc)) end
   if fields.files and #fields.files > 0 then
     table.insert(lines, "Files:")
     for _, file in ipairs(fields.files) do table.insert(lines, "- " .. tostring(file)) end

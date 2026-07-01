@@ -10,10 +10,10 @@ return function(roles, opts)
 
 ]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Test result:") .. [[
 
-Inspect the working tree. Return "approved" if the change is correct, scoped, and sufficiently tested. Return "changes_requested" with actionable feedback otherwise.]],
+Inspect the working tree and plan document at the `Plan doc: ...` path. Verify every checked TODO item is actually completed, require unfinished work items to remain unchecked, preserve the plan-doc path in output `plan_doc`, and return "approved" only if the change is correct, scoped, sufficiently tested, and all required TODO items are complete. Return "changes_requested" with actionable feedback otherwise.]],
       output = {
         status = { "approved", "changes_requested" },
-        fields = { feedback = "string" },
+        fields = { feedback = "string", plan_doc = "string" },
       },
     }
   end

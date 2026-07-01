@@ -800,6 +800,41 @@ mod tests {
                 action.prompt.contains("- Add a status command"),
                 "{step} prompt should include the clarification answer"
             );
+            match step {
+                "plan" => {
+                    assert!(action.prompt.contains("Markdown plan document"));
+                    assert!(action.prompt.contains("Tests to be added/updated"));
+                    assert!(action.prompt.contains("- [ ]"));
+                    assert!(action.prompt.contains("plan_doc"));
+                    assert!(action.prompt.contains("docs/plans/"));
+                    assert!(action.prompt.contains("snake_case"));
+                    assert!(action.prompt.contains("Create `docs/plans`"));
+                    let fields = &action.output.as_ref().unwrap().fields;
+                    assert_eq!(fields["plan_doc"], "string");
+                }
+                "implement" => {
+                    assert!(action.prompt.contains("mark each completed TODO item"));
+                    assert!(action.prompt.contains("- [x]"));
+                    let fields = &action.output.as_ref().unwrap().fields;
+                    assert_eq!(fields["plan_doc"], "string");
+                }
+                "review" => {
+                    assert!(action.prompt.contains("Verify every checked TODO item"));
+                    assert!(action.prompt.contains("unfinished work items"));
+                    let fields = &action.output.as_ref().unwrap().fields;
+                    assert_eq!(fields["plan_doc"], "string");
+                }
+                "revise" => {
+                    assert!(
+                        action
+                            .prompt
+                            .contains("update the approved plan document's TODO list")
+                    );
+                    let fields = &action.output.as_ref().unwrap().fields;
+                    assert_eq!(fields["plan_doc"], "string");
+                }
+                _ => unreachable!(),
+            }
         }
 
         let result = cowboy_workflow_lua::run_step(
@@ -813,6 +848,7 @@ mod tests {
                     "fields": {
                         "summary": "Update AGENTS.md",
                         "files": ["AGENTS.md"],
+                        "plan_doc": "docs/plans/update_agents.md",
                     },
                     "body": "Plan body",
                 },
@@ -827,6 +863,11 @@ mod tests {
         assert!(action.prompt.contains("Status: ready"));
         assert!(action.prompt.contains("Summary: Update AGENTS.md"));
         assert!(action.prompt.contains("- AGENTS.md"));
+        assert!(
+            action
+                .prompt
+                .contains("Plan doc: docs/plans/update_agents.md")
+        );
         assert!(action.prompt.contains("Plan body"));
 
         let result = cowboy_workflow_lua::run_step(
@@ -840,6 +881,7 @@ mod tests {
                     "fields": {
                         "summary": "Changed AGENTS.md",
                         "files": ["AGENTS.md"],
+                        "plan_doc": "docs/plans/update_agents.md",
                     },
                     "body": "Implementation body",
                 },
@@ -851,6 +893,11 @@ mod tests {
         };
         assert!(action.prompt.contains("Implementation result:"));
         assert!(action.prompt.contains("Summary: Changed AGENTS.md"));
+        assert!(
+            action
+                .prompt
+                .contains("Plan doc: docs/plans/update_agents.md")
+        );
         assert!(action.prompt.contains("Implementation body"));
 
         let result = cowboy_workflow_lua::run_step(
@@ -863,6 +910,7 @@ mod tests {
                     "status": "changes_requested",
                     "fields": {
                         "feedback": "Remove generated state from the change set",
+                        "plan_doc": "docs/plans/update_agents.md",
                     },
                     "body": "Review body",
                 },
@@ -882,8 +930,249 @@ mod tests {
         assert!(
             action
                 .prompt
+                .contains("Plan doc: docs/plans/update_agents.md")
+        );
+        assert!(
+            action
+                .prompt
                 .contains("Address only the reviewer feedback above")
         );
+    }
+
+    #[test]
+    fn example_workflows_enforce_plan_document_todo_contract() {
+        let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows")
+            .canonicalize()
+            .unwrap();
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(&examples_root)
+            .load_catalog()
+            .unwrap();
+        let source_ref = catalog.workflows.get("workflows/feature").unwrap();
+        let compiled = cowboy_workflow_lua::load(source_ref).unwrap();
+        let plan_doc = "docs/plans/example.md";
+        let reviewed_plan = "## Plan\nDo it\n\n## Changes\n- Update code\n\n## Tests to be added/updated\n- Add coverage\n\n## How to verify\n- Run tests\n\n## TODO\n- [ ] Update code";
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "plan",
+            serde_json::json!({ "request": "add a status command" }),
+        )
+        .unwrap();
+        let StepAction::Agent(plan_action) = result.action else {
+            panic!("expected plan step to call its agent")
+        };
+        assert!(plan_action.prompt.contains("docs/plans/"));
+        assert!(plan_action.prompt.contains("snake_case"));
+        assert!(plan_action.prompt.contains("Create `docs/plans`"));
+        assert!(plan_action.prompt.contains("Tests to be added/updated"));
+        assert!(plan_action.prompt.contains("- [ ]"));
+        let fields = &plan_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields.get("todo"), None);
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "review_plan",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "plan",
+                    "status": "ready",
+                    "fields": {
+                        "summary": "Example",
+                        "plan_doc": plan_doc,
+                        "files": [plan_doc],
+                    },
+                    "body": reviewed_plan,
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review_plan_action) = result.action else {
+            panic!("expected review_plan step to call its agent")
+        };
+        assert!(
+            review_plan_action
+                .prompt
+                .contains("Plan doc: docs/plans/example.md")
+        );
+        assert!(
+            review_plan_action
+                .prompt
+                .contains("docs/plans/<snake_case_summary>.md")
+        );
+        let fields = &review_plan_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "confirm_plan",
+            serde_json::json!({
+                "steps_executed": 6,
+                "resume": { "plan_confirmation_5": "yes" },
+                "prev": {
+                    "step": "review_plan",
+                    "status": "approved",
+                    "fields": { "plan": reviewed_plan, "plan_doc": plan_doc },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(confirm_action) = result.action else {
+            panic!("expected confirm_plan to preserve the approved plan")
+        };
+        assert_eq!(confirm_action.status, "confirmed");
+        assert_eq!(confirm_action.fields["plan"], reviewed_plan);
+        assert_eq!(confirm_action.fields["plan_doc"], plan_doc);
+        assert_eq!(confirm_action.body, reviewed_plan);
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "implement",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "confirm_plan",
+                    "status": "confirmed",
+                    "fields": { "plan": reviewed_plan, "plan_doc": plan_doc },
+                    "body": reviewed_plan,
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(implement_action) = result.action else {
+            panic!("expected implement step to call its agent")
+        };
+        assert!(implement_action.prompt.contains("Approved plan:"));
+        assert!(
+            implement_action
+                .prompt
+                .contains("Plan doc: docs/plans/example.md")
+        );
+        assert!(implement_action.prompt.contains("## TODO"));
+        assert!(implement_action.prompt.contains("- [ ] Update code"));
+        assert!(
+            implement_action
+                .prompt
+                .contains("changing each completed `- [ ]` item to `- [x]`")
+        );
+        let fields = &implement_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "test",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "implement",
+                    "status": "implemented",
+                    "fields": {
+                        "summary": "Changed code",
+                        "plan_doc": plan_doc,
+                        "files": ["src/main.rs"],
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(test_action) = result.action else {
+            panic!("expected test step to call its agent")
+        };
+        assert!(
+            test_action
+                .prompt
+                .contains("Plan doc: docs/plans/example.md")
+        );
+        let fields = &test_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "review",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "test",
+                    "status": "passed",
+                    "fields": {
+                        "summary": "Tests passed",
+                        "plan_doc": plan_doc,
+                        "commands": ["cargo test"],
+                        "failures": [],
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review_action) = result.action else {
+            panic!("expected review step to call its agent")
+        };
+        assert!(
+            review_action
+                .prompt
+                .contains("Plan doc: docs/plans/example.md")
+        );
+        assert!(
+            review_action
+                .prompt
+                .contains("Verify every checked TODO item is actually completed")
+        );
+        assert!(review_action.prompt.contains("unfinished work items"));
+        let fields = &review_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "revise",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "review",
+                    "status": "changes_requested",
+                    "fields": { "feedback": "Fix one TODO", "plan_doc": plan_doc },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(revise_action) = result.action else {
+            panic!("expected revise step to call its agent")
+        };
+        assert!(
+            revise_action
+                .prompt
+                .contains("Plan doc: docs/plans/example.md")
+        );
+        let fields = &revise_action.output.as_ref().unwrap().fields;
+        assert_eq!(fields["plan_doc"], "string");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "confirm_result",
+            serde_json::json!({
+                "steps_executed": 9,
+                "resume": { "result_confirmation_8": "fix one more thing" },
+                "prev": {
+                    "step": "review",
+                    "status": "approved",
+                    "fields": { "plan_doc": plan_doc },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(confirm_result_action) = result.action else {
+            panic!("expected confirm_result to preserve plan_doc with feedback")
+        };
+        assert_eq!(confirm_result_action.status, "changes_requested");
+        assert_eq!(
+            confirm_result_action.fields["feedback"],
+            "fix one more thing"
+        );
+        assert_eq!(confirm_result_action.fields["plan_doc"], plan_doc);
     }
 
     #[test]

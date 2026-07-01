@@ -13,14 +13,14 @@
 -- not through ctx.prev. The review/revise loop repeats until the reviewer
 -- approves (bounded by the runner's max_visits_per_step budget).
 
-local planner = role("planner", [[You are a senior engineer who turns a request into a concrete plan.
-Inspect the repository to ground the plan in the real code. Do not write code yet; just decide what to change.]])
+local planner = role("planner", [[You are a senior engineer who turns a request into a concrete, repository-grounded plan.
+Inspect the repository before planning. Write the plan to a Markdown document before returning ready. The document must include these sections exactly: Plan, Changes, Tests to be added/updated, How to verify, and TODO. The TODO section must list every implementation work item as checkable Markdown tasks. Do not change code, tests, configs, or workflow logic while planning.]])
 
 local developer = role("developer", [[You are a careful software engineer.
-Implement the requested change in the current repository, keeping the diff focused and consistent with existing conventions. Report exactly what you changed.]])
+Implement the approved plan in the current repository, keeping the diff focused and consistent with existing conventions. Mark each TODO item in the approved plan document completed as you finish it, and do not report implemented while relevant TODO items remain unchecked. Report exactly what you changed.]])
 
 local reviewer = role("reviewer", [[You are a meticulous code reviewer.
-Inspect the working tree for correctness, scope creep, and obvious bugs. Approve only when the change is complete and correct; otherwise give specific, actionable feedback.]])
+Inspect the working tree, plan document, and TODO checklist for correctness, scope creep, and obvious bugs. Verify each checked TODO item is actually complete, and do not approve while required TODO items are unchecked or falsely checked; otherwise give specific, actionable feedback.]])
 
 local function clarification_context(ctx)
   local resume = ctx.resume or {}
@@ -70,6 +70,9 @@ local function previous_step_context(ctx, heading)
   if fields.feedback then
     table.insert(lines, "Feedback: " .. tostring(fields.feedback))
   end
+  if fields.plan_doc then
+    table.insert(lines, "Plan doc: " .. tostring(fields.plan_doc))
+  end
   if fields.files and #fields.files > 0 then
     table.insert(lines, "Files:")
     for _, file in ipairs(fields.files) do
@@ -92,10 +95,12 @@ plan.run = function(ctx)
 
 ]] .. request_context(ctx) .. [[
 
+Before returning "ready", create or update a Markdown plan document at `docs/plans/<snake_case_summary>.md`. Generate `<snake_case_summary>` from the concise plan summary by lowercasing it, removing punctuation, and joining words with underscores. Create `docs/plans` if it does not exist. The plan document must contain these sections exactly: Plan, Changes, Tests to be added/updated, How to verify, and TODO. The TODO section must contain every implementation work item as Markdown task-list items (`- [ ] ...`). Return `plan_doc` exactly as the written path and include that same path in `files`.
+
 Return status "ready" with a short plan once you know which files to change, or "unclear" if the request cannot be planned.]],
     output = {
       status = { "ready", "unclear" },
-      fields = { summary = "string", files = "array" },
+      fields = { summary = "string", plan_doc = "string", files = "array" },
     },
   }
 end
@@ -108,10 +113,10 @@ implement.run = function(ctx)
 
 ]] .. request_context(ctx) .. previous_step_context(ctx, "Previous plan:") .. [[
 
-Make the change now, then return status "implemented" with a summary of what you changed, or "blocked" if you cannot proceed.]],
+Make the change now, mark each completed TODO item in the approved plan document as `- [x]`, and leave incomplete items unchecked. Preserve the `Plan doc: ...` path exactly in your output `plan_doc`. Return status "implemented" only when all required TODO items are completed and checked, or "blocked" if you cannot proceed.]],
     output = {
       status = { "implemented", "blocked" },
-      fields = { summary = "string", files = "array" },
+      fields = { summary = "string", plan_doc = "string", files = "array" },
     },
   }
 end
@@ -124,10 +129,10 @@ review.run = function(ctx)
 
 ]] .. request_context(ctx) .. previous_step_context(ctx, "Implementation result:") .. [[
 
-Return status "approved" if the change is correct and complete, or "changes_requested" with specific feedback the developer can act on.]],
+Inspect the working tree and plan document at the `Plan doc: ...` path. Verify every checked TODO item is actually completed, require unfinished work items to remain unchecked, preserve the plan-doc path in output `plan_doc`, and return status "approved" only if the change is correct, complete, and sufficiently tested. Return "changes_requested" with specific feedback the developer can act on.]],
     output = {
       status = { "approved", "changes_requested" },
-      fields = { feedback = "string" },
+      fields = { feedback = "string", plan_doc = "string" },
     },
   }
 end
@@ -140,10 +145,10 @@ revise.run = function(ctx)
 
 ]] .. request_context(ctx) .. previous_step_context(ctx, "Reviewer feedback:") .. [[
 
-Address only the reviewer feedback above, then return status "implemented" with a summary, or "blocked" if you cannot.]],
+Address only the reviewer feedback above. As you complete follow-up work, update the approved plan document's TODO list so completed items are checked and incomplete items remain unchecked. Preserve the `Plan doc: ...` path exactly in your output `plan_doc`. Return status "implemented" only when the relevant TODO items are completed and checked, or "blocked" if you cannot proceed.]],
     output = {
       status = { "implemented", "blocked" },
-      fields = { summary = "string" },
+      fields = { summary = "string", plan_doc = "string", files = "array" },
     },
   }
 end

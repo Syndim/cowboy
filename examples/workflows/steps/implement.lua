@@ -11,10 +11,10 @@ return function(roles, opts)
 
 ]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Approved plan:") .. [[
 
-Make the change now. Return "implemented" with a summary and files, or "blocked" if you cannot proceed.]],
+Make the change now. As you complete work, update the approved plan document's TODO list by changing each completed `- [ ]` item to `- [x]`; leave incomplete items unchecked. Preserve the `Plan doc: ...` path exactly in your output `plan_doc`. Return "implemented" only when all TODO items required for this implementation are completed and checked. Return "blocked" if you cannot proceed.]],
       output = {
         status = { "implemented", "blocked" },
-        fields = { summary = "string", files = "array" },
+        fields = { summary = "string", plan_doc = "string", files = "array" },
       },
     }
   end
