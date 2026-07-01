@@ -187,10 +187,6 @@ impl AppState {
         &self.input
     }
 
-    pub(in crate::app) fn input_line_count(&self) -> usize {
-        self.input.lines().count().max(1)
-    }
-
     pub(in crate::app) fn background_task_count(&self) -> usize {
         self.background.len()
     }

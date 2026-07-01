@@ -78,6 +78,31 @@ fn draw_places_cursor_at_input_end() {
 }
 
 #[test]
+fn draw_wraps_long_input_into_visible_continuation_row() {
+    let mut state = test_state();
+    state.push_input("abcdefghijklmnop");
+
+    let rendered = rendered_screen(&state, 16, 10);
+
+    assert!(rendered.contains("> abcdefghijkl"));
+    assert!(rendered.contains("  mnop"));
+}
+
+#[test]
+fn draw_places_cursor_at_wrapped_input_end() {
+    let mut state = test_state();
+    state.push_input("abcdefghijklmnop");
+    let backend = ratatui::backend::TestBackend::new(16, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(7, 8));
+}
+
+#[test]
 fn draw_handles_input_taller_than_input_box() {
     let mut state = test_state();
     state.push_input(

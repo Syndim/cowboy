@@ -198,7 +198,7 @@ fn key_code_name(code: &KeyCode) -> &'static str {
 }
 fn draw(frame: &mut ratatui::Frame<'_>, state: &AppState) {
     let area = frame.area();
-    let composer_height = composer::height(state, area.height);
+    let composer_height = composer::height(state, area.height, area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -1,7 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use unicode_width::UnicodeWidthChar;
+
+const PROMPT: &str = "> ";
+const CONTINUATION_PROMPT: &str = "  ";
+const PROMPT_WIDTH: usize = 2;
 
 use super::super::commands::{
     MAX_SLASH_SUGGESTIONS, slash_query, slash_suggestion_line_count, slash_suggestions,
@@ -9,16 +14,24 @@ use super::super::commands::{
 use super::super::state::AppState;
 use super::super::styles::{style_accent, style_border_accent, style_muted};
 
-pub(in crate::app) fn height(state: &AppState, terminal_height: u16) -> u16 {
-    let wanted = (state.input_line_count() + slash_suggestion_line_count(state.input()) + 2)
-        .clamp(3, 12) as u16;
+// Ratatui wraps Paragraph text and can report the wrapped line count, but it does not
+// resize surrounding Layout constraints automatically. The composer still computes
+// its own height and cursor position because the input prompt, continuation indent,
+// latest-lines clipping, and cursor placement are application-specific.
+pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_width: u16) -> u16 {
+    let input_rows = Paragraph::new(state.input())
+        .wrap(Wrap { trim: false })
+        .line_count(input_content_width(composer_width) as u16)
+        .max(1);
+    let wanted = (input_rows + slash_suggestion_line_count(state.input()) + 2).clamp(3, 12) as u16;
     let max_available = terminal_height.saturating_sub(3).max(3);
     wanted.min(max_available)
 }
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let visible_height = area.height.saturating_sub(2) as usize;
-    let rendered = rendered_input(state, visible_height);
+    let content_width = input_content_width(area.width);
+    let rendered = rendered_input(state, visible_height, content_width);
     let composer = Paragraph::new(lines_from_rendered(state, visible_height, &rendered)).block(
         Block::default()
             .title(title(state))
@@ -38,12 +51,16 @@ pub(in crate::app) fn title(state: &AppState) -> String {
 }
 
 #[cfg(test)]
-fn lines(state: &AppState, max_visible_lines: usize) -> Vec<Line<'static>> {
+fn lines(state: &AppState, max_visible_lines: usize, composer_width: u16) -> Vec<Line<'static>> {
     if max_visible_lines == 0 {
         return Vec::new();
     }
 
-    let rendered = rendered_input(state, max_visible_lines);
+    let rendered = rendered_input(
+        state,
+        max_visible_lines,
+        input_content_width(composer_width),
+    );
     lines_from_rendered(state, max_visible_lines, &rendered)
 }
 
@@ -53,21 +70,28 @@ struct RenderedInput {
     cursor_column: usize,
 }
 
-fn rendered_input(state: &AppState, max_visible_lines: usize) -> RenderedInput {
+struct VisualInputLine {
+    line: String,
+    cursor_column: usize,
+}
+
+fn rendered_input(
+    state: &AppState,
+    max_visible_lines: usize,
+    content_width: usize,
+) -> RenderedInput {
     let suggestion_line_count = slash_suggestion_line_count(state.input());
     let input_budget = max_visible_lines
         .saturating_sub(suggestion_line_count)
         .max(1);
-    let raw_lines = if state.input().is_empty() {
-        vec![""]
-    } else {
-        state.input().split('\n').collect::<Vec<_>>()
-    };
-    let cursor_line_text = raw_lines.last().copied().unwrap_or_default();
-    let cursor_column = Line::from(format!("> {cursor_line_text}")).width();
-    let mut lines = raw_lines
+    let visual_lines = wrapped_input_lines(state.input(), content_width);
+    let cursor_column = visual_lines
+        .last()
+        .map(|line| line.cursor_column)
+        .unwrap_or(PROMPT_WIDTH);
+    let mut lines = visual_lines
         .into_iter()
-        .map(|line| format!("> {line}"))
+        .map(|visual_line| visual_line.line)
         .collect::<Vec<_>>();
     let hidden = lines.len().saturating_sub(input_budget);
     if hidden > 0 {
@@ -85,6 +109,73 @@ fn rendered_input(state: &AppState, max_visible_lines: usize) -> RenderedInput {
         cursor_column,
         lines,
     }
+}
+
+fn input_content_width(composer_width: u16) -> usize {
+    let inner_width = composer_width.saturating_sub(2) as usize;
+    inner_width.saturating_sub(PROMPT_WIDTH).max(1)
+}
+
+fn wrapped_input_lines(input: &str, content_width: usize) -> Vec<VisualInputLine> {
+    let mut visual_lines = Vec::new();
+    if input.is_empty() {
+        append_wrapped_input_line("", content_width, &mut visual_lines);
+    } else {
+        for raw_line in input.split('\n') {
+            append_wrapped_input_line(raw_line, content_width, &mut visual_lines);
+        }
+    }
+    visual_lines
+}
+
+fn append_wrapped_input_line(
+    raw_line: &str,
+    content_width: usize,
+    visual_lines: &mut Vec<VisualInputLine>,
+) {
+    if raw_line.is_empty() {
+        visual_lines.push(VisualInputLine {
+            line: PROMPT.to_string(),
+            cursor_column: PROMPT_WIDTH,
+        });
+        return;
+    }
+
+    let mut segment = String::new();
+    let mut segment_width = 0;
+    let mut first_segment = true;
+    for ch in raw_line.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if ch_width > 0 && segment_width > 0 && segment_width + ch_width > content_width {
+            push_visual_input_line(&mut segment, segment_width, first_segment, visual_lines);
+            segment_width = 0;
+            first_segment = false;
+        }
+        segment.push(ch);
+        segment_width += ch_width;
+    }
+    push_visual_input_line(&mut segment, segment_width, first_segment, visual_lines);
+}
+
+fn push_visual_input_line(
+    segment: &mut String,
+    segment_width: usize,
+    first_segment: bool,
+    visual_lines: &mut Vec<VisualInputLine>,
+) {
+    let prefix = if first_segment {
+        PROMPT
+    } else {
+        CONTINUATION_PROMPT
+    };
+    let mut line = String::with_capacity(prefix.len() + segment.len());
+    line.push_str(prefix);
+    line.push_str(segment);
+    visual_lines.push(VisualInputLine {
+        line,
+        cursor_column: PROMPT_WIDTH + segment_width,
+    });
+    segment.clear();
 }
 
 fn lines_from_rendered(
@@ -196,7 +287,7 @@ mod tests {
         let mut state = test_state();
         state.push_input("/");
 
-        let rendered = lines(&state, 12)
+        let rendered = lines(&state, 12, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -213,7 +304,7 @@ mod tests {
         let mut state = test_state();
         state.push_input("/run investigate failing tests");
 
-        let rendered = lines(&state, 12)
+        let rendered = lines(&state, 12, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -228,7 +319,7 @@ mod tests {
         let mut state = test_state();
         state.push_input("plain request");
 
-        let rendered = lines(&state, 12)
+        let rendered = lines(&state, 12, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -243,7 +334,7 @@ mod tests {
         let mut state = test_state();
         state.push_input("/zz");
 
-        let rendered = lines(&state, 12)
+        let rendered = lines(&state, 12, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -257,10 +348,32 @@ mod tests {
         let mut state = test_state();
         state.push_input("one\ntwo\nthree\nfour\nfive");
 
-        let rendered = lines(&state, 3);
+        let rendered = lines(&state, 3, 80);
 
         assert_eq!(rendered.len(), 3);
         assert!(rendered[0].to_string().contains("earlier line"));
         assert_eq!(rendered[2].to_string(), "> five");
+    }
+
+    #[test]
+    fn height_counts_soft_wrapped_input_rows() {
+        let mut state = test_state();
+        state.push_input("abcdefghijklmnop");
+
+        assert_eq!(height(&state, 10, 16), 4);
+    }
+
+    #[test]
+    fn lines_render_soft_wrapped_continuation_rows() {
+        let mut state = test_state();
+        state.push_input("abcdefghijklmnop");
+
+        let rendered = lines(&state, 4, 16)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered[0], "> abcdefghijkl");
+        assert_eq!(rendered[1], "  mnop");
     }
 }
