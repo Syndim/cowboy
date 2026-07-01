@@ -126,7 +126,7 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> String {
             lines.push(format!("{stamp}  Waiting for input"));
             lines.push(format!("         step: {step}"));
             lines.push(format!("         prompt: {prompt_id}"));
-            lines.push(format!("         message: {message}"));
+            push_multiline(&mut lines, "message", message, usize::MAX);
             lines.push(format!("         choices: {choices}"));
             lines.push("         Type an answer below and press Enter.".to_string());
         }
@@ -313,6 +313,30 @@ mod tests {
         assert!(rendered.contains("content: read complete"), "{rendered}");
         assert!(rendered.contains("second line"), "{rendered}");
         assert!(!rendered.contains("{\"content\""), "{rendered}");
+    }
+
+    #[test]
+    fn renders_waiting_prompt_message_as_separate_lines() {
+        let rendered = render_workflow_event(&WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm_plan".to_string(),
+                prompt_id: "plan_confirmation_9".to_string(),
+                message: "Review plan\n- first item\n- second item".to_string(),
+                choices: Vec::new(),
+            },
+        ));
+
+        assert!(rendered.contains("message: Review plan"), "{rendered}");
+        assert!(
+            rendered.contains("                : - first item"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("                : - second item"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("message: Review plan\n-"), "{rendered}");
     }
 
     #[test]

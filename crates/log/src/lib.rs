@@ -5,8 +5,11 @@
 //! events to a log file. Verbosity is controlled by an environment variable, so
 //! getting more detail is just a matter of raising the level — no rebuild.
 
+use std::any::Any;
 use std::io;
+use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
@@ -66,6 +69,52 @@ pub fn init_file_logging(
     Ok(dir.join(file_name))
 }
 
+/// Install a process-wide panic hook that mirrors panic details into `tracing`.
+///
+/// This is intentionally separate from [`init_file_logging`]: binaries should
+/// initialize logging first, then install the hook so panics include the same
+/// file sink as normal diagnostics. The previous panic hook still runs, so
+/// stderr keeps Rust's standard panic report.
+pub fn install_panic_hook() {
+    static INSTALL: Once = Once::new();
+
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = panic_payload(info);
+            let location = info
+                .location()
+                .map(|location| format!("{}:{}", location.file(), location.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("<unnamed>");
+
+            tracing::error!(
+                panic_payload = %payload,
+                panic_location = %location,
+                panic_thread = %thread_name,
+                "process panic"
+            );
+
+            previous(info);
+        }));
+    });
+}
+
+fn panic_payload(info: &PanicHookInfo<'_>) -> String {
+    panic_payload_from_any(info.payload())
+}
+
+fn panic_payload_from_any(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +125,14 @@ mod tests {
         let _ = EnvFilter::new(TEST_APP_DIRECTIVE);
         assert_eq!(DEFAULT_DIRECTIVE, "info");
         assert_eq!(TEST_APP_DIRECTIVE, "debug");
+    }
+
+    #[test]
+    fn extracts_string_panic_payloads() {
+        assert_eq!(panic_payload_from_any(&"boom"), "boom");
+        assert_eq!(
+            panic_payload_from_any(&"owned boom".to_string()),
+            "owned boom"
+        );
     }
 }

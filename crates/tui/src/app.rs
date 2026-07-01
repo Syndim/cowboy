@@ -3,8 +3,9 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
+use crossterm::cursor::Show;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -35,29 +36,73 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     let events = runtime.events();
     let mut workflow_events = events.subscribe();
     let state = AppState::new(config);
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    )?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut terminal_mode = TerminalModeGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    tracing::debug!("TUI terminal session started");
 
     let result = run_loop(&mut terminal, state, &runtime, &mut workflow_events).await;
+    if let Err(err) = &result {
+        tracing::error!(error = ?err, "TUI loop exited with error");
+    }
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    )?;
-    terminal.show_cursor()?;
+    terminal_mode.restore()?;
+    tracing::debug!("TUI terminal session restored");
 
     result
+}
+
+struct TerminalModeGuard {
+    restored: bool,
+}
+
+impl TerminalModeGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+
+        Ok(Self { restored: false })
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+
+        disable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(
+            stdout,
+            PopKeyboardEnhancementFlags,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            Show
+        )?;
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for TerminalModeGuard {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+
+        if let Err(err) = self.restore() {
+            tracing::error!(error = ?err, "failed to restore terminal after TUI exit");
+        }
+    }
 }
 
 async fn run_loop<B: ratatui::backend::Backend>(
@@ -72,23 +117,85 @@ async fn run_loop<B: ratatui::backend::Backend>(
         if state.exit_requested() {
             return Ok(());
         }
-        terminal.draw(|frame| draw(frame, &state))?;
-        if event::poll(Duration::from_millis(100))? {
-            match event::read()? {
-                Event::Paste(text) => state.push_input(&text),
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    match input::handle_key_press(&mut state, key) {
-                        KeyHandling::Continue => {}
-                        KeyHandling::Submit => commands::submit_input(&mut state, runtime).await,
-                        KeyHandling::Exit => return Ok(()),
-                    }
+        if let Err(err) = terminal.draw(|frame| draw(frame, &state)) {
+            tracing::error!(error = ?err, "TUI draw failed");
+            return Err(err.into());
+        }
+
+        let has_event = match event::poll(Duration::from_millis(100)) {
+            Ok(has_event) => has_event,
+            Err(err) => {
+                tracing::error!(error = ?err, "TUI event poll failed");
+                return Err(err.into());
+            }
+        };
+        if !has_event {
+            continue;
+        }
+
+        let event = match event::read() {
+            Ok(event) => event,
+            Err(err) => {
+                tracing::error!(error = ?err, "TUI event read failed");
+                return Err(err.into());
+            }
+        };
+        match event {
+            Event::Paste(text) => {
+                tracing::debug!(chars = text.chars().count(), "TUI paste received");
+                state.push_input(&text);
+            }
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                tracing::trace!(
+                    code = key_code_name(&key.code),
+                    modifiers = ?key.modifiers,
+                    input_chars = state.input().chars().count(),
+                    "TUI key received"
+                );
+                match input::handle_key_press(&mut state, key) {
+                    KeyHandling::Continue => {}
+                    KeyHandling::Submit => commands::submit_input(&mut state, runtime).await,
+                    KeyHandling::Exit => return Ok(()),
                 }
-                _ => {}
+            }
+            event => {
+                tracing::trace!(event = ?event, "TUI event ignored");
             }
         }
     }
 }
 
+fn key_code_name(code: &KeyCode) -> &'static str {
+    match code {
+        KeyCode::Backspace => "backspace",
+        KeyCode::Enter => "enter",
+        KeyCode::Left => "left",
+        KeyCode::Right => "right",
+        KeyCode::Up => "up",
+        KeyCode::Down => "down",
+        KeyCode::Home => "home",
+        KeyCode::End => "end",
+        KeyCode::PageUp => "page_up",
+        KeyCode::PageDown => "page_down",
+        KeyCode::Tab => "tab",
+        KeyCode::BackTab => "back_tab",
+        KeyCode::Delete => "delete",
+        KeyCode::Insert => "insert",
+        KeyCode::F(_) => "function",
+        KeyCode::Char(_) => "char",
+        KeyCode::Null => "null",
+        KeyCode::Esc => "escape",
+        KeyCode::CapsLock => "caps_lock",
+        KeyCode::ScrollLock => "scroll_lock",
+        KeyCode::NumLock => "num_lock",
+        KeyCode::PrintScreen => "print_screen",
+        KeyCode::Pause => "pause",
+        KeyCode::Menu => "menu",
+        KeyCode::KeypadBegin => "keypad_begin",
+        KeyCode::Media(_) => "media",
+        KeyCode::Modifier(_) => "modifier",
+    }
+}
 fn draw(frame: &mut ratatui::Frame<'_>, state: &AppState) {
     let area = frame.area();
     let composer_height = composer::height(state, area.height);

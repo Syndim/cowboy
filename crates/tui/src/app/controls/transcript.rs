@@ -79,15 +79,34 @@ fn prompt_card_lines(prompt: &PendingPrompt) -> Vec<Line<'static>> {
     } else {
         prompt.choices().join(", ")
     };
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled("Waiting for input", style_warning())),
         Line::from(format!("         step: {}", prompt.step())),
         Line::from(format!("         prompt: {}", prompt.prompt_id())),
-        Line::from(format!("         message: {}", prompt.message())),
-        Line::from(format!("         choices: {choices}")),
-        Line::from("         Type an answer below and press Enter."),
-        Line::from(""),
-    ]
+    ];
+    lines.extend(prompt_message_lines(prompt.message()));
+    lines.push(Line::from(format!("         choices: {choices}")));
+    lines.push(Line::from("         Type an answer below and press Enter."));
+    lines.push(Line::from(""));
+    lines
+}
+
+fn prompt_message_lines(message: &str) -> Vec<Line<'static>> {
+    if message.is_empty() {
+        return vec![Line::from("         message:")];
+    }
+
+    message
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            if index == 0 {
+                Line::from(format!("         message: {line}"))
+            } else {
+                Line::from(format!("                {line}"))
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -141,6 +160,37 @@ mod tests {
             .unwrap();
         assert_eq!(first_event.chars().nth(2), Some(':'));
         assert_eq!(first_event.chars().nth(5), Some(':'));
+    }
+
+    #[test]
+    fn prompt_card_splits_multiline_message() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm_plan".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Review plan\n- first item\n- second item".to_string(),
+                choices: Vec::new(),
+            },
+        ));
+        state.push_card("Notice", ["keep prompt visible".to_string()]);
+
+        let rendered_lines = lines(&state, 100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered_lines.iter().all(|line| !line.contains('\n')));
+        let rendered = rendered_lines.join("\n");
+        assert!(rendered.contains("message: Review plan"), "{rendered}");
+        assert!(
+            rendered.contains("                - first item"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("                - second item"),
+            "{rendered}"
+        );
     }
 
     #[test]

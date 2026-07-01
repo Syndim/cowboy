@@ -50,7 +50,15 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    if let Err(err) = run_main().await {
+        tracing::error!(error = ?err, "cowboy exited with error");
+        eprintln!("cowboy error: {err:?}");
+        std::process::exit(1);
+    }
+}
+
+async fn run_main() -> Result<()> {
     let cli = Cli::parse();
     let config = cowboy::load_config(&cli.config)?;
     if let Ok(log_path) = cowboy_log::init_file_logging(
@@ -70,6 +78,7 @@ async fn main() -> Result<()> {
             provider = ?config.agent.model.provider,
             "cowboy logging initialized"
         );
+        cowboy_log::install_panic_hook();
     }
     let cwd = std::env::current_dir()?;
 

@@ -138,7 +138,11 @@ impl AppConfig {
     fn expand_paths(&mut self) {
         self.state_dir = expand_tilde(&self.state_dir);
         self.workflow_store = expand_tilde(&self.workflow_store);
-        self.workflow_dirs = self.workflow_dirs.iter().map(|path| expand_tilde(path)).collect();
+        self.workflow_dirs = self
+            .workflow_dirs
+            .iter()
+            .map(|path| expand_tilde(path))
+            .collect();
     }
 }
 

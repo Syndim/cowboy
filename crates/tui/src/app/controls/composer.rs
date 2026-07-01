@@ -47,7 +47,6 @@ fn lines(state: &AppState, max_visible_lines: usize) -> Vec<Line<'static>> {
     lines_from_rendered(state, max_visible_lines, &rendered)
 }
 
-
 struct RenderedInput {
     lines: Vec<String>,
     cursor_line: usize,
