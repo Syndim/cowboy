@@ -2,6 +2,10 @@ use anyhow::Result;
 use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
 
 use super::events::render_workflow_event;
+use super::markup::render_markup;
+use super::styles::{
+    style_accent, style_error, style_transcript_metadata, style_transcript_normal, style_warning,
+};
 use crate::config::AppConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,11 +77,40 @@ impl TranscriptEntry {
     }
 }
 
+pub(in crate::app) fn render_pending_prompt_lines(
+    prompt: &PendingPrompt,
+) -> Vec<ratatui::text::Line<'static>> {
+    let choices = display_prompt_choices(prompt.choices());
+    let mut lines = vec![ratatui::text::Line::from(vec![
+        ratatui::text::Span::styled("Waiting for input", style_warning()),
+        ratatui::text::Span::styled("  step=", style_transcript_metadata()),
+        ratatui::text::Span::styled(prompt.step().to_string(), style_accent()),
+        ratatui::text::Span::styled("  prompt=", style_transcript_metadata()),
+        ratatui::text::Span::styled(prompt.prompt_id().to_string(), style_transcript_metadata()),
+        ratatui::text::Span::styled("  choices=", style_transcript_metadata()),
+        ratatui::text::Span::styled(choices, style_warning()),
+    ])];
+    lines.extend(render_markup(prompt.message(), style_transcript_normal()));
+    lines
+}
+
+fn render_pending_prompt_line_count(prompt: &PendingPrompt) -> usize {
+    render_pending_prompt_lines(prompt).len()
+}
+
+fn display_prompt_choices(choices: &[String]) -> String {
+    if choices.is_empty() {
+        "<freeform>".to_string()
+    } else {
+        choices.join(", ")
+    }
+}
+
 fn render_card_lines(title: &str, details: &[String]) -> Vec<ratatui::text::Line<'static>> {
     let title_style = match title {
-        "Cancelled" => super::styles::style_error(),
-        "Notice" => super::styles::style_warning(),
-        _ => super::styles::style_accent(),
+        "Cancelled" => style_error(),
+        "Notice" => style_warning(),
+        _ => style_accent(),
     };
     let mut lines = vec![ratatui::text::Line::from(ratatui::text::Span::styled(
         title.to_string(),
@@ -86,7 +119,7 @@ fn render_card_lines(title: &str, details: &[String]) -> Vec<ratatui::text::Line
     lines.extend(details.iter().map(|detail| {
         ratatui::text::Line::from(ratatui::text::Span::styled(
             format!("         {detail}"),
-            super::styles::style_transcript_normal(),
+            style_transcript_normal(),
         ))
     }));
     lines
@@ -577,8 +610,20 @@ impl AppState {
     }
 
     fn transcript_line_count(&self) -> usize {
+        let pending_prompt_lines = self.pending_prompt.as_ref().map_or(0, |prompt| {
+            let prompt_is_latest = self.event_log.last().is_some_and(|entry| {
+                entry.contains("Waiting for input")
+                    && entry.contains(&format!("prompt={}", prompt.prompt_id))
+            });
+            if prompt_is_latest {
+                0
+            } else {
+                render_pending_prompt_line_count(prompt)
+            }
+        });
+
         if self.event_log.is_empty() {
-            return 9 + usize::from(self.pending_prompt.is_some()) * 7;
+            return 9 + pending_prompt_lines;
         }
 
         let event_lines = self
@@ -586,13 +631,6 @@ impl AppState {
             .iter()
             .map(|entry| entry.render_lines().len() + 1)
             .sum::<usize>();
-        let pending_prompt_lines = self.pending_prompt.as_ref().map_or(0, |prompt| {
-            let prompt_is_latest = self.event_log.last().is_some_and(|entry| {
-                entry.contains("Waiting for input")
-                    && entry.contains(&format!("prompt: {}", prompt.prompt_id))
-            });
-            if prompt_is_latest { 0 } else { 7 }
-        });
         event_lines + pending_prompt_lines
     }
 
@@ -651,8 +689,9 @@ mod tests {
         assert_eq!(state.event_entries().len(), 1);
         let entry = &state.event_entries()[0];
         assert_eq!(entry.matches("Agent response"), 1);
+        assert!(entry.contains("Hello, world"), "{}", entry.plain_text());
         assert!(
-            entry.contains("content: Hello, world"),
+            !entry.contains("content: Hello, world"),
             "{}",
             entry.plain_text()
         );
@@ -681,7 +720,12 @@ mod tests {
         let entry = &state.event_entries()[0];
         assert_eq!(entry.matches("Agent thinking"), 1);
         assert!(
-            entry.contains("thought: checking approach"),
+            entry.contains("checking approach"),
+            "{}",
+            entry.plain_text()
+        );
+        assert!(
+            !entry.contains("thought: checking approach"),
             "{}",
             entry.plain_text()
         );
@@ -709,12 +753,42 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 3);
         assert!(state.event_entries()[0].contains("Agent response"));
-        assert!(state.event_entries()[0].contains("content: Hel"));
+        assert!(state.event_entries()[0].contains("Hel"));
+        assert!(!state.event_entries()[0].contains("content: Hel"));
         assert_eq!(state.event_entries()[0].matches("Agent response"), 1);
         assert!(state.event_entries()[1].contains("Notice"));
         assert!(state.event_entries()[1].contains("non-workflow boundary"));
         assert!(state.event_entries()[2].contains("Agent response"));
-        assert!(state.event_entries()[2].contains("content: lo"));
+        assert!(state.event_entries()[2].contains("lo"));
+        assert!(!state.event_entries()[2].contains("content: lo"));
+    }
+
+    #[test]
+    fn transcript_line_count_uses_dynamic_pending_prompt_height() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Review\n- first item\n\n`code`".to_string(),
+                choices: Vec::new(),
+            },
+        ));
+        state.push_card("Notice", ["keep prompt visible".to_string()]);
+
+        let event_and_card_lines = state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.render_lines().len() + 1)
+            .sum::<usize>();
+
+        assert_eq!(
+            render_pending_prompt_lines(state.pending_prompt().unwrap()).len(),
+            5
+        );
+        assert_eq!(state.transcript_line_count(), event_and_card_lines + 5);
+        assert_ne!(state.transcript_line_count(), event_and_card_lines + 7);
     }
 
     #[tokio::test]
@@ -743,7 +817,8 @@ mod tests {
         state.drain_workflow_events(&mut rx);
 
         assert_eq!(state.event_entries().len(), 2);
-        assert!(state.event_entries()[0].contains("content: pre-lag"));
+        assert!(state.event_entries()[0].contains("pre-lag"));
+        assert!(!state.event_entries()[0].contains("content: pre-lag"));
         assert!(!state.event_entries()[0].contains("three"));
         assert!(state.event_entries()[1].contains("Agent response"));
         assert!(state.event_entries()[1].contains("two"));

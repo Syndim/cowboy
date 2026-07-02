@@ -3,11 +3,8 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::super::state::{AppState, PendingPrompt};
-use super::super::styles::{
-    style_accent, style_border, style_muted, style_transcript_metadata, style_transcript_normal,
-    style_warning,
-};
+use super::super::state::{AppState, render_pending_prompt_lines};
+use super::super::styles::{style_accent, style_border, style_muted, style_transcript_normal};
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let visible_height = area.height.saturating_sub(2) as usize;
@@ -52,10 +49,10 @@ fn all_lines(state: &AppState) -> Vec<Line<'static>> {
     if let Some(prompt) = state.pending_prompt() {
         let prompt_is_latest = state.event_entries().last().is_some_and(|entry| {
             entry.contains("Waiting for input")
-                && entry.contains(&format!("prompt: {}", prompt.prompt_id()))
+                && entry.contains(&format!("prompt={}", prompt.prompt_id()))
         });
         if !prompt_is_latest {
-            lines.extend(prompt_card_lines(prompt));
+            lines.extend(render_pending_prompt_lines(prompt));
         }
     }
 
@@ -83,55 +80,6 @@ fn empty_lines() -> Vec<Line<'static>> {
         )),
         Line::from(Span::styled("  > /workflows", style_transcript_normal())),
     ]
-}
-
-fn prompt_card_lines(prompt: &PendingPrompt) -> Vec<Line<'static>> {
-    let choices = if prompt.choices().is_empty() {
-        "<freeform>".to_string()
-    } else {
-        prompt.choices().join(", ")
-    };
-    let mut lines = vec![
-        Line::from(Span::styled("Waiting for input", style_warning())),
-        metadata_line(format!("         step: {}", prompt.step())),
-        metadata_line(format!("         prompt: {}", prompt.prompt_id())),
-    ];
-    lines.extend(prompt_message_lines(prompt.message()));
-    lines.push(Line::from(vec![
-        Span::styled("         choices: ", style_transcript_metadata()),
-        Span::styled(choices, style_warning()),
-    ]));
-    lines.push(metadata_line(
-        "         Type an answer below and press Enter.",
-    ));
-    lines.push(Line::from(""));
-    lines
-}
-
-fn prompt_message_lines(message: &str) -> Vec<Line<'static>> {
-    if message.is_empty() {
-        return vec![metadata_line("         message:")];
-    }
-
-    message
-        .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 {
-                "         message: "
-            } else {
-                "                "
-            };
-            Line::from(vec![
-                Span::styled(prefix, style_transcript_metadata()),
-                Span::styled(line.to_string(), style_transcript_normal()),
-            ])
-        })
-        .collect()
-}
-
-fn metadata_line(text: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(text.into(), style_transcript_metadata()))
 }
 
 #[cfg(test)]
@@ -175,8 +123,12 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("Waiting for input"));
-        assert!(rendered.contains("prompt: approval"));
-        assert!(rendered.contains("message: Approve?"));
+        assert!(rendered.contains("step=approve"));
+        assert!(rendered.contains("prompt=approval"));
+        assert!(rendered.contains("choices=yes, no"));
+        assert!(rendered.contains("\nApprove?"));
+        assert!(!rendered.contains("prompt: approval"));
+        assert!(!rendered.contains("message: Approve?"));
         assert!(!rendered.contains("╭─ Waiting for input ─╮"));
         assert!(!rendered.contains("╰──────────────────────╯"));
         assert!(!rendered.contains("│"));
@@ -208,13 +160,18 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(rendered_lines.iter().all(|line| !line.contains('\n')));
         let rendered = rendered_lines.join("\n");
-        assert!(rendered.contains("message: Review plan"), "{rendered}");
+        assert!(rendered.contains("Waiting for input"), "{rendered}");
+        assert!(rendered.contains("step=confirm_plan"), "{rendered}");
+        assert!(rendered.contains("prompt=approval"), "{rendered}");
+        assert!(rendered.contains("choices=<freeform>"), "{rendered}");
         assert!(
-            rendered.contains("                - first item"),
+            rendered.contains("\nReview plan\n- first item"),
             "{rendered}"
         );
+        assert!(rendered.contains("\n- second item"), "{rendered}");
+        assert!(!rendered.contains("message:"), "{rendered}");
         assert!(
-            rendered.contains("                - second item"),
+            !rendered.contains("                - first item"),
             "{rendered}"
         );
     }
@@ -309,9 +266,12 @@ mod tests {
         assert!(thought < tool_call);
         assert!(tool_call < tool_update);
         assert!(tool_update < response);
-        assert!(rendered.contains("thought: thinking"));
-        assert!(rendered.contains("content: done"));
-        assert!(rendered.contains("content: ready"));
+        assert!(rendered.contains("\nthinking"));
+        assert!(rendered.contains("\ndone"));
+        assert!(rendered.contains("\nready"));
+        assert!(!rendered.contains("thought: thinking"));
+        assert!(!rendered.contains("content: done"));
+        assert!(!rendered.contains("content: ready"));
         assert!(!rendered.contains("id:"), "{rendered}");
         assert!(!rendered.contains("call_1"), "{rendered}");
         assert!(!rendered.contains("{\"text\""), "{rendered}");
@@ -331,7 +291,7 @@ mod tests {
         let rendered = lines(&state, 20);
         let thought_line = rendered
             .iter()
-            .find(|line| line.to_string().contains("thought: thinking"))
+            .find(|line| line.to_string() == "thinking")
             .unwrap();
 
         assert!(thought_line.spans.iter().any(|span| {

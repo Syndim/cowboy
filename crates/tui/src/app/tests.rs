@@ -141,7 +141,7 @@ fn draw_preserves_transcript_styles() {
         let start = y * width;
         let row = &buffer.content[start..start + width];
         let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
-        if text.contains("thought: thinking") {
+        if text.contains("│thinking") {
             let x = text.find("thinking").unwrap();
             assert_eq!(row[x].fg, thought_fg);
             found = true;

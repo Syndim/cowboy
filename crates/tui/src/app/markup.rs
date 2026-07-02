@@ -7,7 +7,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-use super::styles::{style_border, style_transcript_code_fallback, style_transcript_metadata};
+use super::styles::{style_border, style_transcript_code_fallback};
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<syntect::highlighting::ThemeSet> =
@@ -45,47 +45,6 @@ pub(super) fn render_markup(text: &str, base_style: Style) -> Vec<Line<'static>>
     }
 
     rendered
-}
-
-pub(super) fn render_labeled_markup(
-    label: &str,
-    value: &str,
-    base_style: Style,
-    max_lines: usize,
-) -> Vec<Line<'static>> {
-    if value.is_empty() {
-        return vec![metadata_line(format!("         {label:>7}:"))];
-    }
-
-    let mut rendered = Vec::new();
-    let value_lines = render_markup(value, base_style);
-    let total = value.lines().count();
-    for (index, line) in value_lines.into_iter().take(max_lines).enumerate() {
-        let label = if index == 0 { label } else { "" };
-        rendered.push(with_label_prefix(label, line));
-    }
-    if total > max_lines {
-        rendered.push(metadata_line("                ..."));
-    }
-    rendered
-}
-
-pub(super) fn plain_labeled_lines(label: &str, value: &str, style: Style) -> Vec<Line<'static>> {
-    render_labeled_markup(label, value, style, usize::MAX)
-}
-
-fn metadata_line(text: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(text.into(), style_transcript_metadata()))
-}
-
-fn with_label_prefix(label: &str, line: Line<'static>) -> Line<'static> {
-    let mut spans = Vec::with_capacity(line.spans.len() + 1);
-    spans.push(Span::styled(
-        format!("         {label:>7}: "),
-        style_transcript_metadata(),
-    ));
-    spans.extend(line.spans);
-    Line::from(spans)
 }
 
 fn render_inline_code(line: &str, base_style: Style) -> Line<'static> {
