@@ -18,7 +18,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
         )
     } else if state.background_task_count() > 0 {
         format!(
-            "{} ─ PgUp/PgDn scroll ─ End follow ─ Ctrl-C exit ─ Esc cancel ─ tasks:{}",
+            "{} ─ Ctrl-U/Ctrl-D scroll ─ End follow ─ Ctrl-C exit ─ Esc cancel ─ tasks:{}",
             state.display_state(),
             state.background_task_count()
         )
@@ -27,7 +27,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
             .to_string()
     } else {
         format!(
-            "{} ─ {} ─ PgUp/PgDn scroll ─ End follow ─ Ctrl-C exit ─ /help",
+            "{} ─ {} ─ Ctrl-U/Ctrl-D scroll ─ End follow ─ Ctrl-C exit ─ /help",
             state.display_state(),
             state.status()
         )

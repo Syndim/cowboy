@@ -46,11 +46,11 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
             state.history_next();
             KeyHandling::Continue
         }
-        KeyCode::PageUp => {
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.scroll_events_up();
             KeyHandling::Continue
         }
-        KeyCode::PageDown => {
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.scroll_events_down();
             KeyHandling::Continue
         }
@@ -201,5 +201,63 @@ mod tests {
 
         assert_eq!(handling, KeyHandling::Continue);
         assert_eq!(state.input(), "plain request");
+    }
+
+    fn populate_scrollable_transcript(state: &mut AppState) {
+        state.push_card("Transcript", (0..20).map(|index| format!("line {index}")));
+    }
+
+    #[test]
+    fn control_u_scrolls_up_without_mutating_input() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        state.push_input("draft");
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert!(state.scroll_offset() > 0);
+        assert_eq!(state.input(), "draft");
+    }
+
+    #[test]
+    fn control_d_scrolls_down_and_restores_follow_latest_without_mutating_input() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        state.scroll_events_up();
+        state.push_input("draft");
+        assert!(state.scroll_offset() > 0);
+        assert!(!state.is_following_events());
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+        assert_eq!(state.input(), "draft");
+    }
+
+    #[test]
+    fn page_keys_do_not_scroll_transcript() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        state.scroll_events_up();
+        state.push_input("draft");
+        let offset = state.scroll_offset();
+        assert!(offset > 0);
+
+        for code in [KeyCode::PageUp, KeyCode::PageDown] {
+            let handling = handle_key_press(&mut state, KeyEvent::new(code, KeyModifiers::NONE));
+
+            assert_eq!(handling, KeyHandling::Continue);
+            assert_eq!(state.scroll_offset(), offset);
+            assert_eq!(state.input(), "draft");
+        }
     }
 }

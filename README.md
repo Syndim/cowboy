@@ -121,7 +121,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 | `Shift+Enter` / `Ctrl+Enter` | Insert a newline in the input. |
 | `Tab` | Complete the first slash-command suggestion. |
 | `↑` / `↓` | Browse command history. |
-| `PgUp` / `PgDn` | Scroll the transcript. |
+| `Ctrl+U` / `Ctrl+D` | Scroll the transcript. |
 | `End` | Follow the latest transcript entry. |
 | `Ctrl+C` | Quit Cowboy. |
 | `Esc` | Cancel active background tasks. |

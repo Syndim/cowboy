@@ -302,6 +302,11 @@ impl AppState {
         self.history.is_empty()
     }
 
+    #[cfg(test)]
+    pub(in crate::app) fn is_following_events(&self) -> bool {
+        self.follow_events
+    }
+
     pub(in crate::app) fn push_input(&mut self, text: &str) {
         self.input.push_str(text);
         self.history_index = None;
