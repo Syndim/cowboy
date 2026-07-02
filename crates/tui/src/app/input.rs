@@ -12,8 +12,8 @@ pub(super) enum KeyHandling {
 
 pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandling {
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => KeyHandling::Exit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyHandling::Exit,
+        KeyCode::Esc => {
             state.cancel_background_tasks();
             KeyHandling::Continue
         }
@@ -110,6 +110,49 @@ mod tests {
 
         assert_eq!(handling, KeyHandling::Submit);
         assert_eq!(state.input(), "hello");
+    }
+
+    #[test]
+    fn control_c_requests_exit_without_mutating_input() {
+        let mut state = test_state();
+        state.push_input("hello");
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(handling, KeyHandling::Exit);
+        assert_eq!(state.input(), "hello");
+    }
+
+    #[test]
+    fn plain_q_appends_to_composer() {
+        let mut state = test_state();
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.input(), "q");
+    }
+
+    #[tokio::test]
+    async fn esc_cancels_background_tasks_without_mutating_input() {
+        let mut state = test_state();
+        state.push_input("hello");
+        state.spawn_report_task("pending".to_string(), async {
+            std::future::pending::<Result<cowboy_workflow_engine::RunReport, String>>().await
+        });
+
+        let handling =
+            handle_key_press(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.input(), "hello");
+        assert_eq!(state.status(), "cancelled 1 background task(s)");
     }
 
     #[test]

@@ -123,9 +123,9 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 | `↑` / `↓` | Browse command history. |
 | `PgUp` / `PgDn` | Scroll the transcript. |
 | `End` | Follow the latest transcript entry. |
-| `Ctrl+C` | Cancel active background tasks. |
+| `Ctrl+C` | Quit Cowboy. |
+| `Esc` | Cancel active background tasks. |
 | `Backspace` | Delete one input character. |
-| `Esc` / `q` | Quit. |
 
 ## Configuration
 
