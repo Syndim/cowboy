@@ -66,6 +66,11 @@ fn slash_suggestions_are_safe_in_short_terminals() {
 }
 
 #[test]
+fn tui_input_cursor_style_uses_unix_block_cursor() {
+    assert_eq!(tui_input_cursor_style(), SetCursorStyle::BlinkingBlock);
+}
+
+#[test]
 fn draw_places_cursor_at_input_end() {
     let mut state = test_state();
     state.push_input("abc");

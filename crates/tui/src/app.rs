@@ -53,6 +53,10 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     result
 }
 
+fn tui_input_cursor_style() -> SetCursorStyle {
+    SetCursorStyle::BlinkingBlock
+}
+
 struct TerminalModeGuard {
     restored: bool,
 }
@@ -67,7 +71,7 @@ impl TerminalModeGuard {
             EnterAlternateScreen,
             EnableBracketedPaste,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-            SetCursorStyle::BlinkingBar
+            tui_input_cursor_style()
         ) {
             let _ = disable_raw_mode();
             return Err(err.into());
