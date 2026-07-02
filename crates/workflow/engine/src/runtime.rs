@@ -1176,6 +1176,187 @@ mod tests {
     }
 
     #[test]
+    fn example_blocked_step_requests_user_direction() {
+        let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows")
+            .canonicalize()
+            .unwrap();
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(&examples_root)
+            .load_catalog()
+            .unwrap();
+        let source_ref = catalog.workflows.get("workflows/feature").unwrap();
+        let compiled = cowboy_workflow_lua::load(source_ref).unwrap();
+        assert_eq!(
+            compiled.definition.steps["blocked"].transitions.by_status["answered"],
+            "triage_blocked"
+        );
+        assert_eq!(
+            compiled.definition.steps["triage_blocked"]
+                .transitions
+                .by_status["plan"],
+            "plan"
+        );
+        assert_eq!(
+            compiled.definition.steps["triage_blocked"]
+                .transitions
+                .by_status["implement"],
+            "implement"
+        );
+        assert_eq!(
+            compiled.definition.steps["triage_blocked"]
+                .transitions
+                .by_status["revise"],
+            "revise"
+        );
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "blocked",
+            serde_json::json!({
+                "steps_executed": 10,
+                "resume": {},
+                "prev": {
+                    "step": "implement",
+                    "status": "blocked",
+                    "fields": { "summary": "Need credentials" },
+                    "body": "Cannot continue without access",
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(action) = result.action else {
+            panic!("expected blocked step to ask the user")
+        };
+        assert_eq!(action.id, "blocked_10");
+        assert!(action.message.contains("What should Cowboy do next?"));
+        assert!(action.message.contains("feature workflow blocked"));
+        assert!(action.choices.is_empty());
+
+        let blocked_response = "Credentials are available now; continue implementation.";
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "blocked",
+            serde_json::json!({
+                "steps_executed": 11,
+                "resume": { "blocked_10": blocked_response },
+                "prev": {
+                    "step": "implement",
+                    "status": "blocked",
+                    "fields": { "summary": "Need credentials", "plan_doc": "docs/plans/example.md" },
+                    "body": "Cannot continue without access",
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("expected blocked answer to be recorded")
+        };
+        assert_eq!(action.status, "answered");
+        assert_eq!(action.fields["summary"], "Need credentials");
+        assert_eq!(action.fields["plan_doc"], "docs/plans/example.md");
+        assert_eq!(action.fields["blocked_response"], blocked_response);
+        assert_eq!(action.fields["blocked_from_step"], "implement");
+        assert_eq!(action.fields["blocked_from_status"], "blocked");
+        assert!(action.body.contains("User response:"));
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "status": "answered",
+                    "fields": {
+                        "summary": "Need credentials",
+                        "plan_doc": "docs/plans/example.md",
+                        "blocked_response": blocked_response,
+                        "blocked_from_step": "implement",
+                        "blocked_from_status": "blocked"
+                    },
+                    "body": "Workflow was blocked. User response:\nCredentials are available now; continue implementation.",
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("expected triage to route back to implementation")
+        };
+        assert_eq!(action.status, "implement");
+        assert_eq!(action.fields["feedback"], blocked_response);
+        assert_eq!(action.fields["plan_doc"], "docs/plans/example.md");
+        assert_eq!(action.fields["blocked_from_step"], "implement");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "implement",
+            serde_json::json!({
+                "request": "add a status command",
+                "prev": {
+                    "step": "triage_blocked",
+                    "status": "implement",
+                    "fields": {
+                        "summary": "Blocked workflow triaged to implement",
+                        "feedback": blocked_response,
+                        "plan_doc": "docs/plans/example.md",
+                        "files": [],
+                        "blocked_from_step": "implement",
+                        "blocked_from_status": "blocked"
+                    },
+                    "body": "Blocked workflow user response:\nCredentials are available now; continue implementation.",
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("expected implement step to receive triage context")
+        };
+        assert!(action.prompt.contains(blocked_response));
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "status": "answered",
+                    "fields": {
+                        "blocked_response": "Change the plan to reduce scope first.",
+                        "blocked_from_step": "implement"
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("expected triage to route to planning")
+        };
+        assert_eq!(action.status, "plan");
+
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "status": "answered",
+                    "fields": {
+                        "blocked_response": "The dependency is fixed; continue.",
+                        "blocked_from_step": "revise"
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("expected triage to route back to revision")
+        };
+        assert_eq!(action.status, "revise");
+    }
+
+    #[test]
     fn catalog_loads_filesystem_workflow_description() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");

@@ -18,6 +18,7 @@ local revise = require("steps/revise.lua")(roles)
 local commit = require("steps/commit.lua")(roles)
 local done = require("steps/done.lua")("bug fix implemented, tested, reviewed, and committed")
 local blocked = require("steps/blocked.lua")("bug fix workflow blocked")
+local triage_blocked = require("steps/triage_blocked.lua")("triage_blocked")
 
 plan:on("ready", review_plan)
 plan:on("unclear", clarify)
@@ -39,6 +40,10 @@ revise:on("implemented", test)
 revise:on("blocked", blocked)
 commit:on("committed", done)
 commit:on("blocked", blocked)
+blocked:on("answered", triage_blocked)
+triage_blocked:on("plan", plan)
+triage_blocked:on("implement", implement)
+triage_blocked:on("revise", revise)
 
 return workflow("bugfix", plan, {
   description = "Plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
