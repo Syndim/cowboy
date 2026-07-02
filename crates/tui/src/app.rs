@@ -22,6 +22,7 @@ mod commands;
 mod controls;
 mod events;
 mod input;
+mod markup;
 mod state;
 mod styles;
 

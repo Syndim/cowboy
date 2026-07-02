@@ -32,6 +32,75 @@ impl PendingPrompt {
 }
 
 #[derive(Debug, Clone)]
+pub(super) enum TranscriptEntry {
+    Workflow(WorkflowEvent),
+    Card { title: String, details: Vec<String> },
+    Plain(String),
+}
+
+impl TranscriptEntry {
+    pub(in crate::app) fn render_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        match self {
+            Self::Workflow(event) => render_workflow_event(event).lines().to_vec(),
+            Self::Card { title, details } => render_card_lines(title, details),
+            Self::Plain(text) => text
+                .lines()
+                .map(|line| {
+                    ratatui::text::Line::from(ratatui::text::Span::styled(
+                        line.to_string(),
+                        super::styles::style_transcript_normal(),
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    pub(in crate::app) fn plain_text(&self) -> String {
+        match self {
+            Self::Workflow(event) => render_workflow_event(event).text().to_string(),
+            Self::Card { title, details } => card_plain_text(title, details),
+            Self::Plain(text) => text.clone(),
+        }
+    }
+
+    pub(in crate::app) fn contains(&self, needle: &str) -> bool {
+        self.plain_text().contains(needle)
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn matches(&self, needle: &str) -> usize {
+        self.plain_text().matches(needle).count()
+    }
+}
+
+fn render_card_lines(title: &str, details: &[String]) -> Vec<ratatui::text::Line<'static>> {
+    let title_style = match title {
+        "Cancelled" => super::styles::style_error(),
+        "Notice" => super::styles::style_warning(),
+        _ => super::styles::style_accent(),
+    };
+    let mut lines = vec![ratatui::text::Line::from(ratatui::text::Span::styled(
+        title.to_string(),
+        title_style,
+    ))];
+    lines.extend(details.iter().map(|detail| {
+        ratatui::text::Line::from(ratatui::text::Span::styled(
+            format!("         {detail}"),
+            super::styles::style_transcript_normal(),
+        ))
+    }));
+    lines
+}
+
+fn card_plain_text(title: &str, details: &[String]) -> String {
+    let mut lines = vec![title.to_string()];
+    for detail in details {
+        lines.push(format!("         {detail}"));
+    }
+    lines.join("\n")
+}
+
+#[derive(Debug, Clone)]
 struct ActiveStream {
     index: usize,
     event: WorkflowEvent,
@@ -111,7 +180,7 @@ pub(super) struct AppState {
     pending_prompt: Option<PendingPrompt>,
     run_state: String,
     status: String,
-    event_log: Vec<String>,
+    event_log: Vec<TranscriptEntry>,
     active_stream: Option<ActiveStream>,
     scroll_offset: usize,
     follow_events: bool,
@@ -171,7 +240,7 @@ impl AppState {
         &self.status
     }
 
-    pub(in crate::app) fn event_entries(&self) -> &[String] {
+    pub(in crate::app) fn event_entries(&self) -> &[TranscriptEntry] {
         &self.event_log
     }
 
@@ -251,11 +320,10 @@ impl AppState {
         title: &str,
         details: impl IntoIterator<Item = String>,
     ) {
-        let mut lines = vec![title.to_string()];
-        for detail in details {
-            lines.push(format!("         {detail}"));
-        }
-        self.push_event(lines.join("\n"));
+        self.push_event(TranscriptEntry::Card {
+            title: title.to_string(),
+            details: details.into_iter().collect(),
+        });
     }
 
     pub(in crate::app) fn cancel_background_tasks(&mut self) {
@@ -322,7 +390,7 @@ impl AppState {
     {
         self.status = label.clone();
         self.run_state = "running".to_string();
-        self.push_event(label);
+        self.push_event(TranscriptEntry::Plain(label));
         self.background.push(tokio::spawn(future));
     }
 
@@ -345,10 +413,10 @@ impl AppState {
         }
 
         let rendered = render_workflow_event(&event);
-        self.status = rendered.clone();
+        self.status = rendered.text().to_string();
         let is_stream_event = stream_content(&event.kind).is_some();
         self.apply_workflow_event_metadata(&event);
-        self.push_event(rendered);
+        self.push_event(TranscriptEntry::Workflow(event.clone()));
         if is_stream_event {
             self.active_stream = Some(ActiveStream {
                 index: self.event_log.len().saturating_sub(1),
@@ -360,7 +428,7 @@ impl AppState {
     }
 
     fn try_append_streaming_event(&mut self, event: &WorkflowEvent) -> bool {
-        let (index, rendered) = {
+        let (index, rendered, stream_event) = {
             let Some(stream) = self.active_stream.as_mut() else {
                 return false;
             };
@@ -368,11 +436,15 @@ impl AppState {
                 return false;
             }
             stream.append(event);
-            (stream.index, render_workflow_event(&stream.event))
+            (
+                stream.index,
+                render_workflow_event(&stream.event),
+                stream.event.clone(),
+            )
         };
 
-        self.status = rendered.clone();
-        self.event_log[index] = rendered;
+        self.status = rendered.text().to_string();
+        self.event_log[index] = TranscriptEntry::Workflow(stream_event);
         self.apply_workflow_event_metadata(event);
         if self.follow_events {
             self.scroll_offset = 0;
@@ -478,16 +550,16 @@ impl AppState {
                     Ok(Ok(report)) => self.apply_report(report),
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
-                        self.push_event(self.status.clone());
+                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
                     }
                     Err(err) if err.is_cancelled() => {
                         self.status = "background task cancelled".to_string();
                         self.run_state = "cancelled".to_string();
-                        self.push_event(self.status.clone());
+                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
                     }
                     Err(err) => {
                         self.status = format!("background task failed: {err}");
-                        self.push_event(self.status.clone());
+                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
                     }
                 }
             } else {
@@ -497,8 +569,8 @@ impl AppState {
         self.background = pending;
     }
 
-    fn push_event(&mut self, event: impl Into<String>) {
-        self.event_log.push(event.into());
+    fn push_event(&mut self, event: TranscriptEntry) {
+        self.event_log.push(event);
         if self.follow_events {
             self.scroll_offset = 0;
         }
@@ -512,7 +584,7 @@ impl AppState {
         let event_lines = self
             .event_log
             .iter()
-            .map(|entry| entry.lines().count() + 1)
+            .map(|entry| entry.render_lines().len() + 1)
             .sum::<usize>();
         let pending_prompt_lines = self.pending_prompt.as_ref().map_or(0, |prompt| {
             let prompt_is_latest = self.event_log.last().is_some_and(|entry| {
@@ -578,8 +650,12 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 1);
         let entry = &state.event_entries()[0];
-        assert_eq!(entry.matches("Agent response").count(), 1);
-        assert!(entry.contains("content: Hello, world"), "{entry}");
+        assert_eq!(entry.matches("Agent response"), 1);
+        assert!(
+            entry.contains("content: Hello, world"),
+            "{}",
+            entry.plain_text()
+        );
     }
 
     #[test]
@@ -603,8 +679,12 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 1);
         let entry = &state.event_entries()[0];
-        assert_eq!(entry.matches("Agent thinking").count(), 1);
-        assert!(entry.contains("thought: checking approach"), "{entry}");
+        assert_eq!(entry.matches("Agent thinking"), 1);
+        assert!(
+            entry.contains("thought: checking approach"),
+            "{}",
+            entry.plain_text()
+        );
     }
 
     #[test]
@@ -630,10 +710,7 @@ mod tests {
         assert_eq!(state.event_entries().len(), 3);
         assert!(state.event_entries()[0].contains("Agent response"));
         assert!(state.event_entries()[0].contains("content: Hel"));
-        assert_eq!(
-            state.event_entries()[0].matches("Agent response").count(),
-            1
-        );
+        assert_eq!(state.event_entries()[0].matches("Agent response"), 1);
         assert!(state.event_entries()[1].contains("Notice"));
         assert!(state.event_entries()[1].contains("non-workflow boundary"));
         assert!(state.event_entries()[2].contains("Agent response"));

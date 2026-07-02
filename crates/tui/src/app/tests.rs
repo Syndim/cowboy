@@ -1,8 +1,10 @@
+use cowboy_workflow_engine::WorkflowEventKind;
 use ratatui::Terminal;
 use ratatui::layout::Position;
 
 use super::state::AppState;
 use super::*;
+use crate::app::styles::style_transcript_thought;
 use crate::config::AppConfig;
 
 fn test_state() -> AppState {
@@ -114,4 +116,37 @@ fn draw_handles_input_taller_than_input_box() {
     let mut terminal = Terminal::new(backend).unwrap();
 
     terminal.draw(|frame| draw(frame, &state)).unwrap();
+}
+
+#[test]
+fn draw_preserves_transcript_styles() {
+    let mut state = test_state();
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::AgentThought {
+            step_id: "plan".to_string(),
+            content: "thinking".to_string(),
+        },
+    ));
+    let backend = ratatui::backend::TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area.width as usize;
+    let thought_fg = style_transcript_thought().fg.unwrap();
+    let mut found = false;
+    for y in 0..buffer.area.height as usize {
+        let start = y * width;
+        let row = &buffer.content[start..start + width];
+        let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+        if text.contains("thought: thinking") {
+            let x = text.find("thinking").unwrap();
+            assert_eq!(row[x].fg, thought_fg);
+            found = true;
+        }
+    }
+
+    assert!(found, "thought text was not rendered");
 }

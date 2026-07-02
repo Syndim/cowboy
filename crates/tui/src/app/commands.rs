@@ -306,7 +306,12 @@ mod tests {
         let mut state = test_state();
 
         show_help(&mut state);
-        let rendered = state.event_entries().join("\n");
+        let rendered = state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         for command in SLASH_COMMANDS {
             assert!(rendered.contains(command.usage));
@@ -329,7 +334,12 @@ mod tests {
         let mut state = AppState::new(config);
 
         show_workflows(&mut state, &runtime).unwrap();
-        let rendered = state.event_entries().join("\n");
+        let rendered = state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(state.status().contains("workflow"));
         assert!(rendered.contains("known workflows"));

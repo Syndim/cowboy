@@ -4,7 +4,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::super::state::{AppState, PendingPrompt};
-use super::super::styles::{style_accent, style_border, style_muted, style_warning};
+use super::super::styles::{
+    style_accent, style_border, style_muted, style_transcript_metadata, style_transcript_normal,
+    style_warning,
+};
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let visible_height = area.height.saturating_sub(2) as usize;
@@ -40,7 +43,7 @@ fn all_lines(state: &AppState) -> Vec<Line<'static>> {
     } else {
         let mut rendered = Vec::new();
         for entry in state.event_entries() {
-            rendered.extend(entry.lines().map(|line| Line::from(line.to_string())));
+            rendered.extend(entry.render_lines());
             rendered.push(Line::from(""));
         }
         rendered
@@ -64,12 +67,21 @@ fn empty_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled("No workflow transcript yet.", style_muted())),
         Line::from(""),
-        Line::from("Type a request below to start the default workflow, or use /help."),
+        Line::from(Span::styled(
+            "Type a request below to start the default workflow, or use /help.",
+            style_transcript_normal(),
+        )),
         Line::from(""),
         Line::from(Span::styled("Examples", style_accent())),
-        Line::from("  > add a /healthz route"),
-        Line::from("  > /run investigate failing tests"),
-        Line::from("  > /workflows"),
+        Line::from(Span::styled(
+            "  > add a /healthz route",
+            style_transcript_normal(),
+        )),
+        Line::from(Span::styled(
+            "  > /run investigate failing tests",
+            style_transcript_normal(),
+        )),
+        Line::from(Span::styled("  > /workflows", style_transcript_normal())),
     ]
 }
 
@@ -81,32 +93,45 @@ fn prompt_card_lines(prompt: &PendingPrompt) -> Vec<Line<'static>> {
     };
     let mut lines = vec![
         Line::from(Span::styled("Waiting for input", style_warning())),
-        Line::from(format!("         step: {}", prompt.step())),
-        Line::from(format!("         prompt: {}", prompt.prompt_id())),
+        metadata_line(format!("         step: {}", prompt.step())),
+        metadata_line(format!("         prompt: {}", prompt.prompt_id())),
     ];
     lines.extend(prompt_message_lines(prompt.message()));
-    lines.push(Line::from(format!("         choices: {choices}")));
-    lines.push(Line::from("         Type an answer below and press Enter."));
+    lines.push(Line::from(vec![
+        Span::styled("         choices: ", style_transcript_metadata()),
+        Span::styled(choices, style_warning()),
+    ]));
+    lines.push(metadata_line(
+        "         Type an answer below and press Enter.",
+    ));
     lines.push(Line::from(""));
     lines
 }
 
 fn prompt_message_lines(message: &str) -> Vec<Line<'static>> {
     if message.is_empty() {
-        return vec![Line::from("         message:")];
+        return vec![metadata_line("         message:")];
     }
 
     message
         .lines()
         .enumerate()
         .map(|(index, line)| {
-            if index == 0 {
-                Line::from(format!("         message: {line}"))
+            let prefix = if index == 0 {
+                "         message: "
             } else {
-                Line::from(format!("                {line}"))
-            }
+                "                "
+            };
+            Line::from(vec![
+                Span::styled(prefix, style_transcript_metadata()),
+                Span::styled(line.to_string(), style_transcript_normal()),
+            ])
         })
         .collect()
+}
+
+fn metadata_line(text: impl Into<String>) -> Line<'static> {
+    Line::from(Span::styled(text.into(), style_transcript_metadata()))
 }
 
 #[cfg(test)]
@@ -115,6 +140,7 @@ mod tests {
 
     use super::*;
     use crate::app::state::AppState;
+    use crate::app::styles::style_transcript_thought;
     use crate::config::AppConfig;
 
     fn test_state() -> AppState {
@@ -289,5 +315,27 @@ mod tests {
         assert!(!rendered.contains("id:"), "{rendered}");
         assert!(!rendered.contains("call_1"), "{rendered}");
         assert!(!rendered.contains("{\"text\""), "{rendered}");
+    }
+
+    #[test]
+    fn styled_event_spans_survive_transcript_lines() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::AgentThought {
+                step_id: "plan".to_string(),
+                content: "thinking".to_string(),
+            },
+        ));
+
+        let rendered = lines(&state, 20);
+        let thought_line = rendered
+            .iter()
+            .find(|line| line.to_string().contains("thought: thinking"))
+            .unwrap();
+
+        assert!(thought_line.spans.iter().any(|span| {
+            span.content.contains("thinking") && span.style == style_transcript_thought()
+        }));
     }
 }
