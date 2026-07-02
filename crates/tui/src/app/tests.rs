@@ -150,3 +150,28 @@ fn draw_preserves_transcript_styles() {
 
     assert!(found, "thought text was not rendered");
 }
+
+#[test]
+fn draw_scheduler_draws_first_frame_then_stays_clean_until_dirty() {
+    let mut scheduler = DrawScheduler::new();
+
+    assert!(scheduler.should_draw());
+    scheduler.mark_clean();
+    assert!(!scheduler.should_draw());
+
+    scheduler.mark_dirty();
+
+    assert!(scheduler.should_draw());
+}
+
+#[test]
+fn draw_scheduler_only_marks_dirty_for_changed_state() {
+    let mut scheduler = DrawScheduler::new();
+    scheduler.mark_clean();
+
+    scheduler.mark_dirty_if(false);
+    assert!(!scheduler.should_draw());
+
+    scheduler.mark_dirty_if(true);
+    assert!(scheduler.should_draw());
+}

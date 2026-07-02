@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
-use crossterm::cursor::Show;
+use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -66,7 +66,8 @@ impl TerminalModeGuard {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            SetCursorStyle::BlinkingBar
         ) {
             let _ = disable_raw_mode();
             return Err(err.into());
@@ -87,6 +88,7 @@ impl TerminalModeGuard {
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen,
+            SetCursorStyle::DefaultUserShape,
             Show
         )?;
         self.restored = true;
@@ -106,21 +108,54 @@ impl Drop for TerminalModeGuard {
     }
 }
 
+#[derive(Debug)]
+struct DrawScheduler {
+    needs_draw: bool,
+}
+
+impl DrawScheduler {
+    fn new() -> Self {
+        Self { needs_draw: true }
+    }
+
+    fn should_draw(&self) -> bool {
+        self.needs_draw
+    }
+
+    fn mark_dirty(&mut self) {
+        self.needs_draw = true;
+    }
+
+    fn mark_dirty_if(&mut self, changed: bool) {
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
+    fn mark_clean(&mut self) {
+        self.needs_draw = false;
+    }
+}
+
 async fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     mut state: AppState,
     runtime: &WorkflowRuntime,
     workflow_events: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
 ) -> Result<()> {
+    let mut draw_scheduler = DrawScheduler::new();
     loop {
-        state.drain_workflow_events(workflow_events);
-        state.drain_background_tasks().await;
+        draw_scheduler.mark_dirty_if(state.drain_workflow_events(workflow_events));
+        draw_scheduler.mark_dirty_if(state.drain_background_tasks().await);
         if state.exit_requested() {
             return Ok(());
         }
-        if let Err(err) = terminal.draw(|frame| draw(frame, &state)) {
-            tracing::error!(error = ?err, "TUI draw failed");
-            return Err(err.into());
+        if draw_scheduler.should_draw() {
+            if let Err(err) = terminal.draw(|frame| draw(frame, &state)) {
+                tracing::error!(error = ?err, "TUI draw failed");
+                return Err(err.into());
+            }
+            draw_scheduler.mark_clean();
         }
 
         let has_event = match event::poll(Duration::from_millis(100)) {
@@ -145,6 +180,7 @@ async fn run_loop<B: ratatui::backend::Backend>(
             Event::Paste(text) => {
                 tracing::debug!(chars = text.chars().count(), "TUI paste received");
                 state.push_input(&text);
+                draw_scheduler.mark_dirty();
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 tracing::trace!(
@@ -154,11 +190,15 @@ async fn run_loop<B: ratatui::backend::Backend>(
                     "TUI key received"
                 );
                 match input::handle_key_press(&mut state, key) {
-                    KeyHandling::Continue => {}
-                    KeyHandling::Submit => commands::submit_input(&mut state, runtime).await,
+                    KeyHandling::Continue => draw_scheduler.mark_dirty(),
+                    KeyHandling::Submit => {
+                        commands::submit_input(&mut state, runtime).await;
+                        draw_scheduler.mark_dirty();
+                    }
                     KeyHandling::Exit => return Ok(()),
                 }
             }
+            Event::Resize(_, _) => draw_scheduler.mark_dirty(),
             event => {
                 tracing::trace!(event = ?event, "TUI event ignored");
             }

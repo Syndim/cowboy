@@ -430,14 +430,16 @@ impl AppState {
     pub(super) fn drain_workflow_events(
         &mut self,
         workflow_events: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
-    ) {
+    ) -> bool {
         let result = drain_available_events(workflow_events);
+        let changed = result.lagged || !result.events.is_empty();
         if result.lagged {
             self.active_stream = None;
         }
         for event in result.events {
             self.apply_workflow_event(event);
         }
+        changed
     }
 
     pub(in crate::app) fn apply_workflow_event(&mut self, event: WorkflowEvent) {
@@ -574,11 +576,13 @@ impl AppState {
         }
     }
 
-    pub(super) async fn drain_background_tasks(&mut self) {
+    pub(super) async fn drain_background_tasks(&mut self) -> bool {
+        let mut changed = false;
         let mut pending = Vec::new();
         let tasks = std::mem::take(&mut self.background);
         for task in tasks {
             if task.is_finished() {
+                changed = true;
                 match task.await {
                     Ok(Ok(report)) => self.apply_report(report),
                     Ok(Err(err)) => {
@@ -600,6 +604,7 @@ impl AppState {
             }
         }
         self.background = pending;
+        changed
     }
 
     fn push_event(&mut self, event: TranscriptEntry) {
@@ -791,6 +796,68 @@ mod tests {
         assert_ne!(state.transcript_line_count(), event_and_card_lines + 7);
     }
 
+    #[test]
+    fn workflow_event_drain_returns_false_when_no_events_are_pending() {
+        let mut state = test_state();
+        let bus = cowboy_workflow_engine::EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let status = state.status().to_string();
+
+        assert!(!state.drain_workflow_events(&mut rx));
+
+        assert_eq!(state.status(), status);
+        assert!(state.event_log_is_empty());
+    }
+
+    #[test]
+    fn workflow_event_drain_returns_true_when_event_is_applied() {
+        let mut state = test_state();
+        let bus = cowboy_workflow_engine::EventBus::new(8);
+        let mut rx = bus.subscribe();
+        bus.emit(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStatusChanged {
+                status: "running".to_string(),
+            },
+        ));
+
+        assert!(state.drain_workflow_events(&mut rx));
+
+        assert_eq!(state.event_entries().len(), 1);
+        assert_eq!(state.display_state(), "running");
+    }
+
+    #[tokio::test]
+    async fn background_task_drain_returns_false_when_no_task_finished() {
+        let mut state = test_state();
+
+        assert!(!state.drain_background_tasks().await);
+
+        state.spawn_report_task("pending".to_string(), std::future::pending());
+
+        assert!(!state.drain_background_tasks().await);
+        assert_eq!(state.background_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn background_task_drain_returns_true_when_task_finished() {
+        let mut state = test_state();
+        state.spawn_report_task("finished".to_string(), async { Err("boom".to_string()) });
+        tokio::task::yield_now().await;
+
+        assert!(state.drain_background_tasks().await);
+
+        assert_eq!(state.background_task_count(), 0);
+        assert_eq!(state.status(), "error: boom");
+        assert!(
+            state
+                .event_entries()
+                .last()
+                .unwrap()
+                .contains("error: boom")
+        );
+    }
+
     #[tokio::test]
     async fn workflow_event_drain_breaks_active_stream_after_receiver_lag() {
         let mut state = test_state();
@@ -814,7 +881,7 @@ mod tests {
             ));
         }
 
-        state.drain_workflow_events(&mut rx);
+        assert!(state.drain_workflow_events(&mut rx));
 
         assert_eq!(state.event_entries().len(), 2);
         assert!(state.event_entries()[0].contains("pre-lag"));
