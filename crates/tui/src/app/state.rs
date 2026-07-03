@@ -1,5 +1,6 @@
 use anyhow::Result;
 use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
+use tui_input::{Input, InputRequest};
 
 use super::events::render_workflow_event;
 use super::markup::render_markup;
@@ -213,7 +214,7 @@ pub(super) struct AppState {
     active_stream: Option<ActiveStream>,
     scroll_offset: usize,
     follow_events: bool,
-    input: String,
+    input: Input,
     history: Vec<String>,
     history_index: Option<usize>,
     background: Vec<tokio::task::JoinHandle<Result<RunReport, String>>>,
@@ -233,7 +234,7 @@ impl AppState {
             active_stream: None,
             scroll_offset: 0,
             follow_events: true,
-            input: String::new(),
+            input: Input::default(),
             history: Vec::new(),
             history_index: None,
             background: Vec::new(),
@@ -282,7 +283,16 @@ impl AppState {
     }
 
     pub(in crate::app) fn input(&self) -> &str {
-        &self.input
+        self.input.value()
+    }
+
+    pub(in crate::app) fn input_cursor(&self) -> usize {
+        self.input.cursor()
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn set_input_cursor(&mut self, cursor: usize) {
+        self.input.handle(InputRequest::SetCursor(cursor));
     }
 
     pub(in crate::app) fn background_task_count(&self) -> usize {
@@ -304,22 +314,45 @@ impl AppState {
     }
 
     pub(in crate::app) fn push_input(&mut self, text: &str) {
-        self.input.push_str(text);
+        for ch in text.chars() {
+            self.input.handle(InputRequest::InsertChar(ch));
+        }
         self.history_index = None;
     }
 
     pub(in crate::app) fn pop_input_char(&mut self) {
-        self.input.pop();
+        self.input.handle(InputRequest::DeletePrevChar);
         self.history_index = None;
     }
 
+    pub(in crate::app) fn delete_input_char(&mut self) {
+        self.input.handle(InputRequest::DeleteNextChar);
+        self.history_index = None;
+    }
+
+    pub(in crate::app) fn move_input_cursor_left(&mut self) {
+        self.input.handle(InputRequest::GoToPrevChar);
+    }
+
+    pub(in crate::app) fn move_input_cursor_right(&mut self) {
+        self.input.handle(InputRequest::GoToNextChar);
+    }
+
+    pub(in crate::app) fn move_input_cursor_prev_word(&mut self) {
+        self.input.handle(InputRequest::GoToPrevWord);
+    }
+
+    pub(in crate::app) fn move_input_cursor_next_word(&mut self) {
+        self.input.handle(InputRequest::GoToNextWord);
+    }
+
     pub(in crate::app) fn replace_input_from_completion(&mut self, input: String) {
-        self.input = input;
+        self.input = Input::new(input);
         self.history_index = None;
     }
 
     pub(in crate::app) fn take_submitted_input(&mut self) -> Option<String> {
-        let input = std::mem::take(&mut self.input);
+        let input = self.input.value_and_reset();
         let input = input.trim();
         self.history_index = None;
         if input.is_empty() {
@@ -400,7 +433,7 @@ impl AppState {
             .map(|index| index.saturating_sub(1))
             .unwrap_or_else(|| self.history.len() - 1);
         self.history_index = Some(next);
-        self.input = self.history[next].clone();
+        self.input = Input::new(self.history[next].clone());
     }
 
     pub(in crate::app) fn history_next(&mut self) {
@@ -409,11 +442,11 @@ impl AppState {
         };
         if index + 1 >= self.history.len() {
             self.history_index = None;
-            self.input.clear();
+            self.input.reset();
         } else {
             let next = index + 1;
             self.history_index = Some(next);
-            self.input = self.history[next].clone();
+            self.input = Input::new(self.history[next].clone());
         }
     }
 

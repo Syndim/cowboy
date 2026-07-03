@@ -34,10 +34,6 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
             commands::complete_slash_suggestion(state);
             KeyHandling::Continue
         }
-        KeyCode::Backspace => {
-            state.pop_input_char();
-            KeyHandling::Continue
-        }
         KeyCode::Up => {
             state.history_previous();
             KeyHandling::Continue
@@ -58,7 +54,35 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
             state.follow_latest();
             KeyHandling::Continue
         }
-        KeyCode::Char(ch) => {
+        KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.move_input_cursor_prev_word();
+            KeyHandling::Continue
+        }
+        KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.move_input_cursor_next_word();
+            KeyHandling::Continue
+        }
+        KeyCode::Left => {
+            state.move_input_cursor_left();
+            KeyHandling::Continue
+        }
+        KeyCode::Right => {
+            state.move_input_cursor_right();
+            KeyHandling::Continue
+        }
+        KeyCode::Backspace => {
+            state.pop_input_char();
+            KeyHandling::Continue
+        }
+        KeyCode::Delete => {
+            state.delete_input_char();
+            KeyHandling::Continue
+        }
+        KeyCode::Char(ch)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             state.push_input(&ch.to_string());
             KeyHandling::Continue
         }
@@ -137,6 +161,139 @@ mod tests {
 
         assert_eq!(handling, KeyHandling::Continue);
         assert_eq!(state.input(), "q");
+    }
+
+    #[test]
+    fn left_and_right_move_cursor_without_mutating_input_and_clamp() {
+        let mut state = test_state();
+        state.push_input("abc");
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(state.input(), "abc");
+        assert_eq!(state.input_cursor(), 1);
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input(), "abc");
+        assert_eq!(state.input_cursor(), 2);
+
+        for _ in 0..4 {
+            handle_key_press(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(state.input_cursor(), 3);
+
+        for _ in 0..4 {
+            handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert_eq!(state.input_cursor(), 0);
+    }
+
+    #[test]
+    fn typed_characters_insert_at_cursor() {
+        let mut state = test_state();
+        state.push_input("abcd");
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.input(), "abXcd");
+        assert_eq!(state.input_cursor(), 3);
+    }
+
+    #[test]
+    fn control_left_and_right_jump_by_words() {
+        let mut state = test_state();
+        state.push_input("alpha beta gamma");
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.input_cursor(), "alpha beta ".chars().count());
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.input_cursor(), "alpha ".chars().count());
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.input_cursor(), "alpha beta ".chars().count());
+    }
+
+    #[test]
+    fn backspace_and_delete_edit_at_cursor() {
+        let mut state = test_state();
+        state.push_input("abcd");
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input(), "acd");
+        assert_eq!(state.input_cursor(), 1);
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input(), "ad");
+        assert_eq!(state.input_cursor(), 1);
+    }
+
+    #[test]
+    fn paste_and_newline_insert_at_cursor() {
+        let mut state = test_state();
+        state.push_input("abcd");
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        state.push_input("XY");
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(state.input(), "abXY\ncd");
+        assert_eq!(state.input_cursor(), "abXY\n".chars().count());
+    }
+
+    #[test]
+    fn unicode_movement_and_deletion_stay_on_character_boundaries() {
+        let mut state = test_state();
+        state.push_input("a中éb");
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input(), "aéb");
+        assert_eq!(state.input_cursor(), 1);
+
+        handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input(), "ab");
+        assert_eq!(state.input_cursor(), 1);
     }
 
     #[tokio::test]

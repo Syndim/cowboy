@@ -98,6 +98,21 @@ fn draw_places_cursor_at_input_end() {
 }
 
 #[test]
+fn draw_places_cursor_at_moved_single_line_position() {
+    let mut state = test_state();
+    state.push_input("abc");
+    state.set_input_cursor(1);
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(4, 8));
+}
+
+#[test]
 fn draw_wraps_long_input_into_visible_continuation_row() {
     let mut state = test_state();
     state.push_input("abcdefghijklmnop");
@@ -120,6 +135,21 @@ fn draw_places_cursor_at_wrapped_input_end() {
     terminal
         .backend_mut()
         .assert_cursor_position(Position::new(7, 8));
+}
+
+#[test]
+fn draw_places_cursor_at_moved_wrapped_input_position() {
+    let mut state = test_state();
+    state.push_input("abcdefghijklmnop");
+    state.set_input_cursor("abcdefghijkl".chars().count());
+    let backend = ratatui::backend::TestBackend::new(16, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(14, 7));
 }
 
 #[test]

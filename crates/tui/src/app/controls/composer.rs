@@ -70,8 +70,9 @@ struct RenderedInput {
     cursor_column: usize,
 }
 
-struct VisualInputLine {
-    line: String,
+struct WrappedInput {
+    lines: Vec<String>,
+    cursor_line: usize,
     cursor_column: usize,
 }
 
@@ -84,30 +85,39 @@ fn rendered_input(
     let input_budget = max_visible_lines
         .saturating_sub(suggestion_line_count)
         .max(1);
-    let visual_lines = wrapped_input_lines(state.input(), content_width);
-    let cursor_column = visual_lines
-        .last()
-        .map(|line| line.cursor_column)
-        .unwrap_or(PROMPT_WIDTH);
-    let mut lines = visual_lines
-        .into_iter()
-        .map(|visual_line| visual_line.line)
-        .collect::<Vec<_>>();
+    let wrapped = wrapped_input_lines(state.input(), state.input_cursor(), content_width);
+    let mut lines = wrapped.lines;
+    let mut cursor_line = wrapped.cursor_line;
+    let cursor_column = wrapped.cursor_column;
     let hidden = lines.len().saturating_sub(input_budget);
     if hidden > 0 {
         if input_budget == 1 {
-            lines = lines.split_off(lines.len().saturating_sub(1));
+            let start = cursor_line.min(lines.len().saturating_sub(1));
+            lines = vec![lines[start].clone()];
+            cursor_line = 0;
         } else {
             let visible_after_marker = input_budget.saturating_sub(1);
-            lines = lines.split_off(lines.len().saturating_sub(visible_after_marker));
-            lines.insert(0, format!("> … {hidden} earlier line(s) hidden"));
+            let tail_start = lines.len().saturating_sub(visible_after_marker);
+            let start = if cursor_line >= tail_start {
+                tail_start
+            } else {
+                cursor_line.saturating_sub(visible_after_marker.saturating_sub(1))
+            };
+            if start == 0 {
+                lines.truncate(input_budget);
+            } else {
+                let end = (start + visible_after_marker).min(lines.len());
+                lines = lines[start..end].to_vec();
+                lines.insert(0, format!("> … {start} earlier line(s) hidden"));
+                cursor_line = 1 + cursor_line.saturating_sub(start);
+            }
         }
     }
 
     RenderedInput {
-        cursor_line: lines.len().saturating_sub(1),
-        cursor_column,
         lines,
+        cursor_line,
+        cursor_column,
     }
 }
 
@@ -116,52 +126,77 @@ fn input_content_width(composer_width: u16) -> usize {
     inner_width.saturating_sub(PROMPT_WIDTH).max(1)
 }
 
-fn wrapped_input_lines(input: &str, content_width: usize) -> Vec<VisualInputLine> {
-    let mut visual_lines = Vec::new();
-    if input.is_empty() {
-        append_wrapped_input_line("", content_width, &mut visual_lines);
-    } else {
-        for raw_line in input.split('\n') {
-            append_wrapped_input_line(raw_line, content_width, &mut visual_lines);
-        }
-    }
-    visual_lines
-}
-
-fn append_wrapped_input_line(
-    raw_line: &str,
-    content_width: usize,
-    visual_lines: &mut Vec<VisualInputLine>,
-) {
-    if raw_line.is_empty() {
-        visual_lines.push(VisualInputLine {
-            line: PROMPT.to_string(),
-            cursor_column: PROMPT_WIDTH,
-        });
-        return;
-    }
-
+fn wrapped_input_lines(input: &str, cursor: usize, content_width: usize) -> WrappedInput {
+    let mut lines = Vec::new();
     let mut segment = String::new();
     let mut segment_width = 0;
     let mut first_segment = true;
-    for ch in raw_line.chars() {
-        let ch_width = ch.width().unwrap_or(0);
-        if ch_width > 0 && segment_width > 0 && segment_width + ch_width > content_width {
-            push_visual_input_line(&mut segment, segment_width, first_segment, visual_lines);
+    let mut cursor_line = None;
+    let mut cursor_column = PROMPT_WIDTH;
+    let mut codepoint_index = 0;
+
+    for ch in input.chars() {
+        capture_cursor(
+            codepoint_index,
+            cursor,
+            lines.len(),
+            segment_width,
+            &mut cursor_line,
+            &mut cursor_column,
+        );
+        if ch == '\n' {
+            push_visual_input_line(&mut segment, first_segment, &mut lines);
             segment_width = 0;
-            first_segment = false;
+            first_segment = true;
+        } else {
+            let ch_width = ch.width().unwrap_or(0);
+            if ch_width > 0 && segment_width > 0 && segment_width + ch_width > content_width {
+                push_visual_input_line(&mut segment, first_segment, &mut lines);
+                segment_width = 0;
+                first_segment = false;
+            }
+            segment.push(ch);
+            segment_width += ch_width;
         }
-        segment.push(ch);
-        segment_width += ch_width;
+        codepoint_index += 1;
     }
-    push_visual_input_line(&mut segment, segment_width, first_segment, visual_lines);
+
+    capture_cursor(
+        codepoint_index,
+        cursor,
+        lines.len(),
+        segment_width,
+        &mut cursor_line,
+        &mut cursor_column,
+    );
+    push_visual_input_line(&mut segment, first_segment, &mut lines);
+
+    WrappedInput {
+        cursor_line: cursor_line.unwrap_or_else(|| lines.len().saturating_sub(1)),
+        cursor_column,
+        lines,
+    }
+}
+
+fn capture_cursor(
+    codepoint_index: usize,
+    cursor: usize,
+    line_index: usize,
+    segment_width: usize,
+    cursor_line: &mut Option<usize>,
+    cursor_column: &mut usize,
+) {
+    if cursor_line.is_some() || codepoint_index != cursor {
+        return;
+    }
+    *cursor_line = Some(line_index);
+    *cursor_column = PROMPT_WIDTH + segment_width;
 }
 
 fn push_visual_input_line(
     segment: &mut String,
-    segment_width: usize,
     first_segment: bool,
-    visual_lines: &mut Vec<VisualInputLine>,
+    visual_lines: &mut Vec<String>,
 ) {
     let prefix = if first_segment {
         PROMPT
@@ -171,10 +206,7 @@ fn push_visual_input_line(
     let mut line = String::with_capacity(prefix.len() + segment.len());
     line.push_str(prefix);
     line.push_str(segment);
-    visual_lines.push(VisualInputLine {
-        line,
-        cursor_column: PROMPT_WIDTH + segment_width,
-    });
+    visual_lines.push(line);
     segment.clear();
 }
 
@@ -375,5 +407,42 @@ mod tests {
 
         assert_eq!(rendered[0], "> abcdefghijkl");
         assert_eq!(rendered[1], "  mnop");
+    }
+
+    #[test]
+    fn rendered_cursor_uses_moved_wrapped_input_position() {
+        let mut state = test_state();
+        state.push_input("abcdefghijklmnop");
+        state.set_input_cursor("abcdefghijkl".chars().count());
+
+        let rendered = rendered_input(&state, 4, input_content_width(16));
+
+        assert_eq!(rendered.cursor_line, 0);
+        assert_eq!(rendered.cursor_column, PROMPT_WIDTH + 12);
+    }
+
+    #[test]
+    fn rendered_cursor_uses_unicode_display_width() {
+        let mut state = test_state();
+        state.push_input("a中b");
+        state.set_input_cursor("a中".chars().count());
+
+        let rendered = rendered_input(&state, 4, input_content_width(80));
+
+        assert_eq!(rendered.cursor_line, 0);
+        assert_eq!(rendered.cursor_column, PROMPT_WIDTH + 3);
+    }
+
+    #[test]
+    fn clipped_input_keeps_moved_cursor_visible() {
+        let mut state = test_state();
+        state.push_input("one\ntwo\nthree\nfour\nfive");
+        state.set_input_cursor("one\n".chars().count());
+
+        let rendered = rendered_input(&state, 3, input_content_width(80));
+
+        assert_eq!(rendered.lines.len(), 3);
+        assert_eq!(rendered.lines[1], "> two");
+        assert_eq!(rendered.cursor_line, 1);
     }
 }
