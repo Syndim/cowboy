@@ -352,6 +352,7 @@ dependencies = [
 name = "cowboy-log"
 version = "0.1.0"
 dependencies = [
+ "time",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

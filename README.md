@@ -185,7 +185,7 @@ Cowboy stores runtime state under `state_dir`:
 ```text
 workflow.redb                    # runs, heads, immutable source/step/turn objects, role sessions
 events/<run-id>.json             # persisted workflow event log for display/debugging
-logs/cowboy.log                  # diagnostic log
+logs/cowboy.<YYYY-MM-DD>.<pid>.log  # diagnostic log per process and UTC date
 ```
 
 Logging defaults to `info`. Set `COWBOY_LOG` or `RUST_LOG` for more detail, for example:

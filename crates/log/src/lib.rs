@@ -9,8 +9,10 @@ use std::any::Any;
 use std::io;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Once;
 
+use time::{Date, OffsetDateTime};
 use tracing_appender::rolling;
 use tracing_subscriber::EnvFilter;
 
@@ -27,8 +29,8 @@ pub const DEFAULT_DIRECTIVE: &str = "info";
 /// binaries should use [`DEFAULT_DIRECTIVE`] instead.
 pub const TEST_APP_DIRECTIVE: &str = "debug";
 
-/// Route `tracing` diagnostics to `<dir>/<name>.log` (created if missing,
-/// appended across runs).
+/// Route `tracing` diagnostics to `<dir>/<name>.<date>.<pid>.log`
+/// (created if missing, appended across runs for the same process/date name).
 ///
 /// The level filter is read from `COWBOY_LOG`, then `RUST_LOG`, then
 /// `default_directive` (e.g. `"info"`). Both env vars accept full
@@ -47,7 +49,7 @@ pub fn init_file_logging(
 ) -> io::Result<PathBuf> {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
-    let file_name = format!("{name}.log");
+    let file_name = log_file_name(name, OffsetDateTime::now_utc().date(), process::id());
     let appender = rolling::never(dir, &file_name);
 
     let filter = std::env::var("COWBOY_LOG")
@@ -67,6 +69,10 @@ pub fn init_file_logging(
         .try_init();
 
     Ok(dir.join(file_name))
+}
+
+fn log_file_name(name: &str, date: Date, pid: u32) -> String {
+    format!("{name}.{date}.{pid}.log")
 }
 
 /// Install a process-wide panic hook that mirrors panic details into `tracing`.
@@ -118,6 +124,16 @@ fn panic_payload_from_any(payload: &(dyn Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_file_name_includes_date_and_pid_in_order() {
+        let date = Date::from_calendar_date(2026, time::Month::July, 3).unwrap();
+
+        assert_eq!(
+            log_file_name("cowboy", date, 4242),
+            "cowboy.2026-07-03.4242.log"
+        );
+    }
 
     #[test]
     fn default_directives_match_binary_roles() {
