@@ -240,6 +240,11 @@ just acp-test omp
 - [Module map](docs/module-map.md) — Workspace crate responsibilities and seams.
 - [AGENTS.md](AGENTS.md) — Repository guide for AI coding agents.
 
+## Inspiration
+
+Cowboy is inspired by [United Workforce](https://github.com/shazhou-ww/united-workforce), a stateless workflow engine for multi-agent orchestration.
+
 ## License
 
 Cowboy is licensed under the [MIT License](LICENSE).
+
