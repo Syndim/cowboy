@@ -96,11 +96,10 @@ current WorkflowRun
   -> ActionDispatcher runs the StepAction
       agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
-      ask_user -> AskUserActionRunner -> WaitingForInput with pending record metadata
+      ask_user -> AskUserActionRunner -> WaitingForInput with ResumeCallback descriptor
       fail     -> FailActionRunner -> RunStatus::Failed
-      suspend  -> SuspendActionRunner -> RunStatus::Suspended
   -> ActionResult::Completed -> apply_step_record stores record and routes by output.status
-  -> ActionResult::Blocked   -> apply_run_status persists waiting/suspended/failed status
+  -> ActionResult::Blocked   -> apply_run_status persists waiting/failed status
   -> EventBus emits WorkflowEvent
 ```
 
@@ -118,12 +117,12 @@ current WorkflowRun
 
 ### User input
 
-`cowboy-workflow-engine::InputRouter` handles `action.ask_user` answers:
+`cowboy-workflow-engine::ResumeRouter` handles `action.ask_user` answers:
 
 1. validates the run is in `RunStatus::WaitingForInput`
 2. validates prompt id and allowed choices
-3. completes the pending ask-user action into a normal `StepRecord`
-4. applies that record through the same `apply_step_record` path as agent/status actions
+3. dispatches the persisted `ResumeCallback` through `ResumeCallbackRegistry`
+4. applies the callback-produced `ActionResult` through the same `apply_step_record` / `apply_run_status` paths as other actions
 5. emits and persists the ask-user `StepCompleted` event before resumed-step events
 
 Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`; `ctx.resume` is inactive legacy state.

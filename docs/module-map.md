@@ -53,12 +53,11 @@ Owns reusable host-action runners and the dispatcher that maps `StepAction` vari
 
 | Module | Responsibility |
 | --- | --- |
-| `lib.rs` | `EngineActionDispatcher` and public runner exports. |
+| `lib.rs` | `EngineActionDispatcher`, `ResumeCallbackRegistry`, and public runner exports. |
 | `agent.rs` | `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`. |
-| `ask_user.rs` | `AskUserActionRunner`, pending ask-user metadata, and answer completion into `StepRecord`. |
+| `ask_user.rs` | `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
 | `status.rs` | `StatusActionRunner` for immediate completed records. |
 | `fail.rs` | `FailActionRunner` for failed run statuses. |
-| `suspend.rs` | `SuspendActionRunner` for suspended run statuses. |
 
 ## Crate: `cowboy-workflow-engine`
 
@@ -70,7 +69,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 | --- | --- |
 | `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/list workflow runs, wire store/catalog/Lua/action dispatch/agent execution, persist event logs. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
-| `input.rs` | `InputRouter`; validates answers for `RunStatus::WaitingForInput` and completes pending ask-user records. |
+| `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events. Also `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
@@ -80,7 +79,7 @@ Important seams:
 - `WorkflowRuntime` is the high-level application interface.
 - `WorkflowRunner<S, D, P>` depends on `RunStore`, `ActionDispatcher`, and `StepActionProvider`.
 - `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
-- `InputRouter` does not mutate `WorkflowRun.resume`; it turns a validated waiting prompt answer into an ask-user `StepRecord` for the common record-routing path.
+- `ResumeRouter` does not mutate `WorkflowRun.resume`; it validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
 
 ## Crate: `cowboy-workflow-catalog`
@@ -103,8 +102,8 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`, roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `status`, `ask_user`, `fail`, `suspend`. |
-| `state.rs` | Durable `WorkflowRun`, `RunStatus`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
+| `action.rs` | Declarative `StepAction` variants: `agent`, `status`, `ask_user`, `fail`. |
+| `state.rs` | Durable `WorkflowRun`, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates: loader, selector, executor, summarizer, run store. |
 | `engine.rs` | `execute_step` and budget enforcement. |
@@ -181,7 +180,8 @@ CLI/TUI command
   -> WorkflowRun persisted through RunStore
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction
-  -> AgentExecutor/InputRouter handles action
+  -> ActionDispatcher/action runners handle initial StepAction values
+  -> ResumeRouter dispatches waiting answers through ResumeCallbackRegistry
   -> RunStore saves run/head/objects
   -> EventBus emits WorkflowEvent
   -> TUI renders events or CLI prints report

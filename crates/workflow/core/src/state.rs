@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{ObjectHash, RecordId, RoleId, RunId, Status, StepId, TurnId, WorkflowId};
+use crate::{
+    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError, WorkflowId,
+};
 
 /// Durable state of a workflow run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +44,38 @@ pub struct WorkflowRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Durable descriptor for process-local resume handling.
+///
+/// Workflow state stores this small serializable descriptor at external input
+/// boundaries. A runtime rebuilds process-local handlers by `kind` when the
+/// user answer arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeCallback {
+    kind: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+impl ResumeCallback {
+    pub fn new(kind: impl Into<String>, payload: Value) -> Result<Self> {
+        let kind = kind.into();
+        if kind.trim().is_empty() {
+            return Err(WorkflowError::InvalidAction(
+                "resume callback kind cannot be empty".to_string(),
+            ));
+        }
+        Ok(Self { kind, payload })
+    }
+
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn payload(&self) -> &Value {
+        &self.payload
+    }
+}
+
 /// Workflow run lifecycle state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -58,23 +92,8 @@ pub enum RunStatus {
         message: String,
         /// Accepted choices, empty when free-form input is allowed.
         choices: Vec<String>,
-        /// Pending step record id to reuse when the answer completes this step.
-        record_id: RecordId,
-        /// Hash of the previous completed record when the prompt was shown.
-        prev: Option<ObjectHash>,
-        /// Timestamp captured when the prompt was shown.
-        started_at: DateTime<Utc>,
-        /// Output status for the completed ask-user record.
-        output_status: Status,
-        /// Output fields carried from the ask-user action until answer time.
-        output_fields: Value,
-    },
-    /// Run is paused without being failed.
-    Suspended {
-        /// Step that requested or caused suspension.
-        step: StepId,
-        /// Human-readable suspension reason.
-        reason: String,
+        /// Durable descriptor used to resume the blocked action after answer.
+        resume_callback: ResumeCallback,
     },
     /// Run completed successfully.
     Completed,
@@ -239,20 +258,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_status_is_tagged_for_readable_json() {
+    fn resume_callback_rejects_empty_kind() {
+        let err = ResumeCallback::new("  ", Value::Null).unwrap_err();
+        assert!(matches!(err, WorkflowError::InvalidAction(_)));
+    }
+
+    #[test]
+    fn resume_callback_serializes_kind_and_payload() {
+        let callback =
+            ResumeCallback::new("ask_user", serde_json::json!({ "record_id": "record" })).unwrap();
+        let value = serde_json::to_value(callback).unwrap();
+        assert_eq!(value["kind"], "ask_user");
+        assert_eq!(value["payload"]["record_id"], "record");
+    }
+
+    #[test]
+    fn waiting_for_input_keeps_prompt_fields_and_callback() {
         let status = RunStatus::WaitingForInput {
             step: "approve".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec!["yes".to_string(), "no".to_string()],
-            record_id: "run-1".to_string(),
-            prev: Some("prev".to_string()),
-            started_at: Utc::now(),
-            output_status: "answered".to_string(),
-            output_fields: serde_json::json!({ "plan": "ship" }),
+            resume_callback: ResumeCallback::new(
+                "ask_user",
+                serde_json::json!({
+                    "record_id": "run-1",
+                    "prev": "prev",
+                    "started_at": Utc::now(),
+                    "output_status": "answered",
+                    "output_fields": { "plan": "ship" }
+                }),
+            )
+            .unwrap(),
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["status"], "waiting_for_input");
         assert_eq!(value["step"], "approve");
+        assert_eq!(value["resume_callback"]["kind"], "ask_user");
+        assert!(value.get("record_id").is_none());
+        assert!(value.get("output_fields").is_none());
     }
 }

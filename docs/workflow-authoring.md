@@ -152,7 +152,7 @@ Rules:
 
 ## Actions
 
-Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.status`, `action.ask_user`, `action.fail`, or `action.suspend`.
+Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.status`, `action.ask_user`, or `action.fail`.
 
 ### `action.agent { role, prompt, output }`
 
@@ -209,6 +209,8 @@ Use this for deterministic branching, summaries, adapters around previous output
 
 Pauses the run and asks the user for input. When answered, the runtime completes the ask-user action into a normal step record. The following step receives `ctx.prev.action == "ask_user"`, `ctx.prev.status == "answered"` unless overridden, and `ctx.prev.fields.answer` plus any fields supplied on the ask action.
 
+Internally, the waiting run stores prompt metadata plus a durable `ResumeCallback` descriptor. When an answer arrives, the runtime validates the prompt id and choices, dispatches the registered callback by kind, and applies the resulting ask-user `StepRecord` through normal status-based routing.
+
 ```lua
 local ask_scope = step("ask_scope")
 ask_scope.run = function(ctx)
@@ -256,19 +258,6 @@ Fields:
 
 `fail` does not create a step output record and does not use transitions.
 
-### `action.suspend { reason }`
-
-Stops the run without marking it failed.
-
-```lua
-return action.suspend { reason = "Waiting for an external deployment to finish." }
-```
-
-Fields:
-
-- `reason` (required): human-readable suspension reason.
-
-`suspend` records the current step and reason. It does not create a step output record and does not use transitions.
 
 ## Transitions
 
@@ -288,7 +277,7 @@ Rules:
 - Validation rejects unknown target steps.
 - If a completed step returns status `success` and there is no explicit `success` transition, the workflow completes.
 - If a completed step returns any other status without a matching transition, the run errors with an unknown runtime transition.
-- `ask_user`, `fail`, and `suspend` are run-state changes, not completed step outputs, so transition tables are not consulted for those actions.
+- `ask_user` and `fail` are run-state changes, not completed step outputs, so transition tables are not consulted when they initially block or fail the run. The completed ask-user record produced after an answer is routed by its output status.
 
 A common pattern is to normalize agent outputs into terminal status steps:
 
@@ -441,7 +430,7 @@ end
 local needs_fix = step("needs_fix")
 needs_fix.run = function(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
-  return action.suspend {
+  return action.fail {
     reason = fields.summary or "Workflow needs follow-up fixes"
   }
 end

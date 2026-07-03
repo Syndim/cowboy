@@ -365,6 +365,7 @@ dependencies = [
  "chrono",
  "cowboy-workflow-agent",
  "cowboy-workflow-core",
+ "serde",
  "serde_json",
  "tokio",
 ]

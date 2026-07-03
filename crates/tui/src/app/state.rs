@@ -585,11 +585,6 @@ impl AppState {
                     choices: choices.clone(),
                 });
             }
-            WorkflowEventKind::Suspended { step, .. } => {
-                self.current_step = Some(step.clone());
-                self.run_state = "suspended".to_string();
-                self.pending_prompt = None;
-            }
             WorkflowEventKind::StepCompleted { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
             }

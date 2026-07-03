@@ -113,10 +113,6 @@ pub enum WorkflowEventKind {
         message: String,
         choices: Vec<String>,
     },
-    Suspended {
-        step: String,
-        reason: String,
-    },
     RunCompleted,
     RunFailed {
         reason: String,
@@ -144,10 +140,6 @@ impl From<&RunStatus> for WorkflowEventKind {
                 prompt_id: prompt_id.clone(),
                 message: message.clone(),
                 choices: choices.clone(),
-            },
-            RunStatus::Suspended { step, reason } => Self::Suspended {
-                step: step.clone(),
-                reason: reason.clone(),
             },
             RunStatus::Completed => Self::RunCompleted,
             RunStatus::Failed { reason } => Self::RunFailed {
@@ -215,11 +207,11 @@ mod tests {
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec!["yes".to_string(), "no".to_string()],
-                record_id: "record-1".to_string(),
-                prev: Some("prev".to_string()),
-                started_at: Utc::now(),
-                output_status: "answered".to_string(),
-                output_fields: serde_json::json!({ "secret": "internal" }),
+                resume_callback: cowboy_workflow_core::ResumeCallback::new(
+                    "ask_user",
+                    serde_json::json!({ "secret": "internal" }),
+                )
+                .unwrap(),
             },
         );
 

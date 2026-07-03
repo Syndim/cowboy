@@ -15,8 +15,6 @@ pub enum StepAction {
     AskUser(AskUserAction),
     /// Fail the run immediately with a reason.
     Fail(FailAction),
-    /// Suspend the run without marking it failed.
-    Suspend(SuspendAction),
 }
 
 impl StepAction {
@@ -26,7 +24,6 @@ impl StepAction {
             Self::Status(_) => "status",
             Self::AskUser(_) => "ask_user",
             Self::Fail(_) => "fail",
-            Self::Suspend(_) => "suspend",
         }
     }
 }
@@ -96,13 +93,6 @@ pub struct FailAction {
     pub reason: String,
 }
 
-/// Request to suspend the workflow run without treating it as failed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SuspendAction {
-    /// Human-readable suspension reason.
-    pub reason: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +109,46 @@ mod tests {
         assert_eq!(json["action"], "status");
         assert_eq!(json["status"], "success");
         assert_eq!(action.action_name(), "status");
+    }
+
+    #[test]
+    fn deserializing_suspend_is_unknown() {
+        let err = serde_json::from_value::<StepAction>(serde_json::json!({
+            "action": "suspend",
+            "reason": "pause",
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn action_names_cover_remaining_variants() {
+        assert_eq!(
+            StepAction::Agent(AgentAction {
+                role: "developer".to_string(),
+                prompt: "do it".to_string(),
+                output: None,
+            })
+            .action_name(),
+            "agent"
+        );
+        assert_eq!(
+            StepAction::AskUser(AskUserAction {
+                id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: Vec::new(),
+                status: "answered".to_string(),
+                fields: Value::Null,
+            })
+            .action_name(),
+            "ask_user"
+        );
+        assert_eq!(
+            StepAction::Fail(FailAction {
+                reason: "bad".to_string(),
+            })
+            .action_name(),
+            "fail"
+        );
     }
 }

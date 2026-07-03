@@ -223,17 +223,6 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             ));
             push_body(&mut lines, message, usize::MAX, style_transcript_normal());
         }
-        WorkflowEventKind::Suspended { step, reason } => {
-            lines.push(header_line(
-                &stamp,
-                "Run suspended",
-                style_warning(),
-                vec![
-                    ("step", step.as_str(), style_accent()),
-                    ("reason", reason.as_str(), style_warning()),
-                ],
-            ));
-        }
         WorkflowEventKind::RunCompleted => {
             lines.push(header_line(
                 &stamp,

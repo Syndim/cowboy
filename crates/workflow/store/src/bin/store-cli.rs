@@ -177,10 +177,6 @@ fn parse_status(status: &str) -> RunStatus {
         value if value.starts_with("failed:") => RunStatus::Failed {
             reason: value.trim_start_matches("failed:").to_string(),
         },
-        value if value.starts_with("suspended:") => RunStatus::Suspended {
-            step: "unknown".to_string(),
-            reason: value.trim_start_matches("suspended:").to_string(),
-        },
         other => RunStatus::Failed {
             reason: format!("unknown status argument: {other}"),
         },
@@ -204,7 +200,7 @@ fn require_len(args: &[String], expected: usize) -> Result<(), Box<dyn std::erro
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  store-cli <db> save-run <run-id> <workflow> <workflow-hash> <current-step>\n  store-cli <db> load-run <run-id>\n  store-cli <db> list-runs\n  store-cli <db> put-step <record-id> <step-id> <status>\n  store-cli <db> get-step <hash>\n  store-cli <db> put-source <entry> <source>\n  store-cli <db> save-head <run-id> <workflow-hash> <head-hash|-> <running|completed|cancelled|failed:reason|suspended:reason>\n  store-cli <db> load-head <run-id>\n  store-cli <db> append-turn <run-id> <step-record-id> <turn-id> <content>\n  store-cli <db> delete-run <run-id>\n  store-cli <db> delete-object <hash>"
+        "usage:\n  store-cli <db> save-run <run-id> <workflow> <workflow-hash> <current-step>\n  store-cli <db> load-run <run-id>\n  store-cli <db> list-runs\n  store-cli <db> put-step <record-id> <step-id> <status>\n  store-cli <db> get-step <hash>\n  store-cli <db> put-source <entry> <source>\n  store-cli <db> save-head <run-id> <workflow-hash> <head-hash|-> <running|completed|cancelled|failed:reason>\n  store-cli <db> load-head <run-id>\n  store-cli <db> append-turn <run-id> <step-record-id> <turn-id> <content>\n  store-cli <db> delete-run <run-id>\n  store-cli <db> delete-object <hash>"
     );
     std::process::exit(2)
 }

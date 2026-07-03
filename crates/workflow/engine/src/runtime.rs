@@ -16,9 +16,9 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ObjectKind, Result, RoleDefinition, RunHead, RunStatus, RunnerLimits, WorkflowCatalog,
-    WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
-    WorkflowSummarizer, apply_step_record,
+    ActionResult, ObjectKind, Result, RoleDefinition, RunHead, RunStatus, RunnerLimits,
+    WorkflowCatalog, WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef,
+    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::agent_resolver::AgentResolver;
 use crate::workflow::DeterministicSelector;
 use crate::{
-    EngineActionDispatcher, EventBus, InputRouter, LuaStepActionProvider, WorkflowEvent,
+    EngineActionDispatcher, EventBus, LuaStepActionProvider, ResumeRouter, WorkflowEvent,
     WorkflowEventKind, WorkflowRunner,
 };
 
@@ -133,7 +133,7 @@ pub struct WorkflowRuntime {
 /// How far [`WorkflowRuntime`] drives a run in a single call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunMode {
-    /// Execute steps until the run blocks, suspends, fails, or completes.
+    /// Execute steps until the run blocks, fails, or completes.
     UntilBlocked,
     /// Execute exactly one workflow step, then return.
     SingleStep,
@@ -347,12 +347,22 @@ impl WorkflowRuntime {
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
 
-        let record = InputRouter::new().answer(&run, prompt_id, answer)?;
-        let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
-        let events = vec![
-            WorkflowEvent::step_completed(run.id.clone(), &record),
-            WorkflowEvent::run_status(run.id.clone(), &status),
-        ];
+        let result = ResumeRouter::default().answer(&run, prompt_id, answer)?;
+        let mut events = Vec::new();
+        let status = match result {
+            ActionResult::Completed(record) => {
+                let record = *record;
+                let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
+                events.push(WorkflowEvent::step_completed(run.id.clone(), &record));
+                events.push(WorkflowEvent::run_status(run.id.clone(), &status));
+                status
+            }
+            ActionResult::Blocked(status) => {
+                let status = apply_run_status(&store, &mut run, status)?;
+                events.push(WorkflowEvent::run_status(run.id.clone(), &status));
+                status
+            }
+        };
         for event in &events {
             self.events.emit(event.clone());
         }

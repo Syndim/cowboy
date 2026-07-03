@@ -7,7 +7,7 @@ It has one binary with two interfaces:
 - `cowboy` launches the interactive terminal UI.
 - `cowboy <subcommand>` runs non-interactive CLI commands against the same workflow runtime and persisted state.
 
-Workflows are Lua files. A workflow step can run an agent, return a status, ask the user for input, fail, or suspend. Runs, step outputs, agent turns, role sessions, source snapshots, and event logs are persisted so the TUI and CLI see the same state.
+Workflows are Lua files. A workflow step can run an agent, return a status, request input, or fail. Waiting input stores a durable resume descriptor so answers can continue through the same runtime path as other actions. Runs, step outputs, agent turns, role sessions, source snapshots, and event logs are persisted so the TUI and CLI see the same state.
 
 ## Project status
 
@@ -73,7 +73,7 @@ Execute one additional step for a run:
 cowboy step <run-id>
 ```
 
-Answer an `ask_user` prompt:
+Answer a waiting prompt:
 
 ```bash
 cowboy answer <run-id> <prompt-id> <answer>
@@ -201,7 +201,7 @@ CLI/TUI request
   -> workflow catalog selects a Lua workflow
   -> Lua source is snapshotted and compiled into a WorkflowDefinition
   -> WorkflowRun is persisted through redb
-  -> WorkflowRunner executes steps until completed/failed/suspended/waiting
+  -> WorkflowRunner executes steps until completed/failed/waiting
   -> agent steps go through ACP and parse YAML-frontmatter output
   -> workflow events are emitted and persisted for UI/CLI display
 ```

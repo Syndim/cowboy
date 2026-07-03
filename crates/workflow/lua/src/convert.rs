@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
     AgentAction, AskUserAction, FailAction, OutputSpec, RoleDefinition, StatusAction, StepAction,
-    StepDefinition, StepTransitions, SuspendAction, WorkflowDefinition,
+    StepDefinition, StepTransitions, WorkflowDefinition,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -140,9 +140,6 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             fields: lua_to_json(table.get::<Value>("fields")?)?,
         })),
         "fail" => Ok(StepAction::Fail(FailAction {
-            reason: required_string(&table, &action, "reason")?,
-        })),
-        "suspend" => Ok(StepAction::Suspend(SuspendAction {
             reason: required_string(&table, &action, "reason")?,
         })),
         other => Err(Error::UnknownAction(other.to_string())),

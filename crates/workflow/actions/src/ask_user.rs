@@ -1,80 +1,89 @@
 use chrono::{DateTime, Utc};
 use cowboy_workflow_core::{
-    ActionResult, AskUserAction, ExecutionContext, Result, RunStatus, StepDetail, StepInput,
-    StepOutput, StepRecord, WorkflowError,
+    ActionResult, AskUserAction, ExecutionContext, Result, ResumeCallback, ResumeCallbackHandler,
+    ResumeInput, RunStatus, StepDetail, StepInput, StepOutput, StepRecord, WorkflowError,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+pub const ASK_USER_CALLBACK_KIND: &str = "ask_user";
 
 #[derive(Debug, Clone, Default)]
 pub struct AskUserActionRunner;
 
 impl AskUserActionRunner {
     pub fn run(&self, action: AskUserAction, context: ExecutionContext) -> ActionResult {
-        ActionResult::blocked(RunStatus::WaitingForInput {
-            step: context.step_id,
-            prompt_id: action.id,
-            message: action.message,
-            choices: action.choices,
+        let pending = PendingAskUser {
             record_id: context.step_record_id,
             prev: context.prev,
             started_at: Utc::now(),
             output_status: action.status,
             output_fields: action.fields,
+        };
+        let resume_callback = ResumeCallback::new(
+            ASK_USER_CALLBACK_KIND,
+            serde_json::to_value(pending).expect("pending ask-user payload serializes"),
+        )
+        .expect("ask-user resume callback kind is static and non-empty");
+
+        ActionResult::blocked(RunStatus::WaitingForInput {
+            step: context.step_id,
+            prompt_id: action.id,
+            message: action.message,
+            choices: action.choices,
+            resume_callback,
         })
     }
 
-    pub fn complete(
-        &self,
-        pending: PendingAskUser,
-        answer: impl Into<String>,
-        completed_at: DateTime<Utc>,
-    ) -> StepRecord {
-        let answer = answer.into();
-        let fields = fields_with_answer(pending.output_fields, &answer);
+    pub fn complete(&self, pending: PendingAskUser, input: ResumeInput) -> StepRecord {
+        let fields = fields_with_answer(pending.output_fields, &input.answer);
         StepRecord {
             id: pending.record_id,
             prev: pending.prev,
-            step: pending.step,
+            step: input.step,
             action: "ask_user".to_string(),
             input: StepInput {
-                prompt: Some(pending.message.clone()),
+                prompt: Some(input.message.clone()),
                 context: json!({
-                    "prompt_id": pending.prompt_id,
-                    "choices": pending.choices,
+                    "prompt_id": input.prompt_id,
+                    "choices": input.choices,
                 }),
             },
             output: Some(StepOutput {
                 status: pending.output_status,
                 fields,
-                body: answer.clone(),
+                body: input.answer.clone(),
                 raw: json!({
-                    "prompt_id": pending.prompt_id,
-                    "message": pending.message,
-                    "choices": pending.choices,
-                    "answer": answer,
+                    "prompt_id": input.prompt_id,
+                    "message": input.message,
+                    "choices": input.choices,
+                    "answer": input.answer,
                 }),
             }),
             detail: StepDetail {
                 backend: None,
                 session_id: None,
-                duration_ms: (completed_at - pending.started_at)
+                duration_ms: (input.completed_at - pending.started_at)
                     .num_milliseconds()
                     .max(0) as u64,
                 turn_count: 0,
                 usage: None,
             },
             started_at: pending.started_at,
-            completed_at: Some(completed_at),
+            completed_at: Some(input.completed_at),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl ResumeCallbackHandler for AskUserActionRunner {
+    fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
+        let pending = PendingAskUser::from_callback(callback)?;
+        Ok(ActionResult::completed(self.complete(pending, input)))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingAskUser {
-    pub step: String,
-    pub prompt_id: String,
-    pub message: String,
-    pub choices: Vec<String>,
     pub record_id: String,
     pub prev: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -83,34 +92,15 @@ pub struct PendingAskUser {
 }
 
 impl PendingAskUser {
-    pub fn from_status(status: &RunStatus) -> Result<Self> {
-        let RunStatus::WaitingForInput {
-            step,
-            prompt_id,
-            message,
-            choices,
-            record_id,
-            prev,
-            started_at,
-            output_status,
-            output_fields,
-        } = status
-        else {
-            return Err(WorkflowError::InvalidAction(
-                "workflow run is not waiting for input".to_string(),
-            ));
-        };
-
-        Ok(Self {
-            step: step.clone(),
-            prompt_id: prompt_id.clone(),
-            message: message.clone(),
-            choices: choices.clone(),
-            record_id: record_id.clone(),
-            prev: prev.clone(),
-            started_at: *started_at,
-            output_status: output_status.clone(),
-            output_fields: output_fields.clone(),
+    pub fn from_callback(callback: &ResumeCallback) -> Result<Self> {
+        if callback.kind() != ASK_USER_CALLBACK_KIND {
+            return Err(WorkflowError::InvalidAction(format!(
+                "resume callback kind {:?} is not supported by ask_user",
+                callback.kind()
+            )));
+        }
+        serde_json::from_value(callback.payload().clone()).map_err(|err| {
+            WorkflowError::InvalidAction(format!("invalid ask_user resume callback payload: {err}"))
         })
     }
 }

@@ -169,8 +169,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionDispatcher, ActionResult, AgentAction, AskUserAction, FailAction, StatusAction,
-        StepDefinition, StepDetail, StepInput, StepOutput, StepTransitions, SuspendAction,
+        ActionDispatcher, ActionResult, AgentAction, AskUserAction, FailAction, ResumeCallback,
+        StatusAction, StepDefinition, StepDetail, StepInput, StepOutput, StepTransitions,
         WorkflowDefinition,
     };
 
@@ -266,23 +266,25 @@ mod tests {
                     completed_at: Some(now),
                 })),
                 StepAction::AskUser(action) => {
+                    let resume_callback = ResumeCallback::new(
+                        "ask_user",
+                        serde_json::json!({
+                            "record_id": context.step_record_id,
+                            "prev": context.prev,
+                            "started_at": now,
+                            "output_status": action.status,
+                            "output_fields": action.fields,
+                        }),
+                    )?;
                     Ok(ActionResult::blocked(RunStatus::WaitingForInput {
                         step: context.step_id,
                         prompt_id: action.id,
                         message: action.message,
                         choices: action.choices,
-                        record_id: context.step_record_id,
-                        prev: context.prev,
-                        started_at: now,
-                        output_status: action.status,
-                        output_fields: action.fields,
+                        resume_callback,
                     }))
                 }
                 StepAction::Fail(action) => Ok(ActionResult::blocked(RunStatus::Failed {
-                    reason: action.reason,
-                })),
-                StepAction::Suspend(action) => Ok(ActionResult::blocked(RunStatus::Suspended {
-                    step: context.step_id,
                     reason: action.reason,
                 })),
             }
@@ -521,11 +523,7 @@ mod tests {
             prompt_id,
             message,
             choices,
-            record_id,
-            prev,
-            output_status,
-            output_fields,
-            ..
+            resume_callback,
         } = status
         else {
             panic!("expected waiting status")
@@ -534,10 +532,11 @@ mod tests {
         assert_eq!(prompt_id, "approval");
         assert_eq!(message, "Approve?");
         assert_eq!(choices, vec!["yes".to_string(), "no".to_string()]);
-        assert_eq!(record_id, "run-2");
-        assert_eq!(prev, None);
-        assert_eq!(output_status, "answered");
-        assert_eq!(output_fields, Value::Null);
+        assert_eq!(resume_callback.kind(), "ask_user");
+        assert_eq!(resume_callback.payload()["record_id"], "run-2");
+        assert_eq!(resume_callback.payload()["prev"], Value::Null);
+        assert_eq!(resume_callback.payload()["output_status"], "answered");
+        assert_eq!(resume_callback.payload()["output_fields"], Value::Null);
     }
 
     #[tokio::test]
@@ -564,35 +563,6 @@ mod tests {
             status,
             RunStatus::Failed {
                 reason: "bad".to_string()
-            }
-        );
-    }
-
-    #[tokio::test]
-    async fn suspend_action_sets_suspended_status() {
-        let store = MemoryStore::default();
-        let executor = NoopDispatcher::default();
-        let provider = StaticProvider::new(vec![StepAction::Suspend(SuspendAction {
-            reason: "pause".to_string(),
-        })]);
-        let mut run = run();
-
-        let status = execute_step(
-            &store,
-            &executor,
-            &provider,
-            &definition(),
-            &mut run,
-            &RunnerLimits::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            status,
-            RunStatus::Suspended {
-                step: "start".to_string(),
-                reason: "pause".to_string()
             }
         );
     }
@@ -641,9 +611,6 @@ mod tests {
             }),
             StepAction::Fail(FailAction {
                 reason: "bad".to_string(),
-            }),
-            StepAction::Suspend(SuspendAction {
-                reason: "pause".to_string(),
             }),
             StepAction::Agent(AgentAction {
                 role: "developer".to_string(),

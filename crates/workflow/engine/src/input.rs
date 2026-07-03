@@ -1,20 +1,25 @@
 use chrono::Utc;
-use cowboy_workflow_core::{StepRecord, WorkflowError, WorkflowRun};
+use cowboy_workflow_core::{ActionResult, ResumeInput, RunStatus, WorkflowError, WorkflowRun};
 
-use crate::{AskUserActionRunner, PendingAskUser};
+use crate::ResumeCallbackRegistry;
 
-/// Applies TUI/user answers to a workflow run waiting on `action.ask_user`.
+/// Applies user answers to a workflow run waiting on a registered resume callback.
 ///
-/// `action.ask_user` is a step boundary: the dispatcher persists a
-/// `WaitingForInput` run status and stops. When the user answers, this module
-/// validates the answer and completes the pending ask-user action into a normal
-/// `StepRecord`. It does not mutate `run.resume` or step counters.
-#[derive(Debug, Clone, Default)]
-pub struct InputRouter;
+/// The router owns prompt validation. It then dispatches the persisted callback
+/// descriptor by kind without mutating `run.resume`, step counters, or visit
+/// counters.
+#[derive(Debug, Clone)]
+pub struct ResumeRouter {
+    registry: ResumeCallbackRegistry,
+}
 
-impl InputRouter {
-    pub fn new() -> Self {
-        Self
+impl ResumeRouter {
+    pub fn new(registry: ResumeCallbackRegistry) -> Self {
+        Self { registry }
+    }
+
+    pub fn with_default_registry() -> Self {
+        Self::new(ResumeCallbackRegistry::default())
     }
 
     pub fn answer(
@@ -22,24 +27,51 @@ impl InputRouter {
         run: &WorkflowRun,
         prompt_id: &str,
         answer: impl Into<String>,
-    ) -> cowboy_workflow_core::Result<StepRecord> {
+    ) -> cowboy_workflow_core::Result<ActionResult> {
         let answer = answer.into();
-        let pending = PendingAskUser::from_status(&run.status)?;
+        let RunStatus::WaitingForInput {
+            step,
+            prompt_id: waiting_prompt_id,
+            message,
+            choices,
+            resume_callback,
+        } = &run.status
+        else {
+            return Err(WorkflowError::InvalidAction(
+                "workflow run is not waiting for input".to_string(),
+            ));
+        };
 
-        if prompt_id != pending.prompt_id {
+        if prompt_id != waiting_prompt_id {
             return Err(WorkflowError::InvalidAction(format!(
                 "answer prompt id {prompt_id:?} does not match waiting prompt {:?}",
-                pending.prompt_id
+                waiting_prompt_id
             )));
         }
 
-        if !pending.choices.is_empty() && !pending.choices.iter().any(|choice| choice == &answer) {
+        if !choices.is_empty() && !choices.iter().any(|choice| choice == &answer) {
             return Err(WorkflowError::InvalidAction(format!(
                 "answer {answer:?} is not one of the allowed choices"
             )));
         }
 
-        Ok(AskUserActionRunner.complete(pending, answer, Utc::now()))
+        self.registry.dispatch(
+            resume_callback,
+            ResumeInput {
+                step: step.clone(),
+                prompt_id: waiting_prompt_id.clone(),
+                message: message.clone(),
+                choices: choices.clone(),
+                answer,
+                completed_at: Utc::now(),
+            },
+        )
+    }
+}
+
+impl Default for ResumeRouter {
+    fn default() -> Self {
+        Self::with_default_registry()
     }
 }
 
@@ -48,7 +80,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
-    use cowboy_workflow_core::RunStatus;
+    use cowboy_workflow_core::{ResumeCallback, RunStatus};
     use serde_json::{Value, json};
 
     use super::*;
@@ -67,11 +99,17 @@ mod tests {
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec!["yes".to_string(), "no".to_string()],
-                record_id: "run-1-ask".to_string(),
-                prev: Some("previous-hash".to_string()),
-                started_at: now,
-                output_status: "answered".to_string(),
-                output_fields: json!({ "plan": "ship" }),
+                resume_callback: ResumeCallback::new(
+                    "ask_user",
+                    json!({
+                        "record_id": "run-1-ask",
+                        "prev": "previous-hash",
+                        "started_at": now,
+                        "output_status": "answered",
+                        "output_fields": { "plan": "ship" }
+                    }),
+                )
+                .unwrap(),
             },
             current_step: "approve".to_string(),
             head: None,
@@ -84,14 +122,21 @@ mod tests {
     }
 
     #[test]
-    fn answer_builds_record_without_mutating_resume_or_counters() {
+    fn answer_dispatches_callback_without_mutating_resume_or_counters() {
         let run = waiting_run();
         let before_resume = run.resume.clone();
         let before_steps = run.steps_executed;
-        let record = InputRouter::new().answer(&run, "approval", "yes").unwrap();
+        let before_visits = run.step_visits.clone();
+        let ActionResult::Completed(record) = ResumeRouter::default()
+            .answer(&run, "approval", "yes")
+            .unwrap()
+        else {
+            panic!("expected completed ask-user result")
+        };
 
         assert_eq!(run.resume, before_resume);
         assert_eq!(run.steps_executed, before_steps);
+        assert_eq!(run.step_visits, before_visits);
         assert_eq!(record.id, "run-1-ask");
         assert_eq!(record.prev, Some("previous-hash".to_string()));
         assert_eq!(record.step, "approve");
@@ -104,17 +149,19 @@ mod tests {
     }
 
     #[test]
-    fn answer_rejects_wrong_prompt_id() {
+    fn answer_rejects_wrong_prompt_id_before_callback_dispatch() {
         let run = waiting_run();
-        let err = InputRouter::new().answer(&run, "other", "yes").unwrap_err();
+        let err = ResumeRouter::default()
+            .answer(&run, "other", "yes")
+            .unwrap_err();
 
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
     }
 
     #[test]
-    fn answer_rejects_invalid_choice() {
+    fn answer_rejects_invalid_choice_before_callback_dispatch() {
         let run = waiting_run();
-        let err = InputRouter::new()
+        let err = ResumeRouter::default()
             .answer(&run, "approval", "maybe")
             .unwrap_err();
 

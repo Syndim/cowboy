@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::events::{EventBus, WorkflowEvent, WorkflowEventKind};
 
-/// Runs one workflow until it completes, fails, suspends, waits for input, or hits a budget.
+/// Runs one workflow until it completes, fails, waits for input, or hits a budget.
 ///
 /// This is the TUI-facing orchestration seam over `cowboy-workflow-core`: the
 /// core engine owns step semantics, while this runner owns event projection and

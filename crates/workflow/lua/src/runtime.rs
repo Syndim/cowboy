@@ -105,4 +105,20 @@ mod tests {
         assert_eq!(action.status, "accepted");
         assert_eq!(action.fields["plan"], "ship");
     }
+
+    #[test]
+    fn action_suspend_is_unavailable() {
+        let source = snapshot(
+            r#"
+            local step = step("pause")
+            step.run = function(ctx)
+              return action.suspend { reason = "pause" }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+
+        let err = run_step(&source, "pause", serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("suspend"));
+    }
 }

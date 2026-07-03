@@ -72,7 +72,7 @@ pub(super) fn style_transcript_code_fallback() -> Style {
 pub(super) fn style_for_run_state(state: &str) -> Style {
     match state {
         "completed" => style_success(),
-        "waiting" | "suspended" => style_warning(),
+        "waiting" => style_warning(),
         "failed" | "cancelled" => style_error(),
         "running" => style_accent(),
         _ => Style::default(),
@@ -83,7 +83,7 @@ pub(super) fn style_for_tool_status(status: &str) -> Style {
     match status.to_ascii_lowercase().as_str() {
         "completed" | "success" | "succeeded" | "done" => style_success(),
         "failed" | "error" | "cancelled" | "canceled" => style_error(),
-        "waiting" | "warning" | "suspended" => style_warning(),
+        "waiting" | "warning" => style_warning(),
         _ => style_transcript_tool_pending(),
     }
 }

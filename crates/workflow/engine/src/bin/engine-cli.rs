@@ -380,9 +380,6 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
             event.run_id,
             choices.join(",")
         ),
-        WorkflowEventKind::Suspended { step, reason } => {
-            format!("{} suspended at {step}: {reason}", event.run_id)
-        }
         WorkflowEventKind::RunCompleted => format!("{} completed", event.run_id),
         WorkflowEventKind::RunFailed { reason } => format!("{} failed: {reason}", event.run_id),
         WorkflowEventKind::RunCancelled => format!("{} cancelled", event.run_id),
@@ -421,7 +418,6 @@ fn status_label(status: &RunStatus) -> String {
     match status {
         RunStatus::Running => "Running".to_string(),
         RunStatus::WaitingForInput { prompt_id, .. } => format!("WaitingForInput({prompt_id})"),
-        RunStatus::Suspended { reason, .. } => format!("Suspended({reason})"),
         RunStatus::Completed => "Completed".to_string(),
         RunStatus::Failed { reason } => format!("Failed({reason})"),
         RunStatus::Cancelled => "Cancelled".to_string(),

@@ -1,9 +1,10 @@
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    ObjectHash, ObjectKind, Result, RoleDefinition, RoleSession, RunHead, RunId, RunStatus,
-    StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
+    ObjectHash, ObjectKind, Result, ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId,
+    RunStatus, StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
     WorkflowDefinition, WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
 };
 
@@ -42,6 +43,23 @@ pub struct ExecutionContext {
     pub role: Option<RoleDefinition>,
 }
 
+/// User answer and prompt metadata supplied to a registered resume callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeInput {
+    /// Step that registered the callback.
+    pub step: StepId,
+    /// Prompt id being answered.
+    pub prompt_id: String,
+    /// Prompt message originally shown to the user.
+    pub message: String,
+    /// Accepted choices originally shown to the user.
+    pub choices: Vec<String>,
+    /// User-provided answer text.
+    pub answer: String,
+    /// Timestamp captured when the answer was accepted.
+    pub completed_at: DateTime<Utc>,
+}
+
 /// Result produced by dispatching one workflow action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActionResult {
@@ -49,7 +67,7 @@ pub enum ActionResult {
     /// output status drives workflow routing.
     Completed(Box<StepRecord>),
     /// The action blocked or terminally changed the run without completing a
-    /// step record, such as waiting for user input, suspension, or failure.
+    /// step record, such as waiting for user input or failure.
     Blocked(RunStatus),
 }
 
@@ -93,6 +111,9 @@ pub trait ActionDispatcher: Send + Sync {
     -> Result<ActionResult>;
 }
 
+pub trait ResumeCallbackHandler: Send + Sync {
+    fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult>;
+}
 #[async_trait]
 pub trait WorkflowSummarizer: Send + Sync {
     async fn summarize(&self, run: &WorkflowRun) -> Result<WorkflowSummary>;
@@ -169,17 +190,15 @@ mod tests {
 
     #[test]
     fn action_result_blocked_contains_only_status() {
-        let ActionResult::Blocked(status) = ActionResult::blocked(RunStatus::Suspended {
-            step: "step".to_string(),
-            reason: "pause".to_string(),
+        let ActionResult::Blocked(status) = ActionResult::blocked(RunStatus::Failed {
+            reason: "bad".to_string(),
         }) else {
             panic!("expected blocked result")
         };
         assert_eq!(
             status,
-            RunStatus::Suspended {
-                step: "step".to_string(),
-                reason: "pause".to_string(),
+            RunStatus::Failed {
+                reason: "bad".to_string(),
             }
         );
     }
