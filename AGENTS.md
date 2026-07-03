@@ -341,11 +341,12 @@ workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 max_steps_per_run = 100
 max_visits_per_step = 20
 
-[agent]
+[[agents]]
+name = "default"
 command = "copilot"
 args = ["--acp"]
 
-[agent.model]
+[agents.model]
 id = "claude-sonnet-4.5"
 provider = "anthropic"
 ```

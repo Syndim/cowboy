@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// Configuration needed by the new workflow-first TUI shell.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
     /// Directory for app/session state.
     pub state_dir: PathBuf,
@@ -20,13 +20,16 @@ pub struct AppConfig {
     /// Additional workflow roots scanned for `.lua` workflows.
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
-    /// ACP-compatible agent command used by workflow agent actions.
-    pub agent: AgentConfig,
+    /// ACP-compatible agent commands used by workflow agent actions.
+    #[serde(default = "default_agents")]
+    pub agents: Vec<AgentConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    pub name: String,
+    #[serde(default = "default_agent_command")]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -34,18 +37,31 @@ pub struct AgentConfig {
     pub model: ModelConfig,
 }
 
+fn default_agent_command() -> String {
+    "copilot".to_string()
+}
+
+fn default_agent_args() -> Vec<String> {
+    vec!["--acp".to_string()]
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            command: "copilot".to_string(),
-            args: vec!["--acp".to_string()],
+            name: "default".to_string(),
+            command: default_agent_command(),
+            args: default_agent_args(),
             model: ModelConfig::default(),
         }
     }
 }
 
+fn default_agents() -> Vec<AgentConfig> {
+    vec![AgentConfig::default()]
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
     pub id: String,
     pub provider: Option<String>,
@@ -69,7 +85,7 @@ impl Default for AppConfig {
             max_steps_per_run: 100,
             max_visits_per_step: 20,
             workflow_dirs: vec![config_root().join("workflows")],
-            agent: AgentConfig::default(),
+            agents: default_agents(),
         }
     }
 }
@@ -111,8 +127,25 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("failed to read config {}", path.display()))?;
     let mut config: AppConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config {}", path.display()))?;
+    validate_agents(&config.agents)
+        .with_context(|| format!("invalid agent config in {}", path.display()))?;
     config.expand_paths();
     Ok(config)
+}
+
+fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut names = BTreeSet::new();
+    for agent in agents {
+        if agent.name.trim().is_empty() {
+            anyhow::bail!("agent name must not be empty");
+        }
+        if !names.insert(agent.name.as_str()) {
+            anyhow::bail!("agent names must be unique: {:?}", agent.name);
+        }
+    }
+    Ok(())
 }
 
 impl AppConfig {
@@ -122,12 +155,18 @@ impl AppConfig {
             self.state_dir.clone(),
             self.workflow_store.clone(),
             self.workflow_dirs.clone(),
-            AgentRuntimeConfig::new(
-                self.agent.command.clone(),
-                self.agent.args.clone(),
-                self.agent.model.id.clone(),
-                self.agent.model.provider.clone(),
-            ),
+            self.agents
+                .iter()
+                .map(|agent| {
+                    AgentRuntimeConfig::new(
+                        agent.name.clone(),
+                        agent.command.clone(),
+                        agent.args.clone(),
+                        agent.model.id.clone(),
+                        agent.model.provider.clone(),
+                    )
+                })
+                .collect(),
             RunnerLimitsConfig {
                 max_steps_per_run: self.max_steps_per_run,
                 max_visits_per_step: self.max_visits_per_step,
@@ -169,6 +208,9 @@ mod tests {
         let config = load_config(&dir.path().join("missing.toml")).unwrap();
         assert_eq!(config.max_steps_per_run, 100);
         assert_eq!(config.max_visits_per_step, 20);
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "default");
+        assert_eq!(config.agents[0].command, "copilot");
     }
 
     #[test]
@@ -189,6 +231,129 @@ max_visits_per_step = 3
         let config = load_config(&path).unwrap();
         assert_eq!(config.max_steps_per_run, 7);
         assert_eq!(config.max_visits_per_step, 3);
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].name, "default");
+    }
+
+    #[test]
+    fn parses_named_agents_and_runtime_conversion_preserves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+name = "default"
+command = "copilot"
+args = ["--acp"]
+[agents.model]
+id = "claude-sonnet-4.5"
+provider = "anthropic"
+
+[[agents]]
+name = "planner"
+command = "planner-agent"
+args = ["--stdio"]
+model = { id = "planner-model", provider = "anthropic" }
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.agents.len(), 2);
+        assert_eq!(config.agents[1].name, "planner");
+        assert_eq!(config.agents[1].model.id, "planner-model");
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert_eq!(runtime.agents.len(), 2);
+        assert_eq!(runtime.agents[0].name, "default");
+        assert_eq!(runtime.agents[1].name, "planner");
+        assert_eq!(runtime.agents[1].command, "planner-agent");
+        assert_eq!(runtime.agents[1].model.id, "planner-model");
+    }
+
+    #[test]
+    fn rejects_agent_entry_missing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+command = "copilot"
+args = ["--acp"]
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("failed to parse config"));
+        assert!(format!("{err:#}").contains("missing field `name`"));
+    }
+
+    #[test]
+    fn rejects_blank_agent_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+name = "   "
+command = "copilot"
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("invalid agent config"));
+        assert!(format!("{err:#}").contains("agent name must not be empty"));
+    }
+
+    #[test]
+    fn rejects_duplicate_agent_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+name = "default"
+command = "copilot"
+
+[[agents]]
+name = "default"
+command = "other"
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("invalid agent config"));
+        assert!(format!("{err:#}").contains("agent names must be unique"));
+    }
+
+    #[test]
+    fn rejects_legacy_agent_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[agent]
+command = "copilot"
+args = ["--acp"]
+"#,
+        )
+        .unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(err.to_string().contains("failed to parse config"));
+        assert!(format!("{err:#}").contains("unknown field `agent`"));
     }
 
     #[test]

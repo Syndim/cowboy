@@ -56,6 +56,7 @@ mod tests {
         let role = RoleDefinition {
             id: "dev".into(),
             instructions: "Implement changes".into(),
+            agent: None,
             properties: Value::Null,
         };
         let action = AgentAction {

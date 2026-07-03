@@ -4,11 +4,13 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
-use cowboy_agent_client::Client;
-use cowboy_workflow_agent::{AgentExecutionConfig, AgentExecutor, ClientFactory};
+use cowboy_agent_client::ModelInfo;
+use cowboy_workflow_agent::{
+    AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
+};
 use cowboy_workflow_core::{
-    AgentAction, ObjectHash, ObjectKind, RoleSession, RunHead, RunId, RunStore, TurnRecord,
-    WorkflowRun,
+    AgentAction, ObjectHash, ObjectKind, RoleDefinition, RoleSession, RunHead, RunId, RunStore,
+    TurnRecord, WorkflowRun,
 };
 use cowboy_workflow_store::RedbRunStore;
 
@@ -39,14 +41,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         StoreWithSessions { inner: store },
         AgentExecutionConfig {
             cwd: config.cwd,
-            backend: "acp".to_string(),
             ..AgentExecutionConfig::default()
         },
     );
     let execution = executor
         .execute_agent(
             AgentAction {
-                role: config.role,
+                role: config.role.clone(),
                 prompt: config.prompt,
                 output: None,
             },
@@ -55,6 +56,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 step_id: config.step_id,
                 step_record_id: config.record_id,
                 prev: None,
+                role: Some(RoleDefinition {
+                    id: config.role,
+                    instructions: String::new(),
+                    agent: None,
+                    properties: serde_json::Value::Null,
+                }),
             },
         )
         .await?;
@@ -142,9 +149,13 @@ struct AcpFactory {
 impl ClientFactory for AcpFactory {
     async fn create_client(
         &self,
-        _role_id: &str,
-    ) -> cowboy_workflow_agent::Result<Box<dyn Client>> {
-        Ok(Box::new(AcpClient::connect(self.transport.clone()).await?))
+        _role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        Ok(ResolvedAgentClient {
+            client: Box::new(AcpClient::connect(self.transport.clone()).await?),
+            model: ModelInfo::default(),
+            backend: "acp".to_string(),
+        })
     }
 }
 

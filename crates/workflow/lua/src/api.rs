@@ -61,7 +61,18 @@ pub fn install_workflow_api(lua: &Lua) -> Result<()> {
                     .get::<Option<String>>("instructions")?
                     .unwrap_or_default();
                 role.set("instructions", instructions)?;
-                copy_config_fields(&role, &table, &["instructions"])?;
+                match table.get::<Value>("agent")? {
+                    Value::Nil => {}
+                    Value::String(agent) => {
+                        let agent = agent.to_str()?.to_string();
+                        if agent.trim().is_empty() {
+                            return Err(mlua::Error::external(Error::InvalidRoleAgent));
+                        }
+                        role.set("agent", agent)?;
+                    }
+                    _ => return Err(mlua::Error::external(Error::InvalidRoleAgent)),
+                }
+                copy_config_fields(&role, &table, &["instructions", "agent"])?;
             }
             Some(other) => {
                 return Err(mlua::Error::external(Error::UnsupportedValue(format!(

@@ -7,22 +7,25 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
-use cowboy_agent_client::{Client, ModelInfo};
+use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind, ClientFactory,
+    ResolvedAgentClient,
 };
 use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ObjectKind, Result, RunHead, RunStatus, RunnerLimits, WorkflowCatalog, WorkflowError,
-    WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
+    ObjectKind, Result, RoleDefinition, RunHead, RunStatus, RunnerLimits, WorkflowCatalog,
+    WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
+    WorkflowSummarizer,
 };
 use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::agent_resolver::AgentResolver;
 use crate::workflow::DeterministicSelector;
 use crate::{
     EventBus, InputRouter, LuaStepActionProvider, WorkflowEvent, WorkflowEventKind, WorkflowRunner,
@@ -35,12 +38,13 @@ pub struct RuntimeConfig {
     pub workflow_store: PathBuf,
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
-    pub agent: AgentRuntimeConfig,
+    pub agents: Vec<AgentRuntimeConfig>,
     pub limits: RunnerLimitsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRuntimeConfig {
+    pub name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -55,12 +59,14 @@ pub struct RunnerLimitsConfig {
 
 impl AgentRuntimeConfig {
     pub fn new(
+        name: impl Into<String>,
         command: impl Into<String>,
         args: Vec<String>,
         model_id: impl Into<String>,
         provider: Option<String>,
     ) -> Self {
         Self {
+            name: name.into(),
             command: command.into(),
             args,
             model: ModelInfo {
@@ -77,7 +83,7 @@ impl RuntimeConfig {
         state_dir: PathBuf,
         workflow_store: PathBuf,
         workflow_dirs: Vec<PathBuf>,
-        agent: AgentRuntimeConfig,
+        agents: Vec<AgentRuntimeConfig>,
         limits: RunnerLimitsConfig,
     ) -> Self {
         Self {
@@ -85,7 +91,7 @@ impl RuntimeConfig {
             state_dir,
             workflow_store,
             workflow_dirs,
-            agent,
+            agents,
             limits,
         }
     }
@@ -270,13 +276,15 @@ impl WorkflowRuntime {
                 DeterministicSelector::new().select(request, catalog).await
             }
             SelectorMode::Agent => {
-                let client = AcpClient::connect(self.agent_factory().transport)
+                let resolver = AgentResolver::new(self.config.agents.clone())?;
+                let agent = resolver.resolve_default()?;
+                let client = AcpClient::connect(transport_for(agent))
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
                 let selector = crate::AgentWorkflowSelector::new(
                     client,
                     self.config.cwd.to_string_lossy().to_string(),
-                    self.config.agent.model.clone(),
+                    agent.model.clone(),
                 );
                 selector.select(request, catalog).await
             }
@@ -342,13 +350,15 @@ impl WorkflowRuntime {
     pub async fn improve_run(&self, run_id: &str) -> Result<AppliedWorkflowImprovement> {
         tracing::info!(run_id, "improving workflow from run");
         let run = self.load_run(run_id)?;
-        let client = AcpClient::connect(self.agent_factory().transport)
+        let resolver = AgentResolver::new(self.config.agents.clone())?;
+        let agent = resolver.resolve_default()?;
+        let client = AcpClient::connect(transport_for(agent))
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         let summarizer = crate::AgentWorkflowSummarizer::new(
             client,
             self.config.cwd.to_string_lossy().to_string(),
-            self.config.agent.model.clone(),
+            agent.model.clone(),
         );
         let summary = summarizer.summarize(&run).await?;
         let catalog = self.catalog()?;
@@ -442,8 +452,6 @@ impl WorkflowRuntime {
         let agent_config = AgentExecutionConfig {
             cwd: self.config.cwd.to_string_lossy().to_string(),
             mcp_servers: Vec::new(),
-            model: self.config.agent.model.clone(),
-            backend: "acp".to_string(),
             progress: Some(Arc::new(move |progress| {
                 progress_events.emit(WorkflowEvent::new(
                     progress.run_id.clone(),
@@ -451,7 +459,7 @@ impl WorkflowRuntime {
                 ));
             })),
         };
-        let executor = AgentExecutor::new(self.agent_factory(), agent_store, agent_config);
+        let executor = AgentExecutor::new(self.agent_factory()?, agent_store, agent_config);
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, executor, provider, self.events.clone())
             .with_limits(self.config.limits.into());
@@ -540,21 +548,14 @@ impl WorkflowRuntime {
         }
     }
 
-    fn agent_factory(&self) -> AcpClientFactory {
+    fn agent_factory(&self) -> Result<AcpClientFactory> {
         tracing::debug!(
-            command = %self.config.agent.command,
-            args = ?self.config.agent.args,
-            model_id = %self.config.agent.model.id,
-            provider = ?self.config.agent.model.provider,
+            agents = self.config.agents.len(),
             "ACP client factory configured"
         );
-        AcpClientFactory {
-            transport: TransportConfig::Stdio(StdioConfig {
-                command: self.config.agent.command.clone(),
-                args: self.config.agent.args.clone(),
-                env: Vec::new(),
-            }),
-        }
+        Ok(AcpClientFactory {
+            resolver: AgentResolver::new(self.config.agents.clone())?,
+        })
     }
 
     fn open_store(&self) -> Result<RedbRunStore> {
@@ -624,16 +625,39 @@ fn drain_available_workflow_events(
 
 #[derive(Debug, Clone)]
 pub struct AcpClientFactory {
-    transport: TransportConfig,
+    resolver: AgentResolver,
+}
+
+fn transport_for(agent: &AgentRuntimeConfig) -> TransportConfig {
+    TransportConfig::Stdio(StdioConfig {
+        command: agent.command.clone(),
+        args: agent.args.clone(),
+        env: Vec::new(),
+    })
 }
 
 #[async_trait]
 impl ClientFactory for AcpClientFactory {
     async fn create_client(
         &self,
-        _role_id: &str,
-    ) -> cowboy_workflow_agent::Result<Box<dyn Client>> {
-        Ok(Box::new(AcpClient::connect(self.transport.clone()).await?))
+        role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        let agent = self.resolver.resolve(role)?;
+        tracing::debug!(
+            role = %role.id,
+            agent = %agent.name,
+            command = %agent.command,
+            args = ?agent.args,
+            model_id = %agent.model.id,
+            provider = ?agent.model.provider,
+            "resolving ACP client for role"
+        );
+        let client = AcpClient::connect(transport_for(agent)).await?;
+        Ok(ResolvedAgentClient {
+            client: Box::new(client),
+            model: agent.model.clone(),
+            backend: agent.name.clone(),
+        })
     }
 }
 
@@ -669,6 +693,56 @@ fn run_head(run: &WorkflowRun) -> RunHead {
 mod tests {
     use super::*;
     use cowboy_workflow_core::{RunStatus, StepAction};
+    fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
+            name: name.to_string(),
+            command: command.to_string(),
+            args: Vec::new(),
+            model: ModelInfo::default(),
+        }
+    }
+
+    fn runtime_for_agent_workflow(
+        dir: &tempfile::TempDir,
+        role_agent: Option<&str>,
+        agents: Vec<AgentRuntimeConfig>,
+    ) -> WorkflowRuntime {
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        let agent_field = role_agent
+            .map(|agent| format!(", agent = {:?}", agent))
+            .unwrap_or_default();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            format!(
+                r#"
+                local developer = role("developer", {{ instructions = "Implement"{agent_field} }})
+                local start = step("start", {{ role = developer }})
+                start.run = function(ctx)
+                  return action.agent {{
+                    role = developer,
+                    prompt = "Do work",
+                    output = {{ status = {{ "success" }}, fields = {{ summary = "string" }} }}
+                  }}
+                end
+                return workflow("aaa", start)
+                "#
+            ),
+        )
+        .unwrap();
+        WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents,
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        })
+        .with_deterministic_selector()
+    }
 
     #[tokio::test]
     async fn starts_builtin_workflow_until_agent_call_attempts_backend() {
@@ -678,11 +752,12 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            agent: AgentRuntimeConfig {
+            agents: vec![AgentRuntimeConfig {
+                name: "default".to_string(),
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
                 model: ModelInfo::default(),
-            },
+            }],
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
@@ -693,6 +768,58 @@ mod tests {
         let err = runtime.start_run("do it").await.unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_role_agent_uses_named_backend_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            Some("other"),
+            vec![
+                agent("default", "definitely-missing-default-agent"),
+                agent("other", "definitely-missing-other-agent"),
+            ],
+        );
+
+        let err = runtime.start_run("do it").await.unwrap_err();
+
+        assert!(err.to_string().contains("definitely-missing-other-agent"));
+        assert!(!err.to_string().contains("definitely-missing-default-agent"));
+    }
+
+    #[tokio::test]
+    async fn explicit_unknown_role_agent_fails_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            Some("missing"),
+            vec![agent("default", "definitely-missing-default-agent")],
+        );
+
+        let err = runtime.start_run("do it").await.unwrap_err();
+
+        assert!(err.to_string().contains("unknown agent"));
+        assert!(err.to_string().contains("missing"));
+        assert!(!err.to_string().contains("Failed to spawn"));
+    }
+
+    #[tokio::test]
+    async fn implicit_ambiguous_role_agent_fails_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![
+                agent("planner", "definitely-missing-planner-agent"),
+                agent("reviewer", "definitely-missing-reviewer-agent"),
+            ],
+        );
+
+        let err = runtime.start_run("do it").await.unwrap_err();
+
+        assert!(err.to_string().contains("ambiguous"));
+        assert!(!err.to_string().contains("Failed to spawn"));
     }
 
     #[tokio::test]
@@ -716,11 +843,12 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
-            agent: AgentRuntimeConfig {
+            agents: vec![AgentRuntimeConfig {
+                name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: ModelInfo::default(),
-            },
+            }],
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
@@ -1375,11 +1503,12 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
-            agent: AgentRuntimeConfig {
+            agents: vec![AgentRuntimeConfig {
+                name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: ModelInfo::default(),
-            },
+            }],
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
@@ -1443,11 +1572,12 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            agent: AgentRuntimeConfig {
+            agents: vec![AgentRuntimeConfig {
+                name: "default".to_string(),
                 command: "agent".to_string(),
                 args: Vec::new(),
                 model: ModelInfo::default(),
-            },
+            }],
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,

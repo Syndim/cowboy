@@ -7,8 +7,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent};
 use cowboy_workflow_core::{
-    ActionExecution, ActionExecutor, AgentAction, ExecutionContext, RoleId, RoleSession, RunId,
-    RunStore, StepAction, StepDetail, StepInput, StepRecord, TurnRecord, WorkflowError,
+    ActionExecution, ActionExecutor, AgentAction, ExecutionContext, RoleDefinition, RoleId,
+    RoleSession, RunId, RunStore, StepAction, StepDetail, StepInput, StepRecord, TurnRecord,
+    WorkflowError,
 };
 use tokio::sync::Mutex;
 
@@ -66,10 +67,6 @@ pub struct AgentExecutionConfig {
     pub cwd: String,
     /// MCP server configuration passed to new backend sessions.
     pub mcp_servers: Vec<serde_json::Value>,
-    /// Model metadata passed to new backend sessions.
-    pub model: ModelInfo,
-    /// Backend label persisted in role session records and step details.
-    pub backend: String,
     /// Optional progress sink for streaming UI-visible agent/tool updates.
     pub progress: Option<ProgressSink>,
 }
@@ -80,8 +77,6 @@ impl fmt::Debug for AgentExecutionConfig {
             .debug_struct("AgentExecutionConfig")
             .field("cwd", &self.cwd)
             .field("mcp_servers", &self.mcp_servers)
-            .field("model", &self.model)
-            .field("backend", &self.backend)
             .field("progress", &self.progress.as_ref().map(|_| "<sink>"))
             .finish()
     }
@@ -92,8 +87,6 @@ impl Default for AgentExecutionConfig {
         Self {
             cwd: ".".to_string(),
             mcp_servers: Vec::new(),
-            model: ModelInfo::default(),
-            backend: "agent".to_string(),
             progress: None,
         }
     }
@@ -108,11 +101,24 @@ pub struct AgentExecution {
     pub turns: Vec<TurnRecord>,
 }
 
+/// Client plus backend metadata resolved for a workflow role.
+pub struct ResolvedAgentClient {
+    pub client: Box<dyn Client>,
+    pub model: ModelInfo,
+    pub backend: String,
+}
+
+struct ActiveClient {
+    client: Box<dyn Client>,
+    model: ModelInfo,
+    backend: String,
+}
+
 /// Factory that creates backend clients for role sessions.
 #[async_trait]
 pub trait ClientFactory: Send + Sync {
-    /// Create a fresh backend client for `role_id`.
-    async fn create_client(&self, role_id: &str) -> Result<Box<dyn Client>>;
+    /// Resolve and create a fresh backend client for `role`.
+    async fn create_client(&self, role: &RoleDefinition) -> Result<ResolvedAgentClient>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,7 +132,7 @@ pub struct AgentExecutor<F, S> {
     factory: F,
     store: Arc<S>,
     config: AgentExecutionConfig,
-    clients: Arc<Mutex<HashMap<RoleSessionKey, Box<dyn Client>>>>,
+    clients: Arc<Mutex<HashMap<RoleSessionKey, ActiveClient>>>,
 }
 
 impl<F, S> AgentExecutor<F, S> {
@@ -156,40 +162,44 @@ where
             run_id: context.run_id.clone(),
             role_id: action.role.clone(),
         };
+        let role = context.role.as_ref().ok_or_else(|| {
+            WorkflowError::InvalidAction(format!(
+                "agent role {:?} is missing metadata",
+                action.role
+            ))
+        })?;
         tracing::debug!(
             run_id = %context.run_id,
             step = %context.step_id,
             role = %action.role,
-            backend = %self.config.backend,
+            agent = ?role.agent,
             "agent step: starting"
         );
         if !self.clients.lock().await.contains_key(&key) {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent client missing; creating");
-            let client = self.factory.create_client(&key.role_id).await?;
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, agent = ?role.agent, "agent client missing; creating");
+            let resolved = self.factory.create_client(role).await?;
             self.clients
                 .lock()
                 .await
                 .entry(key.clone())
-                .or_insert(client);
+                .or_insert(ActiveClient {
+                    client: resolved.client,
+                    model: resolved.model,
+                    backend: resolved.backend,
+                });
         }
 
         let started_at = Utc::now();
         let start = Instant::now();
-        let role = cowboy_workflow_core::RoleDefinition {
-            id: action.role.clone(),
-            instructions: String::new(),
-            properties: serde_json::Value::Null,
-        };
-        let prompt = build_agent_prompt(&role, &action);
-        tracing::debug!(run_id = %context.run_id, step = %context.step_id, role = %action.role, prompt_chars = prompt.chars().count(), "agent step: sending prompt");
+        let prompt = build_agent_prompt(role, &action);
         let mut visible = String::new();
         let mut turns = Vec::new();
         let mut tool_titles = HashMap::new();
         let mut clients = self.clients.lock().await;
-        let client = clients
+        let active = clients
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
-        let session_id = self.ensure_session(client.as_mut(), &key).await?;
+        let session_id = self.ensure_session(active, &key).await?;
         tracing::debug!(
             run_id = %context.run_id,
             step = %context.step_id,
@@ -215,7 +225,8 @@ where
             },
         );
         let progress = self.config.progress.clone();
-        let stop_reason = client
+        let stop_reason = active
+            .client
             .prompt(
                 &session_id,
                 vec![PromptContent::text(prompt.clone())],
@@ -259,7 +270,7 @@ where
             },
             output: Some(parsed.output),
             detail: StepDetail {
-                backend: Some(self.config.backend.clone()),
+                backend: Some(active.backend.clone()),
                 session_id: Some(session_id),
                 duration_ms: start.elapsed().as_millis() as u64,
                 turn_count: turns.len() as u32,
@@ -273,9 +284,10 @@ where
 
     async fn ensure_session(
         &self,
-        client: &mut dyn Client,
+        active: &mut ActiveClient,
         key: &RoleSessionKey,
     ) -> Result<String> {
+        let client = active.client.as_mut();
         if let Some(session_id) = client.session_id() {
             tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
             return Ok(session_id.to_string());
@@ -330,22 +342,18 @@ where
             run_id = %key.run_id,
             role = %key.role_id,
             cwd = %self.config.cwd,
-            model_id = %self.config.model.id,
-            provider = ?self.config.model.provider,
+            model_id = %active.model.id,
+            provider = ?active.model.provider,
             "agent session: creating new backend session"
         );
         let session_id = client
-            .new_session(
-                &self.config.cwd,
-                &self.config.mcp_servers,
-                &self.config.model,
-            )
+            .new_session(&self.config.cwd, &self.config.mcp_servers, &active.model)
             .await?;
         self.store
             .save_role_session(RoleSession {
                 run_id: key.run_id.clone(),
                 role_id: key.role_id.clone(),
-                backend: self.config.backend.clone(),
+                backend: active.backend.clone(),
                 session_id: session_id.clone(),
                 updated_at: Utc::now(),
             })
@@ -354,7 +362,7 @@ where
             run_id = %key.run_id,
             role = %key.role_id,
             session_id = %session_id,
-            backend = %self.config.backend,
+            backend = %active.backend,
             "agent session saved"
         );
         Ok(session_id)
@@ -591,6 +599,7 @@ mod tests {
         supports_load: bool,
         new_sessions: usize,
         loaded_sessions: Vec<String>,
+        new_session_models: Arc<SyncMutex<Vec<ModelInfo>>>,
     }
 
     impl FakeClient {
@@ -601,6 +610,7 @@ mod tests {
                 supports_load: false,
                 new_sessions: 0,
                 loaded_sessions: Vec::new(),
+                new_session_models: Arc::new(SyncMutex::new(Vec::new())),
             }
         }
 
@@ -630,8 +640,9 @@ mod tests {
             &mut self,
             _cwd: &str,
             _mcp_servers: &[serde_json::Value],
-            _model: &ModelInfo,
+            model: &ModelInfo,
         ) -> anyhow::Result<String> {
+            self.new_session_models.lock().push(model.clone());
             self.new_sessions += 1;
             let session_id = format!("session-{}", self.new_sessions);
             self.session_id = Some(session_id.clone());
@@ -680,7 +691,8 @@ mod tests {
     #[derive(Default)]
     struct FakeFactory {
         clients: SyncMutex<VecDeque<FakeClient>>,
-        created_for_roles: SyncMutex<Vec<String>>,
+        created_for_roles: SyncMutex<Vec<RoleDefinition>>,
+        model: ModelInfo,
     }
 
     impl FakeFactory {
@@ -688,19 +700,29 @@ mod tests {
             Self {
                 clients: SyncMutex::new(clients.into()),
                 created_for_roles: SyncMutex::new(Vec::new()),
+                model: ModelInfo {
+                    id: "fake-model".to_string(),
+                    provider: Some("fake-provider".to_string()),
+                },
             }
         }
     }
 
     #[async_trait]
     impl ClientFactory for FakeFactory {
-        async fn create_client(&self, role_id: &str) -> Result<Box<dyn Client>> {
-            self.created_for_roles.lock().push(role_id.to_string());
-            self.clients
+        async fn create_client(&self, role: &RoleDefinition) -> Result<ResolvedAgentClient> {
+            self.created_for_roles.lock().push(role.clone());
+            let client = self
+                .clients
                 .lock()
                 .pop_front()
                 .map(|client| Box::new(client) as Box<dyn Client>)
-                .ok_or_else(|| Error::MissingClient(role_id.to_string()))
+                .ok_or_else(|| Error::MissingClient(role.id.clone()))?;
+            Ok(ResolvedAgentClient {
+                client,
+                model: self.model.clone(),
+                backend: "fake-agent".to_string(),
+            })
         }
     }
 
@@ -791,12 +813,32 @@ mod tests {
         }
     }
 
+    fn role(id: &str) -> RoleDefinition {
+        RoleDefinition {
+            id: id.to_string(),
+            instructions: format!("Instructions for {id}"),
+            agent: Some("fake".to_string()),
+            properties: serde_json::Value::Null,
+        }
+    }
+
     fn context(run_id: &str, record_id: &str) -> ExecutionContext {
         ExecutionContext {
             run_id: run_id.into(),
             step_id: "implement".into(),
             step_record_id: record_id.into(),
             prev: Some("prev".into()),
+            role: Some(role("developer")),
+        }
+    }
+
+    fn context_with_role(run_id: &str, record_id: &str, role_id: &str) -> ExecutionContext {
+        ExecutionContext {
+            run_id: run_id.into(),
+            step_id: "implement".into(),
+            step_record_id: record_id.into(),
+            prev: Some("prev".into()),
+            role: Some(role(role_id)),
         }
     }
 
@@ -815,8 +857,33 @@ mod tests {
         assert_eq!(output.status, "success");
         assert_eq!(output.fields["summary"], "done");
         assert_eq!(output.body, "body");
-        assert!(execution.record.input.prompt.unwrap().contains("Do work"));
+        let prompt = execution.record.input.prompt.as_ref().unwrap();
+        assert!(prompt.contains("Do work"));
+        assert!(prompt.contains("Instructions for developer"));
+        assert_eq!(
+            execution.record.detail.backend.as_deref(),
+            Some("fake-agent")
+        );
         assert_eq!(execution.turns.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_creation_uses_resolved_agent_model() {
+        let client = FakeClient::new(vec![event()]);
+        let observed_models = client.new_session_models.clone();
+        let factory = FakeFactory::new(vec![client]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap();
+
+        let observed_models = observed_models.lock();
+        assert_eq!(observed_models.len(), 1);
+        assert_eq!(observed_models[0].id, executor.factory.model.id);
+        assert_eq!(observed_models[0].provider, executor.factory.model.provider);
     }
 
     #[tokio::test]
@@ -1133,10 +1200,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            executor.factory.created_for_roles.lock().as_slice(),
-            ["developer"]
-        );
+        let created_roles: Vec<_> = executor
+            .factory
+            .created_for_roles
+            .lock()
+            .iter()
+            .map(|role| role.id.clone())
+            .collect();
+        assert_eq!(created_roles, ["developer"]);
     }
 
     #[tokio::test]
@@ -1153,14 +1224,21 @@ mod tests {
             .await
             .unwrap();
         executor
-            .execute_agent(action("reviewer"), context("run", "record-2"))
+            .execute_agent(
+                action("reviewer"),
+                context_with_role("run", "record-2", "reviewer"),
+            )
             .await
             .unwrap();
 
-        assert_eq!(
-            executor.factory.created_for_roles.lock().as_slice(),
-            ["developer", "reviewer"]
-        );
+        let created_roles: Vec<_> = executor
+            .factory
+            .created_for_roles
+            .lock()
+            .iter()
+            .map(|role| role.id.clone())
+            .collect();
+        assert_eq!(created_roles, ["developer", "reviewer"]);
     }
 
     #[tokio::test]

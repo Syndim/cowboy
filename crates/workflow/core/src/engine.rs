@@ -84,15 +84,24 @@ where
                 choices: action.choices,
             },
         )?,
-        agent_action @ StepAction::Agent(_) => {
+        StepAction::Agent(action) => {
+            let role = definition
+                .roles
+                .get(&action.role)
+                .ok_or_else(|| WorkflowError::UnknownRole {
+                    step: step.id.clone(),
+                    role: action.role.clone(),
+                })?
+                .clone();
             match executor
                 .execute(
-                    agent_action,
+                    StepAction::Agent(action),
                     crate::ExecutionContext {
                         run_id: run.id.clone(),
                         step_id: step.id.clone(),
                         step_record_id: next_record_id(run),
                         prev: run.head.clone(),
+                        role: Some(role),
                     },
                 )
                 .await?
@@ -415,7 +424,15 @@ mod tests {
             description: None,
             source_hash: "source".to_string(),
             head: "start".to_string(),
-            roles: BTreeMap::new(),
+            roles: BTreeMap::from([(
+                "developer".to_string(),
+                crate::RoleDefinition {
+                    id: "developer".to_string(),
+                    instructions: "implement".to_string(),
+                    agent: None,
+                    properties: Value::Null,
+                },
+            )]),
             steps: BTreeMap::from([
                 ("start".to_string(), start),
                 ("next".to_string(), step("next")),

@@ -137,6 +137,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         state_dir = %state_dir.display(),
         workflow_store = %workflow_store.display(),
         workflow_dirs = ?workflow_dirs,
+        agent_name = %agent.name,
         agent_command = %agent.command,
         agent_args = ?agent.args,
         model_id = %agent.model.id,
@@ -150,7 +151,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         state_dir,
         workflow_store,
         workflow_dirs,
-        agent,
+        vec![agent],
         limits,
     )))
 }
@@ -177,7 +178,9 @@ fn resolve_agent() -> Result<AgentRuntimeConfig, Box<dyn std::error::Error>> {
         Ok(value) => Some(value),
         Err(_) => Some(preset.provider.to_string()),
     };
-    Ok(AgentRuntimeConfig::new(command, args, model, provider))
+    Ok(AgentRuntimeConfig::new(
+        "default", command, args, model, provider,
+    ))
 }
 
 /// List the workflows the engine would select from. Unlike the catalog crate,

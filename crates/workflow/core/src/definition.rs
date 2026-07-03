@@ -64,6 +64,9 @@ pub struct RoleDefinition {
     pub id: RoleId,
     /// Instructions/persona text supplied to agent actions using this role.
     pub instructions: String,
+    /// Optional named backend agent configured for this role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// Additional Lua-defined role metadata.
     #[serde(default)]
     pub properties: Value,
@@ -142,6 +145,13 @@ pub fn validate_definition(definition: &WorkflowDefinition) -> Result<Validation
                 key: key.clone(),
                 id: role.id.clone(),
             });
+        }
+        if let Some(agent) = &role.agent {
+            if agent.trim().is_empty() {
+                return Err(WorkflowError::EmptyRoleAgent {
+                    role: role.id.clone(),
+                });
+            }
         }
     }
 
@@ -242,6 +252,15 @@ mod tests {
         }
     }
 
+    fn role(id: &str, agent: Option<&str>) -> RoleDefinition {
+        RoleDefinition {
+            id: id.to_string(),
+            instructions: "implement".to_string(),
+            agent: agent.map(str::to_string),
+            properties: Value::Null,
+        }
+    }
+
     fn definition() -> WorkflowDefinition {
         let mut plan = step("plan");
         plan.transitions.insert("success", "review");
@@ -282,6 +301,32 @@ mod tests {
             WorkflowError::MissingHead {
                 workflow: "default".to_string(),
                 step: "missing".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn validates_named_role_agent() {
+        let mut definition = definition();
+        definition
+            .roles
+            .insert("developer".to_string(), role("developer", Some("planner")));
+
+        validate_definition(&definition).unwrap();
+    }
+
+    #[test]
+    fn rejects_blank_role_agent() {
+        let mut definition = definition();
+        definition
+            .roles
+            .insert("developer".to_string(), role("developer", Some("   ")));
+
+        let err = validate_definition(&definition).unwrap_err();
+        assert_eq!(
+            err,
+            WorkflowError::EmptyRoleAgent {
+                role: "developer".to_string()
             }
         );
     }

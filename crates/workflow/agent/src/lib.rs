@@ -8,7 +8,7 @@ mod prompt;
 pub use error::{Error, Result};
 pub use executor::{
     AgentExecution, AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind,
-    ClientFactory, ProgressSink,
+    ClientFactory, ProgressSink, ResolvedAgentClient,
 };
 pub use frontmatter::{FrontmatterOutput, parse_frontmatter_output};
 pub use prompt::build_agent_prompt;

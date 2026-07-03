@@ -20,6 +20,8 @@ pub enum WorkflowError {
     EmptyStepId,
     #[error("role id must not be empty")]
     EmptyRoleId,
+    #[error("role {role:?} agent must not be empty")]
+    EmptyRoleAgent { role: RoleId },
     #[error("step {step:?} references unknown role {role:?}")]
     UnknownRole { step: StepId, role: RoleId },
     #[error("step {step:?} has an empty transition status")]

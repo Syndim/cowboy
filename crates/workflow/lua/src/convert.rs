@@ -54,12 +54,15 @@ fn roles_from_registry(lua: &Lua) -> Result<BTreeMap<String, RoleDefinition>> {
         if id.trim().is_empty() {
             return Err(Error::InvalidRoleId);
         }
-        let properties = table_properties_to_json(&role, &["__cowboy_kind", "id", "instructions"])?;
+        let agent = optional_role_agent(role.get::<Value>("agent")?)?;
+        let properties =
+            table_properties_to_json(&role, &["__cowboy_kind", "id", "instructions", "agent"])?;
         roles.insert(
             key,
             RoleDefinition {
                 id,
                 instructions,
+                agent,
                 properties,
             },
         );
@@ -227,6 +230,20 @@ fn table_properties_to_json(table: &Table, reserved: &[&str]) -> Result<serde_js
         object.insert(key, lua_to_json(value)?);
     }
     Ok(serde_json::Value::Object(object))
+}
+
+fn optional_role_agent(value: Value) -> Result<Option<String>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::String(agent) => {
+            let agent = agent.to_str()?.to_string();
+            if agent.trim().is_empty() {
+                return Err(Error::InvalidRoleAgent);
+            }
+            Ok(Some(agent))
+        }
+        _ => Err(Error::InvalidRoleAgent),
+    }
 }
 
 fn optional_role_id(value: Value) -> Result<Option<String>> {

@@ -24,6 +24,8 @@ pub enum Error {
     MissingHead,
     #[error("role id must be a non-empty string")]
     InvalidRoleId,
+    #[error("role agent must be a non-empty string")]
+    InvalidRoleAgent,
     #[error("step id must be a non-empty string")]
     InvalidStepId,
     #[error("step {0:?} must define run(ctx)")]

@@ -129,6 +129,65 @@ mod tests {
         assert_eq!(definition.steps["a"].role.as_deref(), Some("developer"));
         assert_eq!(definition.steps["a"].properties["kind"], "agent");
         assert_eq!(definition.steps["a"].transitions.by_status["success"], "b");
+        assert_eq!(definition.roles["developer"].agent, None);
+    }
+
+    #[test]
+    fn role_table_agent_becomes_typed_metadata() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", { instructions = "implement things", agent = "planner", language = "rust" })
+            local step = step("start", { role = role })
+            step.run = function(ctx) return action.status { status = "success" } end
+            return workflow("wf", step)
+            "#,
+        );
+
+        let definition = compile_snapshot(&source).unwrap();
+
+        assert_eq!(
+            definition.roles["developer"].agent.as_deref(),
+            Some("planner")
+        );
+        assert!(
+            definition.roles["developer"]
+                .properties
+                .get("agent")
+                .is_none()
+        );
+        assert_eq!(definition.roles["developer"].properties["language"], "rust");
+    }
+
+    #[test]
+    fn rejects_blank_role_agent() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", { agent = "   " })
+            local step = step("start", { role = role })
+            step.run = function(ctx) return action.status { status = "success" } end
+            return workflow("wf", step)
+            "#,
+        );
+
+        let err = compile_snapshot(&source).unwrap_err();
+        assert!(matches!(err, Error::Lua(_)) || matches!(err, Error::InvalidRoleAgent));
+        assert!(err.to_string().contains("role agent"));
+    }
+
+    #[test]
+    fn rejects_non_string_role_agent_after_mutation() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", "implement things")
+            role.agent = 42
+            local step = step("start", { role = role })
+            step.run = function(ctx) return action.status { status = "success" } end
+            return workflow("wf", step)
+            "#,
+        );
+
+        let err = compile_snapshot(&source).unwrap_err();
+        assert!(matches!(err, Error::InvalidRoleAgent));
     }
 
     #[test]

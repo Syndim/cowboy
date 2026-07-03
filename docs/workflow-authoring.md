@@ -44,6 +44,7 @@ Declares reusable role metadata.
 ```lua
 local developer = role("developer", {
   instructions = "Implement focused changes and explain the result.",
+  agent = "default",
   language = "rust"
 })
 ```
@@ -53,14 +54,15 @@ Accepted forms:
 ```lua
 role("developer")
 role("developer", "Instruction text")
-role("developer", { instructions = "Instruction text", custom = "metadata" })
+role("developer", { instructions = "Instruction text", agent = "planner", custom = "metadata" })
 ```
 
 Rules:
 
 - `id` must be a non-empty string.
 - `instructions` defaults to `""`.
-- Extra table fields are preserved as role properties in the compiled definition.
+- `agent`, when present, must be a non-empty string naming a configured `[[agents]]` entry.
+- Extra table fields other than `instructions` and `agent` are preserved as role properties in the compiled definition.
 - `action.agent` and `step(..., { role = ... })` accept either the role table or the role id string.
 - The role id is also the agent-session reuse key within a run. Keep ids stable and role-specific.
 

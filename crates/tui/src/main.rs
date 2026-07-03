@@ -72,10 +72,8 @@ async fn run_main() -> Result<()> {
             state_dir = %config.state_dir.display(),
             workflow_store = %config.workflow_store.display(),
             workflow_dirs = ?config.workflow_dirs,
-            agent_command = %config.agent.command,
-            agent_args = ?config.agent.args,
-            model_id = %config.agent.model.id,
-            provider = ?config.agent.model.provider,
+            agents = ?config.agents,
+            agent_count = config.agents.len(),
             "cowboy logging initialized"
         );
         cowboy_log::install_panic_hook();

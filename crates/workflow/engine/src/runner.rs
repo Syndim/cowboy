@@ -371,6 +371,7 @@ mod tests {
                 RoleDefinition {
                     id: "developer".to_string(),
                     instructions: "implement".to_string(),
+                    agent: None,
                     properties: Value::Null,
                 },
             )]),

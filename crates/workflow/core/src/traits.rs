@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    ObjectHash, ObjectKind, Result, RoleSession, RunHead, RunId, StepAction, StepDefinition,
-    StepId, StepRecord, TurnRecord, WorkflowCatalog, WorkflowDefinition, WorkflowRun,
-    WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
+    ObjectHash, ObjectKind, Result, RoleDefinition, RoleSession, RunHead, RunId, StepAction,
+    StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog, WorkflowDefinition,
+    WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
 };
 
 /// Result of loading and compiling a workflow source.
@@ -38,6 +38,8 @@ pub struct ExecutionContext {
     pub step_record_id: String,
     /// Hash of the previous completed step record, if any.
     pub prev: Option<ObjectHash>,
+    /// Role metadata for agent actions, when the action targets a compiled role.
+    pub role: Option<RoleDefinition>,
 }
 
 /// Result of executing a workflow action.
