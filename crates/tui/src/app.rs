@@ -248,7 +248,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, state: &AppState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Min(3),
+            Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(composer_height),
         ])

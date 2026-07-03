@@ -94,10 +94,6 @@ pub(in crate::app) fn render_pending_prompt_lines(
     lines
 }
 
-fn render_pending_prompt_line_count(prompt: &PendingPrompt) -> usize {
-    render_pending_prompt_lines(prompt).len()
-}
-
 fn display_prompt_choices(choices: &[String]) -> String {
     if choices.is_empty() {
         "<freeform>".to_string()
@@ -380,8 +376,7 @@ impl AppState {
 
     pub(in crate::app) fn scroll_events_up(&mut self) {
         self.follow_events = false;
-        let max_offset = self.transcript_line_count().saturating_sub(1);
-        self.scroll_offset = (self.scroll_offset + 10).min(max_offset);
+        self.scroll_offset = self.scroll_offset.saturating_add(10);
     }
 
     pub(in crate::app) fn scroll_events_down(&mut self) {
@@ -619,31 +614,6 @@ impl AppState {
         }
     }
 
-    fn transcript_line_count(&self) -> usize {
-        let pending_prompt_lines = self.pending_prompt.as_ref().map_or(0, |prompt| {
-            let prompt_is_latest = self.event_log.last().is_some_and(|entry| {
-                entry.contains("Waiting for input")
-                    && entry.contains(&format!("prompt={}", prompt.prompt_id))
-            });
-            if prompt_is_latest {
-                0
-            } else {
-                render_pending_prompt_line_count(prompt)
-            }
-        });
-
-        if self.event_log.is_empty() {
-            return 9 + pending_prompt_lines;
-        }
-
-        let event_lines = self
-            .event_log
-            .iter()
-            .map(|entry| entry.render_lines().len() + 1)
-            .sum::<usize>();
-        event_lines + pending_prompt_lines
-    }
-
     fn apply_report(&mut self, report: RunReport) {
         self.active_run_id = Some(report.run.id.clone());
         self.workflow_name = Some(report.run.workflow_name.clone());
@@ -771,34 +741,6 @@ mod tests {
         assert!(state.event_entries()[2].contains("Agent response"));
         assert!(state.event_entries()[2].contains("lo"));
         assert!(!state.event_entries()[2].contains("content: lo"));
-    }
-
-    #[test]
-    fn transcript_line_count_uses_dynamic_pending_prompt_height() {
-        let mut state = test_state();
-        state.apply_workflow_event(WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::WaitingForInput {
-                step: "confirm".to_string(),
-                prompt_id: "approval".to_string(),
-                message: "Review\n- first item\n\n`code`".to_string(),
-                choices: Vec::new(),
-            },
-        ));
-        state.push_card("Notice", ["keep prompt visible".to_string()]);
-
-        let event_and_card_lines = state
-            .event_entries()
-            .iter()
-            .map(|entry| entry.render_lines().len() + 1)
-            .sum::<usize>();
-
-        assert_eq!(
-            render_pending_prompt_lines(state.pending_prompt().unwrap()).len(),
-            5
-        );
-        assert_eq!(state.transcript_line_count(), event_and_card_lines + 5);
-        assert_ne!(state.transcript_line_count(), event_and_card_lines + 7);
     }
 
     #[test]

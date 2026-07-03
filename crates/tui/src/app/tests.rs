@@ -33,6 +33,19 @@ fn rendered_screen(state: &AppState, width: u16, height: u16) -> String {
         })
 }
 
+fn rendered_rows(state: &AppState, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, state)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area.width as usize;
+    buffer
+        .content
+        .chunks(width)
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
 #[test]
 fn idle_draw_hides_debug_paths() {
     let dir = tempfile::tempdir().unwrap();
@@ -154,6 +167,42 @@ fn draw_preserves_transcript_styles() {
     }
 
     assert!(found, "thought text was not rendered");
+}
+
+#[test]
+fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
+    let mut state = test_state();
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::AgentResponse {
+            step_id: "review".to_string(),
+            content: "first second third fourth fifth sixth seventh eighth TAILVISIBLE".to_string(),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::WaitingForInput {
+            step: "confirm_result".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve?".to_string(),
+            choices: Vec::new(),
+        },
+    ));
+
+    let rows = rendered_rows(&state, 38, 14);
+    let rendered = rows.join("\n");
+
+    assert!(rendered.contains("TAILVISIBLE"), "{rendered}");
+    assert!(rendered.contains("waiting for input"), "{rendered}");
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("┌ Enter answers active prompt")),
+        "{rendered}"
+    );
+    assert!(
+        rows.last().is_some_and(|row| row.starts_with('└')),
+        "{rendered}"
+    );
 }
 
 #[test]

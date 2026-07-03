@@ -1,37 +1,97 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use super::super::state::{AppState, render_pending_prompt_lines};
 use super::super::styles::{style_accent, style_border, style_muted, style_transcript_normal};
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let visible_height = area.height.saturating_sub(2) as usize;
-    let transcript = Paragraph::new(lines(state, visible_height))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(style_border()),
-        )
-        .wrap(Wrap { trim: false });
+    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
+    let transcript = Paragraph::new(lines(state, visible_height, inner_width)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style_border()),
+    );
     frame.render_widget(transcript, area);
 }
 
-pub(in crate::app) fn lines(state: &AppState, max_visible_lines: usize) -> Vec<Line<'static>> {
-    if max_visible_lines == 0 {
+pub(in crate::app) fn lines(
+    state: &AppState,
+    max_visible_lines: usize,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    if max_visible_lines == 0 || wrap_width == 0 {
         return Vec::new();
     }
 
-    let lines = all_lines(state);
-    if lines.len() <= max_visible_lines {
-        return lines;
+    let rows = visual_rows(all_lines(state), wrap_width);
+    if rows.len() <= max_visible_lines {
+        return rows;
     }
 
-    let offset = state.scroll_offset().min(lines.len().saturating_sub(1));
-    let end = lines.len().saturating_sub(offset).max(1);
+    let offset = state.scroll_offset().min(rows.len().saturating_sub(1));
+    let end = rows.len().saturating_sub(offset).max(1);
     let start = end.saturating_sub(max_visible_lines);
-    lines[start..end].to_vec()
+    rows[start..end].to_vec()
+}
+
+fn visual_rows(logical_lines: Vec<Line<'static>>, wrap_width: usize) -> Vec<Line<'static>> {
+    logical_lines
+        .into_iter()
+        .flat_map(|line| wrap_line(line, wrap_width))
+        .collect()
+}
+
+fn wrap_line(line: Line<'static>, wrap_width: usize) -> Vec<Line<'static>> {
+    let Line {
+        spans,
+        style,
+        alignment,
+    } = line;
+    let mut rows = Vec::new();
+    let mut row_spans = Vec::new();
+    let mut row_width: usize = 0;
+
+    for span in spans {
+        let span_style = span.style;
+        let mut segment = String::new();
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if ch_width > 0 && row_width > 0 && row_width.saturating_add(ch_width) > wrap_width {
+                push_span(&mut row_spans, &mut segment, span_style);
+                push_visual_row(&mut rows, &mut row_spans, style, alignment);
+                row_width = 0;
+            }
+            segment.push(ch);
+            row_width = row_width.saturating_add(ch_width);
+        }
+        push_span(&mut row_spans, &mut segment, span_style);
+    }
+
+    push_visual_row(&mut rows, &mut row_spans, style, alignment);
+    rows
+}
+
+fn push_span(spans: &mut Vec<Span<'static>>, segment: &mut String, style: ratatui::style::Style) {
+    if segment.is_empty() {
+        return;
+    }
+    spans.push(Span::styled(std::mem::take(segment), style));
+}
+
+fn push_visual_row(
+    rows: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    style: ratatui::style::Style,
+    alignment: Option<ratatui::layout::Alignment>,
+) {
+    let mut row = Line::from(std::mem::take(spans));
+    row.style = style;
+    row.alignment = alignment;
+    rows.push(row);
 }
 
 fn all_lines(state: &AppState) -> Vec<Line<'static>> {
@@ -88,7 +148,7 @@ mod tests {
 
     use super::*;
     use crate::app::state::AppState;
-    use crate::app::styles::style_transcript_thought;
+    use crate::app::styles::{style_transcript_metadata, style_transcript_thought};
     use crate::config::AppConfig;
 
     fn test_state() -> AppState {
@@ -116,7 +176,7 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 20)
+        let rendered = lines(&state, 20, usize::MAX)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -154,7 +214,7 @@ mod tests {
         ));
         state.push_card("Notice", ["keep prompt visible".to_string()]);
 
-        let rendered_lines = lines(&state, 100)
+        let rendered_lines = lines(&state, 100, usize::MAX)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -245,7 +305,7 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 100)
+        let rendered = lines(&state, 100, usize::MAX)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
@@ -288,7 +348,7 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 20);
+        let rendered = lines(&state, 20, usize::MAX);
         let thought_line = rendered
             .iter()
             .find(|line| line.to_string() == "thinking")
@@ -297,5 +357,92 @@ mod tests {
         assert!(thought_line.spans.iter().any(|span| {
             span.content.contains("thinking") && span.style == style_transcript_thought()
         }));
+    }
+
+    #[test]
+    fn narrow_width_latest_tail_uses_wrapped_visual_rows() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::AgentResponse {
+                step_id: "review".to_string(),
+                content: "aaaaa bbbbb DONE".to_string(),
+            },
+        ));
+
+        let rendered = lines(&state, 3, 6)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("DONE")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line.contains("aaaaa")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_visual_rows_preserve_span_styles() {
+        let wrapped = visual_rows(
+            vec![Line::from(vec![
+                Span::styled("thought", style_transcript_thought()),
+                Span::styled("meta", style_transcript_metadata()),
+            ])],
+            7,
+        );
+
+        assert_eq!(wrapped[0].to_string(), "thought");
+        assert_eq!(wrapped[0].spans[0].style, style_transcript_thought());
+        assert_eq!(wrapped[1].to_string(), "meta");
+        assert_eq!(wrapped[1].spans[0].style, style_transcript_metadata());
+    }
+
+    #[test]
+    fn scroll_offsets_apply_to_wrapped_visual_rows() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::AgentResponse {
+                step_id: "review".to_string(),
+                content: "0000111122223333444455556666777788889999TAIL".to_string(),
+            },
+        ));
+
+        let following = lines(&state, 4, 4)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            following.iter().any(|line| line.contains("TAIL")),
+            "{following:?}"
+        );
+
+        state.scroll_events_up();
+        let scrolled = lines(&state, 4, 4)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            scrolled.iter().any(|line| line.contains("0000")),
+            "{scrolled:?}"
+        );
+        assert!(
+            scrolled.iter().all(|line| !line.contains("TAIL")),
+            "{scrolled:?}"
+        );
+
+        state.scroll_events_down();
+        let refollowing = lines(&state, 4, 4)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            refollowing.iter().any(|line| line.contains("TAIL")),
+            "{refollowing:?}"
+        );
     }
 }
