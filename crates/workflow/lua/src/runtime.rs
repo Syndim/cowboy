@@ -91,7 +91,7 @@ mod tests {
             r#"
             local step = step("approve")
             step.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" } }
+              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, status = "accepted", fields = { plan = "ship" } }
             end
             return workflow("wf", step)
             "#,
@@ -102,5 +102,7 @@ mod tests {
         };
         assert_eq!(action.id, "approval");
         assert_eq!(action.choices, vec!["yes", "no"]);
+        assert_eq!(action.status, "accepted");
+        assert_eq!(action.fields["plan"], "ship");
     }
 }

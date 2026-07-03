@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent};
 use cowboy_workflow_core::{
-    ActionExecution, ActionExecutor, AgentAction, ExecutionContext, RoleDefinition, RoleId,
-    RoleSession, RunId, RunStore, StepAction, StepDetail, StepInput, StepRecord, TurnRecord,
-    WorkflowError,
+    AgentAction, ExecutionContext, RoleDefinition, RoleId, RoleSession, RunId, RunStore,
+    StepDetail, StepInput, StepRecord, TurnRecord, WorkflowError,
 };
 use tokio::sync::Mutex;
 
@@ -366,30 +365,6 @@ where
             "agent session saved"
         );
         Ok(session_id)
-    }
-}
-
-#[async_trait]
-impl<F, S> ActionExecutor for AgentExecutor<F, S>
-where
-    F: ClientFactory,
-    S: RunStore + 'static,
-{
-    async fn execute(
-        &self,
-        action: StepAction,
-        context: ExecutionContext,
-    ) -> cowboy_workflow_core::Result<ActionExecution> {
-        let StepAction::Agent(action) = action else {
-            return Err(WorkflowError::InvalidAction(
-                "agent executor only handles agent actions".to_string(),
-            ));
-        };
-        let execution = self
-            .execute_agent(action, context)
-            .await
-            .map_err(WorkflowError::from)?;
-        Ok(ActionExecution::StepCompleted(Box::new(execution.record)))
     }
 }
 

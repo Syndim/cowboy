@@ -138,6 +138,7 @@ impl From<&RunStatus> for WorkflowEventKind {
                 prompt_id,
                 message,
                 choices,
+                ..
             } => Self::WaitingForInput {
                 step: step.clone(),
                 prompt_id: prompt_id.clone(),
@@ -214,6 +215,11 @@ mod tests {
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec!["yes".to_string(), "no".to_string()],
+                record_id: "record-1".to_string(),
+                prev: Some("prev".to_string()),
+                started_at: Utc::now(),
+                output_status: "answered".to_string(),
+                output_fields: serde_json::json!({ "secret": "internal" }),
             },
         );
 

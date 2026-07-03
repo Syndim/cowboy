@@ -70,8 +70,8 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - original request
 - current step
 - latest step-record hash
-- run status
-- resume data from user input
+- run status, including pending ask-user metadata when blocked for input
+- inactive legacy resume data retained for old serialized runs
 - step budget counters
 
 `RunHead` is the small mutable pointer for quick lookup/resume. Immutable step/turn/source objects are stored by content hash in `cowboy-workflow-store`.
@@ -86,20 +86,21 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - `improve_run(run_id)`
 - `list_runs()` / `load_events(run_id)`
 
-Internally it uses `WorkflowRunner`, which delegates step semantics to `cowboy-workflow-core::execute_step` and emits workflow events for UI/session consumers.
+Internally it uses `WorkflowRunner`, which delegates step semantics to `cowboy-workflow-core::execute_step` and emits workflow events for UI/session consumers. `execute_step` evaluates Lua into a declarative `StepAction`, builds an action context, dispatches the action through `ActionDispatcher`, then applies the returned `ActionResult` uniformly.
 
 One loop iteration:
 
 ```text
 current WorkflowRun
   -> StepActionProvider evaluates current step
-  -> StepAction
-      agent    -> AgentExecutor -> ACP Client -> StepRecord
-      status   -> StepRecord
-      ask_user -> RunStatus::WaitingForInput
-      fail     -> RunStatus::Failed
-      suspend  -> RunStatus::Suspended
-  -> RunStore persists WorkflowRun + RunHead/objects
+  -> ActionDispatcher runs the StepAction
+      agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
+      status   -> StatusActionRunner -> completed StepRecord
+      ask_user -> AskUserActionRunner -> WaitingForInput with pending record metadata
+      fail     -> FailActionRunner -> RunStatus::Failed
+      suspend  -> SuspendActionRunner -> RunStatus::Suspended
+  -> ActionResult::Completed -> apply_step_record stores record and routes by output.status
+  -> ActionResult::Blocked   -> apply_run_status persists waiting/suspended/failed status
   -> EventBus emits WorkflowEvent
 ```
 
@@ -121,9 +122,11 @@ current WorkflowRun
 
 1. validates the run is in `RunStatus::WaitingForInput`
 2. validates prompt id and allowed choices
-3. writes `run.resume[prompt_id] = answer`
-4. marks the run `Running`
-5. the next runner pass re-evaluates the same step with `ctx.resume`
+3. completes the pending ask-user action into a normal `StepRecord`
+4. applies that record through the same `apply_step_record` path as agent/status actions
+5. emits and persists the ask-user `StepCompleted` event before resumed-step events
+
+Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`; `ctx.resume` is inactive legacy state.
 
 No Lua coroutine or host-call replay cache is persisted.
 

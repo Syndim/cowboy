@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    ActionExecutor, Result, RunStatus, RunStore, RunnerLimits, StepAction, StepActionProvider,
+    ActionDispatcher, Result, RunStatus, RunStore, RunnerLimits, StepAction, StepActionProvider,
     StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
     WorkflowSourceSnapshot, execute_step,
 };
@@ -50,7 +50,7 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
 impl<S, E, P> WorkflowRunner<S, E, P>
 where
     S: RunStore,
-    E: ActionExecutor,
+    E: ActionDispatcher,
     P: StepActionProvider,
 {
     /// Execute `run` from its current step until the core engine returns a
@@ -193,7 +193,7 @@ impl StepActionProvider for LuaStepActionProvider {
                 "role": step.role,
                 "properties": step.properties,
             },
-            "resume": run.resume,
+            "resume": Value::Null,
             "prev": previous_step_context(prev),
             "steps_executed": run.steps_executed,
         });
@@ -210,8 +210,8 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionExecution, ObjectHash, ObjectKind, RunHead, StatusAction, StepDetail, StepInput,
-        StepOutput, TurnRecord,
+        ActionDispatcher, ActionResult, ObjectHash, ObjectKind, RunHead, StatusAction, StepDetail,
+        StepInput, StepOutput, TurnRecord,
     };
     use parking_lot::Mutex;
     use serde::{Serialize, de::DeserializeOwned};
@@ -295,29 +295,45 @@ mod tests {
         }
     }
 
-    struct NoopExecutor;
+    struct NoopDispatcher;
 
     #[async_trait]
-    impl ActionExecutor for NoopExecutor {
-        async fn execute(
+    impl ActionDispatcher for NoopDispatcher {
+        async fn dispatch(
             &self,
-            _action: StepAction,
+            action: StepAction,
             context: cowboy_workflow_core::ExecutionContext,
-        ) -> Result<ActionExecution> {
+        ) -> Result<ActionResult> {
             let now = Utc::now();
-            Ok(ActionExecution::StepCompleted(Box::new(StepRecord {
+            let (action_name, prompt, status, fields, body) = match action {
+                StepAction::Status(action) => (
+                    "status".to_string(),
+                    None,
+                    action.status,
+                    action.fields,
+                    action.body,
+                ),
+                _ => (
+                    "agent".to_string(),
+                    Some("agent prompt".to_string()),
+                    "success".to_string(),
+                    Value::Null,
+                    "agent done".to_string(),
+                ),
+            };
+            Ok(ActionResult::completed(StepRecord {
                 id: context.step_record_id,
                 prev: context.prev,
                 step: context.step_id,
-                action: "agent".to_string(),
+                action: action_name,
                 input: StepInput {
-                    prompt: Some("agent prompt".to_string()),
+                    prompt,
                     context: Value::Null,
                 },
                 output: Some(StepOutput {
-                    status: "success".to_string(),
-                    fields: Value::Null,
-                    body: "agent done".to_string(),
+                    status,
+                    fields,
+                    body,
                     raw: Value::Null,
                 }),
                 detail: StepDetail {
@@ -329,7 +345,7 @@ mod tests {
                 },
                 started_at: now,
                 completed_at: Some(now),
-            })))
+            }))
         }
     }
 
@@ -416,7 +432,7 @@ mod tests {
         let mut events = bus.subscribe();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
-            NoopExecutor,
+            NoopDispatcher,
             StaticProvider(vec![
                 StepAction::Status(StatusAction {
                     status: "next".to_string(),
@@ -459,7 +475,7 @@ mod tests {
     async fn step_once_executes_a_single_step() {
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
-            NoopExecutor,
+            NoopDispatcher,
             StaticProvider(vec![
                 StepAction::Status(StatusAction {
                     status: "next".to_string(),
@@ -535,7 +551,7 @@ mod tests {
         let definition = cowboy_workflow_lua::compile_snapshot(&source_bundle).unwrap();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
-            NoopExecutor,
+            NoopDispatcher,
             LuaStepActionProvider::new(source_bundle),
             Arc::new(EventBus::new(16)),
         );

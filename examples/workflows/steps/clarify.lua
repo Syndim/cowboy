@@ -1,10 +1,12 @@
 return function(id)
   local clarify = step(id or "clarify")
   clarify.run = function(ctx)
-    local answered_prompt_id = "clarification_" .. tostring((ctx.steps_executed or 1) - 1)
-    local answer = ctx.resume and ctx.resume[answered_prompt_id]
-    if answer and tostring(answer) ~= "" then
-      return action.status { status = "clarified", body = "received additional context" }
+    if ctx.prev and ctx.prev.action == "ask_user" then
+      local fields = ctx.prev.fields or {}
+      local answer = fields.answer
+      if answer and tostring(answer) ~= "" then
+        return action.status { status = "clarified", fields = { clarification = tostring(answer) }, body = "received additional context" }
+      end
     end
 
     local prompt_id = "clarification_" .. tostring(ctx.steps_executed or 0)

@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    ObjectHash, ObjectKind, Result, RoleDefinition, RoleSession, RunHead, RunId, StepAction,
-    StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog, WorkflowDefinition,
-    WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
+    ObjectHash, ObjectKind, Result, RoleDefinition, RoleSession, RunHead, RunId, RunStatus,
+    StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
+    WorkflowDefinition, WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
 };
 
 /// Result of loading and compiling a workflow source.
@@ -42,19 +42,25 @@ pub struct ExecutionContext {
     pub role: Option<RoleDefinition>,
 }
 
-/// Result of executing a workflow action.
+/// Result produced by dispatching one workflow action.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ActionExecution {
-    /// The action finished a step. Carries the immutable, content-addressed
-    /// `StepRecord` for that execution; its `output.status` drives transition
-    /// routing. The engine appends the record to run history and advances to the
-    /// next step (or completes the run) via the workflow graph.
-    StepCompleted(Box<StepRecord>),
-    /// The action did not finish a step. Instead it sets the run's head/status
-    /// directly to the given `RunHead` (e.g. waiting for input, suspended, or
-    /// failed). The engine applies it verbatim: no step record is appended and no
-    /// graph routing happens.
-    RunStateChanged(RunHead),
+pub enum ActionResult {
+    /// The action completed a step and produced the immutable step record whose
+    /// output status drives workflow routing.
+    Completed(Box<StepRecord>),
+    /// The action blocked or terminally changed the run without completing a
+    /// step record, such as waiting for user input, suspension, or failure.
+    Blocked(RunStatus),
+}
+
+impl ActionResult {
+    pub fn completed(record: StepRecord) -> Self {
+        Self::Completed(Box::new(record))
+    }
+
+    pub fn blocked(status: RunStatus) -> Self {
+        Self::Blocked(status)
+    }
 }
 
 pub trait StepActionProvider: Send + Sync {
@@ -82,12 +88,9 @@ pub trait WorkflowSelector: Send + Sync {
 }
 
 #[async_trait]
-pub trait ActionExecutor: Send + Sync {
-    async fn execute(
-        &self,
-        action: StepAction,
-        context: ExecutionContext,
-    ) -> Result<ActionExecution>;
+pub trait ActionDispatcher: Send + Sync {
+    async fn dispatch(&self, action: StepAction, context: ExecutionContext)
+    -> Result<ActionResult>;
 }
 
 #[async_trait]
@@ -117,4 +120,67 @@ pub trait RunStore: Send + Sync {
     fn delete_role_sessions(&self, run_id: &str) -> Result<()>;
 
     fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash>;
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use serde_json::Value;
+
+    use super::*;
+    use crate::{StepDetail, StepInput, StepOutput};
+
+    fn record() -> StepRecord {
+        let now = Utc::now();
+        StepRecord {
+            id: "record".to_string(),
+            prev: None,
+            step: "step".to_string(),
+            action: "status".to_string(),
+            input: StepInput {
+                prompt: None,
+                context: Value::Null,
+            },
+            output: Some(StepOutput {
+                status: "success".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+                raw: Value::Null,
+            }),
+            detail: StepDetail {
+                backend: None,
+                session_id: None,
+                duration_ms: 0,
+                turn_count: 0,
+                usage: None,
+            },
+            started_at: now,
+            completed_at: Some(now),
+        }
+    }
+
+    #[test]
+    fn action_result_completed_contains_only_record() {
+        let ActionResult::Completed(record) = ActionResult::completed(record()) else {
+            panic!("expected completed result")
+        };
+        assert_eq!(record.id, "record");
+    }
+
+    #[test]
+    fn action_result_blocked_contains_only_status() {
+        let ActionResult::Blocked(status) = ActionResult::blocked(RunStatus::Suspended {
+            step: "step".to_string(),
+            reason: "pause".to_string(),
+        }) else {
+            panic!("expected blocked result")
+        };
+        assert_eq!(
+            status,
+            RunStatus::Suspended {
+                step: "step".to_string(),
+                reason: "pause".to_string(),
+            }
+        );
+    }
 }

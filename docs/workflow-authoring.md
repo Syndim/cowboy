@@ -10,7 +10,7 @@ Cowboy workflows are Lua files that compile into a durable workflow graph. A run
   -> status transitions: step:on(status, next_step)
 ```
 
-The Lua VM is sandboxed and recreated for each compile or step execution. Persist run state through action outputs, `ctx.prev`, and `ctx.resume`; do not depend on mutable Lua globals surviving between steps.
+The Lua VM is sandboxed and recreated for each compile or step execution. Persist run state through action outputs and `ctx.prev`; do not depend on mutable Lua globals surviving between steps. `ctx.resume` is inactive legacy state and is not the ask-user answer path.
 
 ## File placement
 
@@ -109,8 +109,8 @@ Runtime context passed to `run(ctx)`:
 | `ctx.step.id` | Current step id. |
 | `ctx.step.role` | Current step's configured role id, or `nil`. |
 | `ctx.step.properties` | Non-reserved fields from the step config. |
-| `ctx.resume` | Answers from `action.ask_user`, keyed by prompt id. |
-| `ctx.prev` | Latest completed step output, or `nil` on the first step. |
+| `ctx.resume` | Inactive legacy state retained for old serialized runs; do not use for new workflows. |
+| `ctx.prev` | Latest completed step output, including completed ask-user answers, or `nil` on the first step. |
 | `ctx.steps_executed` | Number of already-executed steps in the run. |
 
 `ctx.prev` has this shape when a previous step completed:
@@ -205,36 +205,42 @@ Fields:
 
 Use this for deterministic branching, summaries, adapters around previous output, and final terminal records.
 
-### `action.ask_user { id, message, choices }`
+### `action.ask_user { id, message, choices, status, fields }`
 
-Pauses the run and asks the user for input. The same step is re-evaluated after the answer is stored in `ctx.resume[id]`.
+Pauses the run and asks the user for input. When answered, the runtime completes the ask-user action into a normal step record. The following step receives `ctx.prev.action == "ask_user"`, `ctx.prev.status == "answered"` unless overridden, and `ctx.prev.fields.answer` plus any fields supplied on the ask action.
 
 ```lua
-local clarify = step("clarify")
-clarify.run = function(ctx)
-  local answer = ctx.resume and ctx.resume.scope
-  if answer then
-    return action.status {
-      status = "answered",
-      fields = { scope = answer }
-    }
-  end
-
+local ask_scope = step("ask_scope")
+ask_scope.run = function(ctx)
   return action.ask_user {
     id = "scope",
     message = "Should Cowboy update docs only or code and docs?",
-    choices = { "docs", "code-and-docs" }
+    choices = { "docs", "code-and-docs" },
+    fields = { source = "triage" }
   }
 end
+
+local route_scope = step("route_scope")
+route_scope.run = function(ctx)
+  local fields = (ctx.prev and ctx.prev.fields) or {}
+  return action.status {
+    status = tostring(fields.answer),
+    fields = { scope = fields.answer, source = fields.source }
+  }
+end
+
+ask_scope:on("answered", route_scope)
 ```
 
 Fields:
 
-- `id` (required): stable prompt id; this becomes the key in `ctx.resume`.
+- `id` (required): stable prompt id used for validation and UI/event display.
 - `message` (required): text shown to the user.
 - `choices` (optional): finite allowed answers. If present, answers outside the list are rejected.
+- `status` (optional): output status for the completed ask-user record; defaults to `"answered"`.
+- `fields` (optional): structured fields copied into the completed ask-user output before `fields.answer` is merged.
 
-Always check `ctx.resume[id]` before asking again; otherwise the workflow will keep pausing on every resume.
+Always route the ask-user step's `answered` status to a follow-up step that reads `ctx.prev.fields.answer`; otherwise the workflow will keep pausing on every visit.
 
 ### `action.fail { reason }`
 
@@ -454,15 +460,17 @@ return workflow("developer-flow", implement, {
 ```lua
 local triage = step("triage")
 triage.run = function(ctx)
-  local answer = ctx.resume and ctx.resume.intent
-  if not answer then
-    return action.ask_user {
-      id = "intent",
-      message = "What kind of work is this?",
-      choices = { "feature", "bug", "docs" }
-    }
-  end
+  return action.ask_user {
+    id = "intent",
+    message = "What kind of work is this?",
+    choices = { "feature", "bug", "docs" }
+  }
+end
 
+local route = step("route")
+route.run = function(ctx)
+  local fields = (ctx.prev and ctx.prev.fields) or {}
+  local answer = tostring(fields.answer)
   return action.status {
     status = answer,
     fields = { intent = answer }
@@ -484,9 +492,10 @@ docs.run = function(ctx)
   return action.status { status = "success", fields = { lane = "docs" } }
 end
 
-triage:on("feature", feature)
-triage:on("bug", bug)
-triage:on("docs", docs)
+triage:on("answered", route)
+route:on("feature", feature)
+route:on("bug", bug)
+route:on("docs", docs)
 
 return workflow("triage", triage, "Ask the user once, then route by answer")
 ```

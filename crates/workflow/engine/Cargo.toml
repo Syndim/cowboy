@@ -11,6 +11,7 @@ cowboy-agent-client = { path = "../../agent/client" }
 cowboy-agent-acp = { path = "../../agent/acp" }
 cowboy-workflow-core = { path = "../core" }
 cowboy-workflow-agent = { path = "../agent" }
+cowboy-workflow-actions = { path = "../actions" }
 cowboy-workflow-catalog = { path = "../catalog" }
 cowboy-workflow-store = { path = "../store" }
 cowboy-workflow-lua = { path = "../lua" }

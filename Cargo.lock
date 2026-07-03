@@ -358,6 +358,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cowboy-workflow-actions"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cowboy-workflow-agent",
+ "cowboy-workflow-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cowboy-workflow-agent"
 version = "0.1.0"
 dependencies = [
@@ -412,6 +424,7 @@ dependencies = [
  "cowboy-agent-acp",
  "cowboy-agent-client",
  "cowboy-log",
+ "cowboy-workflow-actions",
  "cowboy-workflow-agent",
  "cowboy-workflow-catalog",
  "cowboy-workflow-core",

@@ -24,6 +24,7 @@
 //!   COWBOY_ENGINE_AGENT_ARGS override args, whitespace-separated (preset default)
 //!   COWBOY_ENGINE_MODEL      override the model id       (preset default)
 //!   COWBOY_ENGINE_PROVIDER   override the provider, "" clears (preset default)
+//!   COWBOY_ENGINE_SELECTOR  "agent" or "deterministic"       (agent)
 
 use std::env;
 use std::future::Future;
@@ -124,10 +125,12 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         max_steps_per_run: 100,
         max_visits_per_step: 20,
     };
+    let selector = env_or("COWBOY_ENGINE_SELECTOR", "agent");
     eprintln!(
-        "# engine-cli  state={}  workflows={:?}  agent=`{} {}`  model={:?}",
+        "# engine-cli  state={}  workflows={:?}  selector={}  agent=`{} {}`  model={:?}",
         state_dir.display(),
         workflow_dirs,
+        selector,
         agent.command,
         agent.args.join(" "),
         agent.model.id,
@@ -137,6 +140,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         state_dir = %state_dir.display(),
         workflow_store = %workflow_store.display(),
         workflow_dirs = ?workflow_dirs,
+        selector = %selector,
         agent_name = %agent.name,
         agent_command = %agent.command,
         agent_args = ?agent.args,
@@ -146,14 +150,22 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         max_visits_per_step = limits.max_visits_per_step,
         "engine-cli runtime configured"
     );
-    Ok(WorkflowRuntime::new(RuntimeConfig::new(
+    let runtime = WorkflowRuntime::new(RuntimeConfig::new(
         cwd,
         state_dir,
         workflow_store,
         workflow_dirs,
         vec![agent],
         limits,
-    )))
+    ));
+    match selector.as_str() {
+        "agent" => Ok(runtime),
+        "deterministic" => Ok(runtime.with_deterministic_selector()),
+        other => Err(format!(
+            "unknown COWBOY_ENGINE_SELECTOR {other:?}; expected agent or deterministic"
+        )
+        .into()),
+    }
 }
 
 /// Resolve the ACP agent config from a backend preset selected by
@@ -442,6 +454,7 @@ fn usage() -> ! {
     eprintln!("  engine-cli events <run-id>                 print persisted event log");
     eprintln!();
     eprintln!("env: COWBOY_ENGINE_STATE, COWBOY_ENGINE_WORKFLOWS,");
+    eprintln!("     COWBOY_ENGINE_SELECTOR (agent|deterministic),");
     eprintln!("     COWBOY_ENGINE_BACKEND (copilot|omp), COWBOY_ENGINE_AGENT,");
     eprintln!("     COWBOY_ENGINE_AGENT_ARGS, COWBOY_ENGINE_MODEL, COWBOY_ENGINE_PROVIDER");
     std::process::exit(2);

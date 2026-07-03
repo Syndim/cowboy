@@ -12,6 +12,10 @@ pub mod runner;
 pub mod runtime;
 pub mod workflow;
 
+pub use cowboy_workflow_actions::{
+    AgentActionHandler, AgentActionRunner, AskUserActionRunner, EngineActionDispatcher,
+    FailActionRunner, PendingAskUser, StatusActionRunner, SuspendActionRunner,
+};
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::InputRouter;
 pub use runner::{LuaStepActionProvider, WorkflowRunner};

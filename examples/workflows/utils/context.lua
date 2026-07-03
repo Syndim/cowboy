@@ -1,19 +1,11 @@
 local M = {}
 
 function M.clarification_context(ctx)
-  local resume = ctx.resume or {}
-  local clarifications = {}
-  for key, value in pairs(resume) do
-    local order = tonumber(string.match(tostring(key), "^clarification_(%d+)$"))
-    if order and value and tostring(value) ~= "" then
-      table.insert(clarifications, { order = order, value = tostring(value) })
-    end
+  local fields = (ctx.prev and ctx.prev.fields) or {}
+  if fields.clarification and tostring(fields.clarification) ~= "" then
+    return "\nAdditional user context:\n- " .. tostring(fields.clarification)
   end
-  table.sort(clarifications, function(a, b) return a.order < b.order end)
-  if #clarifications == 0 then return "" end
-  local lines = { "", "Additional user context:" }
-  for _, item in ipairs(clarifications) do table.insert(lines, "- " .. item.value) end
-  return table.concat(lines, "\n")
+  return ""
 end
 
 function M.request_context(ctx)

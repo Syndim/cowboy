@@ -45,6 +45,21 @@ This crate owns only CLI/configuration and terminal rendering. It should not own
 | `app/controls/status.rs` | Status strip and context-sensitive hints. |
 | `app/controls/composer.rs` | Composer view, multiline input rendering, cursor placement, and slash-command suggestions. |
 
+## Crate: `cowboy-workflow-actions`
+
+Package name: `cowboy-workflow-actions`.
+
+Owns reusable host-action runners and the dispatcher that maps `StepAction` variants to `ActionResult` values.
+
+| Module | Responsibility |
+| --- | --- |
+| `lib.rs` | `EngineActionDispatcher` and public runner exports. |
+| `agent.rs` | `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`. |
+| `ask_user.rs` | `AskUserActionRunner`, pending ask-user metadata, and answer completion into `StepRecord`. |
+| `status.rs` | `StatusActionRunner` for immediate completed records. |
+| `fail.rs` | `FailActionRunner` for failed run statuses. |
+| `suspend.rs` | `SuspendActionRunner` for suspended run statuses. |
+
 ## Crate: `cowboy-workflow-engine`
 
 Package name: `cowboy-workflow-engine`.
@@ -53,19 +68,19 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/list workflow runs, wire store/catalog/Lua/agent execution, persist event logs. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/list workflow runs, wire store/catalog/Lua/action dispatch/agent execution, persist event logs. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
-| `input.rs` | `InputRouter`; validates and applies answers for `RunStatus::WaitingForInput`. |
-| `runner.rs` | `WorkflowRunner<S, E, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events. Also `LuaStepActionProvider`. |
+| `input.rs` | `InputRouter`; validates answers for `RunStatus::WaitingForInput` and completes pending ask-user records. |
+| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events. Also `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
 
 Important seams:
 
 - `WorkflowRuntime` is the high-level application interface.
-- `WorkflowRunner<S, E, P>` depends on `RunStore`, `ActionExecutor`, and `StepActionProvider`.
-- `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider`.
-- `InputRouter` only mutates `WorkflowRun.resume/status`; it does not execute Lua or agents.
+- `WorkflowRunner<S, D, P>` depends on `RunStore`, `ActionDispatcher`, and `StepActionProvider`.
+- `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
+- `InputRouter` does not mutate `WorkflowRun.resume`; it turns a validated waiting prompt answer into an ask-user `StepRecord` for the common record-routing path.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
 
 ## Crate: `cowboy-workflow-catalog`

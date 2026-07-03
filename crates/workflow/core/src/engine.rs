@@ -1,10 +1,8 @@
 use chrono::Utc;
-use serde_json::Value;
 
 use crate::{
-    ActionExecution, ActionExecutor, ObjectKind, Result, RunHead, RunStatus, RunStore,
-    StatusAction, StepAction, StepActionProvider, StepDefinition, StepDetail, StepInput,
-    StepOutput, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun, next_step,
+    ActionDispatcher, ActionResult, ObjectKind, Result, RunHead, RunStatus, RunStore, StepAction,
+    StepActionProvider, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun, next_step,
 };
 
 /// Safety budgets enforced by the workflow runner.
@@ -26,9 +24,9 @@ impl Default for RunnerLimits {
 }
 
 /// Execute one workflow step action and persist the resulting run state.
-pub async fn execute_step<S, E, P>(
+pub async fn execute_step<S, D, P>(
     store: &S,
-    executor: &E,
+    dispatcher: &D,
     provider: &P,
     definition: &WorkflowDefinition,
     run: &mut WorkflowRun,
@@ -36,7 +34,7 @@ pub async fn execute_step<S, E, P>(
 ) -> Result<RunStatus>
 where
     S: RunStore,
-    E: ActionExecutor,
+    D: ActionDispatcher,
     P: StepActionProvider,
 {
     enforce_budget(run, limits)?;
@@ -55,69 +53,31 @@ where
         .map(|head| store.get_object::<StepRecord>(head))
         .transpose()?;
     let action = provider.step_action(definition, run, step, prev_record.as_ref())?;
-    let status = match action {
-        StepAction::Status(action) => {
-            handle_step_record(store, definition, run, status_record(run, step, action))?
-        }
-        StepAction::Fail(action) => set_run_status(
-            store,
-            run,
-            RunStatus::Failed {
-                reason: action.reason,
-            },
-        )?,
-        StepAction::Suspend(action) => set_run_status(
-            store,
-            run,
-            RunStatus::Suspended {
-                step: step.id.clone(),
-                reason: action.reason,
-            },
-        )?,
-        StepAction::AskUser(action) => set_run_status(
-            store,
-            run,
-            RunStatus::WaitingForInput {
-                step: step.id.clone(),
-                prompt_id: action.id,
-                message: action.message,
-                choices: action.choices,
-            },
-        )?,
-        StepAction::Agent(action) => {
-            let role = definition
+    let role = match &action {
+        StepAction::Agent(action) => Some(
+            definition
                 .roles
                 .get(&action.role)
                 .ok_or_else(|| WorkflowError::UnknownRole {
                     step: step.id.clone(),
                     role: action.role.clone(),
                 })?
-                .clone();
-            match executor
-                .execute(
-                    StepAction::Agent(action),
-                    crate::ExecutionContext {
-                        run_id: run.id.clone(),
-                        step_id: step.id.clone(),
-                        step_record_id: next_record_id(run),
-                        prev: run.head.clone(),
-                        role: Some(role),
-                    },
-                )
-                .await?
-            {
-                ActionExecution::StepCompleted(record) => {
-                    handle_step_record(store, definition, run, *record)?
-                }
-                ActionExecution::RunStateChanged(head) => {
-                    let status = head.status.clone();
-                    apply_run_head(store, run, head)?;
-                    status
-                }
-            }
-        }
+                .clone(),
+        ),
+        _ => None,
     };
-    Ok(status)
+    let context = crate::ExecutionContext {
+        run_id: run.id.clone(),
+        step_id: step.id.clone(),
+        step_record_id: next_record_id(run),
+        prev: run.head.clone(),
+        role,
+    };
+
+    match dispatcher.dispatch(action, context).await? {
+        ActionResult::Completed(record) => apply_step_record(store, definition, run, *record),
+        ActionResult::Blocked(status) => apply_run_status(store, run, status),
+    }
 }
 
 fn enforce_budget(run: &WorkflowRun, limits: &RunnerLimits) -> Result<()> {
@@ -142,36 +102,8 @@ fn increment_budget(run: &mut WorkflowRun) {
     *run.step_visits.entry(run.current_step.clone()).or_default() += 1;
 }
 
-fn status_record(run: &WorkflowRun, step: &StepDefinition, action: StatusAction) -> StepRecord {
-    let now = Utc::now();
-    StepRecord {
-        id: next_record_id(run),
-        prev: run.head.clone(),
-        step: step.id.clone(),
-        action: "status".to_string(),
-        input: StepInput {
-            prompt: None,
-            context: Value::Null,
-        },
-        output: Some(StepOutput {
-            status: action.status,
-            fields: action.fields,
-            body: action.body,
-            raw: Value::Null,
-        }),
-        detail: StepDetail {
-            backend: None,
-            session_id: None,
-            duration_ms: 0,
-            turn_count: 0,
-            usage: None,
-        },
-        started_at: now,
-        completed_at: Some(now),
-    }
-}
-
-fn handle_step_record<S: RunStore>(
+/// Persist a completed step record, advance the run head, and route by output status.
+pub fn apply_step_record<S: RunStore>(
     store: &S,
     definition: &WorkflowDefinition,
     run: &mut WorkflowRun,
@@ -198,7 +130,8 @@ fn handle_step_record<S: RunStore>(
     Ok(status)
 }
 
-fn set_run_status<S: RunStore>(
+/// Persist a run status produced by a blocked or terminal action.
+pub fn apply_run_status<S: RunStore>(
     store: &S,
     run: &mut WorkflowRun,
     status: RunStatus,
@@ -208,15 +141,6 @@ fn set_run_status<S: RunStore>(
     store.save_run(run)?;
     store.update_run_head(&run.id, run_head(run))?;
     Ok(status)
-}
-
-fn apply_run_head<S: RunStore>(store: &S, run: &mut WorkflowRun, head: RunHead) -> Result<()> {
-    run.head = head.head_step.clone();
-    run.status = head.status.clone();
-    run.updated_at = head.updated_at;
-    store.save_run(run)?;
-    store.update_run_head(&run.id, head)?;
-    Ok(())
 }
 
 fn run_head(run: &WorkflowRun) -> RunHead {
@@ -241,10 +165,13 @@ mod tests {
     use chrono::Utc;
     use parking_lot::Mutex;
     use serde::{Serialize, de::DeserializeOwned};
+    use serde_json::Value;
 
     use super::*;
     use crate::{
-        AgentAction, AskUserAction, FailAction, StepTransitions, SuspendAction, WorkflowDefinition,
+        ActionDispatcher, ActionResult, AgentAction, AskUserAction, FailAction, StatusAction,
+        StepDefinition, StepDetail, StepInput, StepOutput, StepTransitions, SuspendAction,
+        WorkflowDefinition,
     };
 
     struct StaticProvider {
@@ -271,44 +198,94 @@ mod tests {
         }
     }
 
-    struct NoopExecutor;
+    #[derive(Default)]
+    struct NoopDispatcher {
+        dispatched: Mutex<Vec<String>>,
+    }
 
     #[async_trait]
-    impl ActionExecutor for NoopExecutor {
-        async fn execute(
+    impl ActionDispatcher for NoopDispatcher {
+        async fn dispatch(
             &self,
             action: StepAction,
             context: crate::ExecutionContext,
-        ) -> Result<ActionExecution> {
-            let StepAction::Agent(action) = action else {
-                return Err(WorkflowError::InvalidAction("expected agent".to_string()));
-            };
+        ) -> Result<ActionResult> {
+            self.dispatched
+                .lock()
+                .push(action.action_name().to_string());
             let now = Utc::now();
-            Ok(ActionExecution::StepCompleted(Box::new(StepRecord {
-                id: context.step_record_id,
-                prev: context.prev,
-                step: context.step_id,
-                action: "agent".to_string(),
-                input: StepInput {
-                    prompt: Some(action.prompt),
-                    context: Value::Null,
-                },
-                output: Some(StepOutput {
-                    status: "success".to_string(),
-                    fields: Value::Null,
-                    body: String::new(),
-                    raw: Value::Null,
-                }),
-                detail: StepDetail {
-                    backend: Some("test".to_string()),
-                    session_id: None,
-                    duration_ms: 0,
-                    turn_count: 0,
-                    usage: None,
-                },
-                started_at: now,
-                completed_at: Some(now),
-            })))
+            match action {
+                StepAction::Agent(action) => Ok(ActionResult::completed(StepRecord {
+                    id: context.step_record_id,
+                    prev: context.prev,
+                    step: context.step_id,
+                    action: "agent".to_string(),
+                    input: StepInput {
+                        prompt: Some(action.prompt),
+                        context: Value::Null,
+                    },
+                    output: Some(StepOutput {
+                        status: "success".to_string(),
+                        fields: Value::Null,
+                        body: String::new(),
+                        raw: Value::Null,
+                    }),
+                    detail: StepDetail {
+                        backend: Some("test".to_string()),
+                        session_id: None,
+                        duration_ms: 0,
+                        turn_count: 0,
+                        usage: None,
+                    },
+                    started_at: now,
+                    completed_at: Some(now),
+                })),
+                StepAction::Status(action) => Ok(ActionResult::completed(StepRecord {
+                    id: context.step_record_id,
+                    prev: context.prev,
+                    step: context.step_id,
+                    action: "status".to_string(),
+                    input: StepInput {
+                        prompt: None,
+                        context: Value::Null,
+                    },
+                    output: Some(StepOutput {
+                        status: action.status,
+                        fields: action.fields,
+                        body: action.body,
+                        raw: Value::Null,
+                    }),
+                    detail: StepDetail {
+                        backend: None,
+                        session_id: None,
+                        duration_ms: 0,
+                        turn_count: 0,
+                        usage: None,
+                    },
+                    started_at: now,
+                    completed_at: Some(now),
+                })),
+                StepAction::AskUser(action) => {
+                    Ok(ActionResult::blocked(RunStatus::WaitingForInput {
+                        step: context.step_id,
+                        prompt_id: action.id,
+                        message: action.message,
+                        choices: action.choices,
+                        record_id: context.step_record_id,
+                        prev: context.prev,
+                        started_at: now,
+                        output_status: action.status,
+                        output_fields: action.fields,
+                    }))
+                }
+                StepAction::Fail(action) => Ok(ActionResult::blocked(RunStatus::Failed {
+                    reason: action.reason,
+                })),
+                StepAction::Suspend(action) => Ok(ActionResult::blocked(RunStatus::Suspended {
+                    step: context.step_id,
+                    reason: action.reason,
+                })),
+            }
         }
     }
 
@@ -464,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn status_action_advances_to_next_step() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "next".to_string(),
             fields: Value::Null,
@@ -492,7 +469,7 @@ mod tests {
     #[tokio::test]
     async fn success_without_transition_completes() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "success".to_string(),
             fields: Value::Null,
@@ -518,11 +495,13 @@ mod tests {
     #[tokio::test]
     async fn ask_user_sets_waiting_status() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::AskUser(AskUserAction {
             id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec!["yes".to_string(), "no".to_string()],
+            status: "answered".to_string(),
+            fields: Value::Null,
         })]);
         let mut run = run();
 
@@ -537,21 +516,34 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            status,
-            RunStatus::WaitingForInput {
-                step: "start".to_string(),
-                prompt_id: "approval".to_string(),
-                message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
-            }
-        );
+        let RunStatus::WaitingForInput {
+            step,
+            prompt_id,
+            message,
+            choices,
+            record_id,
+            prev,
+            output_status,
+            output_fields,
+            ..
+        } = status
+        else {
+            panic!("expected waiting status")
+        };
+        assert_eq!(step, "start");
+        assert_eq!(prompt_id, "approval");
+        assert_eq!(message, "Approve?");
+        assert_eq!(choices, vec!["yes".to_string(), "no".to_string()]);
+        assert_eq!(record_id, "run-2");
+        assert_eq!(prev, None);
+        assert_eq!(output_status, "answered");
+        assert_eq!(output_fields, Value::Null);
     }
 
     #[tokio::test]
     async fn fail_action_sets_failed_status() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Fail(FailAction {
             reason: "bad".to_string(),
         })]);
@@ -579,7 +571,7 @@ mod tests {
     #[tokio::test]
     async fn suspend_action_sets_suspended_status() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Suspend(SuspendAction {
             reason: "pause".to_string(),
         })]);
@@ -608,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn agent_action_uses_executor_result() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Agent(AgentAction {
             role: "developer".to_string(),
             prompt: "do it".to_string(),
@@ -633,9 +625,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn action_dispatcher_receives_each_step_action_variant() {
+        let cases = vec![
+            StepAction::Status(StatusAction {
+                status: "success".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+            }),
+            StepAction::AskUser(AskUserAction {
+                id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: Vec::new(),
+                status: "answered".to_string(),
+                fields: Value::Null,
+            }),
+            StepAction::Fail(FailAction {
+                reason: "bad".to_string(),
+            }),
+            StepAction::Suspend(SuspendAction {
+                reason: "pause".to_string(),
+            }),
+            StepAction::Agent(AgentAction {
+                role: "developer".to_string(),
+                prompt: "do it".to_string(),
+                output: None,
+            }),
+        ];
+
+        for action in cases {
+            let expected = action.action_name().to_string();
+            let store = MemoryStore::default();
+            let dispatcher = NoopDispatcher::default();
+            let provider = StaticProvider::new(vec![action]);
+            let mut run = run();
+            if expected == "agent" {
+                run.current_step = "agent".to_string();
+            }
+
+            execute_step(
+                &store,
+                &dispatcher,
+                &provider,
+                &definition(),
+                &mut run,
+                &RunnerLimits::default(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(dispatcher.dispatched.lock().as_slice(), &[expected]);
+        }
+    }
+
+    #[test]
+    fn apply_step_record_stores_head_and_routes() {
+        let store = MemoryStore::default();
+        let mut run = run();
+        let now = Utc::now();
+        let record = StepRecord {
+            id: "record".to_string(),
+            prev: None,
+            step: "start".to_string(),
+            action: "status".to_string(),
+            input: StepInput {
+                prompt: None,
+                context: Value::Null,
+            },
+            output: Some(StepOutput {
+                status: "next".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+                raw: Value::Null,
+            }),
+            detail: StepDetail {
+                backend: None,
+                session_id: None,
+                duration_ms: 0,
+                turn_count: 0,
+                usage: None,
+            },
+            started_at: now,
+            completed_at: Some(now),
+        };
+
+        let status = apply_step_record(&store, &definition(), &mut run, record).unwrap();
+
+        assert_eq!(status, RunStatus::Running);
+        assert_eq!(run.current_step, "next");
+        assert!(run.head.is_some());
+        assert_eq!(store.load_run(&run.id).unwrap().status, RunStatus::Running);
+        assert_eq!(store.load_run_head(&run.id).unwrap().head_step, run.head);
+    }
+
+    #[tokio::test]
     async fn max_step_budget_is_enforced() {
         let store = MemoryStore::default();
-        let executor = NoopExecutor;
+        let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "success".to_string(),
             fields: Value::Null,

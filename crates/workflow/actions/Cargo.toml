@@ -1,0 +1,17 @@
+[package]
+name = "cowboy-workflow-actions"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Workflow action runners and dispatcher for Cowboy"
+
+[dependencies]
+cowboy-workflow-core = { path = "../core" }
+cowboy-workflow-agent = { path = "../agent" }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }

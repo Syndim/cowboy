@@ -27,7 +27,7 @@ pub struct WorkflowRun {
     pub current_step: StepId,
     /// Hash of the latest completed step record.
     pub head: Option<ObjectHash>,
-    /// Resume data exposed to Lua as `ctx.resume`.
+    /// Legacy resume data retained for old serialized runs; new ask-user answers flow through `ctx.prev`.
     #[serde(default)]
     pub resume: Value,
     /// Total number of step actions completed or terminally handled.
@@ -52,12 +52,22 @@ pub enum RunStatus {
     WaitingForInput {
         /// Step that requested input.
         step: StepId,
-        /// Prompt/input id exposed to Lua resume data.
+        /// Prompt/input id used to validate the answer.
         prompt_id: String,
         /// Message shown to the user.
         message: String,
         /// Accepted choices, empty when free-form input is allowed.
         choices: Vec<String>,
+        /// Pending step record id to reuse when the answer completes this step.
+        record_id: RecordId,
+        /// Hash of the previous completed record when the prompt was shown.
+        prev: Option<ObjectHash>,
+        /// Timestamp captured when the prompt was shown.
+        started_at: DateTime<Utc>,
+        /// Output status for the completed ask-user record.
+        output_status: Status,
+        /// Output fields carried from the ask-user action until answer time.
+        output_fields: Value,
     },
     /// Run is paused without being failed.
     Suspended {
@@ -235,6 +245,11 @@ mod tests {
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec!["yes".to_string(), "no".to_string()],
+            record_id: "run-1".to_string(),
+            prev: Some("prev".to_string()),
+            started_at: Utc::now(),
+            output_status: "answered".to_string(),
+            output_fields: serde_json::json!({ "plan": "ship" }),
         };
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["status"], "waiting_for_input");

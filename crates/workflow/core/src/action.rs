@@ -68,15 +68,25 @@ pub struct StatusAction {
 }
 
 /// Request to pause and ask the user for input.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AskUserAction {
-    /// Stable input id used as key in `ctx.resume` after the answer arrives.
+    /// Stable prompt id shown in waiting state and answer validation.
     pub id: String,
     /// Message shown to the user.
     pub message: String,
     /// Optional finite set of accepted choices.
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Output status used when the user answers.
+    #[serde(default = "default_ask_user_status")]
+    pub status: Status,
+    /// Structured fields carried into the eventual ask-user step output.
+    #[serde(default)]
+    pub fields: Value,
+}
+
+fn default_ask_user_status() -> Status {
+    "answered".to_string()
 }
 
 /// Request to fail the workflow run.

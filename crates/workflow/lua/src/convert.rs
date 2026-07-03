@@ -136,6 +136,8 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             id: required_string(&table, &action, "id")?,
             message: required_string(&table, &action, "message")?,
             choices: string_array(table.get::<Value>("choices")?)?,
+            status: optional_string(&table, "status")?.unwrap_or_else(|| "answered".to_string()),
+            fields: lua_to_json(table.get::<Value>("fields")?)?,
         })),
         "fail" => Ok(StepAction::Fail(FailAction {
             reason: required_string(&table, &action, "reason")?,

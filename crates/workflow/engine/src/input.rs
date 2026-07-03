@@ -1,14 +1,14 @@
 use chrono::Utc;
-use cowboy_workflow_core::{RunStatus, WorkflowError, WorkflowRun};
-use serde_json::{Map, Value};
+use cowboy_workflow_core::{StepRecord, WorkflowError, WorkflowRun};
+
+use crate::{AskUserActionRunner, PendingAskUser};
 
 /// Applies TUI/user answers to a workflow run waiting on `action.ask_user`.
 ///
-/// `action.ask_user` is a step boundary: the runner persists a
+/// `action.ask_user` is a step boundary: the dispatcher persists a
 /// `WaitingForInput` run status and stops. When the user answers, this module
-/// validates the answer, stores it under `run.resume[prompt_id]`, and marks the
-/// run as `Running` so the next runner pass re-evaluates the same Lua step with
-/// `ctx.resume` populated.
+/// validates the answer and completes the pending ask-user action into a normal
+/// `StepRecord`. It does not mutate `run.resume` or step counters.
 #[derive(Debug, Clone, Default)]
 pub struct InputRouter;
 
@@ -19,51 +19,28 @@ impl InputRouter {
 
     pub fn answer(
         &self,
-        run: &mut WorkflowRun,
+        run: &WorkflowRun,
         prompt_id: &str,
         answer: impl Into<String>,
-    ) -> cowboy_workflow_core::Result<RunStatus> {
+    ) -> cowboy_workflow_core::Result<StepRecord> {
         let answer = answer.into();
-        let RunStatus::WaitingForInput {
-            step,
-            prompt_id: expected_prompt_id,
-            choices,
-            ..
-        } = &run.status
-        else {
-            return Err(WorkflowError::InvalidAction(
-                "workflow run is not waiting for input".to_string(),
-            ));
-        };
+        let pending = PendingAskUser::from_status(&run.status)?;
 
-        if prompt_id != expected_prompt_id {
+        if prompt_id != pending.prompt_id {
             return Err(WorkflowError::InvalidAction(format!(
-                "answer prompt id {prompt_id:?} does not match waiting prompt {expected_prompt_id:?}"
+                "answer prompt id {prompt_id:?} does not match waiting prompt {:?}",
+                pending.prompt_id
             )));
         }
 
-        if !choices.is_empty() && !choices.iter().any(|choice| choice == &answer) {
+        if !pending.choices.is_empty() && !pending.choices.iter().any(|choice| choice == &answer) {
             return Err(WorkflowError::InvalidAction(format!(
                 "answer {answer:?} is not one of the allowed choices"
             )));
         }
 
-        run.current_step = step.clone();
-        insert_resume_answer(&mut run.resume, prompt_id, answer);
-        run.status = RunStatus::Running;
-        run.updated_at = Utc::now();
-        Ok(run.status.clone())
+        Ok(AskUserActionRunner.complete(pending, answer, Utc::now()))
     }
-}
-
-fn insert_resume_answer(resume: &mut Value, prompt_id: &str, answer: String) {
-    if !resume.is_object() {
-        *resume = Value::Object(Map::new());
-    }
-    let object = resume
-        .as_object_mut()
-        .expect("resume was normalized to object");
-    object.insert(prompt_id.to_string(), Value::String(answer));
 }
 
 #[cfg(test)]
@@ -71,6 +48,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::Utc;
+    use cowboy_workflow_core::RunStatus;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -88,6 +67,11 @@ mod tests {
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec!["yes".to_string(), "no".to_string()],
+                record_id: "run-1-ask".to_string(),
+                prev: Some("previous-hash".to_string()),
+                started_at: now,
+                output_status: "answered".to_string(),
+                output_fields: json!({ "plan": "ship" }),
             },
             current_step: "approve".to_string(),
             head: None,
@@ -100,33 +84,38 @@ mod tests {
     }
 
     #[test]
-    fn answer_stores_resume_value_and_restarts_run() {
-        let mut run = waiting_run();
-        let status = InputRouter::new()
-            .answer(&mut run, "approval", "yes")
-            .unwrap();
+    fn answer_builds_record_without_mutating_resume_or_counters() {
+        let run = waiting_run();
+        let before_resume = run.resume.clone();
+        let before_steps = run.steps_executed;
+        let record = InputRouter::new().answer(&run, "approval", "yes").unwrap();
 
-        assert_eq!(status, RunStatus::Running);
-        assert_eq!(run.status, RunStatus::Running);
-        assert_eq!(run.current_step, "approve");
-        assert_eq!(run.resume["approval"], "yes");
+        assert_eq!(run.resume, before_resume);
+        assert_eq!(run.steps_executed, before_steps);
+        assert_eq!(record.id, "run-1-ask");
+        assert_eq!(record.prev, Some("previous-hash".to_string()));
+        assert_eq!(record.step, "approve");
+        assert_eq!(record.action, "ask_user");
+        let output = record.output.unwrap();
+        assert_eq!(output.status, "answered");
+        assert_eq!(output.fields["plan"], "ship");
+        assert_eq!(output.fields["answer"], "yes");
+        assert_eq!(output.raw["prompt_id"], "approval");
     }
 
     #[test]
     fn answer_rejects_wrong_prompt_id() {
-        let mut run = waiting_run();
-        let err = InputRouter::new()
-            .answer(&mut run, "other", "yes")
-            .unwrap_err();
+        let run = waiting_run();
+        let err = InputRouter::new().answer(&run, "other", "yes").unwrap_err();
 
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
     }
 
     #[test]
     fn answer_rejects_invalid_choice() {
-        let mut run = waiting_run();
+        let run = waiting_run();
         let err = InputRouter::new()
-            .answer(&mut run, "approval", "maybe")
+            .answer(&run, "approval", "maybe")
             .unwrap_err();
 
         assert!(matches!(err, WorkflowError::InvalidAction(_)));

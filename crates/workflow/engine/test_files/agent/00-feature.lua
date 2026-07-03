@@ -23,26 +23,11 @@ local reviewer = role("reviewer", [[You are a meticulous code reviewer.
 Inspect the working tree, plan document, and TODO checklist for correctness, scope creep, and obvious bugs. Verify each checked TODO item is actually complete, and do not approve while required TODO items are unchecked or falsely checked; otherwise give specific, actionable feedback.]])
 
 local function clarification_context(ctx)
-  local resume = ctx.resume or {}
-  local clarifications = {}
-
-  for key, value in pairs(resume) do
-    local order = tonumber(string.match(tostring(key), "^clarification_(%d+)$"))
-    if order and value and tostring(value) ~= "" then
-      table.insert(clarifications, { order = order, value = tostring(value) })
-    end
+  local fields = (ctx.prev and ctx.prev.fields) or {}
+  if fields.clarification and tostring(fields.clarification) ~= "" then
+    return "\nAdditional user context:\n- " .. tostring(fields.clarification)
   end
-
-  table.sort(clarifications, function(a, b) return a.order < b.order end)
-  if #clarifications == 0 then
-    return ""
-  end
-
-  local lines = { "", "Additional user context:" }
-  for _, item in ipairs(clarifications) do
-    table.insert(lines, "- " .. item.value)
-  end
-  return table.concat(lines, "\n")
+  return ""
 end
 
 local function request_context(ctx)
@@ -160,10 +145,12 @@ end
 
 local unclear = step("unclear")
 unclear.run = function(ctx)
-  local answered_prompt_id = "clarification_" .. tostring((ctx.steps_executed or 1) - 1)
-  local answer = ctx.resume and ctx.resume[answered_prompt_id]
-  if answer and tostring(answer) ~= "" then
-    return action.status { status = "clarified", body = "received additional context" }
+  if ctx.prev and ctx.prev.action == "ask_user" then
+    local fields = ctx.prev.fields or {}
+    local answer = fields.answer
+    if answer and tostring(answer) ~= "" then
+      return action.status { status = "clarified", fields = { clarification = tostring(answer) }, body = "received additional context" }
+    end
   end
 
   local prompt_id = "clarification_" .. tostring(ctx.steps_executed or 0)
@@ -174,6 +161,16 @@ unclear.run = function(ctx)
   }
 end
 
+local unclear_answer = step("unclear_answer")
+unclear_answer.run = function(ctx)
+  local fields = (ctx.prev and ctx.prev.fields) or {}
+  local answer = fields.answer
+  if answer and tostring(answer) ~= "" then
+    return action.status { status = "clarified", fields = { clarification = tostring(answer) }, body = "received additional context" }
+  end
+  return action.fail { reason = "clarification answer was empty" }
+end
+
 local blocked = step("blocked")
 blocked.run = function(ctx)
   return action.status { status = "success", body = "implementation was blocked" }
@@ -181,7 +178,8 @@ end
 
 plan:on("ready", implement)
 plan:on("unclear", unclear)
-unclear:on("clarified", plan)
+unclear:on("answered", unclear_answer)
+unclear_answer:on("clarified", plan)
 implement:on("implemented", review)
 implement:on("blocked", blocked)
 review:on("approved", done)

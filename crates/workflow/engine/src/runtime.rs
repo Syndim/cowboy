@@ -18,7 +18,7 @@ use cowboy_workflow_catalog::{
 use cowboy_workflow_core::{
     ObjectKind, Result, RoleDefinition, RunHead, RunStatus, RunnerLimits, WorkflowCatalog,
     WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
-    WorkflowSummarizer,
+    WorkflowSummarizer, apply_step_record,
 };
 use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,8 @@ use uuid::Uuid;
 use crate::agent_resolver::AgentResolver;
 use crate::workflow::DeterministicSelector;
 use crate::{
-    EventBus, InputRouter, LuaStepActionProvider, WorkflowEvent, WorkflowEventKind, WorkflowRunner,
+    EngineActionDispatcher, EventBus, InputRouter, LuaStepActionProvider, WorkflowEvent,
+    WorkflowEventKind, WorkflowRunner,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,11 +341,30 @@ impl WorkflowRuntime {
         );
         let store = self.open_store()?;
         let mut run = store.load_run(&run_id.to_string())?;
-        InputRouter::new().answer(&mut run, prompt_id, answer)?;
-        store.save_run(&run)?;
-        store.update_run_head(&run.id, run_head(&run))?;
-        tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer persisted");
-        self.resume_run(run_id).await
+        let snapshot = snapshot_from_run(&run);
+        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        definition.name = run.workflow_name.clone();
+        definition.source_hash = run.workflow_hash.clone();
+
+        let record = InputRouter::new().answer(&run, prompt_id, answer)?;
+        let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
+        let events = vec![
+            WorkflowEvent::step_completed(run.id.clone(), &record),
+            WorkflowEvent::run_status(run.id.clone(), &status),
+        ];
+        for event in &events {
+            self.events.emit(event.clone());
+        }
+        tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
+
+        if matches!(status, RunStatus::Running) {
+            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, events)
+                .await
+        } else {
+            self.persist_events(&run.id, &events)?;
+            Ok(RunReport { run, events })
+        }
     }
 
     pub async fn improve_run(&self, run_id: &str) -> Result<AppliedWorkflowImprovement> {
@@ -436,6 +456,18 @@ impl WorkflowRuntime {
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
     ) -> Result<RunReport> {
+        self.run_existing_with_events(run, definition, snapshot, mode, Vec::new())
+            .await
+    }
+
+    async fn run_existing_with_events(
+        &self,
+        run: WorkflowRun,
+        definition: cowboy_workflow_core::WorkflowDefinition,
+        snapshot: WorkflowSourceSnapshot,
+        mode: RunMode,
+        mut events: Vec<WorkflowEvent>,
+    ) -> Result<RunReport> {
         tracing::debug!(
             run_id = %run.id,
             workflow = %definition.name,
@@ -460,8 +492,9 @@ impl WorkflowRuntime {
             })),
         };
         let executor = AgentExecutor::new(self.agent_factory()?, agent_store, agent_config);
+        let dispatcher = EngineActionDispatcher::new(executor);
         let provider = LuaStepActionProvider::new(snapshot);
-        let runner = WorkflowRunner::new(store, executor, provider, self.events.clone())
+        let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
             .with_limits(self.config.limits.into());
         let run_future = async {
             match mode {
@@ -470,7 +503,10 @@ impl WorkflowRuntime {
             }
         };
         tokio::pin!(run_future);
-        let mut events = Vec::new();
+        let prefix_len = events.len();
+        if prefix_len > 0 {
+            self.persist_events(&run_id, &events)?;
+        }
         let run = loop {
             tokio::select! {
                 result = &mut run_future => break result?,
@@ -487,7 +523,7 @@ impl WorkflowRuntime {
             }
         };
         drain_available_workflow_events(&mut rx, &mut events);
-        tracing::debug!(run_id = %run.id, event_count = events.len(), "workflow events collected");
+        tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
         self.persist_events(&run.id, &events)?;
         Ok(RunReport { run, events })
     }
@@ -864,6 +900,135 @@ mod tests {
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn answer_run_persists_ask_user_completion_before_resumed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local ask = step("ask")
+            ask.run = function(ctx)
+              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, fields = { carried = "ok" } }
+            end
+
+            local decide = step("decide")
+            decide.run = function(ctx)
+              local fields = (ctx.prev and ctx.prev.fields) or {}
+              return action.status { status = tostring(fields.answer), fields = { answer = fields.answer, carried = fields.carried }, body = "decided" }
+            end
+
+            local done = step("done")
+            done.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            ask:on("answered", decide)
+            decide:on("yes", done)
+            return workflow("aaa", ask)
+            "#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        })
+        .with_deterministic_selector();
+
+        let start = runtime.start_run("request").await.unwrap();
+        assert!(matches!(
+            start.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        let steps_before_answer = start.run.steps_executed;
+        let report = runtime
+            .answer_run(&start.run.id, "approval", "yes")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(report.run.steps_executed, steps_before_answer + 2);
+        assert!(matches!(
+            report.events[0].kind,
+            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+                if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
+        ));
+        assert!(matches!(
+            report.events[1].kind,
+            WorkflowEventKind::RunStatusChanged { ref status } if status == "running"
+        ));
+        assert!(report.events.iter().skip(2).any(|event| matches!(
+            event.kind,
+            WorkflowEventKind::StepCompleted { ref step_id, .. } if step_id == "decide"
+        )));
+
+        let persisted = runtime.load_events(&report.run.id).unwrap();
+        assert_eq!(persisted, report.events);
+    }
+
+    #[tokio::test]
+    async fn answer_run_persists_ask_user_completion_when_resumed_step_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local ask = step("ask")
+            ask.run = function(ctx)
+              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" } }
+            end
+
+            local broken = step("broken")
+            broken.run = function(ctx)
+              return action.status { body = "missing status" }
+            end
+
+            ask:on("answered", broken)
+            return workflow("aaa", ask)
+            "#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        })
+        .with_deterministic_selector();
+
+        let start = runtime.start_run("request").await.unwrap();
+        let err = runtime
+            .answer_run(&start.run.id, "approval", "yes")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, WorkflowError::InvalidAction(_)));
+        let persisted = runtime.load_events(&start.run.id).unwrap();
+        assert!(matches!(
+            persisted[0].kind,
+            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+                if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
+        ));
+        assert!(matches!(
+            persisted[1].kind,
+            WorkflowEventKind::RunStatusChanged { ref status } if status == "running"
+        ));
+    }
+
     #[test]
     fn agent_feature_unclear_step_requests_and_reuses_clarification() {
         let source = include_str!("../test_files/agent/00-feature.lua");
@@ -875,7 +1040,11 @@ mod tests {
 
         let definition = cowboy_workflow_lua::compile_snapshot(&bundle).unwrap();
         assert_eq!(
-            definition.steps["unclear"].transitions.by_status["clarified"],
+            definition.steps["unclear"].transitions.by_status["answered"],
+            "unclear_answer"
+        );
+        assert_eq!(
+            definition.steps["unclear_answer"].transitions.by_status["clarified"],
             "plan"
         );
 
@@ -894,10 +1063,15 @@ mod tests {
 
         let result = cowboy_workflow_lua::run_step(
             &bundle,
-            "unclear",
+            "unclear_answer",
             serde_json::json!({
                 "steps_executed": 3,
-                "resume": { "clarification_2": "Add a status command" },
+                "prev": {
+                    "step": "unclear",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": { "answer": "Add a status command" },
+                },
             }),
         )
         .unwrap();
@@ -912,7 +1086,11 @@ mod tests {
                 step,
                 serde_json::json!({
                     "request": "Let's implement a feature",
-                    "resume": { "clarification_2": "Add a status command" },
+                    "prev": {
+                        "step": "unclear",
+                        "status": "clarified",
+                        "fields": { "clarification": "Add a status command" },
+                    },
                 }),
             )
             .unwrap();
@@ -1138,14 +1316,14 @@ mod tests {
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "confirm_plan",
+            "confirm_plan_answer",
             serde_json::json!({
                 "steps_executed": 6,
-                "resume": { "plan_confirmation_5": "yes" },
                 "prev": {
-                    "step": "review_plan",
-                    "status": "approved",
-                    "fields": { "plan": reviewed_plan, "plan_doc": plan_doc },
+                    "step": "confirm_plan",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": { "answer": "yes", "plan": reviewed_plan, "plan_doc": plan_doc },
                 },
             }),
         )
@@ -1280,14 +1458,14 @@ mod tests {
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "confirm_result",
+            "confirm_result_answer",
             serde_json::json!({
                 "steps_executed": 9,
-                "resume": { "result_confirmation_8": "fix one more thing" },
                 "prev": {
-                    "step": "review",
-                    "status": "approved",
-                    "fields": { "plan_doc": plan_doc },
+                    "step": "confirm_result",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": { "answer": "fix one more thing", "plan_doc": plan_doc },
                 },
             }),
         )
@@ -1319,6 +1497,12 @@ mod tests {
         let compiled = cowboy_workflow_lua::load(source_ref).unwrap();
         assert_eq!(
             compiled.definition.steps["blocked"].transitions.by_status["answered"],
+            "blocked_answer"
+        );
+        assert_eq!(
+            compiled.definition.steps["blocked_answer"]
+                .transitions
+                .by_status["triaged"],
             "triage_blocked"
         );
         assert_eq!(
@@ -1366,15 +1550,21 @@ mod tests {
         let blocked_response = "Credentials are available now; continue implementation.";
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "blocked",
+            "blocked_answer",
             serde_json::json!({
                 "steps_executed": 11,
-                "resume": { "blocked_10": blocked_response },
                 "prev": {
-                    "step": "implement",
-                    "status": "blocked",
-                    "fields": { "summary": "Need credentials", "plan_doc": "docs/plans/example.md" },
-                    "body": "Cannot continue without access",
+                    "step": "blocked",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": blocked_response,
+                        "summary": "Need credentials",
+                        "plan_doc": "docs/plans/example.md",
+                        "blocked_from_step": "implement",
+                        "blocked_from_status": "blocked"
+                    },
+                    "body": blocked_response,
                 },
             }),
         )
@@ -1382,7 +1572,7 @@ mod tests {
         let StepAction::Status(action) = result.action else {
             panic!("expected blocked answer to be recorded")
         };
-        assert_eq!(action.status, "answered");
+        assert_eq!(action.status, "triaged");
         assert_eq!(action.fields["summary"], "Need credentials");
         assert_eq!(action.fields["plan_doc"], "docs/plans/example.md");
         assert_eq!(action.fields["blocked_response"], blocked_response);
@@ -1396,7 +1586,7 @@ mod tests {
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "status": "answered",
+                    "status": "triaged",
                     "fields": {
                         "summary": "Need credentials",
                         "plan_doc": "docs/plans/example.md",
