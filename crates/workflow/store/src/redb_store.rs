@@ -1,5 +1,6 @@
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use cowboy_workflow_core::{
     ObjectHash, ObjectKind, RoleSession, RunHead, RunId, RunStore, TurnRecord, WorkflowRun,
@@ -11,143 +12,146 @@ use crate::hash::{canonical_object_bytes, object_hash};
 use crate::tables::{OBJECTS, ROLE_SESSIONS, RUN_HEADS, RUN_TURNS, RUNS};
 use crate::{Error, Result};
 
+const OPEN_RETRY_ATTEMPTS: usize = 20;
+const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+
 /// redb-backed implementation of workflow run storage.
 ///
 /// The store keeps immutable content-addressed objects in `OBJECTS` and mutable
-/// run state in dedicated tables. Public inherent methods return store-local
-/// errors; the `RunStore` trait implementation maps them into workflow-core
-/// errors for consumers that depend on the trait.
+/// run state in dedicated tables. The value is path-backed and opens redb only
+/// inside each operation, so idle Cowboy processes do not retain redb's
+/// exclusive writable database lock.
 #[derive(Clone)]
 pub struct RedbRunStore {
-    /// Open redb database handle.
-    db: Arc<Database>,
+    /// Path to the redb workflow database.
+    path: PathBuf,
 }
 
 impl RedbRunStore {
-    /// Create a new database at `path`.
+    /// Create or open a database at `path`, then drop the validation handle.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self {
-            db: Arc::new(Database::create(path)?),
-        })
+        let path = path.as_ref().to_path_buf();
+        ensure_parent_dir(&path)?;
+        drop(open_database_with_retry(&path, |path| {
+            Database::create(path)
+        })?);
+        Ok(Self { path })
     }
 
-    /// Open an existing database at `path`.
+    /// Open an existing database at `path`, then drop the validation handle.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self {
-            db: Arc::new(Database::open(path)?),
-        })
+        let path = path.as_ref().to_path_buf();
+        drop(open_database_with_retry(&path, |path| {
+            Database::open(path)
+        })?);
+        Ok(Self { path })
     }
 
     /// Save the mutable workflow run snapshot by run id.
     pub fn save_run(&self, run: &WorkflowRun) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             let bytes = serde_json::to_vec(run)?;
             let mut runs = write.open_table(RUNS)?;
             runs.insert(run.id.as_str(), bytes.as_slice())?;
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Load a workflow run snapshot by run id.
     pub fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(RUNS)?;
-        let Some(bytes) = table.get(run_id.as_str())? else {
-            return Err(Error::RunNotFound(run_id.clone()));
-        };
-        decode_json(bytes.value())
+        self.with_read(|read| {
+            let table = read.open_table(RUNS)?;
+            let Some(bytes) = table.get(run_id.as_str())? else {
+                return Err(Error::RunNotFound(run_id.clone()));
+            };
+            decode_json(bytes.value())
+        })
     }
 
     /// List all run heads known to the store.
     pub fn list_runs(&self) -> Result<Vec<RunHead>> {
-        let read = self.db.begin_read()?;
-        let table = match read.open_table(RUN_HEADS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-            Err(err) => return Err(err.into()),
-        };
-        let mut out = Vec::new();
-        for item in table.iter()? {
-            let (_, value) = item?;
-            out.push(decode_json(value.value())?);
-        }
-        Ok(out)
+        self.with_read(|read| {
+            let table = match read.open_table(RUN_HEADS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(err.into()),
+            };
+            let mut out = Vec::new();
+            for item in table.iter()? {
+                let (_, value) = item?;
+                out.push(decode_json(value.value())?);
+            }
+            Ok(out)
+        })
     }
 
     /// Store an immutable object and return its content hash.
     pub fn put_object<T: Serialize>(&self, kind: ObjectKind, value: &T) -> Result<ObjectHash> {
-        let write = self.db.begin_write()?;
-        let hash = Self::put_object_in_tx(&write, kind, value)?;
-        write.commit()?;
-        Ok(hash)
+        self.with_write(|write| Self::put_object_in_tx(write, kind, value))
     }
 
     /// Load an immutable object by content hash.
     pub fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> Result<T> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(OBJECTS)?;
-        let Some(bytes) = table.get(hash.as_str())? else {
-            return Err(Error::ObjectNotFound(hash.clone()));
-        };
-        decode_object(bytes.value())
+        self.with_read(|read| {
+            let table = read.open_table(OBJECTS)?;
+            let Some(bytes) = table.get(hash.as_str())? else {
+                return Err(Error::ObjectNotFound(hash.clone()));
+            };
+            decode_object(bytes.value())
+        })
     }
 
     /// Save or replace the mutable head for a run.
     pub fn update_run_head(&self, run_id: &str, head: RunHead) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             let bytes = serde_json::to_vec(&head)?;
             let mut table = write.open_table(RUN_HEADS)?;
             table.insert(run_id, bytes.as_slice())?;
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Load the mutable head for a run.
     pub fn load_run_head(&self, run_id: &str) -> Result<RunHead> {
-        let read = self.db.begin_read()?;
-        let table = read.open_table(RUN_HEADS)?;
-        let Some(bytes) = table.get(run_id)? else {
-            return Err(Error::RunNotFound(run_id.to_string()));
-        };
-        decode_json(bytes.value())
+        self.with_read(|read| {
+            let table = read.open_table(RUN_HEADS)?;
+            let Some(bytes) = table.get(run_id)? else {
+                return Err(Error::RunNotFound(run_id.to_string()));
+            };
+            decode_json(bytes.value())
+        })
     }
 
     /// Save or replace a backend session for one `(run_id, role_id)` pair.
     pub fn save_role_session(&self, session: RoleSession) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             let key = role_session_key(&session.run_id, &session.role_id);
             let bytes = serde_json::to_vec(&session)?;
             let mut table = write.open_table(ROLE_SESSIONS)?;
             table.insert(key.as_str(), bytes.as_slice())?;
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Load a backend session for one `(run_id, role_id)` pair.
     pub fn load_role_session(&self, run_id: &str, role_id: &str) -> Result<Option<RoleSession>> {
-        let read = self.db.begin_read()?;
-        let table = match read.open_table(ROLE_SESSIONS) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-            Err(err) => return Err(err.into()),
-        };
-        let key = role_session_key(run_id, role_id);
-        table
-            .get(key.as_str())?
-            .map(|value| decode_json(value.value()))
-            .transpose()
+        self.with_read(|read| {
+            let table = match read.open_table(ROLE_SESSIONS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+                Err(err) => return Err(err.into()),
+            };
+            let key = role_session_key(run_id, role_id);
+            table
+                .get(key.as_str())?
+                .map(|value| decode_json(value.value()))
+                .transpose()
+        })
     }
 
     /// Delete all backend sessions associated with a run.
     pub fn delete_role_sessions(&self, run_id: &str) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             let mut table = write.open_table(ROLE_SESSIONS)?;
             let prefix = format!("{run_id}:");
             let keys = table
@@ -158,16 +162,14 @@ impl RedbRunStore {
             for key in keys {
                 table.remove(key.as_str())?;
             }
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Store a turn record and append its hash to the run/step turn index.
     pub fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash> {
-        let write = self.db.begin_write()?;
-        let hash = Self::put_object_in_tx(&write, ObjectKind::TurnRecord, &turn)?;
-        {
+        self.with_write(|write| {
+            let hash = Self::put_object_in_tx(write, ObjectKind::TurnRecord, &turn)?;
             let key = format!("{run_id}:{}", turn.step_id);
             let mut table = write.open_table(RUN_TURNS)?;
             let mut turns = table
@@ -178,9 +180,8 @@ impl RedbRunStore {
             turns.push(hash.clone());
             let bytes = serde_json::to_vec(&turns)?;
             table.insert(key.as_str(), bytes.as_slice())?;
-        }
-        write.commit()?;
-        Ok(hash)
+            Ok(hash)
+        })
     }
 
     /// Delete a run snapshot, run head, and indexed turn lists for the run.
@@ -188,10 +189,10 @@ impl RedbRunStore {
     /// Immutable objects are intentionally left in `OBJECTS`; later garbage
     /// collection can remove unreferenced objects once we track reachability.
     pub fn delete_run(&self, run_id: &str) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             write.open_table(RUNS)?.remove(run_id)?;
             write.open_table(RUN_HEADS)?.remove(run_id)?;
+
             let mut role_sessions = write.open_table(ROLE_SESSIONS)?;
             let session_prefix = format!("{run_id}:");
             let session_keys = role_sessions
@@ -202,18 +203,19 @@ impl RedbRunStore {
             for key in session_keys {
                 role_sessions.remove(key.as_str())?;
             }
+
             let mut turns = write.open_table(RUN_TURNS)?;
+            let turn_prefix = format!("{run_id}:");
             let keys = turns
                 .range::<&str>(run_id..)?
                 .filter_map(|item| item.ok().map(|(key, _)| key.value().to_string()))
-                .take_while(|key| key.starts_with(&format!("{run_id}:")))
+                .take_while(|key| key.starts_with(&turn_prefix))
                 .collect::<Vec<_>>();
             for key in keys {
                 turns.remove(key.as_str())?;
             }
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Delete an immutable object by hash.
@@ -221,12 +223,10 @@ impl RedbRunStore {
     /// This is a low-level cleanup API. Callers must ensure no run head, step,
     /// turn list, or future index still references the object.
     pub fn delete_object(&self, hash: &ObjectHash) -> Result<()> {
-        let write = self.db.begin_write()?;
-        {
+        self.with_write(|write| {
             write.open_table(OBJECTS)?.remove(hash.as_str())?;
-        }
-        write.commit()?;
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Store an immutable object inside an existing write transaction.
@@ -241,6 +241,52 @@ impl RedbRunStore {
         table.insert(hash.as_str(), bytes.as_slice())?;
         Ok(hash)
     }
+
+    fn with_read<T>(&self, f: impl FnOnce(&redb::ReadTransaction) -> Result<T>) -> Result<T> {
+        let db = self.open_database()?;
+        let read = db.begin_read()?;
+        f(&read)
+    }
+
+    fn with_write<T>(&self, f: impl FnOnce(&redb::WriteTransaction) -> Result<T>) -> Result<T> {
+        let db = self.open_database()?;
+        let write = db.begin_write()?;
+        let value = f(&write)?;
+        write.commit()?;
+        Ok(value)
+    }
+
+    fn open_database(&self) -> Result<Database> {
+        ensure_parent_dir(&self.path)?;
+        open_database_with_retry(&self.path, |path| Database::create(path))
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn open_database_with_retry(
+    path: &Path,
+    mut open: impl FnMut(&Path) -> std::result::Result<Database, redb::DatabaseError>,
+) -> Result<Database> {
+    for attempt in 0..=OPEN_RETRY_ATTEMPTS {
+        match open(path) {
+            Ok(db) => return Ok(db),
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt < OPEN_RETRY_ATTEMPTS => {
+                thread::sleep(OPEN_RETRY_BACKOFF);
+            }
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(Error::TemporarilyBusy(path.to_path_buf()));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Err(Error::TemporarilyBusy(path.to_path_buf()))
 }
 
 /// Decode a plain JSON value from table bytes.
@@ -519,6 +565,57 @@ mod tests {
             reopened.get_object::<StepRecord>(&record_hash).unwrap(),
             record
         );
+    }
+
+    #[test]
+    fn live_store_value_does_not_keep_database_locked() {
+        let (file, store_a) = store();
+        let run_a = run();
+        let head_a = RunHead {
+            run_id: run_a.id.clone(),
+            workflow_hash: run_a.workflow_hash.clone(),
+            head_step: None,
+            status: RunStatus::Running,
+            updated_at: Utc::now(),
+        };
+        store_a.save_run(&run_a).unwrap();
+        store_a.update_run_head(&run_a.id, head_a.clone()).unwrap();
+
+        let store_b = RedbRunStore::create(file.path()).unwrap();
+        assert_eq!(store_b.load_run(&run_a.id).unwrap(), run_a);
+
+        let mut run_b = run();
+        run_b.id = "run-2".into();
+        let head_b = RunHead {
+            run_id: run_b.id.clone(),
+            workflow_hash: run_b.workflow_hash.clone(),
+            head_step: None,
+            status: RunStatus::Running,
+            updated_at: Utc::now(),
+        };
+        store_b.save_run(&run_b).unwrap();
+        store_b.update_run_head(&run_b.id, head_b.clone()).unwrap();
+
+        assert_eq!(store_a.load_run(&run_b.id).unwrap(), run_b);
+        let mut run_ids = store_b
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .map(|head| head.run_id)
+            .collect::<Vec<_>>();
+        run_ids.sort();
+        assert_eq!(run_ids, vec!["run-1", "run-2"]);
+    }
+
+    #[test]
+    fn create_accepts_existing_valid_database_path() {
+        let (file, store) = store();
+        let run = run();
+        store.save_run(&run).unwrap();
+
+        let reopened_with_create = RedbRunStore::create(file.path()).unwrap();
+
+        assert_eq!(reopened_with_create.load_run(&run.id).unwrap(), run);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use cowboy_workflow_core::ObjectHash;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -20,6 +22,12 @@ pub enum Error {
     /// Committing a redb write transaction failed.
     #[error("redb commit error: {0}")]
     Commit(#[from] redb::CommitError),
+    /// The workflow store stayed locked by another process through the retry window.
+    #[error("workflow store {0:?} is temporarily busy; another Cowboy instance is using it")]
+    TemporarilyBusy(PathBuf),
+    /// Filesystem access for the workflow store failed.
+    #[error("workflow store I/O error: {0}")]
+    Io(#[from] std::io::Error),
     /// JSON serialization/deserialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),

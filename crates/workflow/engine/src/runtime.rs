@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -26,6 +26,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::agent_resolver::AgentResolver;
+use crate::run_lock::RunExecutionLocks;
 use crate::workflow::DeterministicSelector;
 use crate::{
     EngineActionDispatcher, EventBus, LuaStepActionProvider, ResumeRouter, WorkflowEvent,
@@ -126,7 +127,7 @@ pub struct RunSummaryLine {
 pub struct WorkflowRuntime {
     config: RuntimeConfig,
     events: Arc<EventBus>,
-    store: Arc<Mutex<Option<RedbRunStore>>>,
+    run_locks: RunExecutionLocks,
     selector: SelectorMode,
 }
 
@@ -151,9 +152,9 @@ enum SelectorMode {
 impl WorkflowRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
+            run_locks: RunExecutionLocks::new(config.workflow_store.clone()),
             config,
             events: Arc::new(EventBus::default()),
-            store: Arc::new(Mutex::new(None)),
             selector: SelectorMode::Agent,
         }
     }
@@ -189,7 +190,7 @@ impl WorkflowRuntime {
     }
 
     pub fn list_runs(&self) -> Result<Vec<RunSummaryLine>> {
-        let store = self.open_store()?;
+        let store = self.store()?;
         let mut runs = Vec::new();
         for head in store.list_runs()? {
             if let Ok(run) = store.load_run(&head.run_id) {
@@ -206,7 +207,7 @@ impl WorkflowRuntime {
     }
 
     pub fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
-        Ok(self.open_store()?.load_run(&run_id.to_string())?)
+        Ok(self.store()?.load_run(&run_id.to_string())?)
     }
 
     pub async fn start_run(&self, request: impl Into<String>) -> Result<RunReport> {
@@ -221,6 +222,8 @@ impl WorkflowRuntime {
 
     async fn start_with(&self, request: impl Into<String>, mode: RunMode) -> Result<RunReport> {
         let request = request.into();
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let _run_guard = self.run_locks.acquire(&run_id)?;
         tracing::info!(request = %request, mode = ?mode, "starting workflow run");
         let catalog = self.catalog()?;
         tracing::debug!(
@@ -242,9 +245,8 @@ impl WorkflowRuntime {
             "workflow source compiled"
         );
         let now = Utc::now();
-        let run_id = format!("run-{}", Uuid::new_v4());
         let run = WorkflowRun {
-            id: run_id.clone(),
+            id: run_id,
             workflow_name: definition.name.clone(),
             workflow_api_version: 1,
             workflow_hash,
@@ -259,7 +261,7 @@ impl WorkflowRuntime {
             created_at: now,
             updated_at: now,
         };
-        let store = self.open_store()?;
+        let store = self.store()?;
         store.save_run(&run)?;
         store.update_run_head(&run.id, run_head(&run))?;
         tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
@@ -304,6 +306,7 @@ impl WorkflowRuntime {
 
     async fn resume_with(&self, run_id: &str, mode: RunMode) -> Result<RunReport> {
         tracing::debug!(run_id, mode = ?mode, "resuming workflow run");
+        let _run_guard = self.run_locks.acquire(run_id)?;
         let run = self.load_run(run_id)?;
         tracing::debug!(
             run_id = %run.id,
@@ -339,7 +342,8 @@ impl WorkflowRuntime {
             answer_chars = answer.chars().count(),
             "answering workflow prompt"
         );
-        let store = self.open_store()?;
+        let _run_guard = self.run_locks.acquire(run_id)?;
+        let store = self.store()?;
         let mut run = store.load_run(&run_id.to_string())?;
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
@@ -446,7 +450,7 @@ impl WorkflowRuntime {
                 .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
             (definition, snapshot, loaded.source_ref.id)
         };
-        let store = self.open_store()?;
+        let store = self.store()?;
         let workflow_hash = store.put_object(ObjectKind::WorkflowSourceSnapshot, &snapshot)?;
         tracing::debug!(
             workflow_id = %workflow_name,
@@ -488,7 +492,7 @@ impl WorkflowRuntime {
         );
         let run_id = run.id.clone();
         let mut rx = self.events.subscribe();
-        let store = self.open_store()?;
+        let store = self.store()?;
         let agent_store = store.clone();
         let progress_events = self.events.clone();
         let agent_config = AgentExecutionConfig {
@@ -604,26 +608,10 @@ impl WorkflowRuntime {
         })
     }
 
-    fn open_store(&self) -> Result<RedbRunStore> {
-        let mut cached = self
-            .store
-            .lock()
-            .map_err(|_| WorkflowError::InvalidAction("store cache lock poisoned".to_string()))?;
-        if let Some(store) = cached.as_ref() {
-            return Ok(store.clone());
-        }
-        if let Some(parent) = self.config.workflow_store.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        }
+    fn store(&self) -> Result<RedbRunStore> {
         tracing::debug!(path = %self.config.workflow_store.display(), "opening workflow store");
-        let store = if self.config.workflow_store.exists() {
-            RedbRunStore::open(&self.config.workflow_store)
-        } else {
-            RedbRunStore::create(&self.config.workflow_store)
-        }
-        .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        *cached = Some(store.clone());
+        let store = RedbRunStore::create(&self.config.workflow_store)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         tracing::debug!(path = %self.config.workflow_store.display(), "workflow store ready");
         Ok(store)
     }
@@ -908,6 +896,140 @@ mod tests {
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn two_runtimes_start_independent_runs_against_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "done " .. ctx.request }
+            end
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        };
+        let runtime_a = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
+        let runtime_b = WorkflowRuntime::new(config).with_deterministic_selector();
+
+        let first = runtime_a.start_run("first").await.unwrap();
+        let second = runtime_b.start_run("second").await.unwrap();
+
+        assert_eq!(first.run.status, RunStatus::Completed);
+        assert_eq!(second.run.status, RunStatus::Completed);
+        assert_ne!(first.run.id, second.run.id);
+        let mut run_ids = runtime_a
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .map(|run| run.run_id)
+            .collect::<Vec<_>>();
+        run_ids.sort();
+        let mut expected = vec![first.run.id, second.run.id];
+        expected.sort();
+        assert_eq!(run_ids, expected);
+    }
+
+    #[tokio::test]
+    async fn invalid_step_run_id_rejects_before_lock_path_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let runtime = WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: state_dir.clone(),
+            workflow_store: state_dir.join("workflow.redb"),
+            workflow_dirs: Vec::new(),
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        })
+        .with_deterministic_selector();
+
+        let err = runtime
+            .step_run("../run-00000000-0000-0000-0000-000000000000")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("invalid run id"));
+        assert!(!state_dir.join("workflow.redb.locks").exists());
+        assert!(!state_dir.join("locks").exists());
+        assert!(
+            !dir.path()
+                .join("run-00000000-0000-0000-0000-000000000000.lock")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn contended_step_run_returns_active_error_without_redb_wording() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "ready" }
+            end
+
+            local done = step("done")
+            done.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            start:on("next", done)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state-a"),
+            workflow_store: dir.path().join("shared/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+            },
+        };
+        let runtime = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
+        let report = runtime.start_run_stepwise("request").await.unwrap();
+        assert_eq!(report.run.status, RunStatus::Running);
+
+        let locks = RunExecutionLocks::new(config.workflow_store.clone());
+        let _held = locks.acquire(&report.run.id).unwrap();
+        let runtime_with_other_state = WorkflowRuntime::new(RuntimeConfig {
+            state_dir: dir.path().join("state-b"),
+            ..config
+        })
+        .with_deterministic_selector();
+        let err = runtime_with_other_state
+            .step_run(&report.run.id)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("already active"));
+        assert!(!err.to_string().contains("redb"));
     }
 
     #[tokio::test]
