@@ -1,4 +1,5 @@
 local roles = {
+  investigator = require("roles/investigator.lua"),
   planner = require("roles/planner.lua"),
   implementer = require("roles/implementer.lua"),
   tester = require("roles/tester.lua"),
@@ -6,6 +7,8 @@ local roles = {
   committer = require("roles/committer.lua"),
 }
 
+local investigate = require("steps/investigate_bug.lua")(roles)
+local review_rca = require("steps/review_rca.lua")(roles)
 local plan = require("steps/plan.lua")(roles, { kind = "bug fix" })
 local clarify = require("steps/clarify.lua")("clarify")
 local clarify_answer = require("steps/clarify.lua")("clarify_answer")
@@ -24,10 +27,15 @@ local blocked = require("steps/blocked.lua")("bug fix workflow blocked")
 local blocked_answer = require("steps/blocked.lua")("bug fix workflow blocked", "blocked_answer")
 local triage_blocked = require("steps/triage_blocked.lua")("triage_blocked")
 
+investigate:on("documented", review_rca)
+investigate:on("unclear", clarify)
+investigate:on("blocked", blocked)
+review_rca:on("approved", plan)
+review_rca:on("changes_requested", investigate)
 plan:on("ready", review_plan)
 plan:on("unclear", clarify)
 clarify:on("answered", clarify_answer)
-clarify_answer:on("clarified", plan)
+clarify_answer:on("clarified", investigate)
 review_plan:on("approved", confirm_plan)
 review_plan:on("changes_requested", plan)
 confirm_plan:on("answered", confirm_plan_answer)
@@ -49,10 +57,11 @@ commit:on("committed", done)
 commit:on("blocked", blocked)
 blocked:on("answered", blocked_answer)
 blocked_answer:on("triaged", triage_blocked)
+triage_blocked:on("investigate", investigate)
 triage_blocked:on("plan", plan)
 triage_blocked:on("implement", implement)
 triage_blocked:on("revise", revise)
 
-return workflow("bugfix", plan, {
-  description = "Plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
+return workflow("bugfix", investigate, {
+  description = "Investigate, review RCA, plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
 })

@@ -10,7 +10,7 @@ return function(roles, opts)
 
 ]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Approved implementation:") .. [[
 
-Inspect the current diff, stage all request-related files, explicitly including `docs/plans/*.md` plan documents when they were created or updated for this change, and create a local conventional commit. Do not push, amend, rebase, or reset. Return "committed" with the commit hash/message, or "blocked" if committing is unsafe.]],
+Inspect the current diff, stage all request-related files, explicitly including `docs/plans/*.md` plan documents and `docs/plans/*/*.md` bug-fix work-folder documents when they were created or updated for this change, and create a local conventional commit. Do not push, amend, rebase, or reset. Return "committed" with the commit hash/message, or "blocked" if committing is unsafe.]],
       output = {
         status = { "committed", "blocked" },
         fields = { summary = "string", commit = "string" },
