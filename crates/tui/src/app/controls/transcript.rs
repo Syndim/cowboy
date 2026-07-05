@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
-use super::super::state::{AppState, render_pending_prompt_lines};
+use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+
+use super::super::state::{AppState, TranscriptEntry, render_pending_prompt_lines};
 use super::super::styles::{style_accent, style_border, style_muted, style_transcript_normal};
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -27,15 +29,13 @@ pub(in crate::app) fn lines(
         return Vec::new();
     }
 
-    let rows = visual_rows(all_lines(state), wrap_width);
-    if rows.len() <= max_visible_lines {
-        return rows;
-    }
+    let rows = if state.event_log_is_empty() {
+        visual_rows(empty_lines(), wrap_width)
+    } else {
+        bounded_tail_visual_rows(state, max_visible_lines, wrap_width)
+    };
 
-    let offset = state.scroll_offset().min(rows.len().saturating_sub(1));
-    let end = rows.len().saturating_sub(offset).max(1);
-    let start = end.saturating_sub(max_visible_lines);
-    rows[start..end].to_vec()
+    visible_rows(rows, max_visible_lines, state.scroll_offset())
 }
 
 fn visual_rows(logical_lines: Vec<Line<'static>>, wrap_width: usize) -> Vec<Line<'static>> {
@@ -43,6 +43,145 @@ fn visual_rows(logical_lines: Vec<Line<'static>>, wrap_width: usize) -> Vec<Line
         .into_iter()
         .flat_map(|line| wrap_line(line, wrap_width))
         .collect()
+}
+
+fn visible_rows(
+    rows: Vec<Line<'static>>,
+    max_visible_lines: usize,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
+    if rows.len() <= max_visible_lines {
+        return rows;
+    }
+
+    let offset = scroll_offset.min(rows.len().saturating_sub(1));
+    let end = rows.len().saturating_sub(offset).max(1);
+    let start = end.saturating_sub(max_visible_lines);
+    rows[start..end].to_vec()
+}
+
+fn bounded_tail_visual_rows(
+    state: &AppState,
+    max_visible_lines: usize,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    let target_rows = max_visible_lines.saturating_add(state.scroll_offset());
+    let mut chunks = Vec::new();
+    let mut row_count = 0usize;
+
+    if let Some(prompt) = state.pending_prompt()
+        && !pending_prompt_is_latest(state, prompt.prompt_id())
+    {
+        let rows = visual_rows(render_pending_prompt_lines(prompt), wrap_width);
+        row_count = row_count.saturating_add(rows.len());
+        chunks.push(rows);
+    }
+
+    for entry in state.event_entries().iter().rev() {
+        if row_count >= target_rows {
+            break;
+        }
+
+        let mut rows =
+            entry_tail_visual_rows(entry, target_rows.saturating_sub(row_count), wrap_width);
+        rows.push(Line::from(""));
+        row_count = row_count.saturating_add(rows.len());
+        chunks.push(rows);
+    }
+
+    chunks.reverse();
+    chunks.into_iter().flatten().collect()
+}
+
+fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
+    state.event_entries().last().is_some_and(|entry| {
+        entry.contains("Waiting for input") && entry.contains(&format!("prompt={prompt_id}"))
+    })
+}
+
+fn entry_tail_visual_rows(
+    entry: &TranscriptEntry,
+    rows_needed: usize,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    match entry {
+        TranscriptEntry::Workflow(event) => {
+            stream_event_tail_visual_rows(event, rows_needed, wrap_width)
+                .unwrap_or_else(|| visual_rows(entry.render_lines(), wrap_width))
+        }
+        TranscriptEntry::Card { .. } | TranscriptEntry::Plain(_) => {
+            visual_rows(entry.render_lines(), wrap_width)
+        }
+    }
+}
+
+fn stream_event_tail_visual_rows(
+    event: &WorkflowEvent,
+    rows_needed: usize,
+    wrap_width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let retained_body_rows = rows_needed.saturating_add(2).max(1);
+    let retained_body = match &event.kind {
+        WorkflowEventKind::AgentResponse { content, .. }
+        | WorkflowEventKind::AgentThought { content, .. } => {
+            tail_content_for_visual_rows(content, retained_body_rows, wrap_width)
+        }
+        _ => return None,
+    };
+
+    if retained_body.len() == stream_content(event)?.len() {
+        return None;
+    }
+
+    let mut event = event.clone();
+    match &mut event.kind {
+        WorkflowEventKind::AgentResponse { content, .. }
+        | WorkflowEventKind::AgentThought { content, .. } => *content = retained_body,
+        _ => return None,
+    }
+
+    Some(visual_rows(
+        TranscriptEntry::Workflow(event).render_lines(),
+        wrap_width,
+    ))
+}
+
+fn stream_content(event: &WorkflowEvent) -> Option<&str> {
+    match &event.kind {
+        WorkflowEventKind::AgentResponse { content, .. }
+        | WorkflowEventKind::AgentThought { content, .. } => Some(content),
+        _ => None,
+    }
+}
+
+fn tail_content_for_visual_rows(content: &str, max_rows: usize, wrap_width: usize) -> String {
+    let max_width = max_rows.saturating_mul(wrap_width).max(wrap_width);
+    let mut width = 0usize;
+    let mut rows = 1usize;
+    let mut start = content.len();
+
+    for (index, ch) in content.char_indices().rev() {
+        if ch == '\n' {
+            if rows >= max_rows {
+                break;
+            }
+
+            rows = rows.saturating_add(1);
+            width = 0;
+            start = index + ch.len_utf8();
+            continue;
+        }
+
+        let ch_width = ch.width().unwrap_or(0);
+        if ch_width > 0 && width > 0 && width.saturating_add(ch_width) > max_width {
+            break;
+        }
+
+        width = width.saturating_add(ch_width);
+        start = index;
+    }
+
+    content[start..].to_string()
 }
 
 fn wrap_line(line: Line<'static>, wrap_width: usize) -> Vec<Line<'static>> {
@@ -92,31 +231,6 @@ fn push_visual_row(
     row.style = style;
     row.alignment = alignment;
     rows.push(row);
-}
-
-fn all_lines(state: &AppState) -> Vec<Line<'static>> {
-    let mut lines = if state.event_log_is_empty() {
-        empty_lines()
-    } else {
-        let mut rendered = Vec::new();
-        for entry in state.event_entries() {
-            rendered.extend(entry.render_lines());
-            rendered.push(Line::from(""));
-        }
-        rendered
-    };
-
-    if let Some(prompt) = state.pending_prompt() {
-        let prompt_is_latest = state.event_entries().last().is_some_and(|entry| {
-            entry.contains("Waiting for input")
-                && entry.contains(&format!("prompt={}", prompt.prompt_id()))
-        });
-        if !prompt_is_latest {
-            lines.extend(render_pending_prompt_lines(prompt));
-        }
-    }
-
-    lines
 }
 
 fn empty_lines() -> Vec<Line<'static>> {
@@ -386,6 +500,37 @@ mod tests {
     }
 
     #[test]
+    fn long_history_follow_latest_renders_tail_without_early_entries() {
+        let mut state = test_state();
+
+        for index in 0..1_000 {
+            state.push_card("Notice", [format!("early filler {index}")]);
+        }
+
+        state.push_card("Notice", ["TAIL_MARKER".to_string()]);
+
+        let rendered = lines(&state, 6, usize::MAX)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            rendered.iter().any(|line| line.contains("TAIL_MARKER")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().all(|line| !line.contains("early filler 0")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| !line.contains("early filler 500")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
     fn wrapped_visual_rows_preserve_span_styles() {
         let wrapped = visual_rows(
             vec![Line::from(vec![
@@ -418,6 +563,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             following.iter().any(|line| line.contains("TAIL")),
+            "{following:?}"
+        );
+        assert!(
+            following.iter().all(|line| !line.contains("0000")),
             "{following:?}"
         );
 

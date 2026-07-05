@@ -200,6 +200,69 @@ fn draw_preserves_transcript_styles() {
 }
 
 #[test]
+fn draw_with_typed_input_does_not_scale_with_full_transcript_history() {
+    fn state_with_transcript_entries(entries: usize) -> AppState {
+        let mut state = test_state();
+        for index in 0..entries {
+            let content = if index + 1 == entries {
+                format!("transcript entry {index:05} LAG_TAIL_VISIBLE")
+            } else {
+                format!("transcript entry {index:05} filler text for redraw scaling")
+            };
+            state.apply_workflow_event(WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentResponse {
+                    step_id: "review".to_string(),
+                    content,
+                },
+            ));
+        }
+
+        state.push_input("typed input stays responsive");
+        state
+    }
+
+    fn timed_draw(state: &AppState) -> (std::time::Duration, String) {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let started = std::time::Instant::now();
+        terminal.draw(|frame| draw(frame, state)).unwrap();
+        let elapsed = started.elapsed();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .fold(String::new(), |mut rendered, cell| {
+                rendered.push_str(cell.symbol());
+                rendered
+            });
+        std::hint::black_box(rendered.len());
+        (elapsed, rendered)
+    }
+
+    let short_state = state_with_transcript_entries(64);
+    let long_state = state_with_transcript_entries(20_000);
+
+    let (short_draw, short_rendered) = timed_draw(&short_state);
+    let (long_draw, long_rendered) = timed_draw(&long_state);
+    let budget = short_draw
+        .checked_mul(8)
+        .unwrap_or(std::time::Duration::MAX)
+        + std::time::Duration::from_millis(3);
+
+    assert!(short_rendered.contains("> typed input stays responsive"), "{short_rendered}");
+    assert!(long_rendered.contains("> typed input stays responsive"), "{long_rendered}");
+    assert!(long_rendered.contains("LAG_TAIL_VISIBLE"), "{long_rendered}");
+    assert!(
+        long_draw <= budget,
+        "redrawing typed input should render only visible transcript tail rows, not scale with \
+         the full transcript; 64 entries took {short_draw:?}, 20_000 entries took \
+         {long_draw:?}, budget was {budget:?}"
+    );
+}
+
+#[test]
 fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
     let mut state = test_state();
     state.apply_workflow_event(WorkflowEvent::new(
