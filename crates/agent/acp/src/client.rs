@@ -390,12 +390,18 @@ impl Client {
             let outcome = self.prompt_turn(session_id, content, event_handler).await?;
 
             // Done if the agent produced visible text, stopped for a reason
-            // other than a normal end_turn, completed after a permission
-            // exchange, or exhausted continuation attempts. A truly empty
-            // end_turn can be a backend acknowledgement rather than a useful
-            // answer, even when it only emitted housekeeping updates.
-            if !outcome.should_continue() || attempt == MAX_CONTINUATIONS {
+            // other than a normal end_turn, or completed after a permission
+            // exchange. A truly empty end_turn can be a backend acknowledgement
+            // rather than a useful answer, even when it only emitted
+            // housekeeping updates.
+            if !outcome.should_continue() {
                 return Ok(outcome.stop_reason);
+            }
+
+            if attempt == MAX_CONTINUATIONS {
+                anyhow::bail!(
+                    "ACP prompt received repeated empty end_turn responses after {MAX_CONTINUATIONS} continuation prompts for session {session_id}"
+                );
             }
 
             tracing::info!(
@@ -407,7 +413,7 @@ impl Client {
             content = vec![PromptContent::text("Continue")];
         }
 
-        Ok(StopReason::EndTurn)
+        unreachable!("prompt continuation loop always returns or errors")
     }
 
     /// Execute a single prompt turn and report why it stopped plus which
@@ -1073,6 +1079,43 @@ mod tests {
         let continue_req: Value = serde_json::from_str(&sent[2]).unwrap();
         assert_eq!(continue_req["method"], "session/prompt");
         assert_eq!(continue_req["params"]["prompt"][0]["text"], "Continue");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_errors_after_repeated_empty_end_turns() {
+        // The live PID 87922 hang reproduced as OMP returning only housekeeping
+        // updates plus end_turn for the original selector prompt and every
+        // automatic "Continue". Once a continuation also produces no text,
+        // Cowboy should surface the empty backend response instead of treating
+        // repeated blank turns as a successful prompt.
+        let init_resp = init_response(0);
+        let empty_1 = prompt_response(1, "end_turn");
+        let empty_2 = prompt_response(2, "end_turn");
+        let empty_3 = prompt_response(3, "end_turn");
+        let empty_4 = prompt_response(4, "end_turn");
+        let empty_5 = prompt_response(5, "end_turn");
+        let empty_6 = prompt_response(6, "end_turn");
+        let transport = MockTransport::new(vec![
+            &init_resp, &empty_1, &empty_2, &empty_3, &empty_4, &empty_5, &empty_6,
+        ]);
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        let result = client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("select workflow")],
+                &mut |_| {},
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "repeated empty ACP end_turn responses should fail instead of returning success: {result:?}"
+        );
     }
 
     #[tokio::test]
