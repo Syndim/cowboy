@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_agent_client::ModelInfo;
@@ -357,13 +357,13 @@ impl WorkflowRuntime {
             ActionResult::Completed(record) => {
                 let record = *record;
                 let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
-                events.push(WorkflowEvent::step_completed(run.id.clone(), &record));
-                events.push(WorkflowEvent::run_status(run.id.clone(), &status));
+                events.push(WorkflowEvent::step_completed_for_run(&run, &record));
+                events.push(WorkflowEvent::run_status_for_run(&run, &status));
                 status
             }
             ActionResult::Blocked(status) => {
                 let status = apply_run_status(&store, &mut run, status)?;
-                events.push(WorkflowEvent::run_status(run.id.clone(), &status));
+                events.push(WorkflowEvent::run_status_for_run(&run, &status));
                 status
             }
         };
@@ -491,6 +491,7 @@ impl WorkflowRuntime {
             "running workflow"
         );
         let run_id = run.id.clone();
+        let run_started_at = run.created_at;
         let mut rx = self.events.subscribe();
         let store = self.store()?;
         let agent_store = store.clone();
@@ -499,9 +500,9 @@ impl WorkflowRuntime {
             cwd: self.config.cwd.to_string_lossy().to_string(),
             mcp_servers: Vec::new(),
             progress: Some(Arc::new(move |progress| {
-                progress_events.emit(WorkflowEvent::new(
-                    progress.run_id.clone(),
-                    Self::workflow_event_from_agent_progress(progress),
+                progress_events.emit(Self::workflow_event_from_agent_progress(
+                    progress,
+                    run_started_at,
                 ));
             })),
         };
@@ -542,7 +543,16 @@ impl WorkflowRuntime {
         Ok(RunReport { run, events })
     }
 
-    fn workflow_event_from_agent_progress(progress: AgentProgress) -> WorkflowEventKind {
+    fn workflow_event_from_agent_progress(
+        progress: AgentProgress,
+        run_started_at: DateTime<Utc>,
+    ) -> WorkflowEvent {
+        let run_id = progress.run_id.clone();
+        let kind = Self::workflow_event_kind_from_agent_progress(progress);
+        WorkflowEvent::with_run_started_at(run_id, run_started_at, kind)
+    }
+
+    fn workflow_event_kind_from_agent_progress(progress: AgentProgress) -> WorkflowEventKind {
         let step_id = progress.step_id;
         match progress.kind {
             AgentProgressKind::SessionReady { role, session_id } => {
@@ -1101,6 +1111,14 @@ mod tests {
             event.kind,
             WorkflowEventKind::StepCompleted { ref step_id, .. } if step_id == "decide"
         )));
+        assert!(
+            report
+                .events
+                .iter()
+                .all(|event| event.run_started_at == Some(start.run.created_at)),
+            "{:#?}",
+            report.events
+        );
 
         let persisted = runtime.load_events(&report.run.id).unwrap();
         assert_eq!(persisted, report.events);
@@ -2003,12 +2021,30 @@ mod tests {
         ];
 
         for (progress, expected) in cases {
-            let mapped = WorkflowRuntime::workflow_event_from_agent_progress(progress);
+            let mapped = WorkflowRuntime::workflow_event_kind_from_agent_progress(progress);
             assert_eq!(mapped, expected);
             assert!(
                 !matches!(mapped, WorkflowEventKind::StepProgress { .. }),
                 "typed agent progress must not map to generic step progress"
             );
         }
+    }
+
+    #[test]
+    fn agent_progress_workflow_events_use_run_creation_timestamp() {
+        let run_started_at = Utc::now();
+        let event = WorkflowRuntime::workflow_event_from_agent_progress(
+            progress(AgentProgressKind::Response {
+                content: "answer".to_string(),
+            }),
+            run_started_at,
+        );
+
+        assert_eq!(event.run_id, "run-1");
+        assert_eq!(event.run_started_at, Some(run_started_at));
+        assert!(matches!(
+            event.kind,
+            WorkflowEventKind::AgentResponse { ref content, .. } if content == "answer"
+        ));
     }
 }

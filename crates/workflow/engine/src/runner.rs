@@ -95,8 +95,8 @@ where
     ) -> Result<RunStatus> {
         let step_id = run.current_step.clone();
         let previous_head = run.head.clone();
-        self.events.emit(WorkflowEvent::new(
-            run.id.clone(),
+        self.events.emit(WorkflowEvent::for_run(
+            run,
             WorkflowEventKind::StepStarted {
                 step_id: step_id.clone(),
             },
@@ -114,8 +114,8 @@ where
         {
             Ok(status) => status,
             Err(err) => {
-                self.events.emit(WorkflowEvent::new(
-                    run.id.clone(),
+                self.events.emit(WorkflowEvent::for_run(
+                    run,
                     WorkflowEventKind::RunFailed {
                         reason: err.to_string(),
                     },
@@ -128,11 +128,11 @@ where
             if let Some(head) = &run.head {
                 let record = self.store.get_object::<StepRecord>(head)?;
                 self.events
-                    .emit(WorkflowEvent::step_completed(run.id.clone(), &record));
+                    .emit(WorkflowEvent::step_completed_for_run(run, &record));
             }
         }
         self.events
-            .emit(WorkflowEvent::run_status(run.id.clone(), &status));
+            .emit(WorkflowEvent::run_status_for_run(run, &status));
 
         Ok(status)
     }
@@ -448,17 +448,29 @@ mod tests {
             bus,
         );
 
+        let initial_run = run();
+        let run_started_at = initial_run.created_at;
         let run = runner
-            .run_until_blocked(&definition(), run())
+            .run_until_blocked(&definition(), initial_run)
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Completed);
         assert_eq!(run.steps_executed, 2);
 
-        let mut kinds = Vec::new();
+        let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
-            kinds.push(event.kind);
+            collected_events.push(event);
         }
+        assert!(
+            collected_events
+                .iter()
+                .all(|event| event.run_started_at == Some(run_started_at)),
+            "{collected_events:#?}"
+        );
+        let kinds = collected_events
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
         assert!(matches!(kinds[0], WorkflowEventKind::RunStarted { .. }));
         assert!(kinds.iter().any(|kind| matches!(
             kind,

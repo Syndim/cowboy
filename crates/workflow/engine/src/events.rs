@@ -4,11 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-/// UI-facing workflow event with a stable run id and timestamp.
+/// UI-facing workflow event with a stable run id and timestamps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowEvent {
     pub run_id: String,
     pub timestamp: DateTime<Utc>,
+    #[serde(default)]
+    pub run_started_at: Option<DateTime<Utc>>,
     pub kind: WorkflowEventKind,
 }
 
@@ -17,13 +19,31 @@ impl WorkflowEvent {
         Self {
             run_id: run_id.into(),
             timestamp: Utc::now(),
+            run_started_at: None,
+            kind,
+        }
+    }
+
+    pub fn for_run(run: &WorkflowRun, kind: WorkflowEventKind) -> Self {
+        Self::with_run_started_at(run.id.clone(), run.created_at, kind)
+    }
+
+    pub fn with_run_started_at(
+        run_id: impl Into<String>,
+        run_started_at: DateTime<Utc>,
+        kind: WorkflowEventKind,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            timestamp: Utc::now(),
+            run_started_at: Some(run_started_at),
             kind,
         }
     }
 
     pub fn run_started(run: &WorkflowRun) -> Self {
-        Self::new(
-            run.id.clone(),
+        Self::for_run(
+            run,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow_name.clone(),
                 current_step: run.current_step.clone(),
@@ -35,17 +55,26 @@ impl WorkflowEvent {
         Self::new(run_id, WorkflowEventKind::from(status))
     }
 
+    pub fn run_status_for_run(run: &WorkflowRun, status: &RunStatus) -> Self {
+        Self::for_run(run, WorkflowEventKind::from(status))
+    }
+
     pub fn step_completed(run_id: impl Into<String>, record: &StepRecord) -> Self {
+        Self::new(run_id, Self::step_completed_kind(record))
+    }
+
+    pub fn step_completed_for_run(run: &WorkflowRun, record: &StepRecord) -> Self {
+        Self::for_run(run, Self::step_completed_kind(record))
+    }
+
+    fn step_completed_kind(record: &StepRecord) -> WorkflowEventKind {
         let output = record.output.as_ref();
-        Self::new(
-            run_id,
-            WorkflowEventKind::StepCompleted {
-                step_id: record.step.clone(),
-                action: record.action.clone(),
-                status: output.map(|output| output.status.clone()),
-                body: output.map(|output| output.body.clone()).unwrap_or_default(),
-            },
-        )
+        WorkflowEventKind::StepCompleted {
+            step_id: record.step.clone(),
+            action: record.action.clone(),
+            status: output.map(|output| output.status.clone()),
+            body: output.map(|output| output.body.clone()).unwrap_or_default(),
+        }
     }
 }
 
@@ -184,6 +213,7 @@ impl Default for EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use cowboy_workflow_core::{StepDetail, StepInput, StepOutput};
     use serde_json::Value;
 
@@ -265,6 +295,41 @@ mod tests {
                 body: "done".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn workflow_event_round_trips_with_run_started_at() {
+        let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 12, 34, 56).unwrap();
+        let mut event = WorkflowEvent::with_run_started_at(
+            "run-1",
+            run_started_at,
+            WorkflowEventKind::RunCompleted,
+        );
+        event.timestamp = timestamp;
+
+        let raw = serde_json::to_string(&event).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["run_started_at"], "2026-07-05T12:30:00Z");
+
+        let reparsed: WorkflowEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reparsed, event);
+    }
+
+    #[test]
+    fn legacy_workflow_event_json_defaults_missing_run_started_at() {
+        let raw = serde_json::json!({
+            "run_id": "run-1",
+            "timestamp": "2026-07-05T12:34:56Z",
+            "kind": { "kind": "run_completed" },
+        })
+        .to_string();
+
+        let event: WorkflowEvent = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(event.run_id, "run-1");
+        assert_eq!(event.run_started_at, None);
+        assert_eq!(event.kind, WorkflowEventKind::RunCompleted);
     }
 
     #[test]

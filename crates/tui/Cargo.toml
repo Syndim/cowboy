@@ -9,6 +9,7 @@ description = "Workflow-first terminal UI for Cowboy"
 [dependencies]
 cowboy-workflow-engine = { path = "../workflow/engine" }
 anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"

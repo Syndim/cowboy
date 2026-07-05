@@ -32,7 +32,7 @@ impl RenderedWorkflowEvent {
 }
 
 pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEvent {
-    let stamp = event.timestamp.format("%H:%M:%S").to_string();
+    let stamp = elapsed_stamp(event);
     let mut lines = Vec::new();
     match &event.kind {
         WorkflowEventKind::RunStarted {
@@ -271,6 +271,19 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
     RenderedWorkflowEvent { lines, text }
 }
 
+fn elapsed_stamp(event: &WorkflowEvent) -> String {
+    let started_at = event.run_started_at.unwrap_or(event.timestamp);
+    let elapsed_seconds = event
+        .timestamp
+        .signed_duration_since(started_at)
+        .num_seconds()
+        .max(0);
+    let hours = elapsed_seconds / 3600;
+    let minutes = (elapsed_seconds % 3600) / 60;
+    let seconds = elapsed_seconds % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
 fn header_line(
     stamp: &str,
     title: &str,
@@ -408,6 +421,7 @@ fn non_empty(text: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, TimeZone, Utc};
     use ratatui::style::Color;
 
     use super::*;
@@ -415,6 +429,57 @@ mod tests {
         style_error, style_success, style_transcript_thought, style_transcript_tool_pending,
         style_warning,
     };
+    fn rendered_header_for_elapsed(seconds: i64) -> String {
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap();
+        let mut event = WorkflowEvent::with_run_started_at(
+            "run-1",
+            started_at,
+            WorkflowEventKind::RunCompleted,
+        );
+        event.timestamp = started_at + Duration::seconds(seconds);
+        render_workflow_event(&event).lines()[0].to_string()
+    }
+
+    #[test]
+    fn renders_elapsed_time_instead_of_utc_timestamp() {
+        let header = rendered_header_for_elapsed(296);
+
+        assert!(header.starts_with("00:04:56  Run completed"), "{header}");
+        assert!(!header.contains("12:34:56"), "{header}");
+    }
+
+    #[test]
+    fn renders_elapsed_hours_beyond_one_day() {
+        let header = rendered_header_for_elapsed(27 * 3600 + 62);
+
+        assert!(header.starts_with("27:01:02  Run completed"), "{header}");
+    }
+
+    #[test]
+    fn renders_missing_and_negative_elapsed_baselines_as_zero() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 12, 34, 56).unwrap();
+        let mut missing = WorkflowEvent::new("run-1", WorkflowEventKind::RunCompleted);
+        missing.timestamp = timestamp;
+        let missing_header = render_workflow_event(&missing).lines()[0].to_string();
+
+        let started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 35, 0).unwrap();
+        let mut negative = WorkflowEvent::with_run_started_at(
+            "run-1",
+            started_at,
+            WorkflowEventKind::RunCompleted,
+        );
+        negative.timestamp = timestamp;
+        let negative_header = render_workflow_event(&negative).lines()[0].to_string();
+
+        assert!(
+            missing_header.starts_with("00:00:00  Run completed"),
+            "{missing_header}"
+        );
+        assert!(
+            negative_header.starts_with("00:00:00  Run completed"),
+            "{negative_header}"
+        );
+    }
 
     #[test]
     fn renders_agent_prompt_response_thought_and_tool_events() {
