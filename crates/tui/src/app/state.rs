@@ -131,24 +131,36 @@ fn card_plain_text(title: &str, details: &[String]) -> String {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveStream {
+struct ActiveEvent {
     index: usize,
     event: WorkflowEvent,
 }
 
-impl ActiveStream {
+impl ActiveEvent {
     fn accepts(&self, event: &WorkflowEvent) -> bool {
-        self.event.run_id == event.run_id && same_stream_kind(&self.event.kind, &event.kind)
+        self.event.run_id == event.run_id && same_active_event_kind(&self.event.kind, &event.kind)
     }
 
-    fn append(&mut self, event: &WorkflowEvent) {
-        if let Some(content) = stream_content(&event.kind) {
-            append_stream_content(&mut self.event.kind, content);
+    fn merge(&mut self, event: &WorkflowEvent) {
+        match (&mut self.event.kind, &event.kind) {
+            (
+                WorkflowEventKind::AgentResponse { content, .. },
+                WorkflowEventKind::AgentResponse { content: chunk, .. },
+            )
+            | (
+                WorkflowEventKind::AgentThought { content, .. },
+                WorkflowEventKind::AgentThought { content: chunk, .. },
+            ) => content.push_str(chunk),
+            (
+                WorkflowEventKind::AgentToolCallUpdate { .. },
+                WorkflowEventKind::AgentToolCallUpdate { .. },
+            ) => self.event = event.clone(),
+            _ => {}
         }
     }
 }
 
-fn same_stream_kind(left: &WorkflowEventKind, right: &WorkflowEventKind) -> bool {
+fn same_active_event_kind(left: &WorkflowEventKind, right: &WorkflowEventKind) -> bool {
     match (left, right) {
         (
             WorkflowEventKind::AgentResponse { step_id: left, .. },
@@ -158,25 +170,31 @@ fn same_stream_kind(left: &WorkflowEventKind, right: &WorkflowEventKind) -> bool
             WorkflowEventKind::AgentThought { step_id: left, .. },
             WorkflowEventKind::AgentThought { step_id: right, .. },
         ) => left == right,
+        (
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: left_step,
+                tool_call_id: left_call,
+                ..
+            },
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: right_step,
+                tool_call_id: right_call,
+                ..
+            },
+        ) => left_step == right_step && left_call == right_call,
         _ => false,
     }
 }
 
-fn stream_content(kind: &WorkflowEventKind) -> Option<&str> {
-    match kind {
-        WorkflowEventKind::AgentResponse { content, .. }
-        | WorkflowEventKind::AgentThought { content, .. } => Some(content),
-        _ => None,
-    }
+fn is_active_event(kind: &WorkflowEventKind) -> bool {
+    matches!(
+        kind,
+        WorkflowEventKind::AgentResponse { .. }
+            | WorkflowEventKind::AgentThought { .. }
+            | WorkflowEventKind::AgentToolCallUpdate { .. }
+    )
 }
 
-fn append_stream_content(kind: &mut WorkflowEventKind, chunk: &str) {
-    match kind {
-        WorkflowEventKind::AgentResponse { content, .. }
-        | WorkflowEventKind::AgentThought { content, .. } => content.push_str(chunk),
-        _ => {}
-    }
-}
 struct DrainResult {
     events: Vec<WorkflowEvent>,
     lagged: bool,
@@ -211,7 +229,7 @@ pub(super) struct AppState {
     run_state: String,
     status: String,
     event_log: Vec<TranscriptEntry>,
-    active_stream: Option<ActiveStream>,
+    active_event: Option<ActiveEvent>,
     scroll_offset: usize,
     follow_events: bool,
     input: Input,
@@ -231,7 +249,7 @@ impl AppState {
             run_state: "idle".to_string(),
             status: "workflow runtime shell is ready".to_string(),
             event_log: Vec::new(),
-            active_stream: None,
+            active_event: None,
             scroll_offset: 0,
             follow_events: true,
             input: Input::default(),
@@ -467,7 +485,7 @@ impl AppState {
         let result = drain_available_events(workflow_events);
         let changed = result.lagged || !result.events.is_empty();
         if result.lagged {
-            self.active_stream = None;
+            self.active_event = None;
         }
         for event in result.events {
             self.apply_workflow_event(event);
@@ -476,43 +494,43 @@ impl AppState {
     }
 
     pub(in crate::app) fn apply_workflow_event(&mut self, event: WorkflowEvent) {
-        if self.try_append_streaming_event(&event) {
+        if self.try_coalesce_active_event(&event) {
             return;
         }
 
         let rendered = render_workflow_event(&event);
         self.status = rendered.text().to_string();
-        let is_stream_event = stream_content(&event.kind).is_some();
+        let is_active_event = is_active_event(&event.kind);
         self.apply_workflow_event_metadata(&event);
         self.push_event(TranscriptEntry::Workflow(event.clone()));
-        if is_stream_event {
-            self.active_stream = Some(ActiveStream {
+        if is_active_event {
+            self.active_event = Some(ActiveEvent {
                 index: self.event_log.len().saturating_sub(1),
                 event,
             });
         } else {
-            self.active_stream = None;
+            self.active_event = None;
         }
     }
 
-    fn try_append_streaming_event(&mut self, event: &WorkflowEvent) -> bool {
-        let (index, rendered, stream_event) = {
-            let Some(stream) = self.active_stream.as_mut() else {
+    fn try_coalesce_active_event(&mut self, event: &WorkflowEvent) -> bool {
+        let (index, rendered, active_event) = {
+            let Some(active) = self.active_event.as_mut() else {
                 return false;
             };
-            if stream.index + 1 != self.event_log.len() || !stream.accepts(event) {
+            if active.index + 1 != self.event_log.len() || !active.accepts(event) {
                 return false;
             }
-            stream.append(event);
+            active.merge(event);
             (
-                stream.index,
-                render_workflow_event(&stream.event),
-                stream.event.clone(),
+                active.index,
+                render_workflow_event(&active.event),
+                active.event.clone(),
             )
         };
 
         self.status = rendered.text().to_string();
-        self.event_log[index] = TranscriptEntry::Workflow(stream_event);
+        self.event_log[index] = TranscriptEntry::Workflow(active_event);
         self.apply_workflow_event_metadata(event);
         if self.follow_events {
             self.scroll_offset = 0;
@@ -769,6 +787,56 @@ mod tests {
         assert!(state.event_entries()[2].contains("Agent response"));
         assert!(state.event_entries()[2].contains("lo"));
         assert!(!state.event_entries()[2].contains("content: lo"));
+    }
+
+    #[test]
+    fn consecutive_tool_call_updates_replace_current_transcript_entry() {
+        let mut state = test_state();
+        let first = r#"{"content":[{"type":"text","text":""}],"details":{"jobs":[{"id":"job-123","type":"task","status":"running","label":"TuiLagRegressionTest","durationMs":123798}]}}"#;
+        let latest = r#"{"content":[{"type":"text","text":""}],"details":{"jobs":[{"id":"job-123","type":"task","status":"running","label":"TuiLagRegressionTest","durationMs":124300}]}}"#;
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "investigate".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Waiting on tester".to_string(),
+                status: "in_progress".to_string(),
+                content: Some(serde_json::json!(first)),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "investigate".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Waiting on tester".to_string(),
+                status: "in_progress".to_string(),
+                content: Some(serde_json::json!(latest)),
+            },
+        ));
+
+        assert_eq!(state.event_entries().len(), 1);
+        let entry = &state.event_entries()[0];
+        assert_eq!(entry.matches("Agent tool update"), 1);
+        assert!(
+            entry.contains("TuiLagRegressionTest"),
+            "{}",
+            entry.plain_text()
+        );
+        assert!(entry.contains("running"), "{}", entry.plain_text());
+        assert!(!entry.contains("durationMs"), "{}", entry.plain_text());
+        assert!(!entry.contains("job-123"), "{}", entry.plain_text());
+        assert!(!entry.contains("{"), "{}", entry.plain_text());
+
+        let TranscriptEntry::Workflow(event) = entry else {
+            panic!("expected workflow entry");
+        };
+        let WorkflowEventKind::AgentToolCallUpdate { content, .. } = &event.kind else {
+            panic!("expected tool update event");
+        };
+        assert!(content.as_ref().is_some_and(|value| value == latest));
+        assert!(!content.as_ref().is_some_and(|value| value == first));
     }
 
     #[test]

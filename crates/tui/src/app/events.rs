@@ -162,7 +162,7 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
                 ],
             ));
             if let Some(content) = content {
-                let content = display_json_value(content);
+                let content = display_tool_update_content(content);
                 push_body(&mut lines, &content, usize::MAX, style_transcript_normal());
             }
         }
@@ -322,6 +322,55 @@ fn display_tool_title(title: &str, kind: Option<&str>) -> String {
         .unwrap_or_else(|| "<unknown tool>".to_string())
 }
 
+fn display_tool_update_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                return display_tool_update_structured_content(&parsed);
+            }
+
+            display_json_value(value)
+        }
+        _ => display_tool_update_structured_content(value),
+    }
+}
+
+fn display_tool_update_structured_content(value: &serde_json::Value) -> String {
+    extract_json_text(value)
+        .or_else(|| extract_tool_update_jobs(value))
+        .unwrap_or_else(|| "<structured tool result>".to_string())
+}
+
+fn extract_tool_update_jobs(value: &serde_json::Value) -> Option<String> {
+    let jobs = value.get("details")?.get("jobs")?.as_array()?;
+    join_text(jobs.iter().filter_map(display_tool_update_job))
+}
+
+fn display_tool_update_job(job: &serde_json::Value) -> Option<String> {
+    let object = job.as_object()?;
+    let name = string_field(object, "label")
+        .or_else(|| string_field(object, "type"))
+        .unwrap_or("job");
+    let summary = match string_field(object, "status") {
+        Some(status) => format!("{name} ({status})"),
+        None => name.to_string(),
+    };
+
+    non_empty(summary)
+}
+
+fn string_field<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a str> {
+    object
+        .get(key)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
 fn display_json_value(value: &serde_json::Value) -> String {
     extract_json_text(value).unwrap_or_else(|| "<structured tool result>".to_string())
 }
@@ -476,6 +525,61 @@ mod tests {
             rendered.text()
         );
         assert!(!rendered.contains("{"), "{}", rendered.text());
+    }
+
+    #[test]
+    fn renders_json_encoded_tool_update_content_as_progress_summary() {
+        let rendered = render_workflow_event(&WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "implement".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Running background task".to_string(),
+                status: "completed".to_string(),
+                content: Some(serde_json::json!(
+                    r#"{"content":[{"type":"text","text":""}],"details":{"jobs":[{"id":"job-123","type":"task","status":"running","label":"TuiLagRegressionTest","durationMs":123798}]}}"#
+                )),
+            },
+        ));
+
+        let text = rendered.text();
+        assert!(text.contains("TuiLagRegressionTest"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(!text.contains("{"), "{text}");
+        assert!(!text.contains("\"durationMs\""), "{text}");
+        assert!(!text.contains("\"details\""), "{text}");
+    }
+
+    #[test]
+    fn renders_direct_tool_update_job_details_as_progress_summary() {
+        let rendered = render_workflow_event(&WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "implement".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Waiting on tester".to_string(),
+                status: "in_progress".to_string(),
+                content: Some(serde_json::json!({
+                    "details": {
+                        "jobs": [{
+                            "id": "job-123",
+                            "type": "task",
+                            "status": "running",
+                            "label": "TuiLagRegressionTest",
+                            "durationMs": 123798,
+                        }]
+                    }
+                })),
+            },
+        ));
+
+        let text = rendered.text();
+        assert!(text.contains("TuiLagRegressionTest"), "{text}");
+        assert!(text.contains("running"), "{text}");
+        assert!(!text.contains("job-123"), "{text}");
+        assert!(!text.contains("durationMs"), "{text}");
+        assert!(!text.contains("details"), "{text}");
+        assert!(!text.contains("{"), "{text}");
     }
 
     #[test]

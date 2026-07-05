@@ -228,15 +228,16 @@ fn draw_with_typed_input_does_not_scale_with_full_transcript_history() {
         let started = std::time::Instant::now();
         terminal.draw(|frame| draw(frame, state)).unwrap();
         let elapsed = started.elapsed();
-        let rendered = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .fold(String::new(), |mut rendered, cell| {
-                rendered.push_str(cell.symbol());
-                rendered
-            });
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .fold(String::new(), |mut rendered, cell| {
+                    rendered.push_str(cell.symbol());
+                    rendered
+                });
         std::hint::black_box(rendered.len());
         (elapsed, rendered)
     }
@@ -251,9 +252,18 @@ fn draw_with_typed_input_does_not_scale_with_full_transcript_history() {
         .unwrap_or(std::time::Duration::MAX)
         + std::time::Duration::from_millis(3);
 
-    assert!(short_rendered.contains("> typed input stays responsive"), "{short_rendered}");
-    assert!(long_rendered.contains("> typed input stays responsive"), "{long_rendered}");
-    assert!(long_rendered.contains("LAG_TAIL_VISIBLE"), "{long_rendered}");
+    assert!(
+        short_rendered.contains("> typed input stays responsive"),
+        "{short_rendered}"
+    );
+    assert!(
+        long_rendered.contains("> typed input stays responsive"),
+        "{long_rendered}"
+    );
+    assert!(
+        long_rendered.contains("LAG_TAIL_VISIBLE"),
+        "{long_rendered}"
+    );
     assert!(
         long_draw <= budget,
         "redrawing typed input should render only visible transcript tail rows, not scale with \
