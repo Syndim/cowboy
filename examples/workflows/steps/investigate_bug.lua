@@ -20,6 +20,8 @@ The RCA document must contain these sections exactly:
 - Current failing result
 - Fix constraints
 
+The RCA document must not include sensitive user data. Redact, generalize, or omit secrets, credentials, personal data, private paths, and proprietary customer content while preserving enough technical detail to reproduce the issue.
+
 Add one focused regression test that reproduces the bug and fails before the fix. Run the narrow command for that test and record the failing command/output in the RCA. Do not change product code. Return `work_dir` exactly as the written `docs/plans/<snake_case_bug_summary>` folder path. Return `rca_doc` exactly as `<work_dir>/rca.md`. Return `repro_test` as the test file path plus test name when available, e.g. `path/to/test.rs::test_name`. Include both the RCA doc and test file in `files`.
 
 Return "documented" when the RCA and failing test are ready, "unclear" when more user context is required, or "blocked" if the investigation cannot proceed.]],

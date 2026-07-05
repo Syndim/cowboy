@@ -8,6 +8,8 @@ local roles = {
 }
 
 local investigate = require("steps/investigate_bug.lua")(roles)
+local confirm_rca = require("steps/confirm_rca.lua")("confirm_rca")
+local confirm_rca_answer = require("steps/confirm_rca.lua")("confirm_rca_answer")
 local review_rca = require("steps/review_rca.lua")(roles)
 local plan = require("steps/plan.lua")(roles, { kind = "bug fix" })
 local clarify = require("steps/clarify.lua")("clarify")
@@ -30,8 +32,11 @@ local triage_blocked = require("steps/triage_blocked.lua")("triage_blocked")
 investigate:on("documented", review_rca)
 investigate:on("unclear", clarify)
 investigate:on("blocked", blocked)
-review_rca:on("approved", plan)
+review_rca:on("approved", confirm_rca)
 review_rca:on("changes_requested", investigate)
+confirm_rca:on("answered", confirm_rca_answer)
+confirm_rca_answer:on("confirmed", plan)
+confirm_rca_answer:on("changes_requested", investigate)
 plan:on("ready", review_plan)
 plan:on("unclear", clarify)
 clarify:on("answered", clarify_answer)
@@ -63,5 +68,5 @@ triage_blocked:on("implement", implement)
 triage_blocked:on("revise", revise)
 
 return workflow("bugfix", investigate, {
-  description = "Investigate, review RCA, plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
+  description = "Investigate, review RCA, confirm RCA, plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
 })

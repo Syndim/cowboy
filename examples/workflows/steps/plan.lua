@@ -22,6 +22,8 @@ The plan document must contain these sections exactly:
 - How to verify
 - TODO
 
+The plan document must not include sensitive user data. Redact, generalize, or omit secrets, credentials, personal data, private paths, and proprietary customer content while preserving actionable engineering detail.
+
 The TODO section must contain every implementation work item as Markdown task-list items (`- [ ] ...`). Return `plan_doc` exactly as the written plan path, and include that same path in `files`.
 
 Return status "ready" when the request is specific enough to implement, or "unclear" when more user context is needed.]],

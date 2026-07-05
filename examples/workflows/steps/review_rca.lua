@@ -13,6 +13,8 @@ Request:
 
 Inspect the RCA document at the `RCA doc: ...` path and the regression test identified by `Repro test: ...`. Validate that the RCA explains the bug behavior, why it happens, and how to reproduce it. Validate that the regression test is focused on the reported issue and currently fails for the bug rather than for unrelated setup or assertion mistakes.
 
+Verify the RCA document does not include sensitive user data; require redaction or generalization of secrets, credentials, personal data, private paths, and proprietary customer content.
+
 Return "approved" only when the RCA is repository-grounded and the failing test correctly demonstrates the issue. Return "changes_requested" with actionable feedback otherwise. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly from the RCA output.]],
       output = {
         status = { "approved", "changes_requested" },
