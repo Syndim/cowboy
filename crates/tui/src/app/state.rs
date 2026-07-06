@@ -3,6 +3,7 @@ use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
 use tui_input::{Input, InputRequest};
 
 use super::events::render_workflow_event;
+use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
 use super::markup::render_markup;
 use super::styles::{
     style_accent, style_error, style_transcript_metadata, style_transcript_normal, style_warning,
@@ -235,12 +236,16 @@ pub(super) struct AppState {
     input: Input,
     history: Vec<String>,
     history_index: Option<usize>,
+    history_store: InputHistory,
     background: Vec<tokio::task::JoinHandle<Result<RunReport, String>>>,
     exit_requested: bool,
 }
 
 impl AppState {
-    pub(super) fn new(_config: AppConfig) -> Self {
+    pub(super) fn new(config: AppConfig) -> Self {
+        let history_store = InputHistory::new(config.state_dir);
+        let history = history_store.load();
+
         Self {
             active_run_id: None,
             current_step: None,
@@ -253,8 +258,9 @@ impl AppState {
             scroll_offset: 0,
             follow_events: true,
             input: Input::default(),
-            history: Vec::new(),
+            history,
             history_index: None,
+            history_store,
             background: Vec::new(),
             exit_requested: false,
         }
@@ -376,10 +382,24 @@ impl AppState {
         if input.is_empty() {
             return None;
         }
+        self.persist_submitted_history(input);
+        Some(input.to_string())
+    }
+
+    fn persist_submitted_history(&mut self, input: &str) {
+        if let Some(history) = self.history_store.append(input) {
+            self.history = history;
+            return;
+        }
+
         if self.history.last().is_none_or(|last| last != input) {
             self.history.push(input.to_string());
         }
-        Some(input.to_string())
+
+        if self.history.len() > HISTORY_LOAD_LIMIT {
+            let keep_from = self.history.len() - HISTORY_LOAD_LIMIT;
+            self.history.drain(0..keep_from);
+        }
     }
 
     pub(in crate::app) fn set_status(&mut self, status: impl Into<String>) {
@@ -678,6 +698,14 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use std::fs;
+    use std::fs::OpenOptions;
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use fs2::FileExt;
 
     use super::*;
     use crate::config::AppConfig;
@@ -933,5 +961,98 @@ mod tests {
         assert!(state.event_entries()[1].contains("Agent response"));
         assert!(state.event_entries()[1].contains("two"));
         assert!(state.event_entries()[1].contains("three"));
+    }
+
+    #[test]
+    fn contended_history_lock_does_not_block_startup_or_submission() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("input_history"),
+            r#"{"version":1,"entry":"on disk"}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let ready_path = dir.path().join("ready");
+        let mut helper = spawn_lock_helper(&state_dir.join("input_history.lock"), &ready_path);
+        wait_for_ready(&ready_path);
+        let config = AppConfig {
+            state_dir: state_dir.clone(),
+            workflow_store: state_dir.join("workflow.redb"),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+
+        let started = Instant::now();
+        let mut state = AppState::new(config);
+        let startup_elapsed = started.elapsed();
+        state.push_input("during contention");
+        let started = Instant::now();
+        let submitted = state.take_submitted_input();
+        let submit_elapsed = started.elapsed();
+
+        stop_helper(&mut helper);
+        assert!(
+            startup_elapsed < Duration::from_secs(1),
+            "startup elapsed: {startup_elapsed:?}"
+        );
+        assert!(
+            submit_elapsed < Duration::from_secs(1),
+            "submit elapsed: {submit_elapsed:?}"
+        );
+        assert_eq!(submitted, Some("during contention".to_string()));
+        assert!(
+            !fs::read_to_string(state_dir.join("input_history"))
+                .unwrap()
+                .contains("during contention")
+        );
+        state.history_previous();
+        assert_eq!(state.input(), "during contention");
+    }
+
+    fn spawn_lock_helper(lock_path: &Path, ready_path: &Path) -> Child {
+        Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("app::state::tests::hold_history_lock_helper")
+            .arg("--ignored")
+            .env("COWBOY_HISTORY_LOCK_PATH", lock_path)
+            .env("COWBOY_HISTORY_LOCK_READY", ready_path)
+            .spawn()
+            .unwrap()
+    }
+
+    fn wait_for_ready(ready_path: &Path) {
+        let started = Instant::now();
+        while !ready_path.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "lock helper did not become ready"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn stop_helper(helper: &mut Child) {
+        let _ = helper.kill();
+        let _ = helper.wait();
+    }
+
+    #[test]
+    #[ignore]
+    fn hold_history_lock_helper() {
+        let Ok(lock_path) = std::env::var("COWBOY_HISTORY_LOCK_PATH") else {
+            return;
+        };
+        let ready_path = std::env::var("COWBOY_HISTORY_LOCK_READY").unwrap();
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .unwrap();
+        FileExt::lock_exclusive(&lock_file).unwrap();
+        fs::write(ready_path, "ready").unwrap();
+        thread::sleep(Duration::from_secs(10));
     }
 }

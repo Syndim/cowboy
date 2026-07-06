@@ -37,6 +37,7 @@ This crate owns only CLI/configuration and terminal rendering. It should not own
 | `app.rs` | Terminal startup, event loop, and top-level vertical layout only. |
 | `app/commands.rs` | Slash command registry, command completion, command dispatch, and runtime task spawning. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
+| `app/history.rs` | TUI-owned persisted composer input history: locked append-only JSON-lines storage under `state_dir`. |
 | `app/state.rs` | TUI state projection: active run, current step, pending prompt, transcript entries, command history, scroll offset, and background tasks. |
 | `app/events.rs` | Converts typed workflow events into human-readable transcript text. |
 | `app/styles.rs` | Shared ratatui colors/styles and width-safe truncation helpers. |

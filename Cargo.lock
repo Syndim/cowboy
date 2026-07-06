@@ -311,6 +311,7 @@ dependencies = [
  "cowboy-workflow-engine",
  "crossterm 0.29.0",
  "dirs",
+ "fs2",
  "ratatui",
  "serde",
  "serde_json",

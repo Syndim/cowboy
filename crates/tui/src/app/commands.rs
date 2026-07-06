@@ -390,5 +390,7 @@ mod tests {
 
         assert!(state.event_entries().is_empty());
         assert!(state.history_is_empty());
+        assert!(!dir.path().join("state/input_history").exists());
+        assert!(!dir.path().join("state/input_history.lock").exists());
     }
 }

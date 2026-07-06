@@ -417,4 +417,62 @@ mod tests {
             assert_eq!(state.input(), "draft");
         }
     }
+
+    #[test]
+    fn up_restores_persisted_history_from_fresh_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+        let mut first_state = AppState::new(config.clone());
+        first_state.push_input("persist me");
+        assert_eq!(
+            first_state.take_submitted_input(),
+            Some("persist me".to_string())
+        );
+
+        let mut second_state = AppState::new(config);
+        let handling = handle_key_press(
+            &mut second_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(second_state.input(), "persist me");
+    }
+
+    #[test]
+    fn down_after_restored_history_clears_composer_after_newest_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+        let mut first_state = AppState::new(config.clone());
+        first_state.push_input("persist me");
+        assert_eq!(
+            first_state.take_submitted_input(),
+            Some("persist me".to_string())
+        );
+        let mut second_state = AppState::new(config);
+        handle_key_press(
+            &mut second_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+
+        let handling = handle_key_press(
+            &mut second_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(second_state.input(), "");
+    }
 }

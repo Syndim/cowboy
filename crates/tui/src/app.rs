@@ -21,6 +21,7 @@ use crate::config::AppConfig;
 mod commands;
 mod controls;
 mod events;
+mod history;
 mod input;
 mod markup;
 mod state;
