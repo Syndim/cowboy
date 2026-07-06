@@ -37,6 +37,8 @@ enum Command {
     },
     /// Execute exactly one further step of an existing workflow run.
     Step { run_id: String },
+    /// Continue an existing workflow run until it blocks, fails, or completes.
+    Resume { run_id: String },
     /// Answer a workflow input prompt and continue the run.
     Answer {
         run_id: String,
@@ -108,6 +110,12 @@ async fn run_main() -> Result<()> {
         Command::Step { run_id } => {
             let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
             let report = runtime.step_run(&run_id).await?;
+            print_report(&report);
+            Ok(())
+        }
+        Command::Resume { run_id } => {
+            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+            let report = runtime.resume_run(&run_id).await?;
             print_report(&report);
             Ok(())
         }
@@ -230,6 +238,22 @@ mod tests {
     }
 
     #[test]
+    fn resume_with_run_id_parses() {
+        let cli = Cli::parse_from(["cowboy", "resume", "run-1"]);
+        match cli.command {
+            Some(Command::Resume { run_id }) => assert_eq!(run_id, "run-1"),
+            other => panic!("expected resume command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_requires_run_id() {
+        let err = Cli::try_parse_from(["cowboy", "resume"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn resolve_with_status_fields_and_body_parses() {
         let cli = Cli::parse_from([
             "cowboy",
@@ -257,4 +281,3 @@ mod tests {
         }
     }
 }
-

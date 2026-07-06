@@ -65,10 +65,11 @@ List existing runs:
 cowboy runs
 ```
 
-Execute one additional step for a run:
+Execute one additional step for a run, or continue it until it blocks, fails, or completes:
 
 ```bash
 cowboy step <run-id>
+cowboy resume <run-id>
 ```
 
 Answer a waiting prompt:
@@ -116,6 +117,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /run <request>                         start a workflow run
 /run-step <request>                    run only the first workflow step
 /step <run-id>                         execute exactly one more step
+/resume [run-id]                       continue a run until blocked
 /answer <run-id> <prompt-id> <answer>  answer a waiting prompt explicitly
 /runs                                  list workflow runs
 /workflows                             list known workflows
@@ -126,6 +128,8 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /help                                  show built-in commands
 /exit                                  quit Cowboy
 ```
+
+`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes.
 
 ### TUI keys
 

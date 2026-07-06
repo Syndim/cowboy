@@ -20,7 +20,8 @@ use cowboy_workflow_core::{
     RunnerLimits, StatusAction, StepAction, StepActionProvider, StepRecord, WorkflowCatalog,
     WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
     WorkflowSummarizer, apply_run_status, apply_step_record,
-};use cowboy_workflow_store::RedbRunStore;
+};
+use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -1078,7 +1079,9 @@ mod tests {
         assert!(matches!(err, WorkflowError::RecoverableAction(_)));
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
         // The give-up path persists a clean Failed status for later resolution.
-        let run = runtime.load_run(&runtime.list_runs().unwrap()[0].run_id).unwrap();
+        let run = runtime
+            .load_run(&runtime.list_runs().unwrap()[0].run_id)
+            .unwrap();
         assert!(matches!(run.status, RunStatus::Failed { .. }));
     }
 
@@ -1295,6 +1298,83 @@ mod tests {
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_run_continues_stepwise_status_workflow_and_persists_resumed_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "first" }
+            end
+
+            local finish = step("finish")
+            finish.run = function(ctx)
+              local prev = ctx.prev or {}
+              return action.status { status = "success", fields = { prev_status = prev.status }, body = "finished" }
+            end
+
+            start:on("next", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                max_retries_per_step: 2,
+            },
+        })
+        .with_deterministic_selector();
+
+        let start = runtime.start_run_stepwise("request").await.unwrap();
+        assert_eq!(start.run.status, RunStatus::Running);
+        assert_eq!(start.run.current_step, "finish");
+        assert_eq!(start.run.steps_executed, 1);
+
+        let report = runtime.resume_run(&start.run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(report.run.current_step, "finish");
+        assert_eq!(report.run.steps_executed, 2);
+        assert!(report.events.iter().any(|event| matches!(
+            event.kind,
+            WorkflowEventKind::StepStarted { ref step_id } if step_id == "finish"
+        )));
+        assert!(report.events.iter().any(|event| matches!(
+            event.kind,
+            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+                if step_id == "finish" && action == "status" && status.as_deref() == Some("success")
+        )));
+        assert!(
+            report
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, WorkflowEventKind::RunCompleted))
+        );
+
+        let persisted = runtime.load_events(&start.run.id).unwrap();
+        assert_eq!(persisted, report.events);
+        assert!(persisted.iter().any(|event| matches!(
+            event.kind,
+            WorkflowEventKind::StepStarted { ref step_id } if step_id == "finish"
+        )));
+        assert!(persisted.iter().any(|event| matches!(
+            event.kind,
+            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+                if step_id == "finish" && action == "status" && status.as_deref() == Some("success")
+        )));
     }
 
     #[tokio::test]

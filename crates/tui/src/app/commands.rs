@@ -33,6 +33,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         takes_arguments: true,
     },
     SlashCommand {
+        name: "/resume",
+        usage: "/resume [run-id]",
+        description: "continue a run until blocked",
+        takes_arguments: true,
+    },
+    SlashCommand {
         name: "/answer",
         usage: "/answer <run> <id> <answer>",
         description: "answer a waiting prompt",
@@ -146,6 +152,10 @@ async fn dispatch_submitted_input(
         spawn_start_run_stepwise(state, runtime, rest.trim().to_string());
     } else if let Some(rest) = input.strip_prefix("/step ") {
         spawn_step_run(state, runtime, rest.trim().to_string());
+    } else if let Some(rest) = input.strip_prefix("/resume ") {
+        submit_resume_run(state, runtime, Some(rest.trim().to_string()));
+    } else if input == "/resume" {
+        submit_resume_run(state, runtime, None);
     } else if let Some(rest) = input.strip_prefix("/answer ") {
         submit_explicit_answer(state, runtime, rest);
     } else if input == "/cancel" {
@@ -197,6 +207,29 @@ fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Strin
     state.spawn_report_task(format!("submitted step: {run_id}"), async move {
         runtime
             .step_run(&run_id)
+            .await
+            .map_err(|err| err.to_string())
+    });
+}
+
+fn submit_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Option<String>) {
+    let run_id = run_id
+        .filter(|run_id| !run_id.is_empty())
+        .or_else(|| state.active_run_id().map(str::to_string));
+    let Some(run_id) = run_id else {
+        state.set_status("usage: /resume [run-id]");
+        state.push_card("Usage", [state.status().to_string()]);
+        return;
+    };
+
+    spawn_resume_run(state, runtime, run_id);
+}
+
+fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
+    let runtime = runtime.clone();
+    state.spawn_report_task(format!("submitted resume: {run_id}"), async move {
+        runtime
+            .resume_run(&run_id)
             .await
             .map_err(|err| err.to_string())
     });
@@ -295,12 +328,15 @@ async fn resolve_run(state: &mut AppState, runtime: &WorkflowRuntime, rest: &str
             };
             let runtime = runtime.clone();
             let run_id = run_id.to_string();
-            state.spawn_report_task(format!("submitted resolve: {run_id} {status}"), async move {
-                runtime
-                    .resolve_run(&run_id, &status, fields, None)
-                    .await
-                    .map_err(|err| err.to_string())
-            });
+            state.spawn_report_task(
+                format!("submitted resolve: {run_id} {status}"),
+                async move {
+                    runtime
+                        .resolve_run(&run_id, &status, fields, None)
+                        .await
+                        .map_err(|err| err.to_string())
+                },
+            );
             Ok(())
         }
     }
@@ -430,6 +466,16 @@ mod tests {
     }
 
     #[test]
+    fn slash_suggestions_include_resume_usage() {
+        let suggestions = slash_suggestions("/res")
+            .into_iter()
+            .map(|command| command.usage)
+            .collect::<Vec<_>>();
+
+        assert!(suggestions.contains(&"/resume [run-id]"));
+    }
+
+    #[test]
     fn complete_slash_suggestion_updates_input() {
         let mut state = test_state();
         state.push_input("/ru");
@@ -437,6 +483,110 @@ mod tests {
         complete_slash_suggestion(&mut state);
 
         assert_eq!(state.input(), "/run ");
+    }
+
+    #[tokio::test]
+    async fn explicit_resume_spawns_resume_labeled_background_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let mut state = AppState::new(config);
+
+        state.push_input("/resume run-123");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.status(), "submitted resume: run-123");
+        assert_eq!(state.background_task_count(), 1);
+        assert!(
+            state
+                .event_entries()
+                .last()
+                .is_some_and(|entry| entry.contains("submitted resume: run-123"))
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_resume_uses_active_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        std::fs::create_dir(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "ready" }
+            end
+
+            local done = step("done")
+            done.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            start:on("next", done)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            max_steps_per_run: 5,
+            max_visits_per_step: 5,
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .with_deterministic_selector();
+        let start = runtime.start_run_stepwise("request").await.unwrap();
+        let run_id = start.run.id.clone();
+        let mut state = AppState::new(config);
+        state.spawn_report_task("seed active run".to_string(), async move { Ok(start) });
+        tokio::task::yield_now().await;
+        assert!(state.drain_background_tasks().await);
+        assert_eq!(state.active_run_id(), Some(run_id.as_str()));
+
+        state.push_input("/resume");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.status(), format!("submitted resume: {run_id}"));
+        assert_eq!(state.background_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bare_resume_without_active_run_shows_usage_without_spawning_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let mut state = AppState::new(config);
+
+        state.push_input("/resume");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.status(), "usage: /resume [run-id]");
+        assert_eq!(state.background_task_count(), 0);
+        let rendered = state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Usage"));
+        assert!(rendered.contains("usage: /resume [run-id]"));
     }
 
     #[tokio::test]

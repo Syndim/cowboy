@@ -144,6 +144,7 @@ events are persisted for display/debugging under:
 cowboy                                  # launch TUI
 cowboy run <request...>                 # start a run; --step runs only the first step
 cowboy step <run-id>                    # execute exactly one further workflow step
+cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
@@ -174,6 +175,7 @@ Slash commands:
 /run <request>
 /run-step <request>
 /step <run-id>
+/resume [run-id]
 /answer <run-id> <prompt-id> <answer>
 /runs
 /workflows

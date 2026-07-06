@@ -327,8 +327,8 @@ mod tests {
 
         assert!(rendered.contains("> /"));
         assert!(rendered.contains("slash command suggestions"));
-        assert!(rendered.contains("/run <request>"));
-        assert!(rendered.contains("/workflows"));
+        assert!(rendered.contains("/resume [run-id]"));
+        assert!(rendered.contains("more command(s)"));
     }
 
     #[test]
