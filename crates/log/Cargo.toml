@@ -7,7 +7,7 @@ license.workspace = true
 description = "File-based diagnostic logging setup for Cowboy"
 
 [dependencies]
-tracing = "0.1"
-time = "0.3"
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing.workspace = true
+time = "0"
+tracing-appender = "0"
+tracing-subscriber = { version = "0", features = ["env-filter", "fmt"] }

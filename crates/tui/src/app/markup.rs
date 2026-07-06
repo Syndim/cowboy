@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::Theme;
+use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use super::styles::{style_border, style_transcript_code_fallback};
@@ -120,12 +120,47 @@ fn highlight_syntax_line(line: &str, token: Option<&str>) -> Line<'static> {
 
 fn highlight_with(highlighter: &mut HighlightLines<'_>, line: &str) -> Option<Line<'static>> {
     let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
-    let mut spans = Vec::new();
-    for segment in ranges {
-        let span = syntect_tui::into_span(segment).ok()?;
-        spans.push(Span::styled(span.content.into_owned(), span.style));
-    }
+    let spans = ranges
+        .into_iter()
+        .map(|(style, content)| Span::styled(content.to_string(), style_from_syntect(style)))
+        .collect::<Vec<_>>();
     Some(Line::from(spans))
+}
+
+fn style_from_syntect(style: SyntectStyle) -> Style {
+    let foreground = color_from_syntect(style.foreground);
+    Style {
+        fg: foreground,
+        bg: color_from_syntect(style.background),
+        underline_color: foreground,
+        add_modifier: modifier_from_syntect(style.font_style),
+        sub_modifier: Modifier::empty(),
+    }
+}
+
+fn color_from_syntect(color: syntect::highlighting::Color) -> Option<Color> {
+    if color.a == 0 {
+        return None;
+    }
+
+    Some(Color::Rgb(color.r, color.g, color.b))
+}
+
+fn modifier_from_syntect(font_style: FontStyle) -> Modifier {
+    let mut modifier = Modifier::empty();
+    if font_style.contains(FontStyle::BOLD) {
+        modifier |= Modifier::BOLD;
+    }
+
+    if font_style.contains(FontStyle::ITALIC) {
+        modifier |= Modifier::ITALIC;
+    }
+
+    if font_style.contains(FontStyle::UNDERLINE) {
+        modifier |= Modifier::UNDERLINED;
+    }
+
+    modifier
 }
 
 fn fallback_code_line(line: &str) -> Line<'static> {

@@ -5,5 +5,26 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0"
+chrono = "0"
+fs2 = "0"
+parking_lot = "0"
+serde = "1"
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+tokio = "1"
+tracing = "0"
+
+cowboy-agent-acp = { path = "crates/agent/acp" }
+cowboy-agent-client = { path = "crates/agent/client" }
+cowboy-log = { path = "crates/log" }
+cowboy-workflow-agent = { path = "crates/workflow/agent" }
+cowboy-workflow-core = { path = "crates/workflow/core" }
+cowboy-workflow-lua = { path = "crates/workflow/lua" }
+cowboy-workflow-store = { path = "crates/workflow/store" }

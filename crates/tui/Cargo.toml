@@ -8,23 +8,22 @@ description = "Workflow-first terminal UI for Cowboy"
 
 [dependencies]
 cowboy-workflow-engine = { path = "../workflow/engine" }
-anyhow = "1"
-chrono = { version = "0.4", features = ["serde"] }
+anyhow.workspace = true
+chrono = { workspace = true, features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
-fs2 = "0.4"
+crossterm = "0"
+fs2.workspace = true
 dirs = "6"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-tui-input = { version = "0.14.0", default-features = false, features = ["crossterm"] }
-unicode-width = "0.2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+ratatui = { version = "0", features = ["unstable-rendered-line-info"] }
+tui-input = { version = "0", default-features = false, features = ["crossterm"] }
+unicode-width = "0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 syntect = "5"
-syntect-tui = "3"
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["full"] }
 toml = "1"
-cowboy-log = { path = "../log" }
-tracing = "0.1"
+cowboy-log.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

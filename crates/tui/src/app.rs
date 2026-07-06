@@ -142,12 +142,16 @@ impl DrawScheduler {
     }
 }
 
-async fn run_loop<B: ratatui::backend::Backend>(
+async fn run_loop<B>(
     terminal: &mut Terminal<B>,
     mut state: AppState,
     runtime: &WorkflowRuntime,
     workflow_events: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
     let mut draw_scheduler = DrawScheduler::new();
     loop {
         draw_scheduler.mark_dirty_if(state.drain_workflow_events(workflow_events));

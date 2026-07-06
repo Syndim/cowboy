@@ -7,10 +7,10 @@ license.workspace = true
 description = "Built-in and filesystem workflow catalog loading for Cowboy"
 
 [dependencies]
-cowboy-workflow-core = { path = "../core" }
-cowboy-workflow-lua = { path = "../lua" }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
+cowboy-workflow-core.workspace = true
+cowboy-workflow-lua.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
