@@ -33,6 +33,9 @@ enum Command {
         /// Execute only the first workflow step instead of running until blocked.
         #[arg(long)]
         step: bool,
+        /// Catalog workflow id to run, bypassing workflow selection.
+        #[arg(long)]
+        workflow: Option<String>,
         request: Vec<String>,
     },
     /// Execute exactly one further step of an existing workflow run.
@@ -96,13 +99,26 @@ async fn run_main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => cowboy::run_tui(config).await,
-        Command::Run { step, request } => {
+        Command::Run {
+            step,
+            workflow,
+            request,
+        } => {
             let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
             let request = request.join(" ");
-            let report = if step {
-                runtime.start_run_stepwise(request).await?
-            } else {
-                runtime.start_run(request).await?
+            let report = match (step, workflow) {
+                (true, Some(workflow_id)) => {
+                    runtime
+                        .start_run_with_workflow_stepwise(workflow_id, request)
+                        .await?
+                }
+                (false, Some(workflow_id)) => {
+                    runtime
+                        .start_run_with_workflow(workflow_id, request)
+                        .await?
+                }
+                (true, None) => runtime.start_run_stepwise(request).await?,
+                (false, None) => runtime.start_run(request).await?,
             };
             print_report(&report);
             Ok(())
@@ -217,6 +233,59 @@ fn print_report(report: &cowboy_workflow_engine::RunReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_workflow_parses_workflow_override() {
+        let cli = Cli::parse_from(["cowboy", "run", "--workflow", "review", "do", "work"]);
+        match cli.command {
+            Some(Command::Run {
+                workflow, request, ..
+            }) => {
+                assert_eq!(workflow.as_deref(), Some("review"));
+                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_step_with_workflow_parses_first_step_override() {
+        let cli = Cli::parse_from([
+            "cowboy",
+            "run",
+            "--step",
+            "--workflow",
+            "review",
+            "do",
+            "work",
+        ]);
+        match cli.command {
+            Some(Command::Run {
+                step,
+                workflow,
+                request,
+            }) => {
+                assert!(step);
+                assert_eq!(workflow.as_deref(), Some("review"));
+                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_without_workflow_keeps_selector_backed_form() {
+        let cli = Cli::parse_from(["cowboy", "run", "do", "work"]);
+        match cli.command {
+            Some(Command::Run {
+                workflow, request, ..
+            }) => {
+                assert_eq!(workflow, None);
+                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+            }
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
 
     #[test]
     fn resolve_without_status_parses_as_list_form() {

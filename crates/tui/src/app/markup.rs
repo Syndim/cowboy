@@ -219,8 +219,9 @@ fn is_command_line(line: &str) -> bool {
     }
     if matches!(
         trimmed,
-        "/run" | "/runs" | "/resume" | "/workflows" | "/help" | "/exit"
+        "/run" | "/run-workflow" | "/runs" | "/resume" | "/workflows" | "/help" | "/exit"
     ) || trimmed.starts_with("/run ")
+        || trimmed.starts_with("/run-workflow ")
         || trimmed.starts_with("/resume ")
         || trimmed.starts_with("/improve ")
     {
@@ -321,9 +322,14 @@ mod tests {
         assert!(is_command_line("$ cargo test"));
         assert!(is_command_line("cargo run -- run add a route"));
         assert!(is_command_line("/run add a route"));
+        assert!(is_command_line("/run-workflow"));
+
+        assert!(is_command_line("/run-workflow review do work"));
         assert!(is_command_line("/resume"));
         assert!(is_command_line("/resume run-1"));
         assert!(!is_command_line("please run cargo test"));
         assert!(!is_command_line("please resume run-1"));
+        assert!(!is_command_line("please run-workflow review do work"));
+        assert!(!is_command_line("run-workflow review do work"));
     }
 }

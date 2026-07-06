@@ -35,6 +35,7 @@ If no config exists, Cowboy uses defaults:
 ```bash
 cowboy                                  # launch TUI
 cowboy run <request...>                 # start a run; --step runs only the first step
+cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
@@ -42,6 +43,8 @@ cowboy resolve <run-id>                 # list statuses a failed run can resolve
 cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 ```
+
+`--workflow <workflow-id>` uses the catalog id shown by `/workflows` or other catalog listings, not necessarily the Lua-declared workflow name.
 
 Recoverable step failures (missing agent frontmatter, transient backend errors)
 are auto-retried up to `max_retries_per_step` before a run gives up as `Failed`;
@@ -56,6 +59,7 @@ Built-in slash commands:
 
 ```text
 /run <request>
+/run-workflow <workflow-id> <request>
 /improve <run-id>
 /resolve <run-id>
 /resolve <run-id> <status>
@@ -64,6 +68,8 @@ Built-in slash commands:
 /help
 /exit
 ```
+
+`/run-workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the Lua-declared workflow name.
 
 Keys currently supported:
 

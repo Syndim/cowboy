@@ -21,6 +21,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         takes_arguments: true,
     },
     SlashCommand {
+        name: "/run-workflow",
+        usage: "/run-workflow <workflow-id> <request>",
+        description: "start a named workflow run",
+        takes_arguments: true,
+    },
+    SlashCommand {
         name: "/run-step",
         usage: "/run-step <request>",
         description: "run only the first workflow step",
@@ -146,7 +152,11 @@ async fn dispatch_submitted_input(
     runtime: &WorkflowRuntime,
     input: &str,
 ) -> Result<()> {
-    if let Some(rest) = input.strip_prefix("/run ") {
+    if let Some(rest) = input.strip_prefix("/run-workflow ") {
+        submit_start_workflow(state, runtime, rest);
+    } else if input == "/run-workflow" {
+        submit_start_workflow(state, runtime, "");
+    } else if let Some(rest) = input.strip_prefix("/run ") {
         spawn_start_run(state, runtime, rest.trim().to_string());
     } else if let Some(rest) = input.strip_prefix("/run-step ") {
         spawn_start_run_stepwise(state, runtime, rest.trim().to_string());
@@ -200,6 +210,42 @@ fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, req
             .await
             .map_err(|err| err.to_string())
     });
+}
+
+fn submit_start_workflow(state: &mut AppState, runtime: &WorkflowRuntime, rest: &str) {
+    let rest = rest.trim();
+    let Some((workflow_id, request)) = rest.split_once(char::is_whitespace) else {
+        state.set_status("usage: /run-workflow <workflow-id> <request>");
+        state.push_card("Usage", [state.status().to_string()]);
+        return;
+    };
+    let workflow_id = workflow_id.trim();
+    let request = request.trim();
+    if workflow_id.is_empty() || request.is_empty() {
+        state.set_status("usage: /run-workflow <workflow-id> <request>");
+        state.push_card("Usage", [state.status().to_string()]);
+        return;
+    }
+
+    spawn_start_run_with_workflow(state, runtime, workflow_id.to_string(), request.to_string());
+}
+
+fn spawn_start_run_with_workflow(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    workflow_id: String,
+    request: String,
+) {
+    let runtime = runtime.clone();
+    state.spawn_report_task(
+        format!("submitted run-workflow {workflow_id}: {request}"),
+        async move {
+            runtime
+                .start_run_with_workflow(workflow_id, request)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
@@ -462,6 +508,8 @@ mod tests {
         assert!(suggestions.contains(&"/run <request>"));
         assert!(suggestions.contains(&"/run-step <request>"));
         assert!(suggestions.contains(&"/runs"));
+        assert!(suggestions.contains(&"/run-workflow <workflow-id> <request>"));
+
         assert!(!suggestions.contains(&"/answer <run> <id> <answer>"));
     }
 
@@ -473,6 +521,118 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(&"/resume [run-id]"));
+    }
+
+    #[tokio::test]
+    async fn run_workflow_spawns_named_workflow_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        std::fs::create_dir(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("alpha.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "alpha " .. ctx.request }
+            end
+            return workflow("alpha-declared", start)
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("review.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "reviewed " .. ctx.request }
+            end
+            return workflow("review-declared", start)
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            max_steps_per_run: 5,
+            max_visits_per_step: 5,
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .with_deterministic_selector();
+        let mut state = AppState::new(config);
+
+        state.push_input("/run-workflow review do work");
+        submit_input(&mut state, &runtime).await;
+
+        assert!(state.status().contains("run-workflow review"));
+        assert_eq!(state.background_task_count(), 1);
+        tokio::task::yield_now().await;
+        assert!(state.drain_background_tasks().await);
+        assert_eq!(state.background_task_count(), 0);
+        assert_eq!(state.workflow_name(), Some("review"));
+    }
+
+    #[tokio::test]
+    async fn run_workflow_usage_errors_spawn_no_task() {
+        for input in ["/run-workflow", "/run-workflow review"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = AppConfig {
+                state_dir: dir.path().join("state"),
+                workflow_store: dir.path().join("state/workflow.redb"),
+                workflow_dirs: Vec::new(),
+                max_steps_per_run: 1,
+                max_visits_per_step: 1,
+                ..AppConfig::default()
+            };
+            let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+            let mut state = AppState::new(config);
+
+            state.push_input(input);
+            submit_input(&mut state, &runtime).await;
+
+            assert_eq!(
+                state.status(),
+                "usage: /run-workflow <workflow-id> <request>"
+            );
+            assert_eq!(state.background_task_count(), 0);
+            let rendered = state
+                .event_entries()
+                .iter()
+                .map(|entry| entry.plain_text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("Usage"));
+            assert!(rendered.contains("usage: /run-workflow <workflow-id> <request>"));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_and_plain_text_keep_selector_backed_start_labels() {
+        for (input, expected_status) in [
+            ("/run do work", "submitted run: do work"),
+            ("do work", "submitted run: do work"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = AppConfig {
+                state_dir: dir.path().join("state"),
+                workflow_store: dir.path().join("state/workflow.redb"),
+                workflow_dirs: Vec::new(),
+                max_steps_per_run: 1,
+                max_visits_per_step: 1,
+                ..AppConfig::default()
+            };
+            let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+                .with_deterministic_selector();
+            let mut state = AppState::new(config);
+
+            state.push_input(input);
+            submit_input(&mut state, &runtime).await;
+
+            assert_eq!(state.status(), expected_status);
+            assert_eq!(state.background_task_count(), 1);
+            state.cancel_background_tasks();
+        }
     }
 
     #[test]

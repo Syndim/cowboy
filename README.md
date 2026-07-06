@@ -53,10 +53,13 @@ Start the TUI:
 cowboy
 ```
 
-Start a workflow run from the CLI:
+Start a workflow run from the CLI. Add `--workflow <workflow-id>` to bypass
+agent-backed selection and run the catalog id shown by `/workflows` or other
+catalog listings.
 
 ```bash
 cowboy run add a /healthz route
+cowboy run --workflow <workflow-id> add a /healthz route
 ```
 
 List existing runs:
@@ -115,6 +118,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 
 ```text
 /run <request>                         start a workflow run
+/run-workflow <workflow-id> <request>  start a catalog workflow id directly
 /run-step <request>                    run only the first workflow step
 /step <run-id>                         execute exactly one more step
 /resume [run-id]                       continue a run until blocked
@@ -130,6 +134,8 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 ```
 
 `step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes.
+
+`/run-workflow` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
 ### TUI keys
 

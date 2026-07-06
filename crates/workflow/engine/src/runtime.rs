@@ -250,16 +250,36 @@ impl WorkflowRuntime {
         self.start_with(request, RunMode::UntilBlocked).await
     }
 
+    /// Start a new run for the requested catalog workflow id and execute until
+    /// the run blocks, fails, suspends, or completes.
+    pub async fn start_run_with_workflow(
+        &self,
+        workflow_id: impl Into<String>,
+        request: impl Into<String>,
+    ) -> Result<RunReport> {
+        self.start_with_workflow(workflow_id.into(), request, RunMode::UntilBlocked)
+            .await
+    }
+
     /// Start a new run and execute exactly one workflow step, leaving the run
     /// ready to be advanced with [`step_run`].
     pub async fn start_run_stepwise(&self, request: impl Into<String>) -> Result<RunReport> {
         self.start_with(request, RunMode::SingleStep).await
     }
 
+    /// Start a new run for the requested catalog workflow id and execute exactly
+    /// one workflow step, leaving the run ready to be advanced with [`step_run`].
+    pub async fn start_run_with_workflow_stepwise(
+        &self,
+        workflow_id: impl Into<String>,
+        request: impl Into<String>,
+    ) -> Result<RunReport> {
+        self.start_with_workflow(workflow_id.into(), request, RunMode::SingleStep)
+            .await
+    }
+
     async fn start_with(&self, request: impl Into<String>, mode: RunMode) -> Result<RunReport> {
         let request = request.into();
-        let run_id = format!("run-{}", Uuid::new_v4());
-        let _run_guard = self.run_locks.acquire(&run_id)?;
         tracing::info!(request = %request, mode = ?mode, "starting workflow run");
         let catalog = self.catalog()?;
         tracing::debug!(
@@ -267,14 +287,60 @@ impl WorkflowRuntime {
             "workflow catalog loaded"
         );
         let selection = self.select_workflow(&request, &catalog).await?;
+        self.start_catalog_workflow(request, mode, &catalog, &selection.workflow_id)
+            .await
+    }
+
+    async fn start_with_workflow(
+        &self,
+        workflow_id: String,
+        request: impl Into<String>,
+        mode: RunMode,
+    ) -> Result<RunReport> {
+        let request = request.into();
+        tracing::info!(request = %request, workflow_id = %workflow_id, mode = ?mode, "starting requested workflow run");
+        let catalog = self.catalog()?;
+        tracing::debug!(
+            workflow_count = catalog.workflows.len(),
+            "workflow catalog loaded"
+        );
+        self.ensure_workflow_exists(&catalog, &workflow_id)?;
+        self.start_catalog_workflow(request, mode, &catalog, &workflow_id)
+            .await
+    }
+
+    fn ensure_workflow_exists(&self, catalog: &WorkflowCatalog, workflow_id: &str) -> Result<()> {
+        if catalog.workflows.contains_key(workflow_id) {
+            return Ok(());
+        }
+
+        let available = catalog
+            .workflows
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(WorkflowError::InvalidAction(format!(
+            "unknown workflow id {workflow_id:?}; use a catalog id from /workflows or catalog listings; available workflow ids: {available}"
+        )))
+    }
+
+    async fn start_catalog_workflow(
+        &self,
+        request: String,
+        mode: RunMode,
+        catalog: &WorkflowCatalog,
+        workflow_id: &str,
+    ) -> Result<RunReport> {
+        let run_id = format!("run-{}", Uuid::new_v4());
+        let _run_guard = self.run_locks.acquire(&run_id)?;
         let source_ref = catalog
             .workflows
-            .get(&selection.workflow_id)
+            .get(workflow_id)
             .ok_or_else(|| WorkflowError::InvalidAction("selected workflow missing".to_string()))?;
         let (definition, snapshot, workflow_hash) = self.compile_source(source_ref)?;
         tracing::debug!(
-            workflow_id = %selection.workflow_id,
-            confidence = selection.confidence,
+            workflow_id = %workflow_id,
             source_entry = %source_ref.entry,
             source_root = ?source_ref.root,
             workflow_hash = %workflow_hash,
@@ -1051,6 +1117,22 @@ mod tests {
         .with_deterministic_selector()
     }
 
+    fn runtime_for_workflow_dir(dir: &tempfile::TempDir, workflow_dir: PathBuf) -> WorkflowRuntime {
+        WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                max_retries_per_step: 2,
+            },
+        })
+        .with_deterministic_selector()
+    }
+
     #[tokio::test]
     async fn starts_builtin_workflow_until_agent_call_attempts_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -1298,6 +1380,131 @@ mod tests {
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_run_with_workflow_uses_requested_catalog_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("alpha.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "alpha selected" }
+            end
+            return workflow("alpha-declared", start)
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("review.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "review selected: " .. ctx.request }
+            end
+            return workflow("review-declared", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let report = runtime
+            .start_run_with_workflow("review", "do work")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.workflow_name, "review");
+        assert_eq!(report.run.original_request, "do work");
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let head = report.run.head.as_ref().expect("completed head");
+        let record = runtime
+            .store()
+            .unwrap()
+            .get_object::<StepRecord>(head)
+            .unwrap();
+        let output = record.output.expect("status output");
+        assert_eq!(output.body, "review selected: do work");
+        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_workflow_stepwise_uses_requested_catalog_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("alpha.lua"),
+            r#"
+            local start = step("alpha-start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "alpha done" }
+            end
+            return workflow("alpha-declared", start)
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("review.lua"),
+            r#"
+            local start = step("review-start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "review first" }
+            end
+
+            local finish = step("review-finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "review done" }
+            end
+
+            start:on("next", finish)
+            return workflow("review-declared", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let report = runtime
+            .start_run_with_workflow_stepwise("review", "do work")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.workflow_name, "review");
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(report.run.current_step, "review-finish");
+        assert_eq!(report.run.steps_executed, 1);
+        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_run_with_unknown_workflow_id_creates_no_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("review.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "review selected" }
+            end
+            return workflow("review-declared", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let err = runtime
+            .start_run_with_workflow("review-declared", "do work")
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("unknown workflow id"), "{err}");
+        assert!(err.to_string().contains("review-declared"), "{err}");
+        assert!(err.to_string().contains("review"), "{err}");
+        assert!(runtime.list_runs().unwrap().is_empty());
     }
 
     #[tokio::test]
