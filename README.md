@@ -36,8 +36,6 @@ Install from GitHub:
 cargo install --git https://github.com/syndim/cowboy.git cowboy
 ```
 
-Because the repository is private for now, the command requires credentials with access to `https://github.com/syndim/cowboy.git`. After the repository becomes public, the same command will work without private-repository access.
-
 For local development:
 
 ```bash
