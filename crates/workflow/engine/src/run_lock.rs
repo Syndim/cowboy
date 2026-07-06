@@ -51,10 +51,6 @@ impl RunExecutionLocks {
         }
     }
 
-    pub(crate) fn lock_dir(&self) -> &Path {
-        &self.lock_dir
-    }
-
     fn acquire_file_lock(&self, lock_key: &str) -> Result<File> {
         fs::create_dir_all(&self.lock_dir)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -80,7 +76,7 @@ impl RunExecutionLocks {
 
 impl Drop for RunExecutionGuard {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = FileExt::unlock(&self.file);
         let _ = release_in_process(&self.active_key);
     }
 }
@@ -168,7 +164,7 @@ mod tests {
             assert!(err.to_string().contains("invalid run id"));
         }
 
-        assert!(!locks.lock_dir().exists());
+        assert!(!locks.lock_dir.exists());
     }
 
     #[test]
@@ -181,10 +177,10 @@ mod tests {
         let _guard = locks.acquire(run_id).unwrap();
 
         assert_eq!(
-            locks.lock_dir(),
+            locks.lock_dir,
             dir.path().join("shared/workflow.redb.locks")
         );
-        assert!(locks.lock_dir().join(format!("{run_id}.lock")).exists());
+        assert!(locks.lock_dir.join(format!("{run_id}.lock")).exists());
     }
 
     #[test]
