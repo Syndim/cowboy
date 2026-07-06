@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 fn default_config_path() -> PathBuf {
@@ -47,6 +47,18 @@ enum Command {
     Improve { run_id: String },
     /// List workflow runs.
     Runs,
+    /// Resolve a failed run. Without <status>, lists resolvable statuses.
+    Resolve {
+        run_id: String,
+        /// Status to resolve the failed step to. Omit to list options.
+        status: Option<String>,
+        /// JSON object of output fields for the chosen status.
+        #[arg(long)]
+        fields: Option<String>,
+        /// Human-readable body for the synthesized step record.
+        #[arg(long)]
+        body: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -129,7 +141,59 @@ async fn run_main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Resolve {
+            run_id,
+            status,
+            fields,
+            body,
+        } => {
+            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+            match status {
+                None => {
+                    let options = runtime.resolution_options(&run_id)?;
+                    print_resolution_options(&options);
+                    Ok(())
+                }
+                Some(status) => {
+                    let fields = match fields {
+                        Some(raw) => Some(
+                            serde_json::from_str(&raw)
+                                .with_context(|| format!("invalid --fields JSON: {raw}"))?,
+                        ),
+                        None => None,
+                    };
+                    let report = runtime.resolve_run(&run_id, &status, fields, body).await?;
+                    print_report(&report);
+                    Ok(())
+                }
+            }
+        }
     }
+}
+
+fn print_resolution_options(options: &cowboy_workflow_engine::ResolutionOptions) {
+    println!(
+        "run={} failed_step={} reason={}",
+        options.run_id,
+        options.failed_step,
+        options.failure_reason.as_deref().unwrap_or("<none>")
+    );
+    println!("resolvable statuses:");
+    for status in &options.statuses {
+        let target = status.target_step.as_deref().unwrap_or("<run completes>");
+        println!(
+            "  {} -> {} required=[{}] optional=[{}] body_expected={}",
+            status.status,
+            target,
+            status.required_fields.join(", "),
+            status.optional_fields.join(", "),
+            status.body_expected
+        );
+    }
+    println!(
+        "resolve with: cowboy resolve {} <status> [--fields '<json>'] [--body <text>]",
+        options.run_id
+    );
 }
 
 fn print_report(report: &cowboy_workflow_engine::RunReport) {
@@ -141,3 +205,56 @@ fn print_report(report: &cowboy_workflow_engine::RunReport) {
         println!("event={:?}", event.kind);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_without_status_parses_as_list_form() {
+        let cli = Cli::parse_from(["cowboy", "resolve", "run-1"]);
+        match cli.command {
+            Some(Command::Resolve {
+                run_id,
+                status,
+                fields,
+                body,
+            }) => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(status, None);
+                assert_eq!(fields, None);
+                assert_eq!(body, None);
+            }
+            other => panic!("expected resolve command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_with_status_fields_and_body_parses() {
+        let cli = Cli::parse_from([
+            "cowboy",
+            "resolve",
+            "run-1",
+            "approved",
+            "--fields",
+            r#"{"summary":"done"}"#,
+            "--body",
+            "looks good",
+        ]);
+        match cli.command {
+            Some(Command::Resolve {
+                run_id,
+                status,
+                fields,
+                body,
+            }) => {
+                assert_eq!(run_id, "run-1");
+                assert_eq!(status.as_deref(), Some("approved"));
+                assert_eq!(fields.as_deref(), Some(r#"{"summary":"done"}"#));
+                assert_eq!(body.as_deref(), Some("looks good"));
+            }
+            other => panic!("expected resolve command, got {other:?}"),
+        }
+    }
+}
+

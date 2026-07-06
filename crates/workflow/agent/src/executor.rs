@@ -190,7 +190,15 @@ where
 
         let started_at = Utc::now();
         let start = Instant::now();
-        let prompt = build_agent_prompt(role, &action);
+        let base_prompt = build_agent_prompt(role, &action);
+        let prompt = if context.attempt > 1 {
+            format!(
+                "{base_prompt}\n\n{}",
+                crate::prompt::build_retry_nudge(&action, context.retry_reason.as_deref())
+            )
+        } else {
+            base_prompt
+        };
         let mut visible = String::new();
         let mut turns = Vec::new();
         let mut tool_titles = HashMap::new();
@@ -804,6 +812,8 @@ mod tests {
             step_record_id: record_id.into(),
             prev: Some("prev".into()),
             role: Some(role("developer")),
+            attempt: 1,
+            retry_reason: None,
         }
     }
 
@@ -814,7 +824,32 @@ mod tests {
             step_record_id: record_id.into(),
             prev: Some("prev".into()),
             role: Some(role(role_id)),
+            attempt: 1,
+            retry_reason: None,
         }
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_appends_corrective_frontmatter_nudge() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![event()])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        let mut context = context("run", "record");
+        context.attempt = 2;
+        context.retry_reason = Some("missing frontmatter".to_string());
+
+        let execution = executor
+            .execute_agent(action("developer"), context)
+            .await
+            .unwrap();
+
+        let prompt = execution.record.input.prompt.as_ref().unwrap();
+        // The original task prompt is preserved and the corrective nudge appended.
+        assert!(prompt.contains("Do work"));
+        assert!(prompt.contains("## Retry"));
+        assert!(prompt.contains("missing frontmatter"));
+        assert!(prompt.contains("valid YAML frontmatter"));
     }
 
     #[tokio::test]

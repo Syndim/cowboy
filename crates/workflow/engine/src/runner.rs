@@ -3,7 +3,7 @@ use std::sync::Arc;
 use cowboy_workflow_core::{
     ActionDispatcher, Result, RunStatus, RunStore, RunnerLimits, StepAction, StepActionProvider,
     StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
-    WorkflowSourceSnapshot, execute_step,
+    WorkflowSourceSnapshot, apply_run_status, execute_step, retry_current_step,
 };
 use serde_json::{Value, json};
 
@@ -113,15 +113,24 @@ where
         .await
         {
             Ok(status) => status,
-            Err(err) => {
-                self.events.emit(WorkflowEvent::for_run(
-                    run,
-                    WorkflowEventKind::RunFailed {
-                        reason: err.to_string(),
-                    },
-                ));
-                return Err(err);
-            }
+            Err(err) => match self.retry_step(definition, run, &step_id, err).await {
+                Ok(status) => status,
+                Err(err) => {
+                    let reason = err.to_string();
+                    let _ = apply_run_status(
+                        &self.store,
+                        run,
+                        RunStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                    );
+                    self.events.emit(WorkflowEvent::for_run(
+                        run,
+                        WorkflowEventKind::RunFailed { reason },
+                    ));
+                    return Err(err);
+                }
+            },
         };
 
         if run.head != previous_head {
@@ -135,6 +144,52 @@ where
             .emit(WorkflowEvent::run_status_for_run(run, &status));
 
         Ok(status)
+    }
+
+    /// Retry the current step after a recoverable failure, up to
+    /// `max_retries_per_step`. Retries reuse the same step budget and emit a
+    /// [`WorkflowEventKind::StepRetrying`] event before each attempt. Returns the
+    /// resulting status on success or the terminal error to give up on.
+    async fn retry_step(
+        &self,
+        definition: &WorkflowDefinition,
+        run: &mut WorkflowRun,
+        step_id: &str,
+        first_error: WorkflowError,
+    ) -> Result<RunStatus> {
+        let max_retries = self.limits.max_retries_per_step;
+        let max_attempts = max_retries + 1;
+        let mut last_error = first_error;
+        let mut attempt: u32 = 1;
+
+        while last_error.recoverable() && attempt <= max_retries {
+            attempt += 1;
+            self.events.emit(WorkflowEvent::for_run(
+                run,
+                WorkflowEventKind::StepRetrying {
+                    step_id: step_id.to_string(),
+                    attempt,
+                    max_attempts,
+                    reason: last_error.to_string(),
+                },
+            ));
+            match retry_current_step(
+                &self.store,
+                &self.executor,
+                &self.provider,
+                definition,
+                run,
+                attempt,
+                Some(last_error.to_string()),
+            )
+            .await
+            {
+                Ok(status) => return Ok(status),
+                Err(err) => last_error = err,
+            }
+        }
+
+        Err(last_error)
     }
 }
 
@@ -334,6 +389,65 @@ mod tests {
                     status,
                     fields,
                     body,
+                    raw: Value::Null,
+                }),
+                detail: StepDetail {
+                    backend: Some("test".to_string()),
+                    session_id: None,
+                    duration_ms: 0,
+                    turn_count: 0,
+                    usage: None,
+                },
+                started_at: now,
+                completed_at: Some(now),
+            }))
+        }
+    }
+
+    /// Dispatcher that fails its first `remaining_failures` calls (recoverably
+    /// or not) and then completes. Records the `attempt` seen on each call so
+    /// tests can assert retry numbering and budget behaviour.
+    struct FlakyDispatcher {
+        remaining_failures: Mutex<u32>,
+        recoverable: bool,
+        dispatches: Arc<Mutex<u32>>,
+        seen_attempts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    #[async_trait]
+    impl ActionDispatcher for FlakyDispatcher {
+        async fn dispatch(
+            &self,
+            _action: StepAction,
+            context: cowboy_workflow_core::ExecutionContext,
+        ) -> Result<ActionResult> {
+            *self.dispatches.lock() += 1;
+            self.seen_attempts.lock().push(context.attempt);
+            {
+                let mut remaining = self.remaining_failures.lock();
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err(if self.recoverable {
+                        WorkflowError::RecoverableAction("needs frontmatter".to_string())
+                    } else {
+                        WorkflowError::InvalidAction("fatal".to_string())
+                    });
+                }
+            }
+            let now = Utc::now();
+            Ok(ActionResult::completed(StepRecord {
+                id: context.step_record_id,
+                prev: context.prev,
+                step: context.step_id,
+                action: "agent".to_string(),
+                input: StepInput {
+                    prompt: Some("agent prompt".to_string()),
+                    context: Value::Null,
+                },
+                output: Some(StepOutput {
+                    status: "success".to_string(),
+                    fields: Value::Null,
+                    body: "agent done".to_string(),
                     raw: Value::Null,
                 }),
                 detail: StepDetail {
@@ -616,5 +730,163 @@ mod tests {
         };
         assert_eq!(action.status, "success");
         assert_eq!(action.body, "do it");
+    }
+
+    fn agent_run() -> WorkflowRun {
+        let mut run = run();
+        run.current_step = "agent".to_string();
+        run
+    }
+
+    fn agent_action() -> StepAction {
+        StepAction::Agent(cowboy_workflow_core::AgentAction {
+            role: "developer".to_string(),
+            prompt: "do it".to_string(),
+            output: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn retries_recoverable_failure_then_succeeds() {
+        let dispatches = Arc::new(Mutex::new(0));
+        let seen_attempts = Arc::new(Mutex::new(Vec::new()));
+        let bus = Arc::new(EventBus::new(32));
+        let mut events = bus.subscribe();
+        let runner = WorkflowRunner::new(
+            MemoryStore::default(),
+            FlakyDispatcher {
+                remaining_failures: Mutex::new(2),
+                recoverable: true,
+                dispatches: dispatches.clone(),
+                seen_attempts: seen_attempts.clone(),
+            },
+            StaticProvider(vec![agent_action()]),
+            bus,
+        )
+        .with_limits(RunnerLimits {
+            max_steps_per_run: 5,
+            max_visits_per_step: 3,
+            max_retries_per_step: 2,
+        });
+
+        let run = runner
+            .run_until_blocked(&definition(), agent_run())
+            .await
+            .unwrap();
+
+        assert_eq!(run.status, RunStatus::Completed);
+        // Two failures + one success.
+        assert_eq!(*dispatches.lock(), 3);
+        // Attempts are numbered 1, 2, 3 across the retries.
+        assert_eq!(*seen_attempts.lock(), vec![1, 2, 3]);
+        // Retries reuse the same step budget: the step is only visited once.
+        assert_eq!(run.step_visits.get("agent").copied().unwrap_or(0), 1);
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            kinds.push(event.kind);
+        }
+        let retrying = kinds
+            .iter()
+            .filter(|kind| matches!(kind, WorkflowEventKind::StepRetrying { .. }))
+            .count();
+        assert_eq!(retrying, 2);
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, WorkflowEventKind::RunCompleted))
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausts_recoverable_retries_and_persists_failed() {
+        let dispatches = Arc::new(Mutex::new(0));
+        let seen_attempts = Arc::new(Mutex::new(Vec::new()));
+        let bus = Arc::new(EventBus::new(32));
+        let mut events = bus.subscribe();
+        let runner = WorkflowRunner::new(
+            MemoryStore::default(),
+            FlakyDispatcher {
+                remaining_failures: Mutex::new(u32::MAX),
+                recoverable: true,
+                dispatches: dispatches.clone(),
+                seen_attempts: seen_attempts.clone(),
+            },
+            StaticProvider(vec![agent_action()]),
+            bus,
+        )
+        .with_limits(RunnerLimits {
+            max_steps_per_run: 5,
+            max_visits_per_step: 3,
+            max_retries_per_step: 2,
+        });
+
+        let result = runner.run_until_blocked(&definition(), agent_run()).await;
+        assert!(result.is_err());
+
+        // Initial attempt + 2 retries.
+        assert_eq!(*dispatches.lock(), 3);
+
+        let stored = runner.store().load_run(&"run-1".to_string()).unwrap();
+        assert!(matches!(stored.status, RunStatus::Failed { .. }));
+        // The failed step stays current so it can be resolved manually.
+        assert_eq!(stored.current_step, "agent");
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            kinds.push(event.kind);
+        }
+        let retrying = kinds
+            .iter()
+            .filter(|kind| matches!(kind, WorkflowEventKind::StepRetrying { .. }))
+            .count();
+        assert_eq!(retrying, 2);
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, WorkflowEventKind::RunFailed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_recoverable_failure_is_not_retried() {
+        let dispatches = Arc::new(Mutex::new(0));
+        let seen_attempts = Arc::new(Mutex::new(Vec::new()));
+        let bus = Arc::new(EventBus::new(32));
+        let mut events = bus.subscribe();
+        let runner = WorkflowRunner::new(
+            MemoryStore::default(),
+            FlakyDispatcher {
+                remaining_failures: Mutex::new(1),
+                recoverable: false,
+                dispatches: dispatches.clone(),
+                seen_attempts: seen_attempts.clone(),
+            },
+            StaticProvider(vec![agent_action()]),
+            bus,
+        )
+        .with_limits(RunnerLimits {
+            max_steps_per_run: 5,
+            max_visits_per_step: 3,
+            max_retries_per_step: 2,
+        });
+
+        let result = runner.run_until_blocked(&definition(), agent_run()).await;
+        assert!(result.is_err());
+        // No retry attempted for a non-recoverable error.
+        assert_eq!(*dispatches.lock(), 1);
+
+        let stored = runner.store().load_run(&"run-1".to_string()).unwrap();
+        assert!(matches!(stored.status, RunStatus::Failed { .. }));
+
+        let mut kinds = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            kinds.push(event.kind);
+        }
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, WorkflowEventKind::StepRetrying { .. }))
+        );
     }
 }

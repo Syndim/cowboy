@@ -83,6 +83,20 @@ Ask Cowboy to summarize and apply workflow-file improvements from a completed ru
 cowboy improve <run-id>
 ```
 
+Resolve a failed run. A run gives up as `Failed` only after exhausting the
+recoverable-retry budget; its failed step stays current so it can be resolved
+manually. Without a `<status>`, this lists the statuses the failed step can be
+resolved to along with the fields each requires:
+
+```bash
+cowboy resolve <run-id>
+cowboy resolve <run-id> <status> [--fields '<json object>'] [--body <text>]
+```
+
+Recoverable step failures (for example, an agent reply missing its YAML
+frontmatter, or a transient backend error) are retried automatically up to
+`max_retries_per_step` times before the run is marked `Failed`.
+
 ## TUI views
 
 The TUI is organized into four vertical views:
@@ -106,6 +120,8 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /runs                                  list workflow runs
 /workflows                             list known workflows
 /improve <run-id>                      improve workflow source from a run
+/resolve <run-id>                      list statuses a failed run can resolve to
+/resolve <run-id> <status>             resolve a failed step and continue the run
 /cancel                                cancel active background tasks
 /help                                  show built-in commands
 /exit                                  quit Cowboy
@@ -150,6 +166,7 @@ workflow_store = "~/.local/state/cowboy/workflow.redb"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 max_steps_per_run = 100
 max_visits_per_step = 20
+max_retries_per_step = 2
 
 [[agents]]
 name = "default"

@@ -136,6 +136,16 @@ pub enum WorkflowEventKind {
         status: Option<String>,
         body: String,
     },
+    StepRetrying {
+        step_id: String,
+        attempt: u32,
+        max_attempts: u32,
+        reason: String,
+    },
+    ManuallyResolved {
+        step_id: String,
+        status: String,
+    },
     WaitingForInput {
         step: String,
         prompt_id: String,

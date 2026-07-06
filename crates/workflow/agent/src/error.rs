@@ -24,8 +24,72 @@ pub enum Error {
     MissingOutput,
 }
 
+impl Error {
+    /// Whether the failure is worth retrying with the same intact session.
+    ///
+    /// Parse/frontmatter failures mean the agent finished its work but its final
+    /// message was malformed; a corrective nudge on the reused session usually
+    /// recovers. Transient transport/ACP (`Client`) errors are also retryable.
+    /// Missing client wiring and internal conversion errors are not.
+    pub fn recoverable(&self) -> bool {
+        match self {
+            Error::Client(_)
+            | Error::Yaml(_)
+            | Error::MissingFrontmatter
+            | Error::FrontmatterNotMapping
+            | Error::FrontmatterFieldNotString(_)
+            | Error::MissingStatus
+            | Error::MissingOutput => true,
+            Error::MissingClient(_) | Error::Json(_) => false,
+            Error::Workflow(err) => err.recoverable(),
+        }
+    }
+}
+
 impl From<Error> for cowboy_workflow_core::WorkflowError {
     fn from(value: Error) -> Self {
-        cowboy_workflow_core::WorkflowError::InvalidAction(value.to_string())
+        if value.recoverable() {
+            cowboy_workflow_core::WorkflowError::RecoverableAction(value.to_string())
+        } else {
+            cowboy_workflow_core::WorkflowError::InvalidAction(value.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_and_transient_errors_are_recoverable() {
+        assert!(Error::MissingFrontmatter.recoverable());
+        assert!(Error::FrontmatterNotMapping.recoverable());
+        assert!(Error::FrontmatterFieldNotString("status".to_string()).recoverable());
+        assert!(Error::MissingStatus.recoverable());
+        assert!(Error::MissingOutput.recoverable());
+        assert!(Error::Client(anyhow::anyhow!("transport reset")).recoverable());
+    }
+
+    #[test]
+    fn wiring_and_conversion_errors_are_not_recoverable() {
+        assert!(!Error::MissingClient("developer".to_string()).recoverable());
+    }
+
+    #[test]
+    fn conversion_preserves_recoverability() {
+        let recoverable: cowboy_workflow_core::WorkflowError = Error::MissingFrontmatter.into();
+        assert!(recoverable.recoverable());
+        assert!(matches!(
+            recoverable,
+            cowboy_workflow_core::WorkflowError::RecoverableAction(_)
+        ));
+
+        let fatal: cowboy_workflow_core::WorkflowError =
+            Error::MissingClient("developer".to_string()).into();
+        assert!(!fatal.recoverable());
+        assert!(matches!(
+            fatal,
+            cowboy_workflow_core::WorkflowError::InvalidAction(_)
+        ));
     }
 }

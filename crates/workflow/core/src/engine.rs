@@ -12,6 +12,8 @@ pub struct RunnerLimits {
     pub max_steps_per_run: u32,
     /// Maximum number of visits to the same step in one run.
     pub max_visits_per_step: u32,
+    /// Maximum number of recoverable retries for a single step attempt.
+    pub max_retries_per_step: u32,
 }
 
 impl Default for RunnerLimits {
@@ -19,11 +21,16 @@ impl Default for RunnerLimits {
         Self {
             max_steps_per_run: 100,
             max_visits_per_step: 20,
+            max_retries_per_step: 2,
         }
     }
 }
 
 /// Execute one workflow step action and persist the resulting run state.
+///
+/// This consumes the step's visit/step budget once. Recoverable retries of the
+/// same logical step must use [`retry_current_step`], which reruns the current
+/// step without spending additional budget.
 pub async fn execute_step<S, D, P>(
     store: &S,
     dispatcher: &D,
@@ -38,6 +45,55 @@ where
     P: StepActionProvider,
 {
     enforce_budget(run, limits)?;
+    increment_budget(run);
+    dispatch_current_step(store, dispatcher, provider, definition, run, 1, None).await
+}
+
+/// Re-run the current step after a recoverable failure without consuming the
+/// step/visit budget again.
+///
+/// `attempt` is the 1-based attempt number (>= 2 for retries) and `retry_reason`
+/// carries the previous failure so agent actions can emit a corrective nudge.
+pub async fn retry_current_step<S, D, P>(
+    store: &S,
+    dispatcher: &D,
+    provider: &P,
+    definition: &WorkflowDefinition,
+    run: &mut WorkflowRun,
+    attempt: u32,
+    retry_reason: Option<String>,
+) -> Result<RunStatus>
+where
+    S: RunStore,
+    D: ActionDispatcher,
+    P: StepActionProvider,
+{
+    dispatch_current_step(
+        store,
+        dispatcher,
+        provider,
+        definition,
+        run,
+        attempt,
+        retry_reason,
+    )
+    .await
+}
+
+async fn dispatch_current_step<S, D, P>(
+    store: &S,
+    dispatcher: &D,
+    provider: &P,
+    definition: &WorkflowDefinition,
+    run: &mut WorkflowRun,
+    attempt: u32,
+    retry_reason: Option<String>,
+) -> Result<RunStatus>
+where
+    S: RunStore,
+    D: ActionDispatcher,
+    P: StepActionProvider,
+{
     let step =
         definition
             .steps
@@ -45,7 +101,6 @@ where
             .ok_or_else(|| WorkflowError::UnknownStep {
                 step: run.current_step.clone(),
             })?;
-    increment_budget(run);
 
     let prev_record = run
         .head
@@ -72,6 +127,8 @@ where
         step_record_id: next_record_id(run),
         prev: run.head.clone(),
         role,
+        attempt,
+        retry_reason,
     };
 
     match dispatcher.dispatch(action, context).await? {
@@ -705,6 +762,7 @@ mod tests {
             &RunnerLimits {
                 max_steps_per_run: 1,
                 max_visits_per_step: 10,
+                max_retries_per_step: 0,
             },
         )
         .await

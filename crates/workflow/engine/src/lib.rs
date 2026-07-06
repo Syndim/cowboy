@@ -21,7 +21,7 @@ pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::ResumeRouter;
 pub use runner::{LuaStepActionProvider, WorkflowRunner};
 pub use runtime::{
-    AgentRuntimeConfig, RunReport, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig,
-    WorkflowRuntime,
+    AgentRuntimeConfig, ResolutionOptions, ResolutionStatus, RunReport, RunSummaryLine,
+    RunnerLimitsConfig, RuntimeConfig, WorkflowRuntime,
 };
 pub use workflow::{AgentWorkflowSelector, AgentWorkflowSummarizer, DeterministicSelector};

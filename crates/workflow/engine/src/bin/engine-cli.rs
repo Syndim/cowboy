@@ -124,6 +124,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
     let limits = RunnerLimitsConfig {
         max_steps_per_run: 100,
         max_visits_per_step: 20,
+        max_retries_per_step: 2,
     };
     let selector = env_or("COWBOY_ENGINE_SELECTOR", "agent");
     eprintln!(
@@ -381,6 +382,19 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
             choices.join(",")
         ),
         WorkflowEventKind::RunCompleted => format!("{} completed", event.run_id),
+        WorkflowEventKind::StepRetrying {
+            step_id,
+            attempt,
+            max_attempts,
+            reason,
+        } => format!(
+            "{} retrying step {step_id} (attempt {attempt}/{max_attempts}): {reason}",
+            event.run_id
+        ),
+        WorkflowEventKind::ManuallyResolved { step_id, status } => format!(
+            "{} manually resolved step {step_id} with status={status}",
+            event.run_id
+        ),
         WorkflowEventKind::RunFailed { reason } => format!("{} failed: {reason}", event.run_id),
         WorkflowEventKind::RunCancelled => format!("{} cancelled", event.run_id),
         WorkflowEventKind::RunStatusChanged { status } => {

@@ -146,8 +146,14 @@ cowboy run <request...>                 # start a run; --step runs only the firs
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
+cowboy resolve <run-id>                 # list statuses a failed run can resolve to
+cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 ```
+
+Recoverable step failures are auto-retried up to `max_retries_per_step` before a
+run gives up as `Failed`; the failed step stays current so `cowboy resolve` can
+route it to a valid status and continue the run.
 
 ## TUI
 
@@ -172,6 +178,8 @@ Slash commands:
 /runs
 /workflows
 /improve <run-id>
+/resolve <run-id>
+/resolve <run-id> <status>
 /cancel
 /help
 /exit

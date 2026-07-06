@@ -68,10 +68,10 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/list workflow runs, wire store/catalog/Lua/action dispatch/agent execution, persist event logs. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs, recoverable-retry give-up persistence, wire store/catalog/Lua/action dispatch/agent execution, persist event logs. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
-| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events. Also `LuaStepActionProvider`. |
+| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events and owns the bounded recoverable-retry loop (`max_retries_per_step`), persisting `Failed` on give-up. Also `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
 

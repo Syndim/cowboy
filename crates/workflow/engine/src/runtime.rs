@@ -16,11 +16,11 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ActionResult, ObjectKind, Result, RoleDefinition, RunHead, RunStatus, RunnerLimits,
-    WorkflowCatalog, WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef,
-    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
-};
-use cowboy_workflow_store::RedbRunStore;
+    ActionResult, ExecutionContext, ObjectKind, Result, RoleDefinition, RunHead, RunStatus,
+    RunnerLimits, StatusAction, StepAction, StepActionProvider, StepRecord, WorkflowCatalog,
+    WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
+    WorkflowSummarizer, apply_run_status, apply_step_record,
+};use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -57,6 +57,12 @@ pub struct AgentRuntimeConfig {
 pub struct RunnerLimitsConfig {
     pub max_steps_per_run: u32,
     pub max_visits_per_step: u32,
+    #[serde(default = "default_max_retries_per_step")]
+    pub max_retries_per_step: u32,
+}
+
+fn default_max_retries_per_step() -> u32 {
+    2
 }
 
 impl AgentRuntimeConfig {
@@ -104,6 +110,7 @@ impl From<RunnerLimitsConfig> for RunnerLimits {
         Self {
             max_steps_per_run: value.max_steps_per_run,
             max_visits_per_step: value.max_visits_per_step,
+            max_retries_per_step: value.max_retries_per_step,
         }
     }
 }
@@ -121,6 +128,34 @@ pub struct RunSummaryLine {
     pub status: RunStatus,
     pub current_step: String,
     pub head_step: Option<String>,
+}
+
+/// Guided choices for manually resolving a run stopped on a failed step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionOptions {
+    /// Run being resolved.
+    pub run_id: String,
+    /// Step the run is currently stopped on.
+    pub failed_step: String,
+    /// Failure reason recorded on the run, when the run is `Failed`.
+    pub failure_reason: Option<String>,
+    /// Statuses the failed step can be resolved to, with the info each needs.
+    pub statuses: Vec<ResolutionStatus>,
+}
+
+/// One resolvable status for a failed step and the information it requires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionStatus {
+    /// Status the user can resolve the failed step to.
+    pub status: String,
+    /// Step the run routes to for this status, or `None` when the run completes.
+    pub target_step: Option<String>,
+    /// Output fields that must be provided to resolve with this status.
+    pub required_fields: Vec<String>,
+    /// Output fields that may optionally be provided.
+    pub optional_fields: Vec<String>,
+    /// Whether a human-readable body is expected/useful for this status.
+    pub body_expected: bool,
 }
 
 #[derive(Clone)]
@@ -373,6 +408,175 @@ impl WorkflowRuntime {
         tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
 
         if matches!(status, RunStatus::Running) {
+            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, events)
+                .await
+        } else {
+            self.persist_events(&run.id, &events)?;
+            Ok(RunReport { run, events })
+        }
+    }
+
+    /// Inspect a failed run and return the statuses it can be resolved to along
+    /// with the information each status requires. See [`resolve_run`].
+    pub fn resolution_options(&self, run_id: &str) -> Result<ResolutionOptions> {
+        let store = self.store()?;
+        let run = store.load_run(&run_id.to_string())?;
+        self.build_resolution_options(&run, &store)
+    }
+
+    fn build_resolution_options(
+        &self,
+        run: &WorkflowRun,
+        store: &RedbRunStore,
+    ) -> Result<ResolutionOptions> {
+        ensure_resolvable(run)?;
+        let snapshot = snapshot_from_run(run);
+        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        definition.name = run.workflow_name.clone();
+        definition.source_hash = run.workflow_hash.clone();
+
+        let failed_step = run.current_step.clone();
+        let step = definition
+            .steps
+            .get(&failed_step)
+            .ok_or_else(|| WorkflowError::UnknownStep {
+                step: failed_step.clone(),
+            })?
+            .clone();
+
+        // Recompute the failed step's action to recover its output shape; a
+        // failed step persists no StepRecord, so the schema must be re-evaluated.
+        let prev_record = run
+            .head
+            .as_ref()
+            .map(|head| store.get_object::<StepRecord>(head))
+            .transpose()?;
+        let provider = LuaStepActionProvider::new(snapshot);
+        let action = provider
+            .step_action(&definition, run, &step, prev_record.as_ref())
+            .ok();
+        let (required_fields, optional_fields, body_expected) =
+            action_output_shape(action.as_ref());
+
+        let mut statuses = Vec::new();
+        for (status, target) in &step.transitions.by_status {
+            statuses.push(ResolutionStatus {
+                status: status.clone(),
+                target_step: Some(target.clone()),
+                required_fields: required_fields.clone(),
+                optional_fields: optional_fields.clone(),
+                body_expected,
+            });
+        }
+        if !step.transitions.by_status.contains_key("success") {
+            statuses.push(ResolutionStatus {
+                status: "success".to_string(),
+                target_step: None,
+                required_fields: required_fields.clone(),
+                optional_fields: optional_fields.clone(),
+                body_expected,
+            });
+        }
+
+        let failure_reason = match &run.status {
+            RunStatus::Failed { reason } => Some(reason.clone()),
+            _ => None,
+        };
+
+        Ok(ResolutionOptions {
+            run_id: run.id.clone(),
+            failed_step,
+            failure_reason,
+            statuses,
+        })
+    }
+
+    /// Manually resolve a failed run by synthesizing a completed step record for
+    /// the failed step with the chosen `status`, then route and continue the run.
+    pub async fn resolve_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        fields: Option<Value>,
+        body: Option<String>,
+    ) -> Result<RunReport> {
+        tracing::info!(run_id, status, "resolving failed workflow run");
+        let _run_guard = self.run_locks.acquire(run_id)?;
+        let store = self.store()?;
+        let mut run = store.load_run(&run_id.to_string())?;
+        ensure_resolvable(&run)?;
+
+        let options = self.build_resolution_options(&run, &store)?;
+        let Some(chosen) = options.statuses.iter().find(|s| s.status == status) else {
+            return Err(WorkflowError::InvalidAction(format!(
+                "status {status:?} cannot resolve step {:?}. {}",
+                run.current_step,
+                describe_resolution_options(&options)
+            )));
+        };
+
+        let fields_value = fields.unwrap_or(Value::Null);
+        let missing: Vec<String> = chosen
+            .required_fields
+            .iter()
+            .filter(|field| !field_present(&fields_value, field))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(WorkflowError::InvalidAction(format!(
+                "status {status:?} requires field(s): {}. Provide them via --fields '<json object>'.",
+                missing.join(", ")
+            )));
+        }
+
+        let snapshot = snapshot_from_run(&run);
+        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        definition.name = run.workflow_name.clone();
+        definition.source_hash = run.workflow_hash.clone();
+
+        let record_id = format!("{}-{}", run.id, run.steps_executed.max(1));
+        let context = ExecutionContext {
+            run_id: run.id.clone(),
+            step_id: run.current_step.clone(),
+            step_record_id: record_id,
+            prev: run.head.clone(),
+            role: None,
+            attempt: 1,
+            retry_reason: None,
+        };
+        let ActionResult::Completed(record) = crate::StatusActionRunner.run(
+            StatusAction {
+                status: status.to_string(),
+                fields: fields_value,
+                body: body.unwrap_or_default(),
+            },
+            context,
+        ) else {
+            return Err(WorkflowError::InvalidAction(
+                "manual resolution did not produce a completed record".to_string(),
+            ));
+        };
+        let mut record = *record;
+        record.action = "manual_resolution".to_string();
+
+        let mut events = Vec::new();
+        let status_result = apply_step_record(&store, &definition, &mut run, record.clone())?;
+        events.push(WorkflowEvent::step_completed_for_run(&run, &record));
+        events.push(WorkflowEvent::for_run(
+            &run,
+            WorkflowEventKind::ManuallyResolved {
+                step_id: record.step.clone(),
+                status: status.to_string(),
+            },
+        ));
+        events.push(WorkflowEvent::run_status_for_run(&run, &status_result));
+        for event in &events {
+            self.events.emit(event.clone());
+        }
+
+        if matches!(status_result, RunStatus::Running) {
             self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, events)
                 .await
         } else {
@@ -680,6 +884,63 @@ fn transport_for(agent: &AgentRuntimeConfig) -> TransportConfig {
     })
 }
 
+/// A run can be manually resolved only when it is stopped on a step, i.e. it is
+/// `Failed` (after giving up) or still `Running` on the failed step.
+fn ensure_resolvable(run: &WorkflowRun) -> Result<()> {
+    if matches!(run.status, RunStatus::Failed { .. } | RunStatus::Running) {
+        Ok(())
+    } else {
+        Err(WorkflowError::InvalidAction(format!(
+            "run {} is {:?}; only failed runs can be resolved",
+            run.id, run.status
+        )))
+    }
+}
+
+/// Derive the required/optional output fields and body expectation for a step's
+/// recomputed action. Agent actions expose their declared `OutputSpec` fields as
+/// required information for manual resolution.
+fn action_output_shape(action: Option<&StepAction>) -> (Vec<String>, Vec<String>, bool) {
+    match action {
+        Some(StepAction::Agent(agent)) => {
+            let fields = agent
+                .output
+                .as_ref()
+                .and_then(|output| output.fields.as_object())
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            (fields, Vec::new(), true)
+        }
+        _ => (Vec::new(), Vec::new(), true),
+    }
+}
+
+/// Whether `field` is present and non-null in a supplied `--fields` value.
+fn field_present(fields: &Value, field: &str) -> bool {
+    fields
+        .as_object()
+        .and_then(|map| map.get(field))
+        .map(|value| !value.is_null())
+        .unwrap_or(false)
+}
+
+/// Human-readable list of valid statuses and their required fields for errors.
+fn describe_resolution_options(options: &ResolutionOptions) -> String {
+    let mut parts = Vec::new();
+    for status in &options.statuses {
+        if status.required_fields.is_empty() {
+            parts.push(status.status.clone());
+        } else {
+            parts.push(format!(
+                "{} (requires: {})",
+                status.status,
+                status.required_fields.join(", ")
+            ));
+        }
+    }
+    format!("Valid statuses: {}", parts.join("; "))
+}
+
 #[async_trait]
 impl ClientFactory for AcpClientFactory {
     async fn create_client(
@@ -783,6 +1044,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector()
@@ -805,13 +1067,139 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector();
 
         let err = runtime.start_run("do it").await.unwrap_err();
-        assert!(matches!(err, WorkflowError::InvalidAction(_)));
+        // A missing agent command surfaces as a transient (recoverable) client
+        // error; the runner retries it and gives up with a recoverable error.
+        assert!(matches!(err, WorkflowError::RecoverableAction(_)));
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        // The give-up path persists a clean Failed status for later resolution.
+        let run = runtime.load_run(&runtime.list_runs().unwrap()[0].run_id).unwrap();
+        assert!(matches!(run.status, RunStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn resolution_options_discovers_statuses_and_required_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![agent("default", "definitely-missing-agent")],
+        );
+
+        // Fails on the agent step and persists a resolvable Failed run.
+        runtime.start_run("do it").await.unwrap_err();
+        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+
+        let options = runtime.resolution_options(&run_id).unwrap();
+        assert_eq!(options.failed_step, "start");
+        assert!(options.failure_reason.is_some());
+        // The step has no transitions, so only the implicit `success` is offered.
+        let success = options
+            .statuses
+            .iter()
+            .find(|s| s.status == "success")
+            .expect("success option");
+        // Required fields are recovered from the agent action's OutputSpec.
+        assert_eq!(success.required_fields, vec!["summary".to_string()]);
+
+        // Resolving without the required field is a clear, actionable error.
+        let err = runtime
+            .resolve_run(&run_id, "success", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("summary"), "{err}");
+
+        // An unroutable status lists the valid options.
+        let err = runtime
+            .resolve_run(&run_id, "nope", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Valid statuses"), "{err}");
+        assert!(err.to_string().contains("success"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn resolve_run_routes_and_exposes_fields_to_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "planned" }, fields = { summary = "string" } }
+              }
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              local prev = ctx.prev or {}
+              local fields = prev.fields or {}
+              return action.status {
+                status = "success",
+                fields = { prev_status = prev.status, summary = fields.summary },
+                body = tostring(prev.body)
+              }
+            end
+            start:on("planned", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "definitely-missing-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                max_retries_per_step: 2,
+            },
+        })
+        .with_deterministic_selector();
+
+        runtime.start_run("do it").await.unwrap_err();
+        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+
+        // "planned" routes to `finish`; supply the required field and a body.
+        let report = runtime
+            .resolve_run(
+                &run_id,
+                "planned",
+                Some(serde_json::json!({ "summary": "did the thing" })),
+                Some("manual body".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let head = report.run.head.as_ref().expect("final head");
+        let store = runtime.store().unwrap();
+        let record = store.get_object::<StepRecord>(head).unwrap();
+        let output = record.output.expect("finish output");
+        // The synthesized fields/body are visible to the next step via ctx.prev.
+        assert_eq!(output.fields["prev_status"], "planned");
+        assert_eq!(output.fields["summary"], "did the thing");
+        assert_eq!(output.body, "manual body");
+
+        // A ManuallyResolved event is persisted in the run's event log.
+        let events = runtime.load_events(&run_id).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, WorkflowEventKind::ManuallyResolved { .. }))
+        );
     }
 
     #[tokio::test]
@@ -896,6 +1284,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector();
@@ -933,6 +1322,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         };
         let runtime_a = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
@@ -969,6 +1359,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector();
@@ -1020,6 +1411,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         };
         let runtime = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
@@ -1081,6 +1473,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector();
@@ -1156,6 +1549,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         })
         .with_deterministic_selector();
@@ -1852,6 +2246,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         });
 
@@ -1921,6 +2316,7 @@ mod tests {
             limits: RunnerLimitsConfig {
                 max_steps_per_run: 5,
                 max_visits_per_step: 5,
+                max_retries_per_step: 2,
             },
         });
         assert!(runtime.list_runs().unwrap().is_empty());

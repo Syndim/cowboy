@@ -13,6 +13,27 @@ pub fn build_agent_prompt(role: &RoleDefinition, action: &AgentAction) -> String
     parts.join("\n\n")
 }
 
+/// Build a corrective instruction appended to a retry prompt after a
+/// frontmatter/parse failure. Reuses the required-frontmatter description so the
+/// agent re-emits its already-completed work with a valid frontmatter block.
+pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
+    let mut nudge = String::from(
+        "## Retry\n\nYour previous response could not be parsed as a workflow result",
+    );
+    if let Some(reason) = reason {
+        nudge.push_str(&format!(" ({reason})"));
+    }
+    nudge.push_str(
+        ".\n\nDo not redo the work. Re-emit your result now, and make sure the response \
+BEGINS with a valid YAML frontmatter block containing a `status` field.",
+    );
+    if let Some(output) = &action.output {
+        nudge.push_str("\n\n");
+        nudge.push_str(&build_output_instruction(output));
+    }
+    nudge
+}
+
 fn build_output_instruction(output: &OutputSpec) -> String {
     let statuses = if output.statuses.is_empty() {
         "Any status required by the workflow.".to_string()
@@ -73,5 +94,23 @@ mod tests {
         assert!(prompt.contains("valid YAML frontmatter"));
         assert!(prompt.contains("success, failed"));
         assert!(prompt.contains("summary"));
+    }
+
+    #[test]
+    fn retry_nudge_includes_reason_and_frontmatter_instruction() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: Some(OutputSpec {
+                statuses: vec!["success".into()],
+                fields: serde_json::json!({"summary": "string"}),
+            }),
+        };
+        let nudge = build_retry_nudge(&action, Some("missing YAML frontmatter"));
+        assert!(nudge.contains("Retry"));
+        assert!(nudge.contains("missing YAML frontmatter"));
+        assert!(nudge.contains("YAML frontmatter"));
+        assert!(nudge.contains("status"));
+        assert!(nudge.contains("Do not redo the work"));
     }
 }

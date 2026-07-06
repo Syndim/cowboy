@@ -36,4 +36,40 @@ pub enum WorkflowError {
     UnknownRuntimeTransition { step: StepId, status: Status },
     #[error("invalid action: {0}")]
     InvalidAction(String),
+    #[error("recoverable action failure: {0}")]
+    RecoverableAction(String),
+}
+
+impl WorkflowError {
+    /// Whether the runner should retry the current step for this failure.
+    ///
+    /// Only [`WorkflowError::RecoverableAction`] is retryable; graph/definition
+    /// and generic invalid-action errors are terminal.
+    pub fn recoverable(&self) -> bool {
+        matches!(self, WorkflowError::RecoverableAction(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_recoverable_action_is_recoverable() {
+        assert!(WorkflowError::RecoverableAction("nudge me".to_string()).recoverable());
+        assert!(!WorkflowError::InvalidAction("bad".to_string()).recoverable());
+        assert!(
+            !WorkflowError::UnknownStep {
+                step: "plan".to_string()
+            }
+            .recoverable()
+        );
+        assert!(
+            !WorkflowError::UnknownRuntimeTransition {
+                step: "plan".to_string(),
+                status: "weird".to_string()
+            }
+            .recoverable()
+        );
+    }
 }

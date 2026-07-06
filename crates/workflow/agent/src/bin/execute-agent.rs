@@ -62,6 +62,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     agent: None,
                     properties: serde_json::Value::Null,
                 }),
+                attempt: 1,
+                retry_reason: None,
             },
         )
         .await?;

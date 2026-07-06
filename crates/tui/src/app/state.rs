@@ -626,6 +626,15 @@ impl AppState {
             WorkflowEventKind::StepCompleted { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
             }
+            WorkflowEventKind::StepRetrying { step_id, .. } => {
+                self.current_step = Some(step_id.clone());
+                self.run_state = "retrying".to_string();
+            }
+            WorkflowEventKind::ManuallyResolved { step_id, .. } => {
+                self.current_step = Some(step_id.clone());
+                self.run_state = "running".to_string();
+                self.pending_prompt = None;
+            }
             WorkflowEventKind::RunCompleted => {
                 self.run_state = "completed".to_string();
                 self.pending_prompt = None;

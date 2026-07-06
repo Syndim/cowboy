@@ -38,8 +38,14 @@ cowboy run <request...>                 # start a run; --step runs only the firs
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
+cowboy resolve <run-id>                 # list statuses a failed run can resolve to
+cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 ```
+
+Recoverable step failures (missing agent frontmatter, transient backend errors)
+are auto-retried up to `max_retries_per_step` before a run gives up as `Failed`;
+the failed step stays current so `cowboy resolve` can continue the run.
 
 ## TUI Interface
 
@@ -51,6 +57,8 @@ Built-in slash commands:
 ```text
 /run <request>
 /improve <run-id>
+/resolve <run-id>
+/resolve <run-id> <status>
 /runs
 /workflows
 /help
@@ -138,8 +146,8 @@ Owns:
 
 Important modules:
 
-- `runtime.rs` — `WorkflowRuntime`, runtime config, start/resume/step/answer/improve/list operations, catalog/store/Lua/agent wiring, and event-log persistence.
-- `runner.rs` — `WorkflowRunner<S, E, P>` over `cowboy-workflow-core::execute_step`; `LuaStepActionProvider` builds Lua `ctx`, including `ctx.prev` from the latest completed step.
+- `runtime.rs` — `WorkflowRuntime`, runtime config, start/resume/step/answer/improve/resolve/list operations, recoverable-retry give-up persistence, catalog/store/Lua/agent wiring, and event-log persistence.
+- `runner.rs` — `WorkflowRunner<S, E, P>` over `cowboy-workflow-core::execute_step`; owns the bounded recoverable-retry loop (`max_retries_per_step`) and persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`, including `ctx.prev` from the latest completed step.
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `InputRouter` for `RunStatus::WaitingForInput` answers.
 - `workflow.rs` — deterministic/agent selectors and agent summarizer.
@@ -330,6 +338,24 @@ cowboy answer <run-id> <prompt-id> <answer>
   -> runtime resumes same step with ctx.resume populated
 ```
 
+### Retry / resolve
+
+```text
+Recoverable step failure (e.g. MissingFrontmatter, transient Client error)
+  -> WorkflowRunner retries the current step up to max_retries_per_step
+       (budget-safe: retries don't consume max_visits_per_step)
+       (agent retries append a corrective frontmatter nudge, reusing the session)
+  -> on success: run continues
+  -> on give-up: run persisted RunStatus::Failed { reason }, current_step retained
+
+cowboy resolve <run-id>                 # list resolvable statuses + required fields
+cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]
+  -> WorkflowRuntime::resolution_options recomputes the failed step's action
+       (via LuaStepActionProvider) to recover valid statuses + OutputSpec fields
+  -> resolve_run validates status routes via next_step and required fields present
+  -> synthesizes a completed StepRecord, flips to Running, and continues
+```
+
 ## Configuration
 
 Example `~/.config/cowboy/config.toml`:
@@ -340,6 +366,7 @@ workflow_store = "~/.local/state/cowboy/workflow.redb"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 max_steps_per_run = 100
 max_visits_per_step = 20
+max_retries_per_step = 2
 
 [[agents]]
 name = "default"

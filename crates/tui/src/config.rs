@@ -17,6 +17,9 @@ pub struct AppConfig {
     pub max_steps_per_run: u32,
     /// Maximum visits to one workflow step in a single run.
     pub max_visits_per_step: u32,
+    /// Maximum recoverable retries for a single workflow step attempt.
+    #[serde(default = "default_max_retries_per_step")]
+    pub max_retries_per_step: u32,
     /// Additional workflow roots scanned for `.lua` workflows.
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
@@ -60,6 +63,10 @@ fn default_agents() -> Vec<AgentConfig> {
     vec![AgentConfig::default()]
 }
 
+fn default_max_retries_per_step() -> u32 {
+    2
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
@@ -84,6 +91,7 @@ impl Default for AppConfig {
             state_dir,
             max_steps_per_run: 100,
             max_visits_per_step: 20,
+            max_retries_per_step: default_max_retries_per_step(),
             workflow_dirs: vec![config_root().join("workflows")],
             agents: default_agents(),
         }
@@ -170,6 +178,7 @@ impl AppConfig {
             RunnerLimitsConfig {
                 max_steps_per_run: self.max_steps_per_run,
                 max_visits_per_step: self.max_visits_per_step,
+                max_retries_per_step: self.max_retries_per_step,
             },
         )
     }

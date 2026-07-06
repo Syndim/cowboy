@@ -231,6 +231,35 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
                 vec![("run", event.run_id.as_str(), style_transcript_metadata())],
             ));
         }
+        WorkflowEventKind::StepRetrying {
+            step_id,
+            attempt,
+            max_attempts,
+            reason,
+        } => {
+            let attempt_label = format!("{attempt}/{max_attempts}");
+            lines.push(header_line(
+                &stamp,
+                "Step retrying",
+                style_warning(),
+                vec![
+                    ("step", step_id.as_str(), style_accent()),
+                    ("attempt", attempt_label.as_str(), style_warning()),
+                ],
+            ));
+            push_body(&mut lines, reason, usize::MAX, style_transcript_metadata());
+        }
+        WorkflowEventKind::ManuallyResolved { step_id, status } => {
+            lines.push(header_line(
+                &stamp,
+                "Manually resolved",
+                style_success(),
+                vec![
+                    ("step", step_id.as_str(), style_accent()),
+                    ("status", status.as_str(), style_for_run_state(status)),
+                ],
+            ));
+        }
         WorkflowEventKind::RunFailed { reason } => {
             lines.push(header_line(
                 &stamp,
@@ -241,9 +270,15 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             lines.push(Line::from(""));
             lines.push(metadata_line("Next action"));
             lines.push(Line::from(vec![
-                Span::styled("Review the failure, then run ", style_transcript_metadata()),
-                Span::styled("/runs", style_transcript_prompt()),
-                Span::styled(" or start a new request.", style_transcript_metadata()),
+                Span::styled("List resolvable statuses with ", style_transcript_metadata()),
+                Span::styled(
+                    format!("/resolve {}", event.run_id),
+                    style_transcript_prompt(),
+                ),
+                Span::styled(
+                    ", then resolve with /resolve <run> <status>.",
+                    style_transcript_metadata(),
+                ),
             ]));
         }
         WorkflowEventKind::RunCancelled => {

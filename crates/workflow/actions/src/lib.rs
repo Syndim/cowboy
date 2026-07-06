@@ -135,6 +135,8 @@ mod tests {
             step_record_id: "record".to_string(),
             prev: Some("prev-hash".to_string()),
             role: None,
+            attempt: 1,
+            retry_reason: None,
         }
     }
 

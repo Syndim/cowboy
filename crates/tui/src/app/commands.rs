@@ -57,6 +57,12 @@ pub(super) const SLASH_COMMANDS: &[SlashCommand] = &[
         takes_arguments: true,
     },
     SlashCommand {
+        name: "/resolve",
+        usage: "/resolve <run> [status]",
+        description: "list or resolve a failed step",
+        takes_arguments: true,
+    },
+    SlashCommand {
         name: "/cancel",
         usage: "/cancel",
         description: "cancel active background tasks",
@@ -146,6 +152,8 @@ async fn dispatch_submitted_input(
         state.cancel_background_tasks();
     } else if let Some(rest) = input.strip_prefix("/improve ") {
         improve_run(state, runtime, rest.trim()).await?;
+    } else if let Some(rest) = input.strip_prefix("/resolve ") {
+        resolve_run(state, runtime, rest.trim()).await?;
     } else if input == "/exit" {
         state.mark_exit_requested();
         state.set_status("exiting");
@@ -237,6 +245,65 @@ async fn improve_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: &s
     state.set_status(format!("improvement={applied:?}"));
     state.push_card("Improve", [state.status().to_string()]);
     Ok(())
+}
+
+async fn resolve_run(state: &mut AppState, runtime: &WorkflowRuntime, rest: &str) -> Result<()> {
+    let mut parts = rest.splitn(3, ' ');
+    let Some(run_id) = parts.next().filter(|id| !id.is_empty()) else {
+        state.set_status("usage: /resolve <run-id> [status] [fields-json]");
+        state.push_card("Usage", [state.status().to_string()]);
+        return Ok(());
+    };
+    let status = parts.next().map(str::to_string);
+    let fields_raw = parts.next().map(str::to_string);
+
+    match status {
+        None => {
+            let options = runtime.resolution_options(run_id)?;
+            state.set_status(format!("resolve options for {}", options.run_id));
+            let mut details = vec![
+                format!("failed step: {}", options.failed_step),
+                format!(
+                    "reason: {}",
+                    options.failure_reason.as_deref().unwrap_or("<none>")
+                ),
+                "resolvable statuses:".to_string(),
+            ];
+            for status in &options.statuses {
+                let target = status.target_step.as_deref().unwrap_or("<run completes>");
+                details.push(format!(
+                    "  {} -> {} required=[{}]",
+                    status.status,
+                    target,
+                    status.required_fields.join(", ")
+                ));
+            }
+            details.push(format!(
+                "resolve with: cowboy resolve {} <status> [--fields '<json>']",
+                options.run_id
+            ));
+            state.push_card("Resolve", details);
+            Ok(())
+        }
+        Some(status) => {
+            let fields = match fields_raw {
+                Some(raw) => Some(
+                    serde_json::from_str(&raw)
+                        .map_err(|err| anyhow::anyhow!("invalid fields JSON: {err}"))?,
+                ),
+                None => None,
+            };
+            let runtime = runtime.clone();
+            let run_id = run_id.to_string();
+            state.spawn_report_task(format!("submitted resolve: {run_id} {status}"), async move {
+                runtime
+                    .resolve_run(&run_id, &status, fields, None)
+                    .await
+                    .map_err(|err| err.to_string())
+            });
+            Ok(())
+        }
+    }
 }
 
 pub(in crate::app) fn show_help(state: &mut AppState) {
