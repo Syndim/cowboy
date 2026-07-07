@@ -256,29 +256,34 @@ name = "default"
 command = "copilot"
 args = ["--acp"]
 [agents.model]
-id = "claude-sonnet-4.5"
-provider = "anthropic"
+id = "opus-4.8-1m"
+provider = "github-copilot"
 
 [[agents]]
-name = "planner"
-command = "planner-agent"
-args = ["--stdio"]
-model = { id = "planner-model", provider = "anthropic" }
+name = "reviewer"
+command = "copilot"
+args = ["--acp"]
+model = { id = "gpt-5.5-1m", provider = "github-copilot" }
 "#,
         )
         .unwrap();
 
         let config = load_config(&path).unwrap();
         assert_eq!(config.agents.len(), 2);
-        assert_eq!(config.agents[1].name, "planner");
-        assert_eq!(config.agents[1].model.id, "planner-model");
+        assert_eq!(config.agents[0].name, "default");
+        assert_eq!(config.agents[0].model.id, "opus-4.8-1m");
+        assert_eq!(config.agents[0].model.provider.as_deref(), Some("github-copilot"));
+        assert_eq!(config.agents[1].name, "reviewer");
+        assert_eq!(config.agents[1].model.id, "gpt-5.5-1m");
+        assert_eq!(config.agents[1].model.provider.as_deref(), Some("github-copilot"));
 
         let runtime = config.runtime_config(dir.path().to_path_buf());
         assert_eq!(runtime.agents.len(), 2);
         assert_eq!(runtime.agents[0].name, "default");
-        assert_eq!(runtime.agents[1].name, "planner");
-        assert_eq!(runtime.agents[1].command, "planner-agent");
-        assert_eq!(runtime.agents[1].model.id, "planner-model");
+        assert_eq!(runtime.agents[0].model.id, "opus-4.8-1m");
+        assert_eq!(runtime.agents[1].name, "reviewer");
+        assert_eq!(runtime.agents[1].command, "copilot");
+        assert_eq!(runtime.agents[1].model.id, "gpt-5.5-1m");
     }
 
     #[test]

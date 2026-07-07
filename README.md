@@ -184,8 +184,17 @@ command = "copilot"
 args = ["--acp"]
 
 [agents.model]
-id = "claude-sonnet-4.5"
-provider = "anthropic"
+id = "opus-4.8-1m"
+provider = "github-copilot"
+
+[[agents]]
+name = "reviewer"
+command = "copilot"
+args = ["--acp"]
+
+[agents.model]
+id = "gpt-5.5-1m"
+provider = "github-copilot"
 ```
 
 Any ACP-compatible coding-agent CLI can be used by changing an `[[agents]]` entry's `command` and `args`. Roles may select a named agent with `agent = "name"`.

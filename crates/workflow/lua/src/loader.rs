@@ -103,6 +103,68 @@ mod tests {
         }
     }
 
+    fn load_example_workflow(name: &str) -> WorkflowDefinition {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows");
+        let source = WorkflowSourceRef {
+            id: name.into(),
+            root: Some(root.to_string_lossy().into_owned()),
+            entry: format!("workflows/{name}.lua"),
+            description: None,
+        };
+
+        load(&source).unwrap().definition
+    }
+
+    fn assert_expected_role_agents(
+        workflow_name: &str,
+        definition: &WorkflowDefinition,
+        expected_agents: &[(&str, &str)],
+    ) {
+        for (role_name, expected_agent) in expected_agents {
+            let role = definition.roles.get(*role_name).unwrap_or_else(|| {
+                panic!("{workflow_name} workflow should include {role_name} role")
+            });
+
+            assert_eq!(
+                role.agent.as_deref(),
+                Some(*expected_agent),
+                "{workflow_name} {role_name} role should use the expected agent"
+            );
+            assert!(
+                !role.instructions.trim().is_empty(),
+                "{workflow_name} {role_name} role should have instructions"
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_use_expected_named_agents() {
+        let feature = load_example_workflow("feature");
+        assert_expected_role_agents(
+            "feature",
+            &feature,
+            &[
+                ("planner", "default"),
+                ("implementer", "default"),
+                ("reviewer", "reviewer"),
+            ],
+        );
+
+        let bugfix = load_example_workflow("bugfix");
+        assert_expected_role_agents(
+            "bugfix",
+            &bugfix,
+            &[
+                ("investigator", "default"),
+                ("planner", "default"),
+                ("implementer", "default"),
+                ("reviewer", "reviewer"),
+            ],
+        );
+    }
+
     #[test]
     fn compiles_roles_steps_and_transitions() {
         let source = snapshot(
