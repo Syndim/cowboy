@@ -270,7 +270,10 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             lines.push(Line::from(""));
             lines.push(metadata_line("Next action"));
             lines.push(Line::from(vec![
-                Span::styled("List resolvable statuses with ", style_transcript_metadata()),
+                Span::styled(
+                    "List resolvable statuses with ",
+                    style_transcript_metadata(),
+                ),
                 Span::styled(
                     format!("/resolve {}", event.run_id),
                     style_transcript_prompt(),

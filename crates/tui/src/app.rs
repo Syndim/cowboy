@@ -239,8 +239,10 @@ where
         match event {
             Event::Paste(text) => {
                 tracing::debug!(chars = text.chars().count(), "TUI paste received");
-                state.push_input(&text);
-                draw_scheduler.mark_dirty();
+                if state.composer_enabled() {
+                    state.push_input(&text);
+                    draw_scheduler.mark_dirty();
+                }
             }
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 tracing::trace!(

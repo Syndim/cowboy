@@ -23,7 +23,12 @@ pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_wi
         .wrap(Wrap { trim: false })
         .line_count(input_content_width(composer_width) as u16)
         .max(1);
-    let wanted = (input_rows + slash_suggestion_line_count(state.input()) + 2).clamp(3, 12) as u16;
+    let suggestion_rows = if state.composer_enabled() {
+        slash_suggestion_line_count(state.input())
+    } else {
+        0
+    };
+    let wanted = (input_rows + suggestion_rows + 2).clamp(3, 12) as u16;
     let max_available = terminal_height.saturating_sub(3).max(3);
     wanted.min(max_available)
 }
@@ -39,11 +44,15 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
             .border_style(style_border_accent()),
     );
     frame.render_widget(composer, area);
-    set_input_cursor(frame, area, visible_height, &rendered);
+    if state.composer_enabled() {
+        set_input_cursor(frame, area, visible_height, &rendered);
+    }
 }
 
 pub(in crate::app) fn title(state: &AppState) -> String {
-    if state.pending_prompt().is_some() {
+    if !state.composer_enabled() {
+        " Run active ─ input disabled ─ Esc cancels ".to_string()
+    } else if state.pending_prompt().is_some() {
         " Enter answers active prompt ─ Shift/Ctrl-Enter newline ".to_string()
     } else {
         " Enter submits ─ Shift/Ctrl-Enter newline ─ type / for commands ".to_string()
@@ -81,7 +90,11 @@ fn rendered_input(
     max_visible_lines: usize,
     content_width: usize,
 ) -> RenderedInput {
-    let suggestion_line_count = slash_suggestion_line_count(state.input());
+    let suggestion_line_count = if state.composer_enabled() {
+        slash_suggestion_line_count(state.input())
+    } else {
+        0
+    };
     let input_budget = max_visible_lines
         .saturating_sub(suggestion_line_count)
         .max(1);
@@ -261,7 +274,10 @@ fn append_slash_suggestions(
     lines: &mut Vec<Line<'static>>,
     max_visible_lines: usize,
 ) {
-    if slash_query(state.input()).is_none() || lines.len() >= max_visible_lines {
+    if !state.composer_enabled()
+        || slash_query(state.input()).is_none()
+        || lines.len() >= max_visible_lines
+    {
         return;
     }
 
@@ -312,6 +328,14 @@ mod tests {
             max_visits_per_step: 1,
             ..AppConfig::default()
         })
+    }
+
+    fn lock_composer_with_pending_task(state: &mut AppState) {
+        state.spawn_report_task("pending".to_string(), async {
+            std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+                .await
+        });
+        assert!(!state.composer_enabled());
     }
 
     #[test]
@@ -373,6 +397,32 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("No matching command. Try /help."));
+    }
+
+    #[tokio::test]
+    async fn disabled_composer_uses_locked_title_and_hides_slash_suggestions() {
+        let mut state = test_state();
+        state.push_input("/");
+        let enabled = lines(&state, 12, 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(enabled.contains("slash command suggestions"));
+
+        lock_composer_with_pending_task(&mut state);
+
+        let rendered = lines(&state, 12, 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(title(&state), " Run active ─ input disabled ─ Esc cancels ");
+        assert!(rendered.contains("> /"));
+        assert!(!rendered.contains("slash command suggestions"));
+        assert!(!rendered.contains("/resume [run-id]"));
+        state.cancel_background_tasks();
     }
 
     #[test]

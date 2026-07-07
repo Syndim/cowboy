@@ -347,6 +347,112 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
     );
 }
 
+#[tokio::test]
+async fn draw_locked_composer_shows_disabled_copy_without_slash_suggestions() {
+    let mut state = test_state();
+    state.push_input("/");
+    state.spawn_report_task("pending".to_string(), async {
+        std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+            .await
+    });
+
+    let rows = rendered_rows(&state, 100, 14);
+    let rendered = rows.join("\n");
+
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("Run active") && row.contains("input disabled")),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("input disabled while run active"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("> /"), "{rendered}");
+    assert!(
+        !rendered.contains("slash command suggestions"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("/resume [run-id]"), "{rendered}");
+    state.cancel_background_tasks();
+}
+
+#[tokio::test]
+async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let workflow_dir = dir.path().join("workflows");
+    std::fs::create_dir(&workflow_dir).unwrap();
+    std::fs::write(
+        workflow_dir.join("ask.lua"),
+        r#"
+        local confirm = step("confirm")
+        confirm.run = function(ctx)
+          return action.ask_user {
+            id = "approval",
+            message = "Approve?",
+            choices = { "yes", "no" },
+          }
+        end
+
+        local done = step("done")
+        done.run = function(ctx)
+          local fields = (ctx.prev and ctx.prev.fields) or {}
+          return action.status { status = "success", body = "answer=" .. tostring(fields.answer) }
+        end
+
+        confirm:on("answered", done)
+        return workflow("ask", confirm)
+        "#,
+    )
+    .unwrap();
+    let config = AppConfig {
+        state_dir: dir.path().join("state"),
+        workflow_store: dir.path().join("state/workflow.redb"),
+        workflow_dirs: vec![workflow_dir],
+        max_steps_per_run: 5,
+        max_visits_per_step: 5,
+        ..AppConfig::default()
+    };
+    let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+        .with_deterministic_selector();
+    let start = runtime
+        .start_run_with_workflow("ask", "needs approval")
+        .await
+        .unwrap();
+    let run_id = start.run.id.clone();
+    assert!(start.events.iter().any(|event| matches!(
+        &event.kind,
+        WorkflowEventKind::WaitingForInput { prompt_id, .. } if prompt_id == "approval"
+    )));
+    let mut state = AppState::new(config);
+    state.spawn_report_task("seed waiting run".to_string(), async move { Ok(start) });
+    tokio::task::yield_now().await;
+    assert!(state.drain_background_tasks().await);
+    assert_eq!(
+        state.pending_prompt_answer_target(),
+        Some((run_id.clone(), "approval".to_string()))
+    );
+    assert!(state.composer_enabled());
+
+    state.push_input("yes");
+    commands::submit_input(&mut state, &runtime).await;
+
+    assert_eq!(state.input(), "");
+    assert!(state.pending_prompt().is_none());
+    assert_eq!(
+        state.status(),
+        format!("submitted answer: {run_id} approval")
+    );
+    assert_eq!(state.background_task_count(), 1);
+    assert!(!state.composer_enabled());
+
+    tokio::task::yield_now().await;
+    assert!(state.drain_background_tasks().await);
+    assert_eq!(state.background_task_count(), 0);
+    assert_eq!(state.display_state(), "completed");
+    assert!(state.composer_enabled());
+}
+
 #[test]
 fn draw_scheduler_draws_first_frame_then_stays_clean_until_dirty() {
     let mut scheduler = DrawScheduler::new();

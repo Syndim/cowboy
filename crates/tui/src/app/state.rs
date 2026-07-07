@@ -282,6 +282,10 @@ impl AppState {
         self.pending_prompt.as_ref()
     }
 
+    pub(in crate::app) fn composer_enabled(&self) -> bool {
+        self.pending_prompt.is_some() || self.background.is_empty()
+    }
+
     pub(in crate::app) fn display_state(&self) -> String {
         if self.pending_prompt.is_some() {
             "waiting".to_string()
@@ -437,10 +441,13 @@ impl AppState {
             self.push_card("Notice", [self.status.clone()]);
             return;
         }
+
+        let cancelled = self.background.len();
         for task in &self.background {
             task.abort();
         }
-        self.status = format!("cancelled {} background task(s)", self.background.len());
+        self.background.clear();
+        self.status = format!("cancelled {cancelled} background task(s)");
         self.run_state = "cancelled".to_string();
         self.push_card("Cancelled", [self.status.clone()]);
     }
@@ -730,6 +737,12 @@ mod tests {
         })
     }
 
+    fn spawn_pending_report_task(state: &mut AppState) {
+        state.spawn_report_task("pending".to_string(), async {
+            std::future::pending::<std::result::Result<RunReport, String>>().await
+        });
+    }
+
     #[test]
     fn consecutive_agent_response_chunks_append_to_current_transcript_entry() {
         let mut state = test_state();
@@ -917,6 +930,44 @@ mod tests {
 
         assert!(!state.drain_background_tasks().await);
         assert_eq!(state.background_task_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn composer_enabled_tracks_background_prompt_and_cancel_transitions() {
+        let mut state = test_state();
+        assert!(state.composer_enabled());
+
+        spawn_pending_report_task(&mut state);
+        assert!(!state.composer_enabled());
+
+        state.cancel_background_tasks();
+        assert_eq!(state.background_task_count(), 0);
+        assert!(state.composer_enabled());
+
+        let mut waiting_state = test_state();
+        spawn_pending_report_task(&mut waiting_state);
+        assert!(!waiting_state.composer_enabled());
+
+        waiting_state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "approve".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["yes".to_string(), "no".to_string()],
+            },
+        ));
+
+        assert_eq!(waiting_state.display_state(), "waiting");
+        assert_eq!(
+            waiting_state.pending_prompt_answer_target(),
+            Some(("run-1".to_string(), "approval".to_string()))
+        );
+        assert!(waiting_state.composer_enabled());
+
+        waiting_state.cancel_background_tasks();
+        assert_eq!(waiting_state.background_task_count(), 0);
+        assert!(waiting_state.composer_enabled());
     }
 
     #[tokio::test]

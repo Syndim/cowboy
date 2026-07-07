@@ -17,6 +17,19 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
             state.cancel_background_tasks();
             KeyHandling::Continue
         }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.scroll_events_up();
+            KeyHandling::Continue
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.scroll_events_down();
+            KeyHandling::Continue
+        }
+        KeyCode::End => {
+            state.follow_latest();
+            KeyHandling::Continue
+        }
+        _ if !state.composer_enabled() => KeyHandling::Continue,
         KeyCode::Enter
             if key
                 .modifiers
@@ -40,18 +53,6 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
         }
         KeyCode::Down => {
             state.history_next();
-            KeyHandling::Continue
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.scroll_events_up();
-            KeyHandling::Continue
-        }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.scroll_events_down();
-            KeyHandling::Continue
-        }
-        KeyCode::End => {
-            state.follow_latest();
             KeyHandling::Continue
         }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -104,6 +105,23 @@ mod tests {
             max_visits_per_step: 1,
             ..AppConfig::default()
         })
+    }
+
+    fn lock_composer_with_pending_task(state: &mut AppState) {
+        state.spawn_report_task("pending".to_string(), async {
+            std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+                .await
+        });
+        assert!(!state.composer_enabled());
+        assert!(state.pending_prompt().is_none());
+    }
+
+    fn seed_history(state: &mut AppState) {
+        state.push_input("from history");
+        assert_eq!(
+            state.take_submitted_input(),
+            Some("from history".to_string())
+        );
     }
 
     #[test]
@@ -300,9 +318,8 @@ mod tests {
     async fn esc_cancels_background_tasks_without_mutating_input() {
         let mut state = test_state();
         state.push_input("hello");
-        state.spawn_report_task("pending".to_string(), async {
-            std::future::pending::<Result<cowboy_workflow_engine::RunReport, String>>().await
-        });
+        lock_composer_with_pending_task(&mut state);
+        assert!(!state.composer_enabled());
 
         let handling =
             handle_key_press(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -310,6 +327,8 @@ mod tests {
         assert_eq!(handling, KeyHandling::Continue);
         assert_eq!(state.input(), "hello");
         assert_eq!(state.status(), "cancelled 1 background task(s)");
+        assert_eq!(state.background_task_count(), 0);
+        assert!(state.composer_enabled());
     }
 
     #[test]
@@ -362,6 +381,147 @@ mod tests {
 
     fn populate_scrollable_transcript(state: &mut AppState) {
         state.push_card("Transcript", (0..20).map(|index| format!("line {index}")));
+    }
+
+    #[tokio::test]
+    async fn locked_composer_ignores_submission_edits_navigation_and_history() {
+        let cases = [
+            (
+                "printable character",
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            ),
+            (
+                "plain enter",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            ),
+            (
+                "shift enter",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            ),
+            (
+                "control enter",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            ),
+            (
+                "control j",
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            ),
+            ("up", KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ("left", KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)),
+            ("right", KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            (
+                "control left",
+                KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL),
+            ),
+            (
+                "control right",
+                KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+            ),
+            (
+                "backspace",
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            ),
+            ("delete", KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+        ];
+
+        for (name, key) in cases {
+            let mut state = test_state();
+            seed_history(&mut state);
+            state.push_input("alpha beta");
+            state.set_input_cursor("alpha ".chars().count());
+            lock_composer_with_pending_task(&mut state);
+            let input = state.input().to_string();
+            let cursor = state.input_cursor();
+
+            let handling = handle_key_press(&mut state, key);
+
+            assert_eq!(handling, KeyHandling::Continue, "{name}");
+            assert_eq!(state.input(), input, "{name}");
+            assert_eq!(state.input_cursor(), cursor, "{name}");
+            assert_eq!(state.background_task_count(), 1, "{name}");
+            assert!(!state.composer_enabled(), "{name}");
+            state.cancel_background_tasks();
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_composer_ignores_tab_completion_and_history_down() {
+        let mut tab_state = test_state();
+        tab_state.push_input("/ru");
+        lock_composer_with_pending_task(&mut tab_state);
+
+        let handling = handle_key_press(
+            &mut tab_state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(tab_state.input(), "/ru");
+        assert_eq!(tab_state.input_cursor(), "/ru".chars().count());
+        assert!(!tab_state.composer_enabled());
+        tab_state.cancel_background_tasks();
+
+        let mut history_state = test_state();
+        seed_history(&mut history_state);
+        history_state.history_previous();
+        assert_eq!(history_state.input(), "from history");
+        let cursor = history_state.input_cursor();
+        lock_composer_with_pending_task(&mut history_state);
+
+        let handling = handle_key_press(
+            &mut history_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(history_state.input(), "from history");
+        assert_eq!(history_state.input_cursor(), cursor);
+        assert!(!history_state.composer_enabled());
+        history_state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn locked_composer_allows_scroll_follow_latest_and_exit_keys() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        state.push_input("draft");
+        lock_composer_with_pending_task(&mut state);
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(handling, KeyHandling::Continue);
+        assert!(state.scroll_offset() > 0);
+        assert_eq!(state.input(), "draft");
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+        assert_eq!(state.input(), "draft");
+
+        state.scroll_events_up();
+        assert!(state.scroll_offset() > 0);
+        let handling =
+            handle_key_press(&mut state, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+        assert_eq!(state.input(), "draft");
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(handling, KeyHandling::Exit);
+        assert_eq!(state.input(), "draft");
+        assert_eq!(state.background_task_count(), 1);
+        assert!(!state.composer_enabled());
+        state.cancel_background_tasks();
     }
 
     #[test]
