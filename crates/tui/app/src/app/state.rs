@@ -282,7 +282,11 @@ impl AppState {
         self.pending_prompt.as_ref()
     }
 
-    pub(in crate::app) fn composer_enabled(&self) -> bool {
+    pub(in crate::app) fn composer_accepts_edits(&self) -> bool {
+        true
+    }
+
+    pub(in crate::app) fn composer_accepts_submit(&self) -> bool {
         self.pending_prompt.is_some() || self.background.is_empty()
     }
 
@@ -933,20 +937,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composer_enabled_tracks_background_prompt_and_cancel_transitions() {
+    async fn composer_edit_and_submit_gates_track_background_prompt_and_terminal_states() {
         let mut state = test_state();
-        assert!(state.composer_enabled());
+        assert!(state.composer_accepts_edits());
+        assert!(state.composer_accepts_submit());
 
         spawn_pending_report_task(&mut state);
-        assert!(!state.composer_enabled());
+        assert!(state.composer_accepts_edits());
+        assert!(!state.composer_accepts_submit());
 
         state.cancel_background_tasks();
         assert_eq!(state.background_task_count(), 0);
-        assert!(state.composer_enabled());
+        assert!(state.composer_accepts_edits());
+        assert!(state.composer_accepts_submit());
 
         let mut waiting_state = test_state();
         spawn_pending_report_task(&mut waiting_state);
-        assert!(!waiting_state.composer_enabled());
+        assert!(waiting_state.composer_accepts_edits());
+        assert!(!waiting_state.composer_accepts_submit());
 
         waiting_state.apply_workflow_event(WorkflowEvent::new(
             "run-1",
@@ -963,11 +971,33 @@ mod tests {
             waiting_state.pending_prompt_answer_target(),
             Some(("run-1".to_string(), "approval".to_string()))
         );
-        assert!(waiting_state.composer_enabled());
+        assert!(waiting_state.composer_accepts_edits());
+        assert!(waiting_state.composer_accepts_submit());
 
         waiting_state.cancel_background_tasks();
         assert_eq!(waiting_state.background_task_count(), 0);
-        assert!(waiting_state.composer_enabled());
+        assert!(waiting_state.composer_accepts_submit());
+
+        let mut drained_state = test_state();
+        drained_state.spawn_report_task("finished".to_string(), async { Err("boom".to_string()) });
+        tokio::task::yield_now().await;
+        assert!(drained_state.drain_background_tasks().await);
+        assert_eq!(drained_state.background_task_count(), 0);
+        assert!(drained_state.composer_accepts_submit());
+
+        for kind in [
+            WorkflowEventKind::RunCompleted,
+            WorkflowEventKind::RunFailed {
+                reason: "boom".to_string(),
+            },
+            WorkflowEventKind::RunCancelled,
+        ] {
+            let mut terminal_state = test_state();
+            terminal_state.apply_workflow_event(WorkflowEvent::new("run-1", kind));
+            assert_eq!(terminal_state.background_task_count(), 0);
+            assert!(terminal_state.composer_accepts_edits());
+            assert!(terminal_state.composer_accepts_submit());
+        }
     }
 
     #[tokio::test]

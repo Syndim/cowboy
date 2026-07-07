@@ -139,6 +139,43 @@ fn draw_places_cursor_at_input_end() {
         .assert_cursor_position(Position::new(6, 8));
 }
 
+#[tokio::test]
+async fn draw_places_cursor_in_active_run_draft_input() {
+    let mut state = test_state();
+    state.push_input("abc");
+    state.spawn_report_task("pending".to_string(), async {
+        std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+            .await
+    });
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(6, 8));
+    state.cancel_background_tasks();
+}
+
+#[tokio::test]
+async fn paste_appends_to_active_run_draft_input() {
+    let mut state = test_state();
+    state.push_input("ad");
+    state.set_input_cursor(1);
+    state.spawn_report_task("pending".to_string(), async {
+        std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+            .await
+    });
+
+    state.push_input("bc");
+
+    assert_eq!(state.input(), "abcd");
+    assert_eq!(state.input_cursor(), 3);
+    assert_eq!(state.background_task_count(), 1);
+    state.cancel_background_tasks();
+}
+
 #[test]
 fn draw_places_cursor_at_moved_single_line_position() {
     let mut state = test_state();
@@ -351,7 +388,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
 }
 
 #[tokio::test]
-async fn draw_locked_composer_shows_disabled_copy_without_slash_suggestions() {
+async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
     let mut state = test_state();
     state.push_input("/");
     state.spawn_report_task("pending".to_string(), async {
@@ -364,15 +401,21 @@ async fn draw_locked_composer_shows_disabled_copy_without_slash_suggestions() {
 
     let title_row = rows
         .iter()
-        .find(|row| row.contains("Run active") && row.contains("Esc cancels"))
+        .find(|row| row.contains("Run active") && row.contains("Enter waits"))
         .unwrap_or_else(|| panic!("{rendered}"));
+    assert!(title_row.contains("type draft"), "{rendered}");
     assert!(!title_row.contains("input disabled"), "{rendered}");
+    assert!(rendered.contains("draft allowed"), "{rendered}");
     assert!(
-        rendered.contains("input disabled while run active"),
+        rendered.contains("Enter waits for active run"),
         "{rendered}"
     );
     assert!(
-        rendered.contains("Input disabled while run active. Press Esc to cancel."),
+        !rendered.contains("input disabled while run active"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("Input disabled while run active. Press Esc to cancel."),
         "{rendered}"
     );
     assert!(rendered.contains("> /"), "{rendered}");
@@ -439,7 +482,8 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         state.pending_prompt_answer_target(),
         Some((run_id.clone(), "approval".to_string()))
     );
-    assert!(state.composer_enabled());
+    assert!(state.composer_accepts_edits());
+    assert!(state.composer_accepts_submit());
 
     state.push_input("yes");
     commands::submit_input(&mut state, &runtime).await;
@@ -451,13 +495,14 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         format!("submitted answer: {run_id} approval")
     );
     assert_eq!(state.background_task_count(), 1);
-    assert!(!state.composer_enabled());
+    assert!(state.composer_accepts_edits());
+    assert!(!state.composer_accepts_submit());
 
     tokio::task::yield_now().await;
     assert!(state.drain_background_tasks().await);
     assert_eq!(state.background_task_count(), 0);
     assert_eq!(state.display_state(), "completed");
-    assert!(state.composer_enabled());
+    assert!(state.composer_accepts_submit());
 }
 
 #[test]

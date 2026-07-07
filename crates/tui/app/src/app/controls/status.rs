@@ -18,7 +18,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
         )
     } else if state.background_task_count() > 0 {
         format!(
-            "{} ─ input disabled while run active ─ Esc cancel ─ Ctrl-U/Ctrl-D scroll ─ End follow ─ Ctrl-C exit ─ tasks:{}",
+            "{} ─ draft allowed ─ Enter waits for active run ─ Esc cancel ─ Ctrl-U/Ctrl-D scroll ─ End follow ─ Ctrl-C exit ─ tasks:{}",
             state.display_state(),
             state.background_task_count()
         )
@@ -36,4 +36,37 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
         truncate_to_width(text, width as usize),
         style_for_run_state(&state.display_state()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+
+    fn test_state() -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        AppState::new(AppConfig {
+            state_dir: dir.path().to_path_buf(),
+            workflow_store: dir.path().join("workflow.redb"),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn active_run_status_says_draft_allowed_and_enter_waits() {
+        let mut state = test_state();
+        state.spawn_report_task("pending".to_string(), async {
+            std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+                .await
+        });
+
+        let rendered = line(&state, 160).to_string();
+
+        assert!(rendered.contains("draft allowed"));
+        assert!(rendered.contains("Enter waits for active run"));
+        assert!(!rendered.contains("input disabled"));
+        state.cancel_background_tasks();
+    }
 }
