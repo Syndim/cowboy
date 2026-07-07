@@ -93,8 +93,9 @@ pub(crate) fn setup_lua(import_mode: ImportMode) -> Result<Lua> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::run_step;
+    use cowboy_workflow_core::StepAction;
     use std::collections::BTreeMap;
-
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
         WorkflowSourceSnapshot {
             root: None,
@@ -103,7 +104,7 @@ mod tests {
         }
     }
 
-    fn load_example_workflow(name: &str) -> WorkflowDefinition {
+    fn load_example_compiled_workflow(name: &str) -> CompiledWorkflow {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .join("examples/workflows");
@@ -114,7 +115,11 @@ mod tests {
             description: None,
         };
 
-        load(&source).unwrap().definition
+        load(&source).unwrap()
+    }
+
+    fn load_example_workflow(name: &str) -> WorkflowDefinition {
+        load_example_compiled_workflow(name).definition
     }
 
     fn assert_expected_role_agents(
@@ -136,6 +141,373 @@ mod tests {
                 !role.instructions.trim().is_empty(),
                 "{workflow_name} {role_name} role should have instructions"
             );
+        }
+    }
+
+    fn assert_review_transition(
+        workflow_name: &str,
+        definition: &WorkflowDefinition,
+        status: &str,
+        expected_step: &str,
+    ) {
+        let review = definition
+            .steps
+            .get("review")
+            .unwrap_or_else(|| panic!("{workflow_name} workflow should include review step"));
+        assert_eq!(
+            review.transitions.by_status.get(status).map(String::as_str),
+            Some(expected_step),
+            "{workflow_name} review status {status} should route to {expected_step}"
+        );
+    }
+
+    fn assert_step_transition(
+        workflow_name: &str,
+        definition: &WorkflowDefinition,
+        step_id: &str,
+        status: &str,
+        expected_step: &str,
+    ) {
+        let step = definition
+            .steps
+            .get(step_id)
+            .unwrap_or_else(|| panic!("{workflow_name} workflow should include {step_id} step"));
+        assert_eq!(
+            step.transitions.by_status.get(status).map(String::as_str),
+            Some(expected_step),
+            "{workflow_name} {step_id} status {status} should route to {expected_step}"
+        );
+    }
+
+    fn result_feedback_review_step<'a>(
+        workflow_name: &str,
+        definition: &'a WorkflowDefinition,
+    ) -> &'a str {
+        let confirm_result_answer = definition
+            .steps
+            .get("confirm_result_answer")
+            .unwrap_or_else(|| {
+                panic!("{workflow_name} workflow should include confirm_result_answer step")
+            });
+
+        assert_eq!(
+            confirm_result_answer
+                .transitions
+                .by_status
+                .get("confirmed")
+                .map(String::as_str),
+            Some("commit"),
+            "{workflow_name} confirm_result_answer should still route confirmed results to commit"
+        );
+
+        let review_step = confirm_result_answer
+            .transitions
+            .by_status
+            .get("changes_requested")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{workflow_name} confirm_result_answer should route user change requests through a reviewer step"
+                )
+            });
+        assert_ne!(
+            review_step, "revise",
+            "{workflow_name} confirm_result_answer changes_requested should not bypass reviewer triage"
+        );
+        assert!(
+            definition.steps.contains_key(review_step),
+            "{workflow_name} confirm_result_answer changes_requested should target an existing step; got {review_step}"
+        );
+
+        review_step
+    }
+
+    fn assert_result_feedback_prompt_guidance(prompt: &str, workflow_name: &str) {
+        assert_prompt_contains(prompt, "User result feedback:", workflow_name);
+        assert_prompt_contains(prompt, "Step: confirm_result_answer", workflow_name);
+        assert_prompt_contains(prompt, "Status: changes_requested", workflow_name);
+        assert_prompt_contains(
+            prompt,
+            "Feedback: User says the implementation missed the CLI flag",
+            workflow_name,
+        );
+        assert_prompt_contains(
+            prompt,
+            "Work dir: docs/plans/fix_result_feedback_gate",
+            workflow_name,
+        );
+        assert_prompt_contains(
+            prompt,
+            "Plan doc: docs/plans/fix_result_feedback_gate/plan.md",
+            workflow_name,
+        );
+        assert_prompt_contains(
+            prompt,
+            "RCA doc: docs/plans/fix_result_feedback_gate/rca.md",
+            workflow_name,
+        );
+        assert_prompt_contains(
+            prompt,
+            "Repro test: crates/workflow/lua/src/loader.rs::examples_workflows_review_result_feedback_agent_triages_user_feedback",
+            workflow_name,
+        );
+
+        let changes_guidance = prompt_window_after(prompt, "\"changes_requested\"", workflow_name);
+        assert!(
+            changes_guidance.contains("implementation"),
+            "{workflow_name} result-feedback prompt should reserve changes_requested for implementation feedback\nGuidance:\n{changes_guidance}"
+        );
+
+        let replan_guidance = prompt_window_after(prompt, "\"replan_requested\"", workflow_name);
+        assert!(
+            replan_guidance.contains("plan")
+                || replan_guidance.contains("scope")
+                || replan_guidance.contains("requirements"),
+            "{workflow_name} result-feedback prompt should reserve replan_requested for plan-level feedback\nGuidance:\n{replan_guidance}"
+        );
+
+        let preserve_start = prompt.find("Preserve").or_else(|| prompt.find("preserve"));
+        let preserve_start = preserve_start.unwrap_or_else(|| {
+            panic!(
+                "{workflow_name} result-feedback prompt should tell the reviewer to preserve context fields"
+            )
+        });
+        let preserve_guidance = &prompt[preserve_start..];
+        assert!(
+            preserve_guidance.contains("exactly") && preserve_guidance.contains("output fields"),
+            "{workflow_name} result-feedback prompt preserve guidance should require exact output-field preservation\nGuidance:\n{preserve_guidance}"
+        );
+        for field_name in ["Work dir", "Plan doc", "RCA doc", "Repro test"] {
+            assert!(
+                preserve_guidance.contains(field_name),
+                "{workflow_name} result-feedback prompt preserve guidance should mention {field_name:?}\nGuidance:\n{preserve_guidance}"
+            );
+        }
+    }
+
+    fn assert_declares_status(
+        output_statuses: &[String],
+        expected_status: &str,
+        workflow_name: &str,
+    ) {
+        assert!(
+            output_statuses
+                .iter()
+                .any(|candidate| candidate == expected_status),
+            "{workflow_name} result-feedback review output should include {expected_status:?}; got {output_statuses:?}"
+        );
+    }
+    fn assert_prompt_contains(prompt: &str, needle: &str, workflow_name: &str) {
+        assert!(
+            prompt.contains(needle),
+            "{workflow_name} review prompt should contain {needle:?}\nPrompt:\n{prompt}"
+        );
+    }
+
+    fn prompt_window_after<'a>(prompt: &'a str, needle: &str, workflow_name: &str) -> &'a str {
+        let start = prompt
+            .find(needle)
+            .unwrap_or_else(|| panic!("{workflow_name} review prompt should contain {needle:?}"));
+        let relative_end = prompt[start..]
+            .char_indices()
+            .nth(260)
+            .map(|(idx, _)| idx)
+            .unwrap_or_else(|| prompt[start..].len());
+        &prompt[start..start + relative_end]
+    }
+
+    fn assert_review_prompt_guidance(prompt: &str, workflow_name: &str) {
+        let changes_guidance = prompt_window_after(prompt, "\"changes_requested\"", workflow_name);
+        assert!(
+            changes_guidance.contains("implementation") && changes_guidance.contains("fix"),
+            "{workflow_name} review prompt should reserve changes_requested for implementation fixes\nGuidance:\n{changes_guidance}"
+        );
+
+        let replan_guidance = prompt_window_after(prompt, "\"replan_requested\"", workflow_name);
+        assert!(
+            replan_guidance.contains("plan")
+                && [
+                    "incomplete",
+                    "unsafe",
+                    "incorrectly scoped",
+                    "unverifiable",
+                    "unsound",
+                    "not solid",
+                ]
+                .iter()
+                .any(|reason| replan_guidance.contains(reason)),
+            "{workflow_name} review prompt should reserve replan_requested for plan-level rejection\nGuidance:\n{replan_guidance}"
+        );
+
+        let preserve_start = prompt.find("Preserve").or_else(|| prompt.find("preserve"));
+        let preserve_start = preserve_start.unwrap_or_else(|| {
+            panic!(
+                "{workflow_name} review prompt should tell the reviewer to preserve context fields"
+            )
+        });
+        let preserve_guidance = &prompt[preserve_start..];
+        for field_name in ["Work dir", "Plan doc", "RCA doc", "Repro test"] {
+            assert!(
+                preserve_guidance.contains(field_name),
+                "{workflow_name} review prompt preserve guidance should mention {field_name:?}\nGuidance:\n{preserve_guidance}"
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_review_replans_when_approved_plan_is_unsound() {
+        for workflow_name in ["feature", "bugfix"] {
+            let definition = load_example_workflow(workflow_name);
+
+            assert_review_transition(workflow_name, &definition, "approved", "confirm_result");
+            assert_review_transition(workflow_name, &definition, "changes_requested", "revise");
+            assert_review_transition(workflow_name, &definition, "replan_requested", "plan");
+        }
+    }
+
+    #[test]
+    fn examples_workflows_review_agent_output_distinguishes_replanning() {
+        for workflow_name in ["feature", "bugfix"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let result = run_step(
+                &compiled.source_bundle,
+                "review",
+                serde_json::json!({
+                    "request": "Fix approval routing after implementation review",
+                    "prev": {
+                        "step": "test",
+                        "status": "passed",
+                        "fields": {
+                            "summary": "Focused tests passed",
+                            "work_dir": "docs/plans/fix_approval_routing",
+                            "plan_doc": "docs/plans/fix_approval_routing/plan.md",
+                            "rca_doc": "docs/plans/fix_approval_routing/rca.md",
+                            "repro_test": "crates/workflow/lua/src/loader.rs::examples_workflows_review_agent_output_distinguishes_replanning",
+                            "commands": ["cargo test -p cowboy-workflow-lua examples_workflows"]
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+
+            let StepAction::Agent(action) = result.action else {
+                panic!("{workflow_name} review step should request an agent action")
+            };
+            assert_eq!(action.role, "reviewer");
+
+            let output = action
+                .output
+                .as_ref()
+                .unwrap_or_else(|| panic!("{workflow_name} review action should declare output"));
+            for status in ["approved", "changes_requested", "replan_requested"] {
+                assert!(
+                    output.statuses.iter().any(|candidate| candidate == status),
+                    "{workflow_name} review output should include {status:?}; got {:?}",
+                    output.statuses
+                );
+            }
+
+            assert_review_prompt_guidance(&action.prompt, workflow_name);
+            assert_prompt_contains(
+                &action.prompt,
+                "Plan doc: docs/plans/fix_approval_routing/plan.md",
+                workflow_name,
+            );
+            assert_prompt_contains(
+                &action.prompt,
+                "Work dir: docs/plans/fix_approval_routing",
+                workflow_name,
+            );
+            assert_prompt_contains(
+                &action.prompt,
+                "RCA doc: docs/plans/fix_approval_routing/rca.md",
+                workflow_name,
+            );
+            assert_prompt_contains(
+                &action.prompt,
+                "Repro test: crates/workflow/lua/src/loader.rs::examples_workflows_review_agent_output_distinguishes_replanning",
+                workflow_name,
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_gate_result_confirmation_feedback_through_reviewer() {
+        for workflow_name in ["feature", "bugfix"] {
+            let definition = load_example_workflow(workflow_name);
+
+            result_feedback_review_step(workflow_name, &definition);
+        }
+    }
+
+    #[test]
+    fn examples_workflows_review_result_feedback_routes_to_revise_or_plan() {
+        for workflow_name in ["feature", "bugfix"] {
+            let definition = load_example_workflow(workflow_name);
+            let review_step = result_feedback_review_step(workflow_name, &definition);
+
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                review_step,
+                "changes_requested",
+                "revise",
+            );
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                review_step,
+                "replan_requested",
+                "plan",
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_review_result_feedback_agent_triages_user_feedback() {
+        for workflow_name in ["feature", "bugfix"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let review_step =
+                result_feedback_review_step(workflow_name, &compiled.definition).to_string();
+            let result = run_step(
+                &compiled.source_bundle,
+                &review_step,
+                serde_json::json!({
+                    "request": "Finish result feedback gate coverage",
+                    "prev": {
+                        "step": "confirm_result_answer",
+                        "status": "changes_requested",
+                        "fields": {
+                            "feedback": "User says the implementation missed the CLI flag",
+                            "work_dir": "docs/plans/fix_result_feedback_gate",
+                            "plan_doc": "docs/plans/fix_result_feedback_gate/plan.md",
+                            "rca_doc": "docs/plans/fix_result_feedback_gate/rca.md",
+                            "repro_test": "crates/workflow/lua/src/loader.rs::examples_workflows_review_result_feedback_agent_triages_user_feedback"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+
+            let StepAction::Agent(action) = result.action else {
+                panic!("{workflow_name} result-feedback review step should request an agent action")
+            };
+            assert_eq!(action.role, "reviewer");
+
+            let output = action.output.as_ref().unwrap_or_else(|| {
+                panic!("{workflow_name} result-feedback review action should declare output")
+            });
+            assert_declares_status(&output.statuses, "changes_requested", workflow_name);
+            assert_declares_status(&output.statuses, "replan_requested", workflow_name);
+            assert!(
+                !output
+                    .statuses
+                    .iter()
+                    .any(|candidate| candidate == "confirmed" || candidate == "approved"),
+                "{workflow_name} result-feedback review should not approve already-rejected user feedback; got {:?}",
+                output.statuses
+            );
+
+            assert_result_feedback_prompt_guidance(&action.prompt, workflow_name);
         }
     }
 
