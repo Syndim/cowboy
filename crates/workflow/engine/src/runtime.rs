@@ -891,8 +891,8 @@ impl WorkflowRuntime {
 
     fn store(&self) -> Result<RedbRunStore> {
         tracing::debug!(path = %self.config.workflow_store.display(), "opening workflow store");
-        let store = RedbRunStore::create(&self.config.workflow_store)
-            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        let store =
+            RedbRunStore::create(&self.config.workflow_store).map_err(WorkflowError::from)?;
         tracing::debug!(path = %self.config.workflow_store.display(), "workflow store ready");
         Ok(store)
     }

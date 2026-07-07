@@ -44,6 +44,53 @@ pub enum Error {
 
 impl From<Error> for cowboy_workflow_core::WorkflowError {
     fn from(value: Error) -> Self {
-        cowboy_workflow_core::WorkflowError::InvalidAction(value.to_string())
+        let message = value.to_string();
+
+        match value {
+            Error::TemporarilyBusy(_) => {
+                cowboy_workflow_core::WorkflowError::RecoverableAction(message)
+            }
+            _ => cowboy_workflow_core::WorkflowError::InvalidAction(message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use cowboy_workflow_core::WorkflowError;
+
+    use super::*;
+
+    #[test]
+    fn temporarily_busy_store_error_maps_to_recoverable_workflow_error() {
+        let workflow_error: WorkflowError =
+            Error::TemporarilyBusy(PathBuf::from("workflow.redb")).into();
+
+        assert!(
+            workflow_error.recoverable(),
+            "temporary workflow-store lock contention must remain retryable, got {workflow_error}"
+        );
+
+        assert!(
+            !workflow_error.to_string().starts_with("invalid action:"),
+            "temporary workflow-store lock contention must not be reported as an invalid workflow action"
+        );
+    }
+
+    #[test]
+    fn non_temporary_store_error_maps_to_invalid_action_workflow_error() {
+        let workflow_error: WorkflowError = Error::RunNotFound("run-1".to_string()).into();
+
+        assert!(
+            !workflow_error.recoverable(),
+            "non-temporary workflow-store errors must remain terminal, got {workflow_error}"
+        );
+
+        assert!(
+            matches!(workflow_error, WorkflowError::InvalidAction(_)),
+            "non-temporary workflow-store errors must remain invalid actions"
+        );
     }
 }
