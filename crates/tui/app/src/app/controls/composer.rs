@@ -9,11 +9,11 @@ const CONTINUATION_PROMPT: &str = "  ";
 const PROMPT_WIDTH: usize = 2;
 const DISABLED_NOTICE: &str = "Input disabled while run active. Press Esc to cancel.";
 
-use super::super::commands::{
-    MAX_SLASH_SUGGESTIONS, slash_query, slash_suggestion_line_count, slash_suggestions,
-};
 use super::super::state::AppState;
 use super::super::styles::{style_accent, style_border_accent, style_muted, style_warning};
+use cowboy_command_parser::{slash_query, slash_suggestions};
+
+const MAX_SLASH_SUGGESTIONS: usize = 6;
 
 // Ratatui wraps Paragraph text and can report the wrapped line count, but it does not
 // resize surrounding Layout constraints automatically. The composer still computes
@@ -33,6 +33,20 @@ pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_wi
     let wanted = (input_rows + reserved_notice_rows + suggestion_rows + 2).clamp(3, 12) as u16;
     let max_available = terminal_height.saturating_sub(3).max(3);
     wanted.min(max_available)
+}
+
+fn slash_suggestion_line_count(input: &str) -> usize {
+    if slash_query(input).is_none() {
+        return 0;
+    }
+
+    let suggestions = slash_suggestions(input);
+    if suggestions.is_empty() {
+        1
+    } else {
+        let hidden = suggestions.len().saturating_sub(MAX_SLASH_SUGGESTIONS);
+        1 + suggestions.len().min(MAX_SLASH_SUGGESTIONS) + usize::from(hidden > 0)
+    }
 }
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {

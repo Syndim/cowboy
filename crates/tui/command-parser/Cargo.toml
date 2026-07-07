@@ -1,0 +1,11 @@
+[package]
+name = "cowboy-command-parser"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command argument parsing for Cowboy CLI and TUI slash commands"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+shlex = "2"

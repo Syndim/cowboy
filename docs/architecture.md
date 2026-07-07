@@ -5,25 +5,28 @@ Cowboy is a workflow-first terminal agent orchestrator. It has one binary with t
 - `cowboy` with no subcommand launches the interactive TUI.
 - `cowboy <subcommand>` runs a non-interactive CLI command against the same workflow runtime and state.
 
-The current shape keeps UI/CLI code separate from workflow runtime logic:
+The current shape keeps command parsing, UI/CLI code, and workflow runtime logic separate:
 
 ```text
-cowboy CLI/TUI
-  -> cowboy-workflow-engine
-       -> catalog loading / workflow selection / summarization
-       -> WorkflowRun state orchestration
-       -> Lua step action provider
-       -> ACP-backed agent action executor / input router
-       -> StepRecord + RunHead persistence
-       -> workflow events + event log
-  -> TUI renders workflow events and accepts commands
+process argv / slash composer input
+  -> cowboy-command-parser typed commands + metadata
+  -> cowboy CLI/TUI app
+       -> cowboy-workflow-engine
+            -> catalog loading / workflow selection / summarization
+            -> WorkflowRun state orchestration
+            -> Lua step action provider
+            -> ACP-backed agent action executor / input router
+            -> StepRecord + RunHead persistence
+            -> workflow events + event log
+       -> TUI renders workflow events and accepts plain text/prompt answers
 ```
 
 ## Workspace crates
 
 | Crate | Purpose |
 | --- | --- |
-| `cowboy` (`crates/tui`) | CLI argument parsing, config loading, and ratatui rendering only. |
+| `cowboy` (`crates/tui/app`) | Config loading, logging setup, runtime dispatch, and ratatui rendering only. Uses `cowboy-command-parser` for command grammar. |
+| `cowboy-command-parser` (`crates/tui/command-parser`) | Runtime/UI-independent clap-backed parsing for product CLI commands and interactive slash commands, plus metadata/suggestions. |
 | `cowboy-workflow-engine` | Product runtime: starts/resumes/answers/improves workflow runs, emits events, wires ACP agent execution. |
 | `cowboy-workflow-catalog` | Built-in workflow source plus project/user `.lua` workflow catalog loading and update application. |
 | `cowboy-workflow-core` | Serializable workflow domain model, graph validation, `execute_step`, runner traits. |
@@ -140,9 +143,13 @@ events are persisted for display/debugging under:
 
 ## CLI
 
+The `cowboy` binary parses argv through `cowboy-command-parser` and dispatches parsed commands in the app crate:
+
 ```bash
 cowboy                                  # launch TUI
+cowboy tui                              # launch TUI explicitly
 cowboy run <request...>                 # start a run; --step runs only the first step
+cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
@@ -158,7 +165,7 @@ route it to a valid status and continue the run.
 
 ## TUI
 
-The TUI accepts plain requests and slash commands in its composer. It delegates all runtime behavior to `cowboy-workflow-engine` and renders the workflow event stream from the runtime event bus.
+The TUI accepts plain requests and slash commands in its composer. Slash command parsing and completion metadata come from `cowboy-command-parser`; the app crate owns dispatch, pending-prompt fallback, and rendering. Runtime behavior is delegated to `cowboy-workflow-engine`, and the TUI renders the workflow event stream from the runtime event bus.
 
 Current vertical layout:
 
@@ -173,6 +180,7 @@ Slash commands:
 
 ```text
 /run <request>
+/run-workflow <workflow-id> <request>
 /run-step <request>
 /step <run-id>
 /resume [run-id]

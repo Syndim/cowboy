@@ -139,10 +139,7 @@ fn pop_keyboard_enhancement_flags(stdout: &mut io::Stdout, active: bool) -> Resu
     }
 
     #[cfg(not(windows))]
-    execute!(
-        stdout,
-        PopKeyboardEnhancementFlags
-    )?;
+    execute!(stdout, PopKeyboardEnhancementFlags)?;
 
     Ok(())
 }

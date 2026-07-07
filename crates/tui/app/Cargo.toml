@@ -7,10 +7,10 @@ license.workspace = true
 description = "Workflow-first terminal UI for Cowboy"
 
 [dependencies]
-cowboy-workflow-engine = { path = "../workflow/engine" }
+cowboy-command-parser.workspace = true
+cowboy-workflow-engine = { path = "../../workflow/engine" }
 anyhow.workspace = true
 chrono = { workspace = true, features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
 crossterm = "0"
 fs2.workspace = true
 dirs = "6"
@@ -20,7 +20,6 @@ unicode-width = "0"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 syntect = "5"
-shlex = "2"
 tokio = { workspace = true, features = ["full"] }
 toml = "1"
 cowboy-log.workspace = true

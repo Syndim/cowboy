@@ -1,6 +1,6 @@
 # Cowboy module map
 
-Current workspace/module structure. The TUI crate is intentionally thin; workflow runtime logic lives under `crates/workflow/*`.
+Current workspace/module structure. The TUI app crate is intentionally thin; workflow runtime logic lives under `crates/workflow/*`, and command grammar lives in `crates/tui/command-parser`.
 
 ## Workspace crates
 
@@ -18,24 +18,26 @@ Current workspace/module structure. The TUI crate is intentionally thin; workflo
 │   │   ├── lua/             # sandboxed Lua workflow loader/runtime
 │   │   ├── store/           # redb-backed RunStore
 │   │   └── agent/           # agent action executor + output parsing
-│   └── tui/                 # cowboy CLI/TUI shell and ratatui controls
+│   └── tui/
+│       ├── app/             # cowboy CLI/TUI shell and ratatui controls
+│       └── command-parser/  # clap-backed CLI and slash command parsing
 ├── docs/
 └── LICENSE
 ```
 
-## Crate: `cowboy` (`crates/tui`)
+## Crate: `cowboy` (`crates/tui/app`)
 
 Package name: `cowboy`.
 
-This crate owns only CLI/configuration and terminal rendering. It should not own workflow semantics, session persistence, runner state, selector/summarizer behavior, Lua execution, storage, or agent protocol details.
+This crate owns config loading, logging setup, runtime dispatch, and terminal rendering. It should not own command grammar, workflow semantics, session persistence, runner state, selector/summarizer behavior, Lua execution, storage, or agent protocol details.
 
 | Module | Responsibility |
 | --- | --- |
-| `main.rs` | Shared binary entrypoint. No subcommand launches the TUI; subcommands call `cowboy-workflow-engine::WorkflowRuntime`. |
-| `lib.rs` | Public exports for the TUI crate: config and `run_tui`. |
+| `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. |
+| `lib.rs` | Public exports for the TUI app crate: config and `run_tui`. |
 | `config.rs` | Load TOML config and convert it into engine `RuntimeConfig`. |
 | `app.rs` | Terminal startup, event loop, and top-level vertical layout only. |
-| `app/commands.rs` | Slash command registry, command completion, command dispatch, and runtime task spawning. |
+| `app/commands.rs` | Slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
 | `app/history.rs` | TUI-owned persisted composer input history: locked append-only JSON-lines storage under `state_dir`. |
 | `app/state.rs` | TUI state projection: active run, current step, pending prompt, transcript entries, command history, scroll offset, and background tasks. |
@@ -44,7 +46,17 @@ This crate owns only CLI/configuration and terminal rendering. It should not own
 | `app/controls/header.rs` | Header view showing state, step, run, workflow, and task count. |
 | `app/controls/transcript.rs` | Transcript view and waiting-for-input cards. |
 | `app/controls/status.rs` | Status strip and context-sensitive hints. |
-| `app/controls/composer.rs` | Composer view, multiline input rendering, cursor placement, and slash-command suggestions. |
+| `app/controls/composer.rs` | Composer view, multiline input rendering, cursor placement, and slash-command suggestions sourced from `cowboy-command-parser`. |
+
+## Crate: `cowboy-command-parser` (`crates/tui/command-parser`)
+
+Package name: `cowboy-command-parser`.
+
+This crate owns clap-backed parsing for product CLI argv and interactive TUI slash commands. It exposes typed command enums, parse errors, command metadata, and suggestion helpers. It must stay independent of `cowboy-workflow-engine`, ratatui, crossterm, tui-input, app state, and config loading.
+
+| Module | Responsibility |
+| --- | --- |
+| `lib.rs` | `Cli`, `CliCommand`, `SlashCommand`, `SlashParseError`, `SlashCommandMetadata`, slash metadata, completion helpers, and quote/hash-preserving slash tokenization. |
 
 ## Crate: `cowboy-workflow-actions`
 
@@ -190,7 +202,7 @@ CLI/TUI command
 
 ## Refactoring guidance
 
-- Keep `crates/tui` as UI/CLI only.
+- Keep `crates/tui/app` as config/runtime-dispatch/UI only and `crates/tui/command-parser` as runtime/UI-independent command grammar.
 - Keep application runtime orchestration in `cowboy-workflow-engine`.
 - Keep catalog policy in `cowboy-workflow-catalog`.
 - Keep workflow semantics in `cowboy-workflow-core`.
