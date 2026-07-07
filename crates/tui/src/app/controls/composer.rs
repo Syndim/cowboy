@@ -7,12 +7,13 @@ use unicode_width::UnicodeWidthChar;
 const PROMPT: &str = "> ";
 const CONTINUATION_PROMPT: &str = "  ";
 const PROMPT_WIDTH: usize = 2;
+const DISABLED_NOTICE: &str = "Input disabled while run active. Press Esc to cancel.";
 
 use super::super::commands::{
     MAX_SLASH_SUGGESTIONS, slash_query, slash_suggestion_line_count, slash_suggestions,
 };
 use super::super::state::AppState;
-use super::super::styles::{style_accent, style_border_accent, style_muted};
+use super::super::styles::{style_accent, style_border_accent, style_muted, style_warning};
 
 // Ratatui wraps Paragraph text and can report the wrapped line count, but it does not
 // resize surrounding Layout constraints automatically. The composer still computes
@@ -23,12 +24,13 @@ pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_wi
         .wrap(Wrap { trim: false })
         .line_count(input_content_width(composer_width) as u16)
         .max(1);
+    let reserved_notice_rows = usize::from(!state.composer_enabled());
     let suggestion_rows = if state.composer_enabled() {
         slash_suggestion_line_count(state.input())
     } else {
         0
     };
-    let wanted = (input_rows + suggestion_rows + 2).clamp(3, 12) as u16;
+    let wanted = (input_rows + reserved_notice_rows + suggestion_rows + 2).clamp(3, 12) as u16;
     let max_available = terminal_height.saturating_sub(3).max(3);
     wanted.min(max_available)
 }
@@ -51,12 +53,16 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 
 pub(in crate::app) fn title(state: &AppState) -> String {
     if !state.composer_enabled() {
-        " Run active ─ input disabled ─ Esc cancels ".to_string()
+        " Run active ─ Esc cancels ".to_string()
     } else if state.pending_prompt().is_some() {
         " Enter answers active prompt ─ Shift/Ctrl-Enter newline ".to_string()
     } else {
         " Enter submits ─ Shift/Ctrl-Enter newline ─ type / for commands ".to_string()
     }
+}
+
+fn disabled_notice_line() -> Line<'static> {
+    Line::from(Span::styled(DISABLED_NOTICE, style_warning()))
 }
 
 #[cfg(test)]
@@ -90,13 +96,14 @@ fn rendered_input(
     max_visible_lines: usize,
     content_width: usize,
 ) -> RenderedInput {
+    let reserved_notice_rows = usize::from(!state.composer_enabled());
     let suggestion_line_count = if state.composer_enabled() {
         slash_suggestion_line_count(state.input())
     } else {
         0
     };
     let input_budget = max_visible_lines
-        .saturating_sub(suggestion_line_count)
+        .saturating_sub(reserved_notice_rows + suggestion_line_count)
         .max(1);
     let wrapped = wrapped_input_lines(state.input(), state.input_cursor(), content_width);
     let mut lines = wrapped.lines;
@@ -230,6 +237,22 @@ fn lines_from_rendered(
 ) -> Vec<Line<'static>> {
     if max_visible_lines == 0 {
         return Vec::new();
+    }
+
+    if !state.composer_enabled() {
+        if max_visible_lines == 1 {
+            return vec![disabled_notice_line()];
+        }
+
+        let mut lines = rendered
+            .lines
+            .iter()
+            .take(max_visible_lines.saturating_sub(1))
+            .cloned()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        lines.push(disabled_notice_line());
+        return lines;
     }
 
     let mut lines = rendered
@@ -418,8 +441,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(title(&state), " Run active ─ input disabled ─ Esc cancels ");
+        assert_eq!(title(&state), " Run active ─ Esc cancels ");
+        assert_eq!(height(&state, 10, 80), 4);
         assert!(rendered.contains("> /"));
+        assert!(rendered.contains(DISABLED_NOTICE));
         assert!(!rendered.contains("slash command suggestions"));
         assert!(!rendered.contains("/resume [run-id]"));
         state.cancel_background_tasks();

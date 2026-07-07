@@ -87,14 +87,17 @@ fn tui_input_cursor_style_uses_unix_block_cursor() {
 fn windows_terminal_mode_does_not_execute_unsupported_keyboard_enhancement_on_windows() {
     let source = include_str!("../app.rs");
     let lines: Vec<_> = source.lines().collect();
-    let unsupported_commands = ["PushKeyboardEnhancementFlags", "PopKeyboardEnhancementFlags"];
+    let unsupported_commands = [
+        "PushKeyboardEnhancementFlags",
+        "PopKeyboardEnhancementFlags",
+    ];
     let mut unguarded_commands = Vec::new();
 
     for command in unsupported_commands {
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim_start();
-            let executes_command = trimmed.starts_with(command)
-                && (trimmed.contains(',') || trimmed.contains('('));
+            let executes_command =
+                trimmed.starts_with(command) && (trimmed.contains(',') || trimmed.contains('('));
 
             if !executes_command {
                 continue;
@@ -359,13 +362,17 @@ async fn draw_locked_composer_shows_disabled_copy_without_slash_suggestions() {
     let rows = rendered_rows(&state, 100, 14);
     let rendered = rows.join("\n");
 
+    let title_row = rows
+        .iter()
+        .find(|row| row.contains("Run active") && row.contains("Esc cancels"))
+        .unwrap_or_else(|| panic!("{rendered}"));
+    assert!(!title_row.contains("input disabled"), "{rendered}");
     assert!(
-        rows.iter()
-            .any(|row| row.contains("Run active") && row.contains("input disabled")),
+        rendered.contains("input disabled while run active"),
         "{rendered}"
     );
     assert!(
-        rendered.contains("input disabled while run active"),
+        rendered.contains("Input disabled while run active. Press Esc to cancel."),
         "{rendered}"
     );
     assert!(rendered.contains("> /"), "{rendered}");
