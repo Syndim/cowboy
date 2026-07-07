@@ -127,7 +127,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /workflows                             list known workflows
 /improve <run-id>                      improve workflow source from a run
 /resolve <run-id>                      list statuses a failed run can resolve to
-/resolve <run-id> <status>             resolve a failed step and continue the run
+/resolve <run-id> <status> [fields-json]  resolve a failed step and continue the run
 /cancel                                cancel active background tasks
 /help                                  show built-in commands
 /exit                                  quit Cowboy
