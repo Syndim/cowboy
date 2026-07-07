@@ -84,6 +84,45 @@ fn tui_input_cursor_style_uses_unix_block_cursor() {
 }
 
 #[test]
+fn windows_terminal_mode_does_not_execute_unsupported_keyboard_enhancement_on_windows() {
+    let source = include_str!("../app.rs");
+    let lines: Vec<_> = source.lines().collect();
+    let unsupported_commands = ["PushKeyboardEnhancementFlags", "PopKeyboardEnhancementFlags"];
+    let mut unguarded_commands = Vec::new();
+
+    for command in unsupported_commands {
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            let executes_command = trimmed.starts_with(command)
+                && (trimmed.contains(',') || trimmed.contains('('));
+
+            if !executes_command {
+                continue;
+            }
+
+            let guard_start = index.saturating_sub(4);
+            let guard_context = lines[guard_start..=index].join("\n");
+            let guarded_for_non_windows = guard_context.contains("not(windows)")
+                || guard_context.contains("cfg(unix)")
+                || guard_context.contains("cfg!(unix)")
+                || guard_context.contains("!cfg!(windows)");
+
+            if !guarded_for_non_windows {
+                unguarded_commands.push(format!("line {}: {}", index + 1, trimmed));
+            }
+        }
+    }
+
+    assert!(
+        unguarded_commands.is_empty(),
+        "Windows legacy console rejects crossterm keyboard enhancement commands with \
+         `Keyboard progressive enhancement not implemented for the legacy Windows API.`; \
+         gate these commands away from Windows before entering or restoring terminal mode: {}",
+        unguarded_commands.join("; ")
+    );
+}
+
+#[test]
 fn draw_places_cursor_at_input_end() {
     let mut state = test_state();
     state.push_input("abc");

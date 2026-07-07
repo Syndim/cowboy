@@ -6,6 +6,10 @@ use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+};
+
+#[cfg(not(windows))]
+use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -60,6 +64,7 @@ fn tui_input_cursor_style() -> SetCursorStyle {
 
 struct TerminalModeGuard {
     restored: bool,
+    keyboard_enhancement_active: bool,
 }
 
 impl TerminalModeGuard {
@@ -71,14 +76,24 @@ impl TerminalModeGuard {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             tui_input_cursor_style()
         ) {
             let _ = disable_raw_mode();
             return Err(err.into());
         }
 
-        Ok(Self { restored: false })
+        let keyboard_enhancement_active = match push_keyboard_enhancement_flags(&mut stdout) {
+            Ok(active) => active,
+            Err(err) => {
+                let _ = disable_raw_mode();
+                return Err(err);
+            }
+        };
+
+        Ok(Self {
+            restored: false,
+            keyboard_enhancement_active,
+        })
     }
 
     fn restore(&mut self) -> Result<()> {
@@ -88,9 +103,10 @@ impl TerminalModeGuard {
 
         disable_raw_mode()?;
         let mut stdout = io::stdout();
+        pop_keyboard_enhancement_flags(&mut stdout, self.keyboard_enhancement_active)?;
+        self.keyboard_enhancement_active = false;
         execute!(
             stdout,
-            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen,
             SetCursorStyle::DefaultUserShape,
@@ -99,6 +115,41 @@ impl TerminalModeGuard {
         self.restored = true;
         Ok(())
     }
+}
+
+#[cfg(not(windows))]
+fn push_keyboard_enhancement_flags(stdout: &mut io::Stdout) -> Result<bool> {
+    #[cfg(not(windows))]
+    execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn push_keyboard_enhancement_flags(_stdout: &mut io::Stdout) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(windows))]
+fn pop_keyboard_enhancement_flags(stdout: &mut io::Stdout, active: bool) -> Result<()> {
+    if !active {
+        return Ok(());
+    }
+
+    #[cfg(not(windows))]
+    execute!(
+        stdout,
+        PopKeyboardEnhancementFlags
+    )?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pop_keyboard_enhancement_flags(_stdout: &mut io::Stdout, _active: bool) -> Result<()> {
+    Ok(())
 }
 
 impl Drop for TerminalModeGuard {
