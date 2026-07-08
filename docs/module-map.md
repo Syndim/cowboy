@@ -52,11 +52,11 @@ This crate owns config loading, logging setup, runtime dispatch, and terminal re
 
 Package name: `cowboy-command-parser`.
 
-This crate owns clap-backed parsing for product CLI argv and interactive TUI slash commands. It exposes typed command enums, parse errors, command metadata, and suggestion helpers. It must stay independent of `cowboy-workflow-engine`, ratatui, crossterm, tui-input, app state, and config loading.
+This crate owns clap-backed parsing for product CLI argv and interactive TUI slash commands. It exposes typed command enums, parse errors, generated command rows, and suggestion helpers. It must stay independent of `cowboy-workflow-engine`, ratatui, crossterm, tui-input, app state, and config loading.
 
 | Module | Responsibility |
 | --- | --- |
-| `lib.rs` | `Cli`, `CliCommand`, `SlashCommand`, `SlashParseError`, `SlashCommandMetadata`, slash metadata, completion helpers, and quote/hash-preserving slash tokenization. |
+| `lib.rs` | `Cli`, `CliCommand`, shared `SharedCommand`, `SlashCommand`, `SlashParseError`, generated slash help/completion helpers, and quote/hash-preserving slash argv tokenization. |
 
 ## Crate: `cowboy-workflow-actions`
 

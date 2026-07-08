@@ -64,23 +64,21 @@ cancellation.
 Built-in slash commands:
 
 ```text
-/run <request>
-/run-workflow <workflow-id> <request>
-/run-step <request>
+/run [--step] [--workflow <workflow-id>] <request>
 /step <run-id>
-/resume [run-id]
+/resume <run-id>
 /answer <run-id> <prompt-id> <answer>
-/runs
-/workflows
 /improve <run-id>
 /resolve <run-id>
-/resolve <run-id> <status>
+/resolve <run-id> <status> [fields-json]
+/runs
+/workflows
 /cancel
 /help
 /exit
 ```
 
-`/run-workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the Lua-declared workflow name.
+`/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the Lua-declared workflow name.
 
 Keys currently supported:
 

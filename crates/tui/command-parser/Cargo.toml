@@ -8,4 +8,3 @@ description = "Command argument parsing for Cowboy CLI and TUI slash commands"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-shlex = "2"

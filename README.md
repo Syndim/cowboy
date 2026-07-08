@@ -117,25 +117,23 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 ### TUI commands
 
 ```text
-/run <request>                         start a workflow run
-/run-workflow <workflow-id> <request>  start a catalog workflow id directly
-/run-step <request>                    run only the first workflow step
-/step <run-id>                         execute exactly one more step
-/resume [run-id]                       continue a run until blocked
-/answer <run-id> <prompt-id> <answer>  answer a waiting prompt explicitly
-/runs                                  list workflow runs
-/workflows                             list known workflows
-/improve <run-id>                      improve workflow source from a run
-/resolve <run-id>                      list statuses a failed run can resolve to
-/resolve <run-id> <status> [fields-json]  resolve a failed step and continue the run
-/cancel                                cancel active background tasks
-/help                                  show built-in commands
-/exit                                  quit Cowboy
+/run [--step] [--workflow <workflow-id>] <request>  start a workflow run
+/step <run-id>                                    execute exactly one more step
+/resume <run-id>                                  continue a run until blocked
+/answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly
+/runs                                             list workflow runs
+/workflows                                        list known workflows
+/improve <run-id>                                 improve workflow source from a run
+/resolve <run-id>                                 list statuses a failed run can resolve to
+/resolve <run-id> <status> [fields-json]          resolve a failed step and continue the run
+/cancel                                           cancel active background tasks
+/help                                             show built-in commands
+/exit                                             quit Cowboy
 ```
 
 `step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes.
 
-`/run-workflow` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
+`/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
 ### TUI keys
 

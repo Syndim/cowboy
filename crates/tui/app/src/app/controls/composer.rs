@@ -366,7 +366,7 @@ mod tests {
 
         assert!(rendered.contains("> /"));
         assert!(rendered.contains("slash command suggestions"));
-        assert!(rendered.contains("/resume [run-id]"));
+        assert!(rendered.contains("/resume <run-id>"));
         assert!(rendered.contains("more command(s)"));
     }
 
@@ -442,7 +442,7 @@ mod tests {
         assert!(!rendered.contains("Input disabled"));
         assert!(!rendered.contains("input disabled"));
         assert!(!rendered.contains("slash command suggestions"));
-        assert!(!rendered.contains("/resume [run-id]"));
+        assert!(!rendered.contains("/resume <run-id>"));
         state.cancel_background_tasks();
     }
 

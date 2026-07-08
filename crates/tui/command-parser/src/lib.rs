@@ -2,14 +2,14 @@
 //!
 //! This crate owns the grammar for both product CLI commands and interactive TUI
 //! slash commands. Callers pass process-style argv or a raw slash-command input
-//! string and receive runtime-agnostic typed command values plus metadata for
-//! help and completion UI. The crate intentionally has no dependency on the
-//! workflow runtime, ratatui, terminal input, config loading, or app state.
+//! string and receive runtime-agnostic typed command values plus generated help
+//! and completion UI. The crate intentionally has no dependency on the workflow
+//! runtime, ratatui, terminal input, config loading, or app state.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Arg, ArgAction, Args, Command, CommandFactory, Parser, Subcommand};
 
 /// Cowboy product CLI parser.
 #[derive(Debug, Parser)]
@@ -73,89 +73,155 @@ pub enum CliCommand {
     /// Launch the interactive terminal UI.
     #[command(alias = "start")]
     Tui,
-    /// Start a new workflow run. With --step, execute only the first step.
-    Run {
-        /// Execute only the first workflow step instead of running until blocked.
-        #[arg(long)]
-        step: bool,
-        /// Catalog workflow id to run, bypassing workflow selection.
-        #[arg(long)]
-        workflow: Option<String>,
-        request: Vec<String>,
-    },
+
+    #[command(flatten)]
+    Shared(SharedCommand),
+}
+
+/// Runtime commands shared by the product CLI and TUI slash command surfaces.
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
+pub enum SharedCommand {
+    /// Start a workflow run.
+    #[command(about = "start a workflow run")]
+    Run(RunArgs),
+
     /// Execute exactly one further step of an existing workflow run.
-    Step { run_id: String },
+    #[command(about = "execute one more step")]
+    Step(RunIdArgs),
+
     /// Continue an existing workflow run until it blocks, fails, or completes.
-    Resume { run_id: String },
+    #[command(about = "continue a run until blocked")]
+    Resume(RunIdArgs),
+
     /// Answer a workflow input prompt and continue the run.
-    Answer {
-        run_id: String,
-        prompt_id: String,
-        answer: String,
-    },
+    #[command(about = "answer a waiting prompt")]
+    Answer(AnswerArgs),
+
     /// Summarize a completed run and apply proposed workflow file updates.
-    Improve { run_id: String },
+    #[command(about = "improve workflow source")]
+    Improve(RunIdArgs),
+
     /// List workflow runs.
+    #[command(about = "list workflow runs")]
     Runs,
+
     /// Resolve a failed run. Without <status>, lists resolvable statuses.
-    Resolve {
-        run_id: String,
-        /// Status to resolve the failed step to. Omit to list options.
-        status: Option<String>,
-        /// JSON object of output fields for the chosen status.
-        #[arg(long)]
-        fields: Option<String>,
-        /// Human-readable body for the synthesized step record.
-        #[arg(long)]
-        body: Option<String>,
-    },
+    #[command(about = "list or resolve a failed step")]
+    Resolve(ResolveArgs),
+}
+
+/// Arguments for starting a workflow run.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct RunArgs {
+    /// Execute only the first workflow step instead of running until blocked.
+    #[arg(long)]
+    pub step: bool,
+
+    /// Catalog workflow id to run, bypassing workflow selection.
+    #[arg(long, value_name = "workflow-id")]
+    pub workflow: Option<String>,
+
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "request")]
+    pub request: Vec<String>,
+}
+
+impl RunArgs {
+    /// Return the trailing request words normalized into the runtime request string.
+    pub fn into_request(self) -> String {
+        join_trailing_args(self.request)
+    }
+}
+
+/// Arguments for commands that address one workflow run.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct RunIdArgs {
+    #[arg(value_name = "run-id")]
+    pub run_id: String,
+}
+
+/// Arguments for answering a workflow prompt.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct AnswerArgs {
+    #[arg(value_name = "run-id")]
+    pub run_id: String,
+
+    #[arg(value_name = "prompt-id")]
+    pub prompt_id: String,
+
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "answer")]
+    pub answer: Vec<String>,
+}
+
+impl AnswerArgs {
+    /// Return the trailing answer words normalized into the runtime answer string.
+    pub fn into_answer(self) -> String {
+        join_trailing_args(self.answer)
+    }
+}
+
+/// Arguments for resolving a failed run.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct ResolveArgs {
+    #[arg(value_name = "run-id")]
+    pub run_id: String,
+
+    /// Status to resolve the failed step to. Omit to list options.
+    #[arg(value_name = "status", allow_hyphen_values = true)]
+    pub status: Option<String>,
+
+    /// JSON object of output fields for the chosen status.
+    #[arg(long, value_name = "json", conflicts_with = "fields_json")]
+    pub fields: Option<String>,
+
+    /// Human-readable body for the synthesized step record.
+    #[arg(long, value_name = "text")]
+    pub body: Option<String>,
+
+    #[arg(
+        value_name = "fields-json",
+        allow_hyphen_values = true,
+        conflicts_with = "fields",
+        hide = true
+    )]
+    pub fields_json: Option<String>,
+}
+
+impl ResolveArgs {
+    /// Return fields JSON supplied through either the CLI option or slash positional form.
+    pub fn into_fields(self) -> Option<String> {
+        self.fields.or(self.fields_json)
+    }
 }
 
 /// Parsed TUI slash command.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Subcommand, PartialEq, Eq)]
 pub enum SlashCommand {
-    Run {
-        request: String,
-    },
-    RunWorkflow {
-        workflow_id: String,
-        request: String,
-    },
-    RunStep {
-        request: String,
-    },
-    Step {
-        run_id: String,
-    },
-    Resume {
-        run_id: Option<String>,
-    },
-    Answer {
-        run_id: String,
-        prompt_id: String,
-        answer: String,
-    },
-    Runs,
+    #[command(flatten)]
+    Shared(SharedCommand),
+
+    /// List known workflows.
+    #[command(about = "list known workflows")]
     Workflows,
-    Improve {
-        run_id: String,
-    },
-    Resolve {
-        run_id: String,
-        status: Option<String>,
-        fields_json: Option<String>,
-    },
+
+    /// Cancel active background tasks.
+    #[command(about = "cancel active background tasks")]
     Cancel,
+
+    /// Quit Cowboy.
+    #[command(about = "quit Cowboy")]
     Exit,
+
+    /// Show built-in commands.
+    #[command(about = "show built-in commands")]
     Help,
 }
 
-/// Metadata used by help, usage rendering, and completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlashCommandMetadata {
-    pub name: &'static str,
-    pub usage: &'static str,
-    pub description: &'static str,
+/// Generated slash command row used by help, usage rendering, and completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandInfo {
+    pub name: String,
+    pub usage: String,
+    pub description: String,
     pub takes_arguments: bool,
 }
 
@@ -169,88 +235,6 @@ pub enum SlashParseError {
     },
 }
 
-/// Advertised slash command registry.
-pub const SLASH_COMMANDS: &[SlashCommandMetadata] = &[
-    SlashCommandMetadata {
-        name: "/run",
-        usage: "/run <request>",
-        description: "start a workflow run",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/run-workflow",
-        usage: "/run-workflow <workflow-id> <request>",
-        description: "start a named workflow run",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/run-step",
-        usage: "/run-step <request>",
-        description: "run only the first workflow step",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/step",
-        usage: "/step <run-id>",
-        description: "execute one more step",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/resume",
-        usage: "/resume [run-id]",
-        description: "continue a run until blocked",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/answer",
-        usage: "/answer <run> <id> <answer>",
-        description: "answer a waiting prompt",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/runs",
-        usage: "/runs",
-        description: "list workflow runs",
-        takes_arguments: false,
-    },
-    SlashCommandMetadata {
-        name: "/workflows",
-        usage: "/workflows",
-        description: "list known workflows",
-        takes_arguments: false,
-    },
-    SlashCommandMetadata {
-        name: "/improve",
-        usage: "/improve <run-id>",
-        description: "improve workflow source",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/resolve",
-        usage: "/resolve <run-id> [status] [fields-json]",
-        description: "list or resolve a failed step",
-        takes_arguments: true,
-    },
-    SlashCommandMetadata {
-        name: "/cancel",
-        usage: "/cancel",
-        description: "cancel active background tasks",
-        takes_arguments: false,
-    },
-    SlashCommandMetadata {
-        name: "/exit",
-        usage: "/exit",
-        description: "quit Cowboy",
-        takes_arguments: false,
-    },
-    SlashCommandMetadata {
-        name: "/help",
-        usage: "/help",
-        description: "show built-in commands",
-        takes_arguments: false,
-    },
-];
-
 #[derive(Debug, Parser)]
 #[command(
     name = "cowboy-tui",
@@ -261,77 +245,7 @@ pub const SLASH_COMMANDS: &[SlashCommandMetadata] = &[
 )]
 struct SlashCli {
     #[command(subcommand)]
-    command: SlashSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum SlashSubcommand {
-    #[command(name = "run")]
-    Run(TrailingRequestArgs),
-    #[command(name = "run-workflow")]
-    RunWorkflow(RunWorkflowArgs),
-    #[command(name = "run-step")]
-    RunStep(TrailingRequestArgs),
-    #[command(name = "step")]
-    Step(RunIdArgs),
-    #[command(name = "resume")]
-    Resume(ResumeArgs),
-    #[command(name = "answer")]
-    Answer(AnswerArgs),
-    #[command(name = "runs")]
-    Runs,
-    #[command(name = "workflows")]
-    Workflows,
-    #[command(name = "improve")]
-    Improve(RunIdArgs),
-    #[command(name = "resolve")]
-    Resolve(ResolveArgs),
-    #[command(name = "cancel")]
-    Cancel,
-    #[command(name = "exit")]
-    Exit,
-    #[command(name = "help")]
-    Help,
-}
-
-#[derive(Debug, Args)]
-struct TrailingRequestArgs {
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-    request: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-struct RunWorkflowArgs {
-    workflow_id: String,
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-    request: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-struct RunIdArgs {
-    run_id: String,
-}
-
-#[derive(Debug, Args)]
-struct ResumeArgs {
-    run_id: Option<String>,
-}
-
-#[derive(Debug, Args)]
-struct AnswerArgs {
-    run_id: String,
-    prompt_id: String,
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-    answer: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-struct ResolveArgs {
-    run_id: String,
-    #[arg(allow_hyphen_values = true)]
-    status: Option<String>,
-    #[arg(num_args = 0.., trailing_var_arg = true, allow_hyphen_values = true)]
-    fields_json: Vec<String>,
+    command: SlashCommand,
 }
 
 /// Return the active slash query when input is completing a command name.
@@ -340,15 +254,36 @@ pub fn slash_query(input: &str) -> Option<&str> {
     (!query.chars().any(char::is_whitespace)).then_some(query)
 }
 
-/// Return all command metadata entries matching the current slash command prefix.
-pub fn slash_suggestions(input: &str) -> Vec<&'static SlashCommandMetadata> {
+/// Return all generated command rows matching the current slash command prefix.
+pub fn slash_suggestions(input: &str) -> Vec<SlashCommandInfo> {
     let Some(query) = slash_query(input) else {
         return Vec::new();
     };
 
-    SLASH_COMMANDS
-        .iter()
+    slash_command_infos()
+        .into_iter()
         .filter(|command| command.name[1..].starts_with(query))
+        .collect()
+}
+
+/// Return generated rows for every advertised slash command.
+pub fn slash_help_rows() -> Vec<SlashCommandInfo> {
+    slash_command_infos()
+}
+
+/// Return the slash usage string for a command name without its leading slash.
+pub fn slash_command_usage(command_name: &str) -> Option<String> {
+    slash_command_infos()
+        .into_iter()
+        .find(|command| command.name.strip_prefix('/') == Some(command_name))
+        .map(|command| command.usage)
+}
+
+/// Return generated slash command names without their leading slash.
+pub fn slash_command_names() -> Vec<String> {
+    slash_command_infos()
+        .into_iter()
+        .map(|command| command.name.trim_start_matches('/').to_string())
         .collect()
 }
 
@@ -371,121 +306,141 @@ pub fn parse_slash_command(input: &str) -> Result<SlashCommand, SlashParseError>
         message: err.to_string(),
     })?;
 
-    Ok(parsed_slash_command(cli.command))
+    Ok(cli.command)
 }
 
-/// Return metadata for a command name without its leading slash.
-pub fn slash_command_metadata(command_name: &str) -> Option<&'static SlashCommandMetadata> {
-    SLASH_COMMANDS
-        .iter()
-        .find(|command| command.name.strip_prefix('/') == Some(command_name))
+fn slash_command_infos() -> Vec<SlashCommandInfo> {
+    let command = SlashCli::command();
+    command.get_subcommands().map(slash_command_info).collect()
+}
+
+fn slash_command_info(command: &Command) -> SlashCommandInfo {
+    SlashCommandInfo {
+        name: format!("/{}", command.get_name()),
+        usage: slash_usage(command),
+        description: command
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        takes_arguments: command.get_arguments().next().is_some(),
+    }
+}
+
+fn slash_usage(command: &Command) -> String {
+    let mut parts = vec![format!("/{}", command.get_name())];
+    parts.extend(command.get_arguments().filter_map(arg_usage));
+    parts.join(" ")
+}
+
+fn arg_usage(arg: &Arg) -> Option<String> {
+    if arg.is_hide_set() && arg.get_id() != "fields_json" {
+        return None;
+    }
+
+    if matches!(arg.get_id().as_str(), "fields" | "body") {
+        return None;
+    }
+
+    if let Some(long) = arg.get_long() {
+        let usage = if matches!(arg.get_action(), ArgAction::SetTrue | ArgAction::SetFalse) {
+            format!("--{long}")
+        } else {
+            format!("--{long} <{}>", value_name(arg))
+        };
+
+        return Some(optional_usage(arg, usage));
+    }
+
+    let usage = match arg.get_id().as_str() {
+        "request" => "<request>".to_string(),
+        "answer" => "<answer>".to_string(),
+        id => format!("<{}>", id.replace('_', "-")),
+    };
+
+    Some(optional_usage(arg, usage))
+}
+
+fn optional_usage(arg: &Arg, usage: String) -> String {
+    if arg.is_required_set() {
+        usage
+    } else if usage.starts_with('<') && usage.ends_with('>') {
+        format!("[{}]", usage.trim_start_matches('<').trim_end_matches('>'))
+    } else {
+        format!("[{usage}]")
+    }
+}
+
+fn value_name(arg: &Arg) -> String {
+    arg.get_value_names()
+        .and_then(|names| names.first())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| arg.get_id().as_str().replace('_', "-"))
 }
 
 fn tokenize_slash_input(input: &str) -> Result<Vec<String>, SlashParseError> {
-    let input = escape_comment_start_hashes(input);
-    shlex::split(&input).ok_or(SlashParseError::UnmatchedQuote)
-}
-
-fn escape_comment_start_hashes(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut in_token = false;
     let mut quote = None;
-    let mut backslash = false;
-    let mut word_started = false;
+    let mut chars = input.chars();
 
-    for ch in input.chars() {
+    while let Some(ch) = chars.next() {
         match quote {
             Some('\'') => {
-                escaped.push(ch);
-                word_started = true;
                 if ch == '\'' {
                     quote = None;
+                } else {
+                    token.push(ch);
                 }
             }
-            Some('"') => {
-                escaped.push(ch);
-                word_started = true;
-                if backslash {
-                    backslash = false;
-                } else if ch == '\\' {
-                    backslash = true;
-                } else if ch == '"' {
-                    quote = None;
-                }
-            }
-            _ if backslash => {
-                escaped.push(ch);
-                backslash = false;
-                word_started = true;
-            }
-            _ => match ch {
+            Some('"') => match ch {
+                '"' => quote = None,
                 '\\' => {
-                    escaped.push(ch);
-                    backslash = true;
-                    word_started = true;
+                    if let Some(escaped) = chars.next() {
+                        token.push(escaped);
+                    } else {
+                        token.push(ch);
+                    }
                 }
+                _ => token.push(ch),
+            },
+            Some(_) => unreachable!("unsupported quote delimiter"),
+            None => match ch {
                 '\'' | '"' => {
-                    escaped.push(ch);
                     quote = Some(ch);
-                    word_started = true;
+                    in_token = true;
                 }
-                ' ' | '\t' | '\n' => {
-                    escaped.push(ch);
-                    word_started = false;
+                '\\' => {
+                    in_token = true;
+                    if let Some(escaped) = chars.next() {
+                        token.push(escaped);
+                    } else {
+                        token.push(ch);
+                    }
                 }
-                '#' if !word_started => {
-                    escaped.push('\\');
-                    escaped.push(ch);
-                    word_started = true;
+                ch if ch.is_whitespace() => {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut token));
+                        in_token = false;
+                    }
                 }
                 _ => {
-                    escaped.push(ch);
-                    word_started = true;
+                    token.push(ch);
+                    in_token = true;
                 }
             },
         }
     }
 
-    escaped
-}
-
-fn parsed_slash_command(command: SlashSubcommand) -> SlashCommand {
-    match command {
-        SlashSubcommand::Run(args) => SlashCommand::Run {
-            request: join_trailing_args(args.request),
-        },
-        SlashSubcommand::RunWorkflow(args) => SlashCommand::RunWorkflow {
-            workflow_id: args.workflow_id,
-            request: join_trailing_args(args.request),
-        },
-        SlashSubcommand::RunStep(args) => SlashCommand::RunStep {
-            request: join_trailing_args(args.request),
-        },
-        SlashSubcommand::Step(args) => SlashCommand::Step {
-            run_id: args.run_id,
-        },
-        SlashSubcommand::Resume(args) => SlashCommand::Resume {
-            run_id: args.run_id,
-        },
-        SlashSubcommand::Answer(args) => SlashCommand::Answer {
-            run_id: args.run_id,
-            prompt_id: args.prompt_id,
-            answer: join_trailing_args(args.answer),
-        },
-        SlashSubcommand::Runs => SlashCommand::Runs,
-        SlashSubcommand::Workflows => SlashCommand::Workflows,
-        SlashSubcommand::Improve(args) => SlashCommand::Improve {
-            run_id: args.run_id,
-        },
-        SlashSubcommand::Resolve(args) => SlashCommand::Resolve {
-            run_id: args.run_id,
-            status: args.status,
-            fields_json: (!args.fields_json.is_empty())
-                .then(|| join_trailing_args(args.fields_json)),
-        },
-        SlashSubcommand::Cancel => SlashCommand::Cancel,
-        SlashSubcommand::Exit => SlashCommand::Exit,
-        SlashSubcommand::Help => SlashCommand::Help,
+    if quote.is_some() {
+        return Err(SlashParseError::UnmatchedQuote);
     }
+
+    if in_token {
+        tokens.push(token);
+    }
+
+    Ok(tokens)
 }
 
 fn join_trailing_args(args: Vec<String>) -> String {
@@ -496,23 +451,35 @@ fn join_trailing_args(args: Vec<String>) -> String {
 mod tests {
     use super::*;
 
+    fn shared_cli_command(args: impl IntoIterator<Item = &'static str>) -> SharedCommand {
+        match Cli::parse_from(args).command {
+            Some(CliCommand::Shared(command)) => command,
+            other => panic!("expected shared command, got {other:?}"),
+        }
+    }
+
+    fn shared_slash_command(input: &str) -> SharedCommand {
+        match parse_slash_command(input).unwrap() {
+            SlashCommand::Shared(command) => command,
+            other => panic!("expected shared slash command, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn run_with_workflow_parses_workflow_override() {
-        let cli = Cli::parse_from(["cowboy", "run", "--workflow", "review", "do", "work"]);
-        match cli.command {
-            Some(CliCommand::Run {
-                workflow, request, ..
-            }) => {
-                assert_eq!(workflow.as_deref(), Some("review"));
-                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+    fn cli_run_parses_through_shared_command() {
+        match shared_cli_command(["cowboy", "run", "do", "work"]) {
+            SharedCommand::Run(args) => {
+                assert!(!args.step);
+                assert_eq!(args.workflow, None);
+                assert_eq!(args.request, vec!["do".to_string(), "work".to_string()]);
             }
             other => panic!("expected run command, got {other:?}"),
         }
     }
 
     #[test]
-    fn run_step_with_workflow_parses_first_step_override() {
-        let cli = Cli::parse_from([
+    fn cli_run_step_and_workflow_parse_through_shared_command() {
+        match shared_cli_command([
             "cowboy",
             "run",
             "--step",
@@ -520,73 +487,125 @@ mod tests {
             "review",
             "do",
             "work",
-        ]);
-        match cli.command {
-            Some(CliCommand::Run {
-                step,
-                workflow,
-                request,
-            }) => {
-                assert!(step);
-                assert_eq!(workflow.as_deref(), Some("review"));
-                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+        ]) {
+            SharedCommand::Run(args) => {
+                assert!(args.step);
+                assert_eq!(args.workflow.as_deref(), Some("review"));
+                assert_eq!(args.request, vec!["do".to_string(), "work".to_string()]);
             }
             other => panic!("expected run command, got {other:?}"),
         }
     }
 
     #[test]
-    fn run_without_workflow_keeps_selector_backed_form() {
-        let cli = Cli::parse_from(["cowboy", "run", "do", "work"]);
-        match cli.command {
-            Some(CliCommand::Run {
-                workflow, request, ..
-            }) => {
-                assert_eq!(workflow, None);
-                assert_eq!(request, vec!["do".to_string(), "work".to_string()]);
+    fn slash_run_parses_through_shared_command() {
+        match shared_slash_command("/run do work") {
+            SharedCommand::Run(args) => {
+                assert!(!args.step);
+                assert_eq!(args.workflow, None);
+                assert_eq!(args.into_request(), "do work");
             }
             other => panic!("expected run command, got {other:?}"),
         }
     }
 
     #[test]
-    fn resolve_without_status_parses_as_list_form() {
-        let cli = Cli::parse_from(["cowboy", "resolve", "run-1"]);
-        match cli.command {
-            Some(CliCommand::Resolve {
-                run_id,
-                status,
-                fields,
-                body,
-            }) => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(status, None);
-                assert_eq!(fields, None);
-                assert_eq!(body, None);
+    fn slash_run_step_and_workflow_parse_through_shared_command() {
+        match shared_slash_command("/run --step --workflow review do work") {
+            SharedCommand::Run(args) => {
+                assert!(args.step);
+                assert_eq!(args.workflow.as_deref(), Some("review"));
+                assert_eq!(args.into_request(), "do work");
             }
-            other => panic!("expected resolve command, got {other:?}"),
+            other => panic!("expected run command, got {other:?}"),
         }
     }
 
     #[test]
-    fn resume_with_run_id_parses() {
-        let cli = Cli::parse_from(["cowboy", "resume", "run-1"]);
-        match cli.command {
-            Some(CliCommand::Resume { run_id }) => assert_eq!(run_id, "run-1"),
+    fn quoted_and_unquoted_run_requests_parse_equivalently() {
+        let expected = SharedCommand::Run(RunArgs {
+            step: false,
+            workflow: None,
+            request: vec!["do work".to_string()],
+        });
+
+        assert_eq!(shared_slash_command("/run \"do work\""), expected);
+        assert_eq!(
+            shared_slash_command("/run do work").into_request(),
+            "do work"
+        );
+    }
+
+    #[test]
+    fn hash_issue_references_are_preserved() {
+        match shared_slash_command("/run fix #123 regression") {
+            SharedCommand::Run(args) => assert_eq!(args.into_request(), "fix #123 regression"),
+            other => panic!("expected run command, got {other:?}"),
+        }
+
+        match shared_slash_command("/answer run-1 prompt-1 see #123") {
+            SharedCommand::Answer(args) => {
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.prompt_id, "prompt-1");
+                assert_eq!(args.into_answer(), "see #123");
+            }
+            other => panic!("expected answer command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_accepts_clap_delimited_hyphen_leading_request() {
+        match shared_slash_command("/run -- --dry-run now") {
+            SharedCommand::Run(args) => assert_eq!(args.into_request(), "--dry-run now"),
+            other => panic!("expected run command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_requires_run_id_for_cli_and_slash() {
+        match shared_cli_command(["cowboy", "resume", "run-1"]) {
+            SharedCommand::Resume(args) => assert_eq!(args.run_id, "run-1"),
             other => panic!("expected resume command, got {other:?}"),
         }
+
+        match shared_slash_command("/resume run-1") {
+            SharedCommand::Resume(args) => assert_eq!(args.run_id, "run-1"),
+            other => panic!("expected resume command, got {other:?}"),
+        }
+
+        assert_eq!(
+            Cli::try_parse_from(["cowboy", "resume"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(matches!(
+            parse_slash_command("/resume"),
+            Err(SlashParseError::Validation { .. })
+        ));
     }
 
     #[test]
-    fn resume_requires_run_id() {
-        let err = Cli::try_parse_from(["cowboy", "resume"]).unwrap_err();
+    fn answer_parses_unquoted_and_quoted_multi_word_answers() {
+        let expected = SharedCommand::Answer(AnswerArgs {
+            run_id: "run-1".to_string(),
+            prompt_id: "prompt-1".to_string(),
+            answer: vec!["ship it".to_string()],
+        });
 
-        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert_eq!(
+            shared_slash_command("/answer run-1 prompt-1 \"ship it\""),
+            expected
+        );
+        match shared_slash_command("/answer run-1 prompt-1 ship it") {
+            SharedCommand::Answer(args) => assert_eq!(args.into_answer(), "ship it"),
+            other => panic!("expected answer command, got {other:?}"),
+        }
     }
 
     #[test]
-    fn resolve_with_status_fields_and_body_parses() {
-        let cli = Cli::parse_from([
+    fn resolve_parses_cli_options_and_slash_positional_fields() {
+        match shared_cli_command([
             "cowboy",
             "resolve",
             "run-1",
@@ -595,141 +614,65 @@ mod tests {
             r#"{"summary":"done"}"#,
             "--body",
             "looks good",
-        ]);
-        match cli.command {
-            Some(CliCommand::Resolve {
-                run_id,
-                status,
-                fields,
-                body,
-            }) => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(status.as_deref(), Some("approved"));
-                assert_eq!(fields.as_deref(), Some(r#"{"summary":"done"}"#));
-                assert_eq!(body.as_deref(), Some("looks good"));
+        ]) {
+            SharedCommand::Resolve(args) => {
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.status.as_deref(), Some("approved"));
+                assert_eq!(args.fields.as_deref(), Some(r#"{"summary":"done"}"#));
+                assert_eq!(args.body.as_deref(), Some("looks good"));
+                assert_eq!(args.fields_json, None);
+            }
+            other => panic!("expected resolve command, got {other:?}"),
+        }
+
+        match shared_slash_command(
+            r#"/resolve run-1 failed '{"reason":"needs work","retry":false}'"#,
+        ) {
+            SharedCommand::Resolve(args) => {
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.status.as_deref(), Some("failed"));
+                assert_eq!(
+                    args.fields_json.as_deref(),
+                    Some("{\"reason\":\"needs work\",\"retry\":false}")
+                );
             }
             other => panic!("expected resolve command, got {other:?}"),
         }
     }
 
     #[test]
-    fn quoted_and_unquoted_run_requests_parse_equivalently() {
-        let expected = SlashCommand::Run {
-            request: "do work".to_string(),
-        };
+    fn cli_resolve_help_advertises_cli_options() {
+        let mut command = Cli::command();
+        let resolve = command
+            .find_subcommand_mut("resolve")
+            .expect("resolve subcommand exists");
+        let mut help = Vec::new();
+        resolve.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
 
-        assert_eq!(
-            parse_slash_command("/run do work").unwrap(),
-            expected.clone()
-        );
-        assert_eq!(parse_slash_command("/run \"do work\"").unwrap(), expected);
+        assert!(help.contains("--fields <json>"), "{help}");
+        assert!(help.contains("--body <text>"), "{help}");
     }
 
     #[test]
-    fn run_workflow_parses_workflow_id_and_trailing_request() {
-        assert_eq!(
-            parse_slash_command("/run-workflow review do work").unwrap(),
-            SlashCommand::RunWorkflow {
-                workflow_id: "review".to_string(),
-                request: "do work".to_string(),
+    fn resolve_list_and_status_forms_parse() {
+        match shared_slash_command("/resolve run-1") {
+            SharedCommand::Resolve(args) => {
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.status, None);
+                assert_eq!(args.fields_json, None);
             }
-        );
-    }
+            other => panic!("expected resolve command, got {other:?}"),
+        }
 
-    #[test]
-    fn hash_issue_references_are_preserved() {
-        assert_eq!(
-            parse_slash_command("/run fix #123 regression").unwrap(),
-            SlashCommand::Run {
-                request: "fix #123 regression".to_string(),
+        match shared_slash_command("/resolve run-1 failed") {
+            SharedCommand::Resolve(args) => {
+                assert_eq!(args.run_id, "run-1");
+                assert_eq!(args.status.as_deref(), Some("failed"));
+                assert_eq!(args.fields_json, None);
             }
-        );
-        assert_eq!(
-            parse_slash_command("/run-workflow review fix #123 regression").unwrap(),
-            SlashCommand::RunWorkflow {
-                workflow_id: "review".to_string(),
-                request: "fix #123 regression".to_string(),
-            }
-        );
-        assert_eq!(
-            parse_slash_command("/answer run-1 prompt-1 see #123").unwrap(),
-            SlashCommand::Answer {
-                run_id: "run-1".to_string(),
-                prompt_id: "prompt-1".to_string(),
-                answer: "see #123".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn run_step_accepts_hyphen_leading_request() {
-        assert_eq!(
-            parse_slash_command("/run-step --dry-run now").unwrap(),
-            SlashCommand::RunStep {
-                request: "--dry-run now".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn resume_parses_bare_and_explicit_run_id_forms() {
-        assert_eq!(
-            parse_slash_command("/resume").unwrap(),
-            SlashCommand::Resume { run_id: None }
-        );
-        assert_eq!(
-            parse_slash_command("/resume run-1").unwrap(),
-            SlashCommand::Resume {
-                run_id: Some("run-1".to_string()),
-            }
-        );
-    }
-
-    #[test]
-    fn answer_parses_unquoted_and_quoted_multi_word_answers() {
-        let expected = SlashCommand::Answer {
-            run_id: "run-1".to_string(),
-            prompt_id: "prompt-1".to_string(),
-            answer: "ship it".to_string(),
-        };
-
-        assert_eq!(
-            parse_slash_command("/answer run-1 prompt-1 ship it").unwrap(),
-            expected.clone()
-        );
-        assert_eq!(
-            parse_slash_command("/answer run-1 prompt-1 \"ship it\"").unwrap(),
-            expected
-        );
-    }
-
-    #[test]
-    fn resolve_parses_list_status_and_quoted_fields_forms() {
-        assert_eq!(
-            parse_slash_command("/resolve run-1").unwrap(),
-            SlashCommand::Resolve {
-                run_id: "run-1".to_string(),
-                status: None,
-                fields_json: None,
-            }
-        );
-        assert_eq!(
-            parse_slash_command("/resolve run-1 failed").unwrap(),
-            SlashCommand::Resolve {
-                run_id: "run-1".to_string(),
-                status: Some("failed".to_string()),
-                fields_json: None,
-            }
-        );
-        assert_eq!(
-            parse_slash_command(r#"/resolve run-1 failed '{"reason":"needs work","retry":false}'"#)
-                .unwrap(),
-            SlashCommand::Resolve {
-                run_id: "run-1".to_string(),
-                status: Some("failed".to_string()),
-                fields_json: Some("{\"reason\":\"needs work\",\"retry\":false}".to_string()),
-            }
-        );
+            other => panic!("expected resolve command, got {other:?}"),
+        }
     }
 
     #[test]
@@ -741,104 +684,92 @@ mod tests {
     }
 
     #[test]
-    fn advertised_slash_commands_parse_to_their_variants() {
-        for command in SLASH_COMMANDS {
-            let (input, expected) = match command.name {
-                "/run" => (
-                    "/run do work",
-                    SlashCommand::Run {
-                        request: "do work".to_string(),
-                    },
-                ),
-                "/run-workflow" => (
-                    "/run-workflow review do work",
-                    SlashCommand::RunWorkflow {
-                        workflow_id: "review".to_string(),
-                        request: "do work".to_string(),
-                    },
-                ),
-                "/run-step" => (
-                    "/run-step do work",
-                    SlashCommand::RunStep {
-                        request: "do work".to_string(),
-                    },
-                ),
-                "/step" => (
-                    "/step run-1",
-                    SlashCommand::Step {
-                        run_id: "run-1".to_string(),
-                    },
-                ),
-                "/resume" => (
-                    "/resume run-1",
-                    SlashCommand::Resume {
-                        run_id: Some("run-1".to_string()),
-                    },
-                ),
-                "/answer" => (
-                    "/answer run-1 prompt-1 ship it",
-                    SlashCommand::Answer {
-                        run_id: "run-1".to_string(),
-                        prompt_id: "prompt-1".to_string(),
-                        answer: "ship it".to_string(),
-                    },
-                ),
-                "/runs" => ("/runs", SlashCommand::Runs),
-                "/workflows" => ("/workflows", SlashCommand::Workflows),
-                "/improve" => (
-                    "/improve run-1",
-                    SlashCommand::Improve {
-                        run_id: "run-1".to_string(),
-                    },
-                ),
-                "/resolve" => (
-                    "/resolve run-1 failed",
-                    SlashCommand::Resolve {
-                        run_id: "run-1".to_string(),
-                        status: Some("failed".to_string()),
-                        fields_json: None,
-                    },
-                ),
-                "/cancel" => ("/cancel", SlashCommand::Cancel),
-                "/exit" => ("/exit", SlashCommand::Exit),
-                "/help" => ("/help", SlashCommand::Help),
-                name => panic!("advertised slash command {name} has no parser sample"),
-            };
-
-            assert_eq!(parse_slash_command(input).unwrap(), expected);
-            assert!(slash_command_metadata(command.name.trim_start_matches('/')).is_some());
-        }
+    fn tui_only_commands_parse_to_tui_variants() {
+        assert_eq!(
+            parse_slash_command("/workflows").unwrap(),
+            SlashCommand::Workflows
+        );
+        assert_eq!(
+            parse_slash_command("/cancel").unwrap(),
+            SlashCommand::Cancel
+        );
+        assert_eq!(parse_slash_command("/exit").unwrap(), SlashCommand::Exit);
+        assert_eq!(parse_slash_command("/help").unwrap(), SlashCommand::Help);
     }
 
     #[test]
-    fn slash_suggestions_filter_by_command_prefix() {
+    fn removed_run_command_names_are_unknown_and_not_advertised() {
+        assert!(matches!(
+            parse_slash_command("/run-workflow review do work"),
+            Err(SlashParseError::Validation { .. })
+        ));
+        assert!(matches!(
+            parse_slash_command("/run-step do work"),
+            Err(SlashParseError::Validation { .. })
+        ));
+
+        let names = slash_command_names();
+        assert!(!names.contains(&"run-workflow".to_string()));
+        assert!(!names.contains(&"run-step".to_string()));
+    }
+
+    #[test]
+    fn slash_suggestions_are_generated_from_clap_commands() {
         let suggestions = slash_suggestions("/run")
             .into_iter()
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(suggestions.contains(&"/run <request>"));
-        assert!(suggestions.contains(&"/run-step <request>"));
-        assert!(suggestions.contains(&"/runs"));
-        assert!(suggestions.contains(&"/run-workflow <workflow-id> <request>"));
-
-        assert!(!suggestions.contains(&"/answer <run> <id> <answer>"));
+        assert!(
+            suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
+        );
+        assert!(suggestions.contains(&"/runs".to_string()));
+        assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
+        assert!(
+            !suggestions
+                .iter()
+                .any(|usage| usage.contains("run-workflow"))
+        );
+        assert!(!suggestions.iter().any(|usage| usage.starts_with("/answer")));
     }
 
     #[test]
-    fn slash_suggestions_include_resume_usage() {
+    fn slash_suggestions_include_required_resume_usage() {
         let suggestions = slash_suggestions("/res")
             .into_iter()
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(suggestions.contains(&"/resume [run-id]"));
+        assert!(suggestions.contains(&"/resume <run-id>".to_string()));
+    }
+
+    #[test]
+    fn slash_help_rows_include_descriptions_from_clap_commands() {
+        let rows = slash_help_rows();
+        assert!(rows.iter().any(|row| {
+            row.name == "/run"
+                && row.usage == "/run [--step] [--workflow <workflow-id>] <request>"
+                && row.description == "start a workflow run"
+                && row.takes_arguments
+        }));
+        assert!(rows.iter().any(|row| {
+            row.name == "/resolve"
+                && row.usage == "/resolve <run-id> [status] [fields-json]"
+                && !row.usage.contains("--fields")
+                && !row.usage.contains("--body")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.name == "/help"
+                && row.usage == "/help"
+                && row.description == "show built-in commands"
+        }));
     }
 
     #[test]
     fn parser_crate_stays_runtime_and_ui_independent() {
         let manifest = include_str!("../Cargo.toml");
         for forbidden in [
+            "shlex",
             "cowboy-workflow-engine",
             "ratatui",
             "crossterm",
@@ -848,6 +779,19 @@ mod tests {
                 !manifest.contains(forbidden),
                 "forbidden dependency: {forbidden}"
             );
+        }
+    }
+
+    trait SharedCommandTestExt {
+        fn into_request(self) -> String;
+    }
+
+    impl SharedCommandTestExt for SharedCommand {
+        fn into_request(self) -> String {
+            match self {
+                SharedCommand::Run(args) => args.into_request(),
+                other => panic!("expected run command, got {other:?}"),
+            }
         }
     }
 }

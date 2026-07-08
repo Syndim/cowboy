@@ -179,17 +179,15 @@ Current vertical layout:
 Slash commands:
 
 ```text
-/run <request>
-/run-workflow <workflow-id> <request>
-/run-step <request>
+/run [--step] [--workflow <workflow-id>] <request>
 /step <run-id>
-/resume [run-id]
+/resume <run-id>
 /answer <run-id> <prompt-id> <answer>
 /runs
 /workflows
 /improve <run-id>
 /resolve <run-id>
-/resolve <run-id> <status>
+/resolve <run-id> <status> [fields-json]
 /cancel
 /help
 /exit

@@ -219,11 +219,23 @@ fn is_command_line(line: &str) -> bool {
     }
     if matches!(
         trimmed,
-        "/run" | "/run-workflow" | "/runs" | "/resume" | "/workflows" | "/help" | "/exit"
+        "/run"
+            | "/step"
+            | "/resume"
+            | "/answer"
+            | "/runs"
+            | "/workflows"
+            | "/improve"
+            | "/resolve"
+            | "/cancel"
+            | "/help"
+            | "/exit"
     ) || trimmed.starts_with("/run ")
-        || trimmed.starts_with("/run-workflow ")
+        || trimmed.starts_with("/step ")
         || trimmed.starts_with("/resume ")
+        || trimmed.starts_with("/answer ")
         || trimmed.starts_with("/improve ")
+        || trimmed.starts_with("/resolve ")
     {
         return true;
     }
@@ -322,11 +334,11 @@ mod tests {
         assert!(is_command_line("$ cargo test"));
         assert!(is_command_line("cargo run -- run add a route"));
         assert!(is_command_line("/run add a route"));
-        assert!(is_command_line("/run-workflow"));
-
-        assert!(is_command_line("/run-workflow review do work"));
+        assert!(is_command_line("/run --workflow review do work"));
+        assert!(is_command_line("/run --step do work"));
+        assert!(!is_command_line("/run-workflow"));
+        assert!(!is_command_line("/run-workflow review do work"));
         assert!(is_command_line("/resume"));
-        assert!(is_command_line("/resume run-1"));
         assert!(!is_command_line("please run cargo test"));
         assert!(!is_command_line("please resume run-1"));
         assert!(!is_command_line("please run-workflow review do work"));

@@ -421,7 +421,7 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
         !rendered.contains("slash command suggestions"),
         "{rendered}"
     );
-    assert!(!rendered.contains("/resume [run-id]"), "{rendered}");
+    assert!(!rendered.contains("/resume <run-id>"), "{rendered}");
     state.cancel_background_tasks();
 }
 

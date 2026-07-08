@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use cowboy_command_parser::{Cli, CliCommand};
+use cowboy_command_parser::{Cli, CliCommand, SharedCommand};
 
 #[tokio::main]
 async fn main() {
@@ -35,12 +35,24 @@ async fn run_main() -> Result<()> {
 
     match cli.command.unwrap_or(CliCommand::Tui) {
         CliCommand::Tui => cowboy::run_tui(config).await,
-        CliCommand::Run {
-            step,
-            workflow,
-            request,
-        } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+        CliCommand::Shared(command) => run_shared_command(command, config, cwd).await,
+    }
+}
+
+async fn run_shared_command(
+    command: SharedCommand,
+    config: cowboy::AppConfig,
+    cwd: std::path::PathBuf,
+) -> Result<()> {
+    let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+
+    match command {
+        SharedCommand::Run(args) => {
+            let cowboy_command_parser::RunArgs {
+                step,
+                workflow,
+                request,
+            } = args;
             let request = request.join(" ");
             let report = match (step, workflow) {
                 (true, Some(workflow_id)) => {
@@ -59,36 +71,33 @@ async fn run_main() -> Result<()> {
             print_report(&report);
             Ok(())
         }
-        CliCommand::Step { run_id } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
-            let report = runtime.step_run(&run_id).await?;
+        SharedCommand::Step(args) => {
+            let report = runtime.step_run(&args.run_id).await?;
             print_report(&report);
             Ok(())
         }
-        CliCommand::Resume { run_id } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
-            let report = runtime.resume_run(&run_id).await?;
+        SharedCommand::Resume(args) => {
+            let report = runtime.resume_run(&args.run_id).await?;
             print_report(&report);
             Ok(())
         }
-        CliCommand::Answer {
-            run_id,
-            prompt_id,
-            answer,
-        } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+        SharedCommand::Answer(args) => {
+            let cowboy_command_parser::AnswerArgs {
+                run_id,
+                prompt_id,
+                answer,
+            } = args;
+            let answer = answer.join(" ");
             let report = runtime.answer_run(&run_id, &prompt_id, &answer).await?;
             print_report(&report);
             Ok(())
         }
-        CliCommand::Improve { run_id } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
-            let applied = runtime.improve_run(&run_id).await?;
+        SharedCommand::Improve(args) => {
+            let applied = runtime.improve_run(&args.run_id).await?;
             println!("improvement={applied:?}");
             Ok(())
         }
-        CliCommand::Runs => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+        SharedCommand::Runs => {
             for run in runtime.list_runs()? {
                 println!(
                     "{} workflow={} status={:?} step={} head={}",
@@ -101,13 +110,14 @@ async fn run_main() -> Result<()> {
             }
             Ok(())
         }
-        CliCommand::Resolve {
-            run_id,
-            status,
-            fields,
-            body,
-        } => {
-            let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+        SharedCommand::Resolve(args) => {
+            let cowboy_command_parser::ResolveArgs {
+                run_id,
+                status,
+                fields,
+                body,
+                fields_json,
+            } = args;
             match status {
                 None => {
                     let options = runtime.resolution_options(&run_id)?;
@@ -115,10 +125,10 @@ async fn run_main() -> Result<()> {
                     Ok(())
                 }
                 Some(status) => {
-                    let fields = match fields {
+                    let fields = match fields.or(fields_json) {
                         Some(raw) => Some(
                             serde_json::from_str(&raw)
-                                .with_context(|| format!("invalid --fields JSON: {raw}"))?,
+                                .with_context(|| format!("invalid fields JSON: {raw}"))?,
                         ),
                         None => None,
                     };

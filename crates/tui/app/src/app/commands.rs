@@ -1,7 +1,7 @@
 use anyhow::Result;
 use cowboy_command_parser::{
-    SLASH_COMMANDS, SlashCommand, SlashParseError, parse_slash_command, slash_command_metadata,
-    slash_suggestions,
+    SharedCommand, SlashCommand, SlashParseError, parse_slash_command, slash_command_usage,
+    slash_help_rows, slash_suggestions,
 };
 use cowboy_workflow_engine::WorkflowRuntime;
 
@@ -25,8 +25,8 @@ fn show_slash_parse_error(state: &mut AppState, err: SlashParseError) {
         SlashParseError::UnmatchedQuote => "usage: unmatched quote in slash command".to_string(),
         SlashParseError::Validation { command, message } => command
             .as_deref()
-            .and_then(slash_command_metadata)
-            .map(|command| format!("usage: {}", command.usage))
+            .and_then(slash_command_usage)
+            .map(|usage| format!("usage: {usage}"))
             .unwrap_or_else(|| first_error_line(&message)),
     };
 
@@ -85,27 +85,8 @@ async fn dispatch_slash_command(
     command: SlashCommand,
 ) -> Result<()> {
     match command {
-        SlashCommand::Run { request } => spawn_start_run(state, runtime, request),
-        SlashCommand::RunWorkflow {
-            workflow_id,
-            request,
-        } => spawn_start_run_with_workflow(state, runtime, workflow_id, request),
-        SlashCommand::RunStep { request } => spawn_start_run_stepwise(state, runtime, request),
-        SlashCommand::Step { run_id } => spawn_step_run(state, runtime, run_id),
-        SlashCommand::Resume { run_id } => submit_resume_run(state, runtime, run_id),
-        SlashCommand::Answer {
-            run_id,
-            prompt_id,
-            answer,
-        } => spawn_answer_task(state, runtime, run_id, prompt_id, answer),
-        SlashCommand::Runs => show_runs(state, runtime)?,
+        SlashCommand::Shared(command) => dispatch_shared_command(state, runtime, command).await?,
         SlashCommand::Workflows => show_workflows(state, runtime)?,
-        SlashCommand::Improve { run_id } => improve_run(state, runtime, &run_id).await?,
-        SlashCommand::Resolve {
-            run_id,
-            status,
-            fields_json,
-        } => resolve_run(state, runtime, run_id, status, fields_json).await?,
         SlashCommand::Cancel => state.cancel_background_tasks(),
         SlashCommand::Exit => {
             state.mark_exit_requested();
@@ -116,6 +97,64 @@ async fn dispatch_slash_command(
     }
 
     Ok(())
+}
+
+async fn dispatch_shared_command(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    command: SharedCommand,
+) -> Result<()> {
+    match command {
+        SharedCommand::Run(args) => spawn_start_run_from_args(state, runtime, args),
+        SharedCommand::Step(args) => spawn_step_run(state, runtime, args.run_id),
+        SharedCommand::Resume(args) => spawn_resume_run(state, runtime, args.run_id),
+        SharedCommand::Answer(args) => {
+            let cowboy_command_parser::AnswerArgs {
+                run_id,
+                prompt_id,
+                answer,
+            } = args;
+            spawn_answer_task(state, runtime, run_id, prompt_id, answer.join(" "));
+        }
+        SharedCommand::Runs => show_runs(state, runtime)?,
+        SharedCommand::Improve(args) => improve_run(state, runtime, &args.run_id).await?,
+        SharedCommand::Resolve(args) => {
+            let cowboy_command_parser::ResolveArgs {
+                run_id,
+                status,
+                fields,
+                body,
+                fields_json,
+            } = args;
+            resolve_run(state, runtime, run_id, status, fields.or(fields_json), body).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_start_run_from_args(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    args: cowboy_command_parser::RunArgs,
+) {
+    let cowboy_command_parser::RunArgs {
+        step,
+        workflow,
+        request,
+    } = args;
+    let request = request.join(" ");
+
+    match (step, workflow) {
+        (true, Some(workflow_id)) => {
+            spawn_start_run_with_workflow_stepwise(state, runtime, workflow_id, request);
+        }
+        (false, Some(workflow_id)) => {
+            spawn_start_run_with_workflow(state, runtime, workflow_id, request);
+        }
+        (true, None) => spawn_start_run_stepwise(state, runtime, request),
+        (false, None) => spawn_start_run(state, runtime, request),
+    }
 }
 
 fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
@@ -130,7 +169,7 @@ fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: Str
 
 fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
     let runtime = runtime.clone();
-    state.spawn_report_task(format!("submitted run-step: {request}"), async move {
+    state.spawn_report_task(format!("submitted run --step: {request}"), async move {
         runtime
             .start_run_stepwise(request)
             .await
@@ -146,10 +185,28 @@ fn spawn_start_run_with_workflow(
 ) {
     let runtime = runtime.clone();
     state.spawn_report_task(
-        format!("submitted run-workflow {workflow_id}: {request}"),
+        format!("submitted run --workflow {workflow_id}: {request}"),
         async move {
             runtime
                 .start_run_with_workflow(workflow_id, request)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
+}
+
+fn spawn_start_run_with_workflow_stepwise(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    workflow_id: String,
+    request: String,
+) {
+    let runtime = runtime.clone();
+    state.spawn_report_task(
+        format!("submitted run --step --workflow {workflow_id}: {request}"),
+        async move {
+            runtime
+                .start_run_with_workflow_stepwise(workflow_id, request)
                 .await
                 .map_err(|err| err.to_string())
         },
@@ -164,19 +221,6 @@ fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Strin
             .await
             .map_err(|err| err.to_string())
     });
-}
-
-fn submit_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Option<String>) {
-    let run_id = run_id
-        .filter(|run_id| !run_id.is_empty())
-        .or_else(|| state.active_run_id().map(str::to_string));
-    let Some(run_id) = run_id else {
-        state.set_status("usage: /resume [run-id]");
-        state.push_card("Usage", [state.status().to_string()]);
-        return;
-    };
-
-    spawn_resume_run(state, runtime, run_id);
 }
 
 fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
@@ -222,6 +266,7 @@ async fn resolve_run(
     run_id: String,
     status: Option<String>,
     fields_raw: Option<String>,
+    body: Option<String>,
 ) -> Result<()> {
     match status {
         None => {
@@ -245,7 +290,7 @@ async fn resolve_run(
                 ));
             }
             details.push(format!(
-                "resolve with: cowboy resolve {} <status> [--fields '<json>']",
+                "resolve with: /resolve {} <status> [fields-json]",
                 options.run_id
             ));
             state.push_card("Resolve", details);
@@ -264,7 +309,7 @@ async fn resolve_run(
                 format!("submitted resolve: {run_id} {status}"),
                 async move {
                     runtime
-                        .resolve_run(&run_id, &status, fields, None)
+                        .resolve_run(&run_id, &status, fields, body)
                         .await
                         .map_err(|err| err.to_string())
                 },
@@ -279,9 +324,9 @@ pub(in crate::app) fn show_help(state: &mut AppState) {
     let mut details =
         vec!["Plain text starts a workflow run. Slash commands control runs.".to_string()];
     details.extend(
-        SLASH_COMMANDS
-            .iter()
-            .map(|command| format!("{:<28} {}", command.usage, command.description)),
+        slash_help_rows()
+            .into_iter()
+            .map(|command| format!("{:<42} {}", command.usage, command.description)),
     );
     state.push_card("Help", details);
 }
@@ -353,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn help_uses_slash_command_metadata() {
+    fn help_uses_generated_slash_command_rows() {
         let mut state = test_state();
 
         show_help(&mut state);
@@ -364,9 +409,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        for command in SLASH_COMMANDS {
-            assert!(rendered.contains(command.usage));
-            assert!(rendered.contains(command.description));
+        for command in slash_help_rows() {
+            assert!(rendered.contains(&command.usage));
+            assert!(rendered.contains(&command.description));
         }
     }
 
@@ -407,12 +452,18 @@ mod tests {
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(suggestions.contains(&"/run <request>"));
-        assert!(suggestions.contains(&"/run-step <request>"));
-        assert!(suggestions.contains(&"/runs"));
-        assert!(suggestions.contains(&"/run-workflow <workflow-id> <request>"));
+        assert!(
+            suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
+        );
+        assert!(suggestions.contains(&"/runs".to_string()));
 
-        assert!(!suggestions.contains(&"/answer <run> <id> <answer>"));
+        assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
+        assert!(
+            !suggestions
+                .iter()
+                .any(|usage| usage.contains("run-workflow"))
+        );
+        assert!(!suggestions.iter().any(|usage| usage.starts_with("/answer")));
     }
 
     #[test]
@@ -422,7 +473,7 @@ mod tests {
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(suggestions.contains(&"/resume [run-id]"));
+        assert!(suggestions.contains(&"/resume <run-id>".to_string()));
     }
 
     #[tokio::test]
@@ -464,10 +515,10 @@ mod tests {
             .with_deterministic_selector();
         let mut state = AppState::new(config);
 
-        state.push_input("/run-workflow review do work");
+        state.push_input("/run --workflow review do work");
         submit_input(&mut state, &runtime).await;
 
-        assert!(state.status().contains("run-workflow review"));
+        assert!(state.status().contains("run --workflow review"));
         assert_eq!(state.background_task_count(), 1);
         tokio::task::yield_now().await;
         assert!(state.drain_background_tasks().await);
@@ -478,17 +529,19 @@ mod tests {
     #[tokio::test]
     async fn missing_required_slash_args_show_usage_without_spawning_tasks() {
         for (input, usage) in [
-            ("/run", "/run <request>"),
-            ("/run-step", "/run-step <request>"),
+            ("/run", "/run [--step] [--workflow <workflow-id>] <request>"),
             ("/step", "/step <run-id>"),
-            ("/answer", "/answer <run> <id> <answer>"),
-            ("/answer run-1 prompt-1", "/answer <run> <id> <answer>"),
+            ("/resume", "/resume <run-id>"),
+            ("/answer", "/answer <run-id> <prompt-id> <answer>"),
+            (
+                "/answer run-1 prompt-1",
+                "/answer <run-id> <prompt-id> <answer>",
+            ),
             ("/improve", "/improve <run-id>"),
             ("/resolve", "/resolve <run-id> [status] [fields-json]"),
-            ("/run-workflow", "/run-workflow <workflow-id> <request>"),
             (
-                "/run-workflow review",
-                "/run-workflow <workflow-id> <request>",
+                "/run --workflow review",
+                "/run [--step] [--workflow <workflow-id>] <request>",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state();
@@ -533,6 +586,7 @@ mod tests {
     async fn run_and_plain_text_keep_selector_backed_start_labels() {
         for (input, expected_status) in [
             ("/run do work", "submitted run: do work"),
+            ("/run --step do work", "submitted run --step: do work"),
             ("do work", "submitted run: do work"),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -693,55 +747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_resume_uses_active_run_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let workflow_dir = dir.path().join("workflows");
-        std::fs::create_dir(&workflow_dir).unwrap();
-        std::fs::write(
-            workflow_dir.join("aaa.lua"),
-            r#"
-            local start = step("start")
-            start.run = function(ctx)
-              return action.status { status = "next", body = "ready" }
-            end
-
-            local done = step("done")
-            done.run = function(ctx)
-              return action.status { status = "success", body = "done" }
-            end
-
-            start:on("next", done)
-            return workflow("aaa", start)
-            "#,
-        )
-        .unwrap();
-        let config = AppConfig {
-            state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
-            workflow_dirs: vec![workflow_dir],
-            max_steps_per_run: 5,
-            max_visits_per_step: 5,
-            ..AppConfig::default()
-        };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
-            .with_deterministic_selector();
-        let start = runtime.start_run_stepwise("request").await.unwrap();
-        let run_id = start.run.id.clone();
-        let mut state = AppState::new(config);
-        state.spawn_report_task("seed active run".to_string(), async move { Ok(start) });
-        tokio::task::yield_now().await;
-        assert!(state.drain_background_tasks().await);
-        assert_eq!(state.active_run_id(), Some(run_id.as_str()));
-
-        state.push_input("/resume");
-        submit_input(&mut state, &runtime).await;
-
-        assert_eq!(state.status(), format!("submitted resume: {run_id}"));
-        assert_eq!(state.background_task_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn bare_resume_without_active_run_shows_usage_without_spawning_task() {
+    async fn bare_resume_shows_required_run_id_usage_without_spawning_task() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
@@ -757,7 +763,7 @@ mod tests {
         state.push_input("/resume");
         submit_input(&mut state, &runtime).await;
 
-        assert_eq!(state.status(), "usage: /resume [run-id]");
+        assert_eq!(state.status(), "usage: /resume <run-id>");
         assert_eq!(state.background_task_count(), 0);
         let rendered = state
             .event_entries()
@@ -766,7 +772,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(rendered.contains("Usage"));
-        assert!(rendered.contains("usage: /resume [run-id]"));
+        assert!(rendered.contains("usage: /resume <run-id>"));
     }
 
     #[tokio::test]
