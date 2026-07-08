@@ -285,6 +285,117 @@ fn parse_selection_response(text: &str) -> Result<SelectionResponse> {
         .map_err(|err| WorkflowError::InvalidAction(format!("invalid selector JSON: {err}")))
 }
 
+pub const REQUEST_TOPIC_MAX_CHARS: usize = 80;
+
+/// Agent-backed generator for a compact title-bar topic from the initial request.
+#[derive(Debug)]
+pub struct AgentRequestTopicGenerator<C> {
+    client: Mutex<C>,
+    session_id: Mutex<Option<String>>,
+    cwd: String,
+    mcp_servers: Vec<serde_json::Value>,
+    model: ModelInfo,
+}
+
+impl<C> AgentRequestTopicGenerator<C> {
+    pub fn new(client: C, cwd: impl Into<String>, model: ModelInfo) -> Self {
+        Self {
+            client: Mutex::new(client),
+            session_id: Mutex::new(None),
+            cwd: cwd.into(),
+            mcp_servers: Vec::new(),
+            model,
+        }
+    }
+
+    pub fn with_mcp_servers(mut self, mcp_servers: Vec<serde_json::Value>) -> Self {
+        self.mcp_servers = mcp_servers;
+        self
+    }
+}
+
+impl<C> AgentRequestTopicGenerator<C>
+where
+    C: Client,
+{
+    pub async fn generate(&self, request: &str) -> Result<String> {
+        let mut client = self.client.lock().await;
+        let session_id = self.ensure_session(client.as_mut_client()).await?;
+        let mut text = String::new();
+        client
+            .prompt(
+                &session_id,
+                vec![PromptContent::text(request_topic_prompt(request))],
+                &mut |event| collect_text(event, &mut text),
+            )
+            .await
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        parse_request_topic_response(&text)
+    }
+
+    async fn ensure_session(&self, client: &mut dyn Client) -> Result<String> {
+        if let Some(session_id) = self.session_id.lock().await.clone() {
+            return Ok(session_id);
+        }
+        if let Some(session_id) = client.session_id() {
+            let session_id = session_id.to_string();
+            *self.session_id.lock().await = Some(session_id.clone());
+            return Ok(session_id);
+        }
+        let session_id = client
+            .new_session(&self.cwd, &self.mcp_servers, &self.model)
+            .await
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        *self.session_id.lock().await = Some(session_id.clone());
+        Ok(session_id)
+    }
+}
+
+fn request_topic_prompt(request: &str) -> String {
+    format!(
+        "Create a compact title-bar topic for this user request. This is a one-shot \
+summarization task: do NOT run tools, do NOT ask questions, and do NOT include \
+Markdown or prose outside the JSON. The topic must be a non-empty single-line \
+phrase, at most {REQUEST_TOPIC_MAX_CHARS} characters, ideally 2-6 words.\n\n\
+User request:\n{request}\n\n\
+Respond with ONLY a single JSON object, nothing else:\n\
+{{\"topic\": \"<short topic>\"}}"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct RequestTopicResponse {
+    topic: String,
+}
+
+fn parse_request_topic_response(text: &str) -> Result<String> {
+    let response: RequestTopicResponse = parse_json_response(text, "request topic")?;
+    validate_request_topic(response.topic)
+}
+
+fn validate_request_topic(topic: String) -> Result<String> {
+    let topic = topic.trim();
+    if topic.is_empty() {
+        return Err(WorkflowError::InvalidAction(
+            "request topic is empty".to_string(),
+        ));
+    }
+
+    if topic.contains('\n') || topic.contains('\r') {
+        return Err(WorkflowError::InvalidAction(
+            "request topic must be a single line".to_string(),
+        ));
+    }
+
+    if topic.chars().count() > REQUEST_TOPIC_MAX_CHARS {
+        return Err(WorkflowError::InvalidAction(format!(
+            "request topic must be at most {REQUEST_TOPIC_MAX_CHARS} characters"
+        )));
+    }
+
+    Ok(topic.to_string())
+}
+
 /// Agent-backed post-run summarizer that produces a `WorkflowSummary` JSON object.
 #[derive(Debug)]
 pub struct AgentWorkflowSummarizer<C> {
@@ -574,6 +685,108 @@ mod tests {
             message.contains(reply),
             "selector error should include the agent reply, got: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn request_topic_generator_prompts_for_json_and_trims_topic() {
+        let generator = AgentRequestTopicGenerator::new(
+            FakeClient::new(r#"{"topic":"  Header Topic  "}"#),
+            "/repo",
+            ModelInfo::default(),
+        );
+
+        let topic = generator.generate("Add compact UI chrome").await.unwrap();
+
+        assert_eq!(topic, "Header Topic");
+        let client = generator.client.lock().await;
+        assert_eq!(client.prompts.len(), 1);
+        let prompt = &client.prompts[0];
+        assert!(prompt.contains("Create a compact title-bar topic"), "{prompt}");
+        assert!(prompt.contains("do NOT run tools"), "{prompt}");
+        assert!(prompt.contains("Respond with ONLY a single JSON object"), "{prompt}");
+        assert!(prompt.contains(r#"{"topic": "<short topic>"}"#), "{prompt}");
+        assert!(prompt.contains("Add compact UI chrome"), "{prompt}");
+    }
+
+    #[test]
+    fn request_topic_response_rejects_invalid_title_bar_topics() {
+        for (raw, expected) in [
+            (r#"{"topic":"   "}"#, "request topic is empty"),
+            (r#"{"topic":"first\nsecond"}"#, "request topic must be a single line"),
+            (
+                r#"{"topic":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabc"}"#,
+                "request topic must be at most 80 characters",
+            ),
+        ] {
+            let err = parse_request_topic_response(raw).unwrap_err();
+
+            assert!(
+                err.to_string().contains(expected),
+                "expected {expected:?} in {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_topic_generator_prompts_for_json_without_tools_or_questions() {
+        let generator = AgentRequestTopicGenerator::new(
+            FakeClient::new(r#"{"topic":"Add health route"}"#),
+            ".",
+            ModelInfo::default(),
+        );
+
+        let topic = generator.generate("add a /healthz route").await.unwrap();
+        let prompts = generator.client.lock().await.prompts.clone();
+
+        assert_eq!(topic, "Add health route");
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("do NOT run tools"));
+        assert!(prompts[0].contains("do NOT ask questions"));
+        assert!(prompts[0].contains(r#"{"topic": "<short topic>"}"#));
+        assert!(prompts[0].contains("add a /healthz route"));
+    }
+
+    #[tokio::test]
+    async fn request_topic_generator_extracts_json_from_surrounding_prose() {
+        let generator = AgentRequestTopicGenerator::new(
+            FakeClient::new(r#"Here is JSON: {"topic":"Review branch"}."#),
+            ".",
+            ModelInfo::default(),
+        );
+
+        let topic = generator.generate("review this branch").await.unwrap();
+
+        assert_eq!(topic, "Review branch");
+    }
+
+    #[tokio::test]
+    async fn request_topic_generator_rejects_invalid_json() {
+        let generator = AgentRequestTopicGenerator::new(
+            FakeClient::new("not json"),
+            ".",
+            ModelInfo::default(),
+        );
+
+        let err = generator.generate("fix it").await.unwrap_err();
+
+        assert!(err.to_string().contains("request topic response missing JSON"));
+    }
+
+    #[test]
+    fn request_topic_validation_rejects_empty_and_multiline_topics() {
+        let empty = parse_request_topic_response(r#"{"topic":"   "}"#).unwrap_err();
+        assert!(empty.to_string().contains("empty"));
+
+        let multiline = parse_request_topic_response(r#"{"topic":"first\nsecond"}"#).unwrap_err();
+        assert!(multiline.to_string().contains("single line"));
+    }
+
+    #[test]
+    fn request_topic_validation_rejects_overlong_topics() {
+        let topic = "x".repeat(REQUEST_TOPIC_MAX_CHARS + 1);
+        let err = validate_request_topic(topic).unwrap_err();
+
+        assert!(err.to_string().contains("at most"));
     }
 
     #[tokio::test]

@@ -359,6 +359,7 @@ mod tests {
             WorkflowEventKind::RunStarted {
                 workflow_name: "agent/00-feature".to_string(),
                 current_step: "plan".to_string(),
+                request_topic: None,
             },
         ));
         state.apply_workflow_event(WorkflowEvent::new(

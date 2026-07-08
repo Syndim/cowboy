@@ -88,19 +88,6 @@ pub(super) fn style_for_tool_status(status: &str) -> Style {
     }
 }
 
-pub(super) fn truncate_to_width(text: impl AsRef<str>, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let text = text.as_ref();
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    text.chars()
-        .take(width.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
 
 #[cfg(test)]
 mod tests {

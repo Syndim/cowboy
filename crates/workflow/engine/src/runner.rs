@@ -20,6 +20,7 @@ pub struct WorkflowRunner<S, E, P> {
     provider: P,
     events: Arc<EventBus>,
     limits: RunnerLimits,
+    request_topic: Option<String>,
 }
 
 impl<S, E, P> WorkflowRunner<S, E, P> {
@@ -30,11 +31,17 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
             provider,
             events,
             limits: RunnerLimits::default(),
+            request_topic: None,
         }
     }
 
     pub fn with_limits(mut self, limits: RunnerLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    pub fn with_request_topic(mut self, request_topic: Option<String>) -> Self {
+        self.request_topic = request_topic;
         self
     }
 
@@ -60,7 +67,8 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events.emit(WorkflowEvent::run_started(&run));
+        self.events
+            .emit(WorkflowEvent::run_started_with_topic(&run, self.request_topic.clone()));
 
         while matches!(run.status, RunStatus::Running) {
             self.execute_one(definition, &mut run).await?;
@@ -77,7 +85,8 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events.emit(WorkflowEvent::run_started(&run));
+        self.events
+            .emit(WorkflowEvent::run_started_with_topic(&run, self.request_topic.clone()));
 
         if matches!(run.status, RunStatus::Running) {
             self.execute_one(definition, &mut run).await?;
@@ -560,7 +569,8 @@ mod tests {
                 }),
             ]),
             bus,
-        );
+        )
+        .with_request_topic(Some("Add health route".to_string()));
 
         let initial_run = run();
         let run_started_at = initial_run.created_at;
@@ -585,7 +595,14 @@ mod tests {
             .into_iter()
             .map(|event| event.kind)
             .collect::<Vec<_>>();
-        assert!(matches!(kinds[0], WorkflowEventKind::RunStarted { .. }));
+        assert_eq!(
+            kinds[0],
+            WorkflowEventKind::RunStarted {
+                workflow_name: "wf".to_string(),
+                current_step: "start".to_string(),
+                request_topic: Some("Add health route".to_string()),
+            }
+        );
         assert!(kinds.iter().any(|kind| matches!(
             kind,
             WorkflowEventKind::StepCompleted { step_id, .. } if step_id == "start"
@@ -599,6 +616,8 @@ mod tests {
 
     #[tokio::test]
     async fn step_once_executes_a_single_step() {
+        let bus = Arc::new(EventBus::new(16));
+        let mut events = bus.subscribe();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             NoopDispatcher,
@@ -614,8 +633,9 @@ mod tests {
                     output: None,
                 }),
             ]),
-            Arc::new(EventBus::new(16)),
-        );
+            bus.clone(),
+        )
+        .with_request_topic(Some("Single step topic".to_string()));
         let definition = definition();
 
         // First step runs `start`, routes to `agent`, run stays Running.
@@ -623,6 +643,15 @@ mod tests {
         assert_eq!(run.steps_executed, 1);
         assert_eq!(run.current_step, "agent");
         assert_eq!(run.status, RunStatus::Running);
+        let first_event = events.try_recv().unwrap();
+        assert_eq!(
+            first_event.kind,
+            WorkflowEventKind::RunStarted {
+                workflow_name: "wf".to_string(),
+                current_step: "start".to_string(),
+                request_topic: Some("Single step topic".to_string()),
+            }
+        );
 
         // Second step runs `agent`, which has no transition -> Completed.
         let run = runner.step_once(&definition, run).await.unwrap();

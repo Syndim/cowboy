@@ -294,6 +294,7 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
         WorkflowEventKind::RunStarted {
             workflow_name,
             current_step,
+            ..
         } => format!(
             "{} started workflow {workflow_name} at {current_step}",
             event.run_id

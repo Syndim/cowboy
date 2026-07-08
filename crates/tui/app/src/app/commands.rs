@@ -558,6 +558,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_paths_display_runtime_supplied_topic_only() {
+        for (input, expected_status) in [
+            ("do work", "submitted run: do work"),
+            ("/run do work", "submitted run: do work"),
+            ("/run-step do work", "submitted run-step: do work"),
+            (
+                "/run-workflow review do work",
+                "submitted run-workflow review: do work",
+            ),
+        ] {
+            let (_dir, runtime, mut state) = test_runtime_state();
+
+            state.push_input(input);
+            submit_input(&mut state, &runtime).await;
+
+            assert_eq!(state.status(), expected_status);
+            assert_eq!(state.background_task_count(), 1);
+            assert_eq!(crate::app::header::text(&state, 120), "Cowboy");
+            assert_eq!(state.current_run_topic(), None);
+
+            state.apply_workflow_event(WorkflowEvent::new(
+                "run-topic",
+                WorkflowEventKind::RunStarted {
+                    workflow_name: "default".to_string(),
+                    current_step: "start".to_string(),
+                    request_topic: Some("Agent supplied topic".to_string()),
+                },
+            ));
+
+            assert_eq!(state.current_run_topic(), Some("Agent supplied topic"));
+            assert_eq!(
+                crate::app::header::text(&state, 120),
+                "Cowboy - Agent supplied topic"
+            );
+            state.cancel_background_tasks();
+        }
+    }
+
+    #[tokio::test]
     async fn pending_prompt_answer_fallback_spawns_answer_task_and_clears_target() {
         let (_dir, runtime, mut state) = test_runtime_state();
         state.apply_workflow_event(WorkflowEvent::new(

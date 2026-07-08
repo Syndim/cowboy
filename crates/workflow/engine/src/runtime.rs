@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 use crate::agent_resolver::AgentResolver;
 use crate::run_lock::RunExecutionLocks;
-use crate::workflow::DeterministicSelector;
+use crate::workflow::{AgentRequestTopicGenerator, DeterministicSelector};
 use crate::{
     EngineActionDispatcher, EventBus, LuaStepActionProvider, ResumeRouter, WorkflowEvent,
     WorkflowEventKind, WorkflowRunner,
@@ -165,6 +165,8 @@ pub struct WorkflowRuntime {
     events: Arc<EventBus>,
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
+    #[cfg(test)]
+    request_topic_override: Option<String>,
 }
 
 /// How far [`WorkflowRuntime`] drives a run in a single call.
@@ -192,6 +194,8 @@ impl WorkflowRuntime {
             config,
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
+            #[cfg(test)]
+            request_topic_override: None,
         }
     }
 
@@ -204,6 +208,12 @@ impl WorkflowRuntime {
 
     pub fn events(&self) -> Arc<EventBus> {
         self.events.clone()
+    }
+
+    #[cfg(test)]
+    fn with_request_topic_for_tests(mut self, topic: impl Into<String>) -> Self {
+        self.request_topic_override = Some(topic.into());
+        self
     }
 
     pub fn catalog(&self) -> Result<WorkflowCatalog> {
@@ -367,7 +377,9 @@ impl WorkflowRuntime {
         store.save_run(&run)?;
         store.update_run_head(&run.id, run_head(&run))?;
         tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
-        self.run_existing(run, definition, snapshot, mode).await
+        let request_topic = self.generate_request_topic(&run.original_request).await;
+        self.run_existing(run, definition, snapshot, mode, request_topic)
+            .await
     }
 
     async fn select_workflow(
@@ -394,6 +406,39 @@ impl WorkflowRuntime {
                 selector.select(request, catalog).await
             }
         }
+    }
+
+    async fn generate_request_topic(&self, request: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(topic) = &self.request_topic_override {
+            return Some(topic.clone());
+        }
+
+        if matches!(self.selector, SelectorMode::Deterministic) {
+            return None;
+        }
+
+        match self.generate_request_topic_result(request).await {
+            Ok(topic) => Some(topic),
+            Err(err) => {
+                tracing::warn!(error = %err, "request topic generation failed");
+                None
+            }
+        }
+    }
+
+    async fn generate_request_topic_result(&self, request: &str) -> Result<String> {
+        let resolver = AgentResolver::new(self.config.agents.clone())?;
+        let agent = resolver.resolve_default()?;
+        let client = AcpClient::connect(transport_for(agent))
+            .await
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        let generator = AgentRequestTopicGenerator::new(
+            client,
+            self.config.cwd.to_string_lossy().to_string(),
+            agent.model.clone(),
+        );
+        generator.generate(request).await
     }
 
     pub async fn resume_run(&self, run_id: &str) -> Result<RunReport> {
@@ -429,7 +474,7 @@ impl WorkflowRuntime {
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
-        self.run_existing(run, definition, snapshot, mode).await
+        self.run_existing(run, definition, snapshot, mode, None).await
     }
 
     pub async fn answer_run(
@@ -475,7 +520,7 @@ impl WorkflowRuntime {
         tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
 
         if matches!(status, RunStatus::Running) {
-            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, events)
+            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, None, events)
                 .await
         } else {
             self.persist_events(&run.id, &events)?;
@@ -644,7 +689,7 @@ impl WorkflowRuntime {
         }
 
         if matches!(status_result, RunStatus::Running) {
-            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, events)
+            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, None, events)
                 .await
         } else {
             self.persist_events(&run.id, &events)?;
@@ -740,8 +785,9 @@ impl WorkflowRuntime {
         definition: cowboy_workflow_core::WorkflowDefinition,
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
+        request_topic: Option<String>,
     ) -> Result<RunReport> {
-        self.run_existing_with_events(run, definition, snapshot, mode, Vec::new())
+        self.run_existing_with_events(run, definition, snapshot, mode, request_topic, Vec::new())
             .await
     }
 
@@ -751,6 +797,7 @@ impl WorkflowRuntime {
         definition: cowboy_workflow_core::WorkflowDefinition,
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
+        request_topic: Option<String>,
         mut events: Vec<WorkflowEvent>,
     ) -> Result<RunReport> {
         tracing::debug!(
@@ -781,7 +828,8 @@ impl WorkflowRuntime {
         let dispatcher = EngineActionDispatcher::new(executor);
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
-            .with_limits(self.config.limits.into());
+            .with_limits(self.config.limits.into())
+            .with_request_topic(request_topic);
         let run_future = async {
             match mode {
                 RunMode::UntilBlocked => runner.run_until_blocked(&definition, run).await,
@@ -1133,6 +1181,102 @@ mod tests {
         .with_deterministic_selector()
     }
 
+    fn runtime_for_topic_workflow(dir: &tempfile::TempDir, topic: &str) -> WorkflowRuntime {
+        let workflow_dir = dir.path().join("topic-workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "first" }
+            end
+
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            start:on("next", finish)
+            return workflow("aaa-declared", start)
+            "#,
+        )
+        .unwrap();
+        runtime_for_workflow_dir(dir, workflow_dir).with_request_topic_for_tests(topic)
+    }
+
+    fn first_run_started_topic(report: &RunReport) -> Option<&str> {
+        report.events.iter().find_map(|event| match &event.kind {
+            WorkflowEventKind::RunStarted { request_topic, .. } => request_topic.as_deref(),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn start_run_attaches_generated_topic_to_runner_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Add health route");
+
+        let report = runtime.start_run("add a /healthz route").await.unwrap();
+
+        assert_eq!(first_run_started_topic(&report), Some("Add health route"));
+    }
+
+    #[tokio::test]
+    async fn start_run_stepwise_attaches_generated_topic_to_runner_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Plan implementation");
+
+        let report = runtime.start_run_stepwise("plan implementation").await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(first_run_started_topic(&report), Some("Plan implementation"));
+    }
+
+    #[tokio::test]
+    async fn start_run_with_workflow_attaches_generated_topic_to_runner_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Review branch");
+
+        let report = runtime
+            .start_run_with_workflow("aaa", "review branch")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.workflow_name, "aaa");
+        assert_eq!(first_run_started_topic(&report), Some("Review branch"));
+    }
+
+    #[tokio::test]
+    async fn start_run_with_workflow_stepwise_attaches_generated_topic_to_runner_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Scoped fix");
+
+        let report = runtime
+            .start_run_with_workflow_stepwise("aaa", "fix scoped issue")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(first_run_started_topic(&report), Some("Scoped fix"));
+    }
+
+    #[tokio::test]
+    async fn existing_run_resume_does_not_attach_new_topic() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Initial topic");
+        let start = runtime.start_run_stepwise("do first step").await.unwrap();
+
+        let report = runtime.resume_run(&start.run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(first_run_started_topic(&report), None);
+        assert!(report.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::RunStarted { request_topic: None, .. }
+        )));
+    }
+
     #[tokio::test]
     async fn starts_builtin_workflow_until_agent_call_attempts_backend() {
         let dir = tempfile::tempdir().unwrap();
@@ -1252,7 +1396,8 @@ mod tests {
                 max_retries_per_step: 2,
             },
         })
-        .with_deterministic_selector();
+        .with_deterministic_selector()
+        .with_request_topic_for_tests("Original topic");
 
         runtime.start_run("do it").await.unwrap_err();
         let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
@@ -1277,6 +1422,10 @@ mod tests {
         assert_eq!(output.fields["prev_status"], "planned");
         assert_eq!(output.fields["summary"], "did the thing");
         assert_eq!(output.body, "manual body");
+        assert!(report.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::RunStarted { request_topic: None, .. }
+        )), "{:#?}", report.events);
 
         // A ManuallyResolved event is persisted in the run's event log.
         let events = runtime.load_events(&run_id).unwrap();
@@ -1556,12 +1705,12 @@ mod tests {
         assert_eq!(report.run.current_step, "finish");
         assert_eq!(report.run.steps_executed, 2);
         assert!(report.events.iter().any(|event| matches!(
-            event.kind,
-            WorkflowEventKind::StepStarted { ref step_id } if step_id == "finish"
+            &event.kind,
+            WorkflowEventKind::StepStarted { step_id } if step_id == "finish"
         )));
         assert!(report.events.iter().any(|event| matches!(
-            event.kind,
-            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+            &event.kind,
+            WorkflowEventKind::StepCompleted { step_id, action, status, .. }
                 if step_id == "finish" && action == "status" && status.as_deref() == Some("success")
         )));
         assert!(
@@ -1574,12 +1723,12 @@ mod tests {
         let persisted = runtime.load_events(&start.run.id).unwrap();
         assert_eq!(persisted, report.events);
         assert!(persisted.iter().any(|event| matches!(
-            event.kind,
-            WorkflowEventKind::StepStarted { ref step_id } if step_id == "finish"
+            &event.kind,
+            WorkflowEventKind::StepStarted { step_id } if step_id == "finish"
         )));
         assert!(persisted.iter().any(|event| matches!(
-            event.kind,
-            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+            &event.kind,
+            WorkflowEventKind::StepCompleted { step_id, action, status, .. }
                 if step_id == "finish" && action == "status" && status.as_deref() == Some("success")
         )));
     }
@@ -1763,7 +1912,8 @@ mod tests {
                 max_retries_per_step: 2,
             },
         })
-        .with_deterministic_selector();
+        .with_deterministic_selector()
+        .with_request_topic_for_tests("Initial prompt topic");
 
         let start = runtime.start_run("request").await.unwrap();
         assert!(matches!(
@@ -1771,6 +1921,7 @@ mod tests {
             RunStatus::WaitingForInput { .. }
         ));
         let steps_before_answer = start.run.steps_executed;
+        assert_eq!(first_run_started_topic(&start), Some("Initial prompt topic"));
         let report = runtime
             .answer_run(&start.run.id, "approval", "yes")
             .await
@@ -1779,17 +1930,17 @@ mod tests {
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(report.run.steps_executed, steps_before_answer + 2);
         assert!(matches!(
-            report.events[0].kind,
-            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+            &report.events[0].kind,
+            WorkflowEventKind::StepCompleted { step_id, action, status, .. }
                 if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
         ));
         assert!(matches!(
-            report.events[1].kind,
-            WorkflowEventKind::RunStatusChanged { ref status } if status == "running"
+            &report.events[1].kind,
+            WorkflowEventKind::RunStatusChanged { status } if status == "running"
         ));
         assert!(report.events.iter().skip(2).any(|event| matches!(
-            event.kind,
-            WorkflowEventKind::StepCompleted { ref step_id, .. } if step_id == "decide"
+            &event.kind,
+            WorkflowEventKind::StepCompleted { step_id, .. } if step_id == "decide"
         )));
         assert!(
             report
@@ -1799,6 +1950,10 @@ mod tests {
             "{:#?}",
             report.events
         );
+        assert!(report.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::RunStarted { request_topic: None, .. }
+        )), "{:#?}", report.events);
 
         let persisted = runtime.load_events(&report.run.id).unwrap();
         assert_eq!(persisted, report.events);
@@ -1850,13 +2005,13 @@ mod tests {
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
         let persisted = runtime.load_events(&start.run.id).unwrap();
         assert!(matches!(
-            persisted[0].kind,
-            WorkflowEventKind::StepCompleted { ref step_id, ref action, ref status, .. }
+            &persisted[0].kind,
+            WorkflowEventKind::StepCompleted { step_id, action, status, .. }
                 if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
         ));
         assert!(matches!(
-            persisted[1].kind,
-            WorkflowEventKind::RunStatusChanged { ref status } if status == "running"
+            &persisted[1].kind,
+            WorkflowEventKind::RunStatusChanged { status } if status == "running"
         ));
     }
 
@@ -2726,8 +2881,8 @@ mod tests {
         assert_eq!(event.run_id, "run-1");
         assert_eq!(event.run_started_at, Some(run_started_at));
         assert!(matches!(
-            event.kind,
-            WorkflowEventKind::AgentResponse { ref content, .. } if content == "answer"
+            &event.kind,
+            WorkflowEventKind::AgentResponse { content, .. } if content == "answer"
         ));
     }
 }

@@ -38,6 +38,7 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
         WorkflowEventKind::RunStarted {
             workflow_name,
             current_step,
+            ..
         } => {
             lines.push(header_line(
                 &stamp,

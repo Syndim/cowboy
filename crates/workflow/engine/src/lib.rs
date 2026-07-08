@@ -24,4 +24,6 @@ pub use runtime::{
     AgentRuntimeConfig, ResolutionOptions, ResolutionStatus, RunReport, RunSummaryLine,
     RunnerLimitsConfig, RuntimeConfig, WorkflowRuntime,
 };
-pub use workflow::{AgentWorkflowSelector, AgentWorkflowSummarizer, DeterministicSelector};
+pub use workflow::{
+    AgentRequestTopicGenerator, AgentWorkflowSelector, AgentWorkflowSummarizer, DeterministicSelector,
+};

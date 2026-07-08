@@ -226,6 +226,8 @@ pub(super) struct AppState {
     active_run_id: Option<String>,
     current_step: Option<String>,
     workflow_name: Option<String>,
+    current_topic_run_id: Option<String>,
+    current_run_topic: Option<String>,
     pending_prompt: Option<PendingPrompt>,
     run_state: String,
     status: String,
@@ -250,6 +252,8 @@ impl AppState {
             active_run_id: None,
             current_step: None,
             workflow_name: None,
+            current_topic_run_id: None,
+            current_run_topic: None,
             pending_prompt: None,
             run_state: "idle".to_string(),
             status: "workflow runtime shell is ready".to_string(),
@@ -276,6 +280,10 @@ impl AppState {
 
     pub(in crate::app) fn workflow_name(&self) -> Option<&str> {
         self.workflow_name.as_deref()
+    }
+
+    pub(in crate::app) fn current_run_topic(&self) -> Option<&str> {
+        self.current_run_topic.as_deref()
     }
 
     pub(in crate::app) fn pending_prompt(&self) -> Option<&PendingPrompt> {
@@ -575,7 +583,19 @@ impl AppState {
             WorkflowEventKind::RunStarted {
                 workflow_name,
                 current_step,
+                request_topic,
             } => {
+                match request_topic {
+                    Some(topic) => {
+                        self.current_topic_run_id = Some(event.run_id.clone());
+                        self.current_run_topic = Some(topic.clone());
+                    }
+                    None if self.current_topic_run_id.as_deref() == Some(event.run_id.as_str()) => {}
+                    None => {
+                        self.current_topic_run_id = None;
+                        self.current_run_topic = None;
+                    }
+                }
                 self.workflow_name = Some(workflow_name.clone());
                 self.current_step = Some(current_step.clone());
                 self.run_state = "running".to_string();
@@ -700,7 +720,34 @@ impl AppState {
         }
     }
 
+    fn report_has_topic_for_run(report: &RunReport) -> bool {
+        report.events.iter().any(|event| {
+            event.run_id.as_str() == report.run.id.as_str()
+                && matches!(
+                    &event.kind,
+                    WorkflowEventKind::RunStarted {
+                        request_topic: Some(_),
+                        ..
+                    }
+                )
+        })
+    }
+
+    fn clear_stale_topic_for_report(&mut self, report: &RunReport) {
+        if self.current_topic_run_id.as_deref() == Some(report.run.id.as_str()) {
+            return;
+        }
+
+        if Self::report_has_topic_for_run(report) {
+            return;
+        }
+
+        self.current_topic_run_id = None;
+        self.current_run_topic = None;
+    }
+
     fn apply_report(&mut self, report: RunReport) {
+        self.clear_stale_topic_for_report(&report);
         self.active_run_id = Some(report.run.id.clone());
         self.workflow_name = Some(report.run.workflow_name.clone());
         self.current_step = Some(report.run.current_step.clone());
@@ -717,13 +764,14 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
     use std::fs;
     use std::fs::OpenOptions;
     use std::path::Path;
     use std::process::{Child, Command};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind, WorkflowRuntime};
 
     use fs2::FileExt;
 
@@ -745,6 +793,34 @@ mod tests {
         state.spawn_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<RunReport, String>>().await
         });
+    }
+
+    fn runtime_with_completed_workflow(dir: &tempfile::TempDir) -> WorkflowRuntime {
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("complete.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            return workflow("complete", start)
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            max_steps_per_run: 2,
+            max_visits_per_step: 2,
+            ..AppConfig::default()
+        };
+
+        WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .with_deterministic_selector()
     }
 
     #[test]
@@ -922,6 +998,85 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 1);
         assert_eq!(state.display_state(), "running");
+    }
+
+    #[test]
+    fn run_started_topic_lifecycle_sets_preserves_and_clears_by_run() {
+        let mut state = test_state();
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "start".to_string(),
+                request_topic: Some("Add health route".to_string()),
+            },
+        ));
+        assert_eq!(state.current_run_topic(), Some("Add health route"));
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "finish".to_string(),
+                request_topic: None,
+            },
+        ));
+        assert_eq!(state.current_run_topic(), Some("Add health route"));
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "start".to_string(),
+                request_topic: None,
+            },
+        ));
+        assert_eq!(state.current_run_topic(), None);
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "start".to_string(),
+                request_topic: Some("Review changes".to_string()),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-2",
+            WorkflowEventKind::RunCompleted,
+        ));
+        assert_eq!(state.current_run_topic(), Some("Review changes"));
+    }
+
+    #[tokio::test]
+    async fn report_for_different_run_without_topic_clears_stale_topic() {
+        let mut state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_completed_workflow(&dir);
+        let run_a = runtime.start_run("first").await.unwrap().run.id;
+        let run_b = runtime.start_run("second").await.unwrap().run.id;
+        state.apply_workflow_event(WorkflowEvent::new(
+            run_a.clone(),
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "start".to_string(),
+                request_topic: Some("Add health route".to_string()),
+            },
+        ));
+
+        let same_run_report = runtime.resume_run(&run_a).await.unwrap();
+        assert!(same_run_report.events.is_empty());
+        state.apply_report(same_run_report);
+        assert_eq!(state.current_run_topic(), Some("Add health route"));
+
+        let different_run_report = runtime.resume_run(&run_b).await.unwrap();
+        assert!(different_run_report.events.is_empty());
+        state.apply_report(different_run_report);
+
+        assert_eq!(state.active_run_id(), Some(run_b.as_str()));
+        assert_eq!(state.current_run_topic(), None);
+        assert_eq!(crate::app::controls::header::text(&state, 120), "Cowboy");
     }
 
     #[tokio::test]

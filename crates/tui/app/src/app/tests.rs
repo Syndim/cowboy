@@ -375,7 +375,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
     let rendered = rows.join("\n");
 
     assert!(rendered.contains("TAILVISIBLE"), "{rendered}");
-    assert!(rendered.contains("waiting for input"), "{rendered}");
+    assert!(rendered.contains("Waiting for input"), "{rendered}");
     assert!(
         rows.iter()
             .any(|row| row.contains("┌ Enter answers active prompt")),
@@ -405,11 +405,9 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
         .unwrap_or_else(|| panic!("{rendered}"));
     assert!(title_row.contains("type draft"), "{rendered}");
     assert!(!title_row.contains("input disabled"), "{rendered}");
-    assert!(rendered.contains("draft allowed"), "{rendered}");
-    assert!(
-        rendered.contains("Enter waits for active run"),
-        "{rendered}"
-    );
+    assert!(rendered.contains("● ─ ◷ 1"), "{rendered}");
+    assert!(!rendered.contains("draft allowed"), "{rendered}");
+    assert!(!rendered.contains("Enter waits for active run"), "{rendered}");
     assert!(
         !rendered.contains("input disabled while run active"),
         "{rendered}"

@@ -42,11 +42,16 @@ impl WorkflowEvent {
     }
 
     pub fn run_started(run: &WorkflowRun) -> Self {
+        Self::run_started_with_topic(run, None)
+    }
+
+    pub fn run_started_with_topic(run: &WorkflowRun, request_topic: Option<String>) -> Self {
         Self::for_run(
             run,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow_name.clone(),
                 current_step: run.current_step.clone(),
+                request_topic,
             },
         )
     }
@@ -85,6 +90,8 @@ pub enum WorkflowEventKind {
     RunStarted {
         workflow_name: String,
         current_step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_topic: Option<String>,
     },
     StepStarted {
         step_id: String,
@@ -340,6 +347,46 @@ mod tests {
         assert_eq!(event.run_id, "run-1");
         assert_eq!(event.run_started_at, None);
         assert_eq!(event.kind, WorkflowEventKind::RunCompleted);
+    }
+
+    #[test]
+    fn run_started_request_topic_is_optional_for_legacy_event_json() {
+        let raw = serde_json::json!({
+            "kind": "run_started",
+            "workflow_name": "agent/00-feature",
+            "current_step": "implement",
+        })
+        .to_string();
+
+        let event: WorkflowEventKind = serde_json::from_str(&raw).unwrap();
+
+        assert_eq!(
+            event,
+            WorkflowEventKind::RunStarted {
+                workflow_name: "agent/00-feature".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            }
+        );
+    }
+
+    #[test]
+    fn run_started_request_topic_serializes_only_when_present() {
+        let with_topic = serde_json::to_value(WorkflowEventKind::RunStarted {
+            workflow_name: "agent/00-feature".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: Some("Add health route".to_string()),
+        })
+        .unwrap();
+        let without_topic = serde_json::to_value(WorkflowEventKind::RunStarted {
+            workflow_name: "agent/00-feature".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        })
+        .unwrap();
+
+        assert_eq!(with_topic["request_topic"], "Add health route");
+        assert!(without_topic.get("request_topic").is_none(), "{without_topic}");
     }
 
     #[test]
