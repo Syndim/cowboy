@@ -146,12 +146,12 @@ pub fn validate_definition(definition: &WorkflowDefinition) -> Result<Validation
                 id: role.id.clone(),
             });
         }
-        if let Some(agent) = &role.agent {
-            if agent.trim().is_empty() {
-                return Err(WorkflowError::EmptyRoleAgent {
-                    role: role.id.clone(),
-                });
-            }
+        if let Some(agent) = &role.agent
+            && agent.trim().is_empty()
+        {
+            return Err(WorkflowError::EmptyRoleAgent {
+                role: role.id.clone(),
+            });
         }
     }
 
@@ -165,13 +165,13 @@ pub fn validate_definition(definition: &WorkflowDefinition) -> Result<Validation
                 id: step.id.clone(),
             });
         }
-        if let Some(role) = &step.role {
-            if !definition.roles.contains_key(role) {
-                return Err(WorkflowError::UnknownRole {
-                    step: step.id.clone(),
-                    role: role.clone(),
-                });
-            }
+        if let Some(role) = &step.role
+            && !definition.roles.contains_key(role)
+        {
+            return Err(WorkflowError::UnknownRole {
+                step: step.id.clone(),
+                role: role.clone(),
+            });
         }
         for (status, target) in &step.transitions.by_status {
             if status.trim().is_empty() {

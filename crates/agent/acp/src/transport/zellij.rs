@@ -155,10 +155,10 @@ impl ZellijTransport {
                 continue;
             }
             // Check if it's valid JSON-RPC
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if value.get("jsonrpc").is_some() {
-                    self.message_buffer.push_back(trimmed.to_string());
-                }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed)
+                && value.get("jsonrpc").is_some()
+            {
+                self.message_buffer.push_back(trimmed.to_string());
             }
         }
 

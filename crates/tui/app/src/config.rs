@@ -272,10 +272,16 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
         assert_eq!(config.agents.len(), 2);
         assert_eq!(config.agents[0].name, "default");
         assert_eq!(config.agents[0].model.id, "opus-4.8-1m");
-        assert_eq!(config.agents[0].model.provider.as_deref(), Some("github-copilot"));
+        assert_eq!(
+            config.agents[0].model.provider.as_deref(),
+            Some("github-copilot")
+        );
         assert_eq!(config.agents[1].name, "reviewer");
         assert_eq!(config.agents[1].model.id, "gpt-5.5-1m");
-        assert_eq!(config.agents[1].model.provider.as_deref(), Some("github-copilot"));
+        assert_eq!(
+            config.agents[1].model.provider.as_deref(),
+            Some("github-copilot")
+        );
 
         let runtime = config.runtime_config(dir.path().to_path_buf());
         assert_eq!(runtime.agents.len(), 2);

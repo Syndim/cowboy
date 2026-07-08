@@ -159,15 +159,15 @@ impl Transport for StdioTransport {
             status = ?status,
             "Closing agent subprocess"
         );
-        if status.is_none() {
-            if let Err(err) = self.child.kill().await {
-                tracing::warn!(
-                    command = %self.command,
-                    pid = ?self.pid,
-                    error = %err,
-                    "Agent subprocess kill failed"
-                );
-            }
+        if status.is_none()
+            && let Err(err) = self.child.kill().await
+        {
+            tracing::warn!(
+                command = %self.command,
+                pid = ?self.pid,
+                error = %err,
+                "Agent subprocess kill failed"
+            );
         }
         Ok(())
     }

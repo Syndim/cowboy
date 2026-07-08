@@ -133,12 +133,12 @@ where
             },
         };
 
-        if run.head != previous_head {
-            if let Some(head) = &run.head {
-                let record = self.store.get_object::<StepRecord>(head)?;
-                self.events
-                    .emit(WorkflowEvent::step_completed_for_run(run, &record));
-            }
+        if run.head != previous_head
+            && let Some(head) = &run.head
+        {
+            let record = self.store.get_object::<StepRecord>(head)?;
+            self.events
+                .emit(WorkflowEvent::step_completed_for_run(run, &record));
         }
         self.events
             .emit(WorkflowEvent::run_status_for_run(run, &status));

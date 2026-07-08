@@ -309,10 +309,7 @@ mod tests {
         );
         assert!(!narrow.contains("◷"), "{narrow}");
         assert!(narrow.contains("⎇ agent/00-feature"), "{narrow}");
-        assert!(
-            display_width(&narrow) <= display_width(&full) - 1,
-            "{narrow}"
-        );
+        assert!(display_width(&narrow) < display_width(&full), "{narrow}");
         state.cancel_background_tasks();
     }
 

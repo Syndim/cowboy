@@ -260,10 +260,10 @@ fn agent_reply(text: &str) -> String {
 }
 
 fn collect_text(event: Event, text: &mut String) {
-    if let Event::MessageChunk { content } = event {
-        if let Some(chunk) = content.get("text").and_then(|value| value.as_str()) {
-            text.push_str(chunk);
-        }
+    if let Event::MessageChunk { content } = event
+        && let Some(chunk) = content.get("text").and_then(|value| value.as_str())
+    {
+        text.push_str(chunk);
     }
 }
 

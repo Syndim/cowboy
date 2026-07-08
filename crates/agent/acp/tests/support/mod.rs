@@ -140,10 +140,10 @@ pub async fn run_session_prompt(backend: &AcpBackend) -> anyhow::Result<()> {
                 "Reply with exactly one short sentence that contains the word cowboy.",
             )],
             &mut |event| {
-                if let Event::MessageChunk { content } = event {
-                    if let Some(text) = chunk_text(&content) {
-                        response_text.push_str(text);
-                    }
+                if let Event::MessageChunk { content } = event
+                    && let Some(text) = chunk_text(&content)
+                {
+                    response_text.push_str(text);
                 }
             },
         ),

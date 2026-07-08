@@ -295,44 +295,44 @@ pub fn parse_acp_message(msg: &Value) -> Option<Message> {
         }
 
         // JSON-RPC Request from Agent (has "id" + "method")
-        if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
-            if method == "session/request_permission" {
-                let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                return Some(Message::PermissionRequest {
-                    id,
-                    session_id: params
-                        .get("sessionId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    tool_call: params.get("toolCall").cloned().unwrap_or(Value::Null),
-                    options: params
-                        .get("options")
-                        .and_then(|v| v.as_array())
-                        .cloned()
-                        .unwrap_or_default(),
-                });
-            }
+        if let Some(method) = msg.get("method").and_then(|v| v.as_str())
+            && method == "session/request_permission"
+        {
+            let params = msg.get("params").cloned().unwrap_or(Value::Null);
+            return Some(Message::PermissionRequest {
+                id,
+                session_id: params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                tool_call: params.get("toolCall").cloned().unwrap_or(Value::Null),
+                options: params
+                    .get("options")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default(),
+            });
         }
     }
 
     // JSON-RPC Notification (has "method", no "id")
-    if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
-        if method == "session/update" {
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-            let session_id = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            // ACP spec: update payload is in params.update, not params itself
-            let update_value = params.get("update").cloned().unwrap_or(Value::Null);
-            tracing::trace!(raw_update = %update_value, "session/update raw payload");
-            if let Some(update) = parse_session_update_payload(&update_value) {
-                return Some(Message::SessionUpdate { session_id, update });
-            } else {
-                tracing::warn!(raw = %update_value, "session/update: failed to parse update payload");
-            }
+    if let Some(method) = msg.get("method").and_then(|v| v.as_str())
+        && method == "session/update"
+    {
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let session_id = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // ACP spec: update payload is in params.update, not params itself
+        let update_value = params.get("update").cloned().unwrap_or(Value::Null);
+        tracing::trace!(raw_update = %update_value, "session/update raw payload");
+        if let Some(update) = parse_session_update_payload(&update_value) {
+            return Some(Message::SessionUpdate { session_id, update });
+        } else {
+            tracing::warn!(raw = %update_value, "session/update: failed to parse update payload");
         }
     }
 

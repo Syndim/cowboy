@@ -17,9 +17,8 @@ pub fn build_agent_prompt(role: &RoleDefinition, action: &AgentAction) -> String
 /// frontmatter/parse failure. Reuses the required-frontmatter description so the
 /// agent re-emits its already-completed work with a valid frontmatter block.
 pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
-    let mut nudge = String::from(
-        "## Retry\n\nYour previous response could not be parsed as a workflow result",
-    );
+    let mut nudge =
+        String::from("## Retry\n\nYour previous response could not be parsed as a workflow result");
     if let Some(reason) = reason {
         nudge.push_str(&format!(" ({reason})"));
     }

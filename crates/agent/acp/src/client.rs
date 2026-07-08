@@ -548,23 +548,23 @@ impl Client {
                 continue;
             }
             tracing::debug!(payload = %line, "ACP <<< trailing");
-            if let Ok(json) = serde_json::from_str::<Value>(&line) {
-                if let Some(msg) = parse_acp_message(&json) {
-                    match msg {
-                        Message::SessionUpdate { update, .. } => {
-                            if matches!(update, Event::MessageChunk { .. }) {
-                                saw_text = true;
-                            }
-                            event_handler(update);
-                            // Keep draining — more events may follow
-                            drain_timeout = Duration::from_millis(200);
-                            continue;
+            if let Ok(json) = serde_json::from_str::<Value>(&line)
+                && let Some(msg) = parse_acp_message(&json)
+            {
+                match msg {
+                    Message::SessionUpdate { update, .. } => {
+                        if matches!(update, Event::MessageChunk { .. }) {
+                            saw_text = true;
                         }
-                        _ => {
-                            // Non-update message — push back for next recv_message
-                            pushback_line = Some(line);
-                            break;
-                        }
+                        event_handler(update);
+                        // Keep draining — more events may follow
+                        drain_timeout = Duration::from_millis(200);
+                        continue;
+                    }
+                    _ => {
+                        // Non-update message — push back for next recv_message
+                        pushback_line = Some(line);
+                        break;
                     }
                 }
             }

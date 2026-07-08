@@ -9,7 +9,7 @@ const CONTINUATION_PROMPT: &str = "  ";
 const PROMPT_WIDTH: usize = 2;
 
 use super::super::state::AppState;
-use super::super::styles::{style_accent, style_border_accent, style_muted, style_warning};
+use super::super::styles::{style_accent, style_border_accent, style_muted};
 use cowboy_command_parser::{slash_query, slash_suggestions};
 
 const MAX_SLASH_SUGGESTIONS: usize = 6;
