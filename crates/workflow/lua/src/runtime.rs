@@ -107,6 +107,124 @@ mod tests {
     }
 
     #[test]
+    fn converts_command_action() {
+        let source = snapshot(
+            r#"
+            local step = step("run_command")
+            step.run = function(ctx)
+              return action.command {
+                program = "printf",
+                args = { "hello", ctx.request },
+                success_status = "ok",
+                failure_status = "bad",
+                timeout_ms = 1000,
+              }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let result = run_step(
+            &source,
+            "run_command",
+            serde_json::json!({"request": "world"}),
+        )
+        .unwrap();
+        let StepAction::Command(action) = result.action else {
+            panic!("expected command action")
+        };
+        assert_eq!(action.program, "printf");
+        assert_eq!(action.args, vec!["hello", "world"]);
+        assert_eq!(action.success_status, "ok");
+        assert_eq!(action.failure_status, "bad");
+        assert_eq!(action.timeout_ms, Some(1000));
+    }
+
+    #[test]
+    fn command_action_defaults_optional_fields() {
+        let source = snapshot(
+            r#"
+            local step = step("run_command")
+            step.run = function(ctx)
+              return action.command { program = "true" }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let result = run_step(&source, "run_command", serde_json::json!({})).unwrap();
+        let StepAction::Command(action) = result.action else {
+            panic!("expected command action")
+        };
+        assert_eq!(action.program, "true");
+        assert!(action.args.is_empty());
+        assert_eq!(action.success_status, "success");
+        assert_eq!(action.failure_status, "failed");
+        assert_eq!(action.timeout_ms, None);
+    }
+
+    #[test]
+    fn rejects_invalid_command_actions() {
+        let cases = [
+            (
+                "missing program",
+                "return action.command { args = { \"x\" } }",
+                "program",
+            ),
+            (
+                "empty program",
+                "return action.command { program = \" \" }",
+                "non-empty",
+            ),
+            (
+                "non-table args",
+                "return action.command { program = \"echo\", args = \"x\" }",
+                "args",
+            ),
+            (
+                "non-string arg",
+                "return action.command { program = \"echo\", args = { 1 } }",
+                "args",
+            ),
+            (
+                "empty success status",
+                "return action.command { program = \"echo\", success_status = \"\" }",
+                "success_status",
+            ),
+            (
+                "empty failure status",
+                "return action.command { program = \"echo\", failure_status = \"\" }",
+                "failure_status",
+            ),
+            (
+                "zero timeout",
+                "return action.command { program = \"echo\", timeout_ms = 0 }",
+                "timeout_ms",
+            ),
+            (
+                "float timeout",
+                "return action.command { program = \"echo\", timeout_ms = 0.5 }",
+                "timeout_ms",
+            ),
+        ];
+
+        for (name, command, expected) in cases {
+            let source = snapshot(&format!(
+                r#"
+                local step = step("run_command")
+                step.run = function(ctx)
+                  {command}
+                end
+                return workflow("wf", step)
+                "#
+            ));
+            let err = run_step(&source, "run_command", serde_json::json!({})).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: expected error containing {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn action_suspend_is_unavailable() {
         let source = snapshot(
             r#"

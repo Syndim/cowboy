@@ -152,7 +152,7 @@ Rules:
 
 ## Actions
 
-Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.status`, `action.ask_user`, or `action.fail`.
+Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.ask_user`, or `action.fail`.
 
 ### `action.agent { role, prompt, output }`
 
@@ -181,6 +181,53 @@ Fields:
   - `output.fields`: table describing expected fields; string values become human-readable field descriptions in the prompt.
 
 The output spec is prompt guidance. The runtime parses frontmatter and then routes by the returned status; it does not currently enforce a JSON Schema for `fields`.
+
+### `action.command { program, args, success_status, failure_status, timeout_ms }`
+
+Runs one command-line program directly, without a shell. Cowboy passes `program` and `args` to the OS process spawner as an explicit argument vector; it does not interpret quotes, variables, pipes, redirects, globs, or command substitution.
+
+```lua
+return action.command {
+  program = "git",
+  args = { "status", "--short" },
+  success_status = "clean",
+  failure_status = "failed",
+  timeout_ms = 5000
+}
+```
+
+Fields:
+
+- `program` (required): non-empty executable name or path.
+- `args` (optional): array of string arguments; defaults to `{}`.
+- `success_status` (optional): output status for exit code `0`; defaults to `"success"`.
+- `failure_status` (optional): output status for non-zero exit, spawn error, or timeout; defaults to `"failed"`.
+- `timeout_ms` (optional): positive integer wall-clock timeout. On timeout, Cowboy kills the child and completes the step with `failure_status`.
+
+The command runs from `RuntimeConfig.cwd`. Workflows cannot override cwd, environment, or stdin for this action; stdin is closed. Cowboy clears the child environment and passes through only `PATH` when Cowboy itself has `PATH`, so commands must not rely on inherited credentials or ambient environment variables.
+
+Security warning: `action.command` is not a sandbox. Use it only for trusted workflows and trusted commands. The child process still runs as the Cowboy OS user from `RuntimeConfig.cwd`; it can read or write files and use any network resources available to the Cowboy process, even though Cowboy does not invoke a shell and sanitizes environment/stdin.
+
+The completed `StepOutput.fields` contains:
+
+- `program`, `args`
+- `success`
+- `exit_code` (`null` for spawn errors or signal-only exits)
+- `stdout`, `stderr`
+- `timed_out`
+- `stdout_truncated`, `stderr_truncated`
+- `spawn_error` when the process could not be started
+
+Captured stdout and stderr are bounded. The truncation flags tell following steps whether a captured stream was cut. `StepOutput.body` is stdout on success; on failure it is stderr when present, otherwise stdout, otherwise the spawn error or timeout text.
+
+Command `program`, `args`, captured stdout, and captured stderr are persisted in the step output so later workflow steps can read them through `ctx.prev.fields`. `program` is persisted too and may expose an absolute or private path; prefer bare executable names or non-sensitive paths when persisted run records may be shared. Do not put secrets, tokens, personal data, private local paths, or proprietary content in command metadata or command output.
+
+Route both success and failure statuses when the workflow should continue after command execution:
+
+```lua
+run_tests:on("success", summarize)
+run_tests:on("failed", diagnose)
+```
 
 ### `action.status { status, fields, body }`
 
@@ -261,7 +308,7 @@ Fields:
 
 ## Transitions
 
-Transitions route completed `agent` or `status` step outputs by status.
+Transitions route completed `agent`, `command`, `status`, or answered `ask_user` step outputs by status.
 
 ```lua
 implement:on("success", finish)

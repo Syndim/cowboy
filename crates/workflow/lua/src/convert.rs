@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AskUserAction, FailAction, OutputSpec, RoleDefinition, StatusAction, StepAction,
-    StepDefinition, StepTransitions, WorkflowDefinition,
+    AgentAction, AskUserAction, CommandAction, FailAction, OutputSpec, RoleDefinition,
+    StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowDefinition,
+    default_command_failure_status, default_command_success_status,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -127,6 +128,15 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             prompt: required_string(&table, &action, "prompt")?,
             output: output_spec(table.get::<Value>("output")?)?,
         })),
+        "command" => Ok(StepAction::Command(CommandAction {
+            program: non_empty_required_string(&table, &action, "program")?,
+            args: string_array_field(&table, &action, "args")?,
+            success_status: optional_non_empty_string(&table, &action, "success_status")?
+                .unwrap_or_else(default_command_success_status),
+            failure_status: optional_non_empty_string(&table, &action, "failure_status")?
+                .unwrap_or_else(default_command_failure_status),
+            timeout_ms: optional_positive_timeout_ms(&table, &action)?,
+        })),
         "status" => Ok(StepAction::Status(StatusAction {
             status: required_string(&table, &action, "status")?,
             fields: lua_to_json(table.get::<Value>("fields")?)?,
@@ -173,6 +183,43 @@ fn output_spec(value: Value) -> Result<Option<OutputSpec>> {
     }
 }
 
+fn non_empty_required_string(table: &Table, action: &str, field: &str) -> Result<String> {
+    let value = required_string(table, action, field)?;
+    if value.trim().is_empty() {
+        return Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: field.to_string(),
+            reason: "must be a non-empty string".to_string(),
+        });
+    }
+
+    Ok(value)
+}
+
+fn optional_non_empty_string(table: &Table, action: &str, field: &str) -> Result<Option<String>> {
+    let value = optional_string(table, field).map_err(|err| invalid_field_action(err, action))?;
+    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: field.to_string(),
+            reason: "must be a non-empty string".to_string(),
+        });
+    }
+
+    Ok(value)
+}
+
+fn invalid_field_action(err: Error, action: &str) -> Error {
+    match err {
+        Error::InvalidActionField { field, reason, .. } => Error::InvalidActionField {
+            action: action.to_string(),
+            field,
+            reason,
+        },
+        other => other,
+    }
+}
+
 fn required_string(table: &Table, action: &str, field: &str) -> Result<String> {
     optional_string(table, field)?.ok_or_else(|| Error::MissingActionField {
         action: action.to_string(),
@@ -200,6 +247,73 @@ fn string_array(value: Value) -> Result<Vec<String>> {
             action: "ask_user".to_string(),
             field: "choices".to_string(),
             reason: "must be an array of strings".to_string(),
+        }),
+    }
+}
+
+fn string_array_field(table: &Table, action: &str, field: &str) -> Result<Vec<String>> {
+    match table.get::<Value>(field)? {
+        Value::Nil => Ok(Vec::new()),
+        Value::Table(table) => strict_string_array(&table, action, field),
+        _ => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: field.to_string(),
+            reason: "must be an array of strings".to_string(),
+        }),
+    }
+}
+
+fn strict_string_array(table: &Table, action: &str, field: &str) -> Result<Vec<String>> {
+    let len = table.raw_len();
+    let mut out = vec![None; len];
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(Error::InvalidActionField {
+                action: action.to_string(),
+                field: field.to_string(),
+                reason: "must be an array of strings".to_string(),
+            });
+        };
+        if index < 1 || index as usize > len {
+            return Err(Error::InvalidActionField {
+                action: action.to_string(),
+                field: field.to_string(),
+                reason: "must be a contiguous array of strings".to_string(),
+            });
+        }
+        let Value::String(value) = value else {
+            return Err(Error::InvalidActionField {
+                action: action.to_string(),
+                field: field.to_string(),
+                reason: "must be an array of strings".to_string(),
+            });
+        };
+        out[index as usize - 1] = Some(value.to_str()?.to_string());
+    }
+
+    out.into_iter()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::InvalidActionField {
+            action: action.to_string(),
+            field: field.to_string(),
+            reason: "must be a contiguous array of strings".to_string(),
+        })
+}
+
+fn optional_positive_timeout_ms(table: &Table, action: &str) -> Result<Option<u64>> {
+    match table.get::<Value>("timeout_ms")? {
+        Value::Nil => Ok(None),
+        Value::Integer(value) if value > 0 => Ok(Some(value as u64)),
+        Value::Integer(_) => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: "timeout_ms".to_string(),
+            reason: "must be greater than zero".to_string(),
+        }),
+        _ => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: "timeout_ms".to_string(),
+            reason: "must be a positive integer".to_string(),
         }),
     }
 }

@@ -14,8 +14,9 @@ pub mod runtime;
 pub mod workflow;
 
 pub use cowboy_workflow_actions::{
-    AgentActionHandler, AgentActionRunner, AskUserActionRunner, EngineActionDispatcher,
-    FailActionRunner, PendingAskUser, ResumeCallbackRegistry, StatusActionRunner,
+    AgentActionHandler, AgentActionRunner, AskUserActionRunner, CommandActionRunner,
+    EngineActionDispatcher, FailActionRunner, PendingAskUser, ResumeCallbackRegistry,
+    StatusActionRunner,
 };
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::ResumeRouter;

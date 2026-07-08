@@ -98,6 +98,7 @@ current WorkflowRun
   -> StepActionProvider evaluates current step
   -> ActionDispatcher runs the StepAction
       agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
+      command  -> CommandActionRunner -> tokio::process::Command -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
       ask_user -> AskUserActionRunner -> WaitingForInput with ResumeCallback descriptor
       fail     -> FailActionRunner -> RunStatus::Failed

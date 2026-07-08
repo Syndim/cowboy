@@ -9,6 +9,8 @@ use crate::{RoleId, Status};
 pub enum StepAction {
     /// Run an agent with a role and prompt, then normalize the agent output.
     Agent(AgentAction),
+    /// Run one command-line program directly with explicit arguments.
+    Command(CommandAction),
     /// Complete the step immediately with a status and optional data.
     Status(StatusAction),
     /// Pause the run and ask the user for input.
@@ -21,6 +23,7 @@ impl StepAction {
     pub fn action_name(&self) -> &'static str {
         match self {
             Self::Agent(_) => "agent",
+            Self::Command(_) => "command",
             Self::Status(_) => "status",
             Self::AskUser(_) => "ask_user",
             Self::Fail(_) => "fail",
@@ -49,6 +52,33 @@ pub struct OutputSpec {
     /// Field specification for the structured output body.
     #[serde(default)]
     pub fields: Value,
+}
+
+/// Request to execute one command-line program directly, without a shell.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandAction {
+    /// Program executable name or path passed to the OS process spawner.
+    pub program: String,
+    /// Exact argument vector passed to the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Output status used when the command exits with status code 0.
+    #[serde(default = "default_command_success_status")]
+    pub success_status: Status,
+    /// Output status used when the command fails, cannot spawn, or times out.
+    #[serde(default = "default_command_failure_status")]
+    pub failure_status: Status,
+    /// Optional wall-clock timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+pub fn default_command_success_status() -> Status {
+    "success".to_string()
+}
+
+pub fn default_command_failure_status() -> Status {
+    "failed".to_string()
 }
 
 /// Immediate non-agent step result.
@@ -112,6 +142,40 @@ mod tests {
     }
 
     #[test]
+    fn command_action_serializes_and_defaults() {
+        let action = StepAction::Command(CommandAction {
+            program: "printf".to_string(),
+            args: vec!["hello".to_string()],
+            success_status: "ok".to_string(),
+            failure_status: "nope".to_string(),
+            timeout_ms: Some(250),
+        });
+
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["action"], "command");
+        assert_eq!(json["program"], "printf");
+        assert_eq!(json["args"], serde_json::json!(["hello"]));
+        assert_eq!(json["success_status"], "ok");
+        assert_eq!(json["failure_status"], "nope");
+        assert_eq!(json["timeout_ms"], 250);
+        assert_eq!(action.action_name(), "command");
+
+        let defaulted = serde_json::from_value::<StepAction>(serde_json::json!({
+            "action": "command",
+            "program": "true"
+        }))
+        .unwrap();
+        let StepAction::Command(defaulted) = defaulted else {
+            panic!("expected command action")
+        };
+        assert_eq!(defaulted.program, "true");
+        assert!(defaulted.args.is_empty());
+        assert_eq!(defaulted.success_status, "success");
+        assert_eq!(defaulted.failure_status, "failed");
+        assert_eq!(defaulted.timeout_ms, None);
+    }
+
+    #[test]
     fn deserializing_suspend_is_unknown() {
         let err = serde_json::from_value::<StepAction>(serde_json::json!({
             "action": "suspend",
@@ -131,6 +195,17 @@ mod tests {
             })
             .action_name(),
             "agent"
+        );
+        assert_eq!(
+            StepAction::Command(CommandAction {
+                program: "echo".to_string(),
+                args: Vec::new(),
+                success_status: "success".to_string(),
+                failure_status: "failed".to_string(),
+                timeout_ms: None,
+            })
+            .action_name(),
+            "command"
         );
         assert_eq!(
             StepAction::AskUser(AskUserAction {

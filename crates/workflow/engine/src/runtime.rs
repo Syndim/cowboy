@@ -950,7 +950,7 @@ impl WorkflowRuntime {
             })),
         };
         let executor = AgentExecutor::new(self.agent_factory()?, agent_store, agent_config);
-        let dispatcher = EngineActionDispatcher::new(executor);
+        let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
             .with_limits(self.config.limits.into())
@@ -1238,6 +1238,8 @@ fn run_head(run: &WorkflowRun) -> RunHead {
 mod tests {
     use super::*;
     use cowboy_workflow_core::{ResumeCallback, RunStatus, StepAction};
+    use std::os::unix::fs::PermissionsExt;
+
     fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             name: name.to_string(),
@@ -1368,6 +1370,127 @@ mod tests {
         )
         .unwrap();
         runtime_for_workflow_dir(dir, workflow_dir).with_request_topic_for_tests(topic)
+    }
+
+    fn command_script(dir: &tempfile::TempDir) -> PathBuf {
+        let script = dir.path().join("command-helper.sh");
+        fs::write(
+            &script,
+            r#"#!/bin/sh
+echo "command stdout: $PWD"
+echo "command stderr: $1" >&2
+if [ "$1" = "fail" ]; then
+  exit 4
+fi
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    fn command_output_record(runtime: &WorkflowRuntime, report: &RunReport) -> StepRecord {
+        let head = report.run.head.as_ref().expect("completed head");
+        runtime
+            .store()
+            .unwrap()
+            .get_object::<StepRecord>(head)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn command_action_runtime_routes_and_exposes_prev_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = command_script(&dir);
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            format!(
+                r#"
+                local run_command = step("run_command")
+                run_command.run = function(ctx)
+                  return action.command {{
+                    program = {},
+                    args = {{ ctx.request }},
+                    success_status = "command_ok",
+                    failure_status = "command_failed",
+                  }}
+                end
+
+                local inspect = step("inspect")
+                inspect.run = function(ctx)
+                  return action.status {{
+                    status = "success",
+                    fields = {{
+                      prev_action = ctx.prev.action,
+                      prev_status = ctx.prev.status,
+                      stdout = ctx.prev.fields.stdout,
+                      stderr = ctx.prev.fields.stderr,
+                      success = ctx.prev.fields.success,
+                      exit_code = ctx.prev.fields.exit_code,
+                    }}
+                  }}
+                end
+
+                run_command:on("command_ok", inspect)
+                run_command:on("command_failed", inspect)
+                return workflow("aaa", run_command)
+                "#,
+                serde_json::to_string(&script.to_string_lossy()).unwrap()
+            ),
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let success = runtime
+            .start_run_with_workflow("aaa", "success")
+            .await
+            .unwrap();
+        assert_eq!(success.run.status, RunStatus::Completed);
+        let output = command_output_record(&runtime, &success).output.unwrap();
+        assert_eq!(output.fields["prev_action"], "command");
+        assert_eq!(output.fields["prev_status"], "command_ok");
+        assert_eq!(output.fields["success"], true);
+        assert_eq!(output.fields["exit_code"], 0);
+        assert!(
+            output.fields["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("command stdout:")
+        );
+        assert!(
+            output.fields["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("command stderr: success")
+        );
+
+        let failure = runtime
+            .start_run_with_workflow("aaa", "fail")
+            .await
+            .unwrap();
+        assert_eq!(failure.run.status, RunStatus::Completed);
+        let output = command_output_record(&runtime, &failure).output.unwrap();
+        assert_eq!(output.fields["prev_action"], "command");
+        assert_eq!(output.fields["prev_status"], "command_failed");
+        assert_eq!(output.fields["success"], false);
+        assert_eq!(output.fields["exit_code"], 4);
+        assert!(
+            output.fields["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("command stdout:")
+        );
+        assert!(
+            output.fields["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("command stderr: fail")
+        );
     }
 
     fn first_run_started_topic(report: &RunReport) -> Option<&str> {

@@ -157,7 +157,7 @@ pub fn install_workflow_api(lua: &Lua) -> Result<()> {
     globals.set("workflow", workflow_fn)?;
 
     let action = lua.create_table()?;
-    for kind in ["agent", "status", "ask_user", "fail"] {
+    for kind in ["agent", "command", "status", "ask_user", "fail"] {
         let function = lua.create_function(move |_, table: mlua::Table| {
             table.set("action", kind)?;
             Ok(table)

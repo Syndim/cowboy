@@ -381,6 +381,13 @@ mod tests {
                     action.fields,
                     action.body,
                 ),
+                StepAction::Command(action) => (
+                    "command".to_string(),
+                    None,
+                    action.success_status,
+                    Value::Null,
+                    "command done".to_string(),
+                ),
                 _ => (
                     "agent".to_string(),
                     Some("agent prompt".to_string()),

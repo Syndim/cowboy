@@ -68,6 +68,7 @@ Owns reusable host-action runners and the dispatcher that maps `StepAction` vari
 | --- | --- |
 | `lib.rs` | `EngineActionDispatcher`, `ResumeCallbackRegistry`, and public runner exports. |
 | `agent.rs` | `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`. |
+| `command.rs` | `CommandActionRunner` for direct non-shell process execution from runtime cwd. |
 | `ask_user.rs` | `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
 | `status.rs` | `StatusActionRunner` for immediate completed records. |
 | `fail.rs` | `FailActionRunner` for failed run statuses. |
@@ -115,7 +116,7 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`, roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `status`, `ask_user`, `fail`. |
+| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `fail`. |
 | `state.rs` | Durable `WorkflowRun`, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates: loader, selector, executor, summarizer, run store. |

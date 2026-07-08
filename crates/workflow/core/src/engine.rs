@@ -226,9 +226,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionDispatcher, ActionResult, AgentAction, AskUserAction, FailAction, ResumeCallback,
-        StatusAction, StepDefinition, StepDetail, StepInput, StepOutput, StepTransitions,
-        WorkflowDefinition,
+        ActionDispatcher, ActionResult, AgentAction, AskUserAction, CommandAction, FailAction,
+        ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput, StepOutput,
+        StepTransitions, WorkflowDefinition,
     };
 
     struct StaticProvider {
@@ -289,6 +289,31 @@ mod tests {
                     }),
                     detail: StepDetail {
                         backend: Some("test".to_string()),
+                        session_id: None,
+                        duration_ms: 0,
+                        turn_count: 0,
+                        usage: None,
+                    },
+                    started_at: now,
+                    completed_at: Some(now),
+                })),
+                StepAction::Command(action) => Ok(ActionResult::completed(StepRecord {
+                    id: context.step_record_id,
+                    prev: context.prev,
+                    step: context.step_id,
+                    action: "command".to_string(),
+                    input: StepInput {
+                        prompt: None,
+                        context: Value::Null,
+                    },
+                    output: Some(StepOutput {
+                        status: action.success_status,
+                        fields: Value::Null,
+                        body: String::new(),
+                        raw: Value::Null,
+                    }),
+                    detail: StepDetail {
+                        backend: None,
                         session_id: None,
                         duration_ms: 0,
                         turn_count: 0,
@@ -659,6 +684,13 @@ mod tests {
                 status: "success".to_string(),
                 fields: Value::Null,
                 body: String::new(),
+            }),
+            StepAction::Command(CommandAction {
+                program: "echo".to_string(),
+                args: vec!["ok".to_string()],
+                success_status: "success".to_string(),
+                failure_status: "failed".to_string(),
+                timeout_ms: None,
             }),
             StepAction::AskUser(AskUserAction {
                 id: "approval".to_string(),

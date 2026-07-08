@@ -9,7 +9,7 @@ It has one binary with two interfaces:
 - `cowboy` with no subcommand launches the interactive terminal UI.
 - `cowboy <subcommand>` runs a non-interactive CLI command against the same workflow runtime and persisted state.
 
-Workflows are Lua files. A workflow step can run an ACP-compatible coding agent, return a status immediately, ask the user for input, or fail.
+Workflows are Lua files. A workflow step can run an ACP-compatible coding agent, run a command-line program with explicit args, return a status immediately, ask the user for input, or fail.
 
 ## Quick Start
 
@@ -202,13 +202,14 @@ Owns:
 
 - `EngineActionDispatcher`
 - `ResumeCallbackRegistry`
-- action runners for `agent`, `status`, `ask_user`, and `fail`
+- action runners for `agent`, `command`, `status`, `ask_user`, and `fail`
 - `ask_user` resume callback payloads and callback-to-`StepRecord` handling
 
 Important modules:
 
 - `lib.rs` — dispatcher, resume callback registry, and public runner exports.
 - `agent.rs` — `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`.
+- `command.rs` — `CommandActionRunner` for direct non-shell process execution from runtime cwd.
 - `ask_user.rs` — `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`.
 - `status.rs` — `StatusActionRunner` for immediate completed records.
 - `fail.rs` — `FailActionRunner` for failed run statuses.
@@ -237,7 +238,7 @@ Owns:
 
 - `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
-- `StepAction`: `agent`, `status`, `ask_user`, `fail`
+- `StepAction`: `agent`, `command`, `status`, `ask_user`, `fail`
 - `WorkflowRun`, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
 - `ResumeCallback`, `ActionResult`, `ExecutionContext`, `RunStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
 - `execute_step`, budget enforcement, and step-record/status application helpers
@@ -382,6 +383,7 @@ WorkflowRun.current_step
        ctx.prev contains previous output status/fields/body/raw, or null
   -> StepAction
        agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> StepRecord
+       command  -> CommandActionRunner -> tokio::process::Command -> StepRecord
        status   -> StatusActionRunner -> StepRecord
        ask_user -> AskUserActionRunner -> RunStatus::WaitingForInput + ResumeCallback
        fail     -> FailActionRunner -> RunStatus::Failed

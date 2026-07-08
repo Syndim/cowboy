@@ -1,5 +1,6 @@
 mod agent;
 mod ask_user;
+mod command;
 mod fail;
 mod status;
 
@@ -15,21 +16,24 @@ use cowboy_workflow_core::{
 
 pub use agent::{AgentActionHandler, AgentActionRunner};
 pub use ask_user::{ASK_USER_CALLBACK_KIND, AskUserActionRunner, PendingAskUser};
+pub use command::CommandActionRunner;
 pub use fail::FailActionRunner;
 pub use status::StatusActionRunner;
 
 #[derive(Debug, Clone)]
 pub struct EngineActionDispatcher<A> {
     agent: AgentActionRunner<A>,
+    command: CommandActionRunner,
     status: StatusActionRunner,
     fail: FailActionRunner,
     ask_user: AskUserActionRunner,
 }
 
 impl<A> EngineActionDispatcher<A> {
-    pub fn new(agent: A) -> Self {
+    pub fn new(agent: A, cwd: impl Into<std::path::PathBuf>) -> Self {
         Self {
             agent: AgentActionRunner::new(agent),
+            command: CommandActionRunner::new(cwd),
             status: StatusActionRunner,
             fail: FailActionRunner,
             ask_user: AskUserActionRunner,
@@ -48,6 +52,7 @@ where
         context: ExecutionContext,
     ) -> Result<ActionResult> {
         match action {
+            StepAction::Command(action) => self.command.run(action, context).await,
             StepAction::Status(action) => Ok(self.status.run(action, context)),
             StepAction::Fail(action) => Ok(self.fail.run(action)),
             StepAction::AskUser(action) => Ok(self.ask_user.run(action, context)),
@@ -120,9 +125,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionDispatcher, AgentAction, AskUserAction, ExecutionContext, FailAction, ResumeCallback,
-        ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail, StepInput,
-        StepOutput, StepRecord,
+        ActionDispatcher, AgentAction, AskUserAction, CommandAction, ExecutionContext, FailAction,
+        ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail,
+        StepInput, StepOutput, StepRecord,
     };
     use serde_json::{Value, json};
 
@@ -321,7 +326,9 @@ mod tests {
 
     #[tokio::test]
     async fn action_dispatcher_routes_each_remaining_variant() {
-        let dispatcher = EngineActionDispatcher::new(FakeAgent);
+        let dispatcher = EngineActionDispatcher::new(FakeAgent, std::env::current_dir().unwrap());
+        let missing_command_dir = tempfile::tempdir().unwrap();
+        let missing_command = missing_command_dir.path().join("missing-command");
 
         let ActionResult::Completed(record) = dispatcher
             .dispatch(
@@ -338,6 +345,24 @@ mod tests {
             panic!("expected status record")
         };
         assert_eq!(record.action, "status");
+
+        let ActionResult::Completed(record) = dispatcher
+            .dispatch(
+                StepAction::Command(CommandAction {
+                    program: missing_command.to_string_lossy().to_string(),
+                    args: Vec::new(),
+                    success_status: "ok".to_string(),
+                    failure_status: "bad".to_string(),
+                    timeout_ms: None,
+                }),
+                context(),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected command record")
+        };
+        assert_eq!(record.action, "command");
 
         let ActionResult::Blocked(RunStatus::WaitingForInput { prompt_id, .. }) = dispatcher
             .dispatch(
