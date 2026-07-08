@@ -309,6 +309,158 @@ fn draw_preserves_transcript_styles() {
 }
 
 #[test]
+fn draw_uses_rounded_cards_without_outer_transcript_border() {
+    let mut state = test_state();
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "bugfix".to_string(),
+            current_step: "plan".to_string(),
+            request_topic: None,
+        },
+    ));
+
+    let rows = rendered_rows(&state, 100, 14);
+    let rendered = rows.join("\n");
+    let composer_row = rows
+        .iter()
+        .position(|row| row.contains("Enter submits"))
+        .unwrap_or_else(|| panic!("{rendered}"));
+
+    assert!(
+        rendered.contains("● Run started · ↳ plan · ▶ 170dc431 · ⎇ bugfix"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("╭"), "{rendered}");
+    assert!(rendered.contains("╰"), "{rendered}");
+    assert!(rows[composer_row].starts_with('┌'), "{rendered}");
+    assert!(
+        rows[..composer_row]
+            .iter()
+            .all(|row| !row.starts_with('┌') && !row.starts_with('└')),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("step="), "{rendered}");
+    assert!(!rendered.contains("run="), "{rendered}");
+    assert!(!rendered.contains("workflow="), "{rendered}");
+}
+
+#[test]
+fn draw_smoke_covers_workflow_tool_cards_and_resize() {
+    let mut state = test_state();
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "bugfix".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::AgentThought {
+            step_id: "implement".to_string(),
+            content: "thinking through cards".to_string(),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::AgentToolCall {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_read".to_string(),
+            title: "Read artifact://28".to_string(),
+            tool_kind: "read".to_string(),
+            status: "pending".to_string(),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_read".to_string(),
+            title: "Read artifact://28".to_string(),
+            status: "completed".to_string(),
+            content: Some(serde_json::json!({"text":"diff output"})),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::AgentResponse {
+            step_id: "implement".to_string(),
+            content: "implemented cards".to_string(),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::StepCompleted {
+            step_id: "implement".to_string(),
+            action: "agent".to_string(),
+            status: Some("implemented".to_string()),
+            body: "done".to_string(),
+        },
+    ));
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-170dc431-abc",
+        WorkflowEventKind::WaitingForInput {
+            step: "review".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve?".to_string(),
+            choices: vec!["approve".to_string(), "reject".to_string()],
+        },
+    ));
+
+    let wide_rows = rendered_rows(&state, 120, 40);
+    let wide = wide_rows.join("\n");
+    assert!(
+        wide.contains("● Run started · ↳ implement · ▶ 170dc431 · ⎇ bugfix"),
+        "{wide}"
+    );
+    assert!(
+        wide.contains("● Agent thinking · ↳ implement · ▶ 170dc431"),
+        "{wide}"
+    );
+    assert!(
+        wide.contains("✓ • Read artifact://28 · ↳ implement · ▶ 170dc431"),
+        "{wide}"
+    );
+    assert!(wide.contains("├─── Output "), "{wide}");
+    assert!(wide.contains("diff output"), "{wide}");
+    assert!(
+        wide.contains("● Agent response · ↳ implement · ▶ 170dc431"),
+        "{wide}"
+    );
+    assert!(
+        wide.contains("✓ Step completed · ↳ implement · ▶ 170dc431"),
+        "{wide}"
+    );
+    assert!(
+        wide.contains("◔ Waiting for input · ↳ review · ▶ 170dc431"),
+        "{wide}"
+    );
+    assert!(wide.contains("approve · reject"), "{wide}");
+    assert!(!wide.contains("step="), "{wide}");
+    assert!(!wide.contains("run="), "{wide}");
+    assert!(!wide.contains("workflow="), "{wide}");
+    assert!(!wide.contains("call_read"), "{wide}");
+    assert!(
+        wide_rows
+            .iter()
+            .any(|row| row.contains("┌ Enter answers active prompt")),
+        "{wide}"
+    );
+
+    let narrow_rows = rendered_rows(&state, 36, 18);
+    let narrow = narrow_rows.join("\n");
+    assert!(narrow.contains("╭"), "{narrow}");
+    assert!(narrow.contains("╰"), "{narrow}");
+    assert!(narrow.contains("◔ Waiting for input"), "{narrow}");
+    assert!(
+        narrow_rows.iter().all(|row| row.chars().count() <= 36),
+        "{narrow}"
+    );
+}
+
+#[test]
 fn draw_with_typed_input_does_not_scale_with_full_transcript_history() {
     fn state_with_transcript_entries(entries: usize) -> AppState {
         let mut state = test_state();

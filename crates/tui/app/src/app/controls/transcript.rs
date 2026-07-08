@@ -1,22 +1,18 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 
 use super::super::state::{AppState, TranscriptEntry, render_pending_prompt_lines};
-use super::super::styles::{style_accent, style_border, style_muted, style_transcript_normal};
+use super::super::styles::{style_accent, style_muted, style_transcript_normal};
 
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let visible_height = area.height.saturating_sub(2) as usize;
-    let inner_width = usize::from(area.width.saturating_sub(2)).max(1);
-    let transcript = Paragraph::new(lines(state, visible_height, inner_width)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(style_border()),
-    );
+    let visible_height = area.height as usize;
+    let inner_width = usize::from(area.width).max(1);
+    let transcript = Paragraph::new(lines(state, visible_height, inner_width));
     frame.render_widget(transcript, area);
 }
 
@@ -69,15 +65,20 @@ fn bounded_tail_visual_rows(
     let mut chunks = Vec::new();
     let mut row_count = 0usize;
 
+    let mut prompt_id_to_skip = None;
     if let Some(prompt) = state.pending_prompt()
         && !pending_prompt_is_latest(state, prompt.prompt_id())
     {
-        let rows = visual_rows(render_pending_prompt_lines(prompt), wrap_width);
+        let rows = render_pending_prompt_lines(prompt, wrap_width);
         row_count = row_count.saturating_add(rows.len());
         chunks.push(rows);
+        prompt_id_to_skip = Some(prompt.prompt_id());
     }
 
     for entry in state.event_entries().iter().rev() {
+        if prompt_id_to_skip.is_some_and(|prompt_id| entry_is_waiting_prompt(entry, prompt_id)) {
+            continue;
+        }
         if row_count >= target_rows {
             break;
         }
@@ -94,9 +95,26 @@ fn bounded_tail_visual_rows(
 }
 
 fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
-    state.event_entries().last().is_some_and(|entry| {
-        entry.contains("Waiting for input") && entry.contains(&format!("prompt={prompt_id}"))
-    })
+    state
+        .event_entries()
+        .last()
+        .is_some_and(|entry| match entry {
+            TranscriptEntry::Workflow(event) => matches!(
+                &event.kind,
+                WorkflowEventKind::WaitingForInput { prompt_id: id, .. } if id == prompt_id
+            ),
+            _ => false,
+        })
+}
+
+fn entry_is_waiting_prompt(entry: &TranscriptEntry, prompt_id: &str) -> bool {
+    matches!(
+        entry,
+        TranscriptEntry::Workflow(WorkflowEvent {
+            kind: WorkflowEventKind::WaitingForInput { prompt_id: id, .. },
+            ..
+        }) if id == prompt_id
+    )
 }
 
 fn entry_tail_visual_rows(
@@ -107,11 +125,10 @@ fn entry_tail_visual_rows(
     match entry {
         TranscriptEntry::Workflow(event) => {
             stream_event_tail_visual_rows(event, rows_needed, wrap_width)
-                .unwrap_or_else(|| visual_rows(entry.render_lines(), wrap_width))
+                .unwrap_or_else(|| entry.render_lines_for_width(wrap_width))
         }
-        TranscriptEntry::Card { .. } | TranscriptEntry::Plain(_) => {
-            visual_rows(entry.render_lines(), wrap_width)
-        }
+        TranscriptEntry::Card { .. } => entry.render_lines_for_width(wrap_width),
+        TranscriptEntry::Plain(_) => visual_rows(entry.render_lines(), wrap_width),
     }
 }
 
@@ -140,10 +157,7 @@ fn stream_event_tail_visual_rows(
         _ => return None,
     }
 
-    Some(visual_rows(
-        TranscriptEntry::Workflow(event).render_lines(),
-        wrap_width,
-    ))
+    Some(TranscriptEntry::Workflow(event).render_lines_for_width(wrap_width))
 }
 
 fn stream_content(event: &WorkflowEvent) -> Option<&str> {
@@ -259,6 +273,7 @@ fn empty_lines() -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use unicode_width::UnicodeWidthStr;
 
     use super::*;
     use crate::app::state::AppState;
@@ -276,6 +291,14 @@ mod tests {
         })
     }
 
+    fn rendered_text(state: &AppState, height: usize, width: usize) -> String {
+        lines(state, height, width)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn workflow_events_render_as_focused_prompt_card() {
         let mut state = test_state();
@@ -290,32 +313,24 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 20, usize::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = rendered_text(&state, 20, 80);
 
-        assert!(rendered.contains("Waiting for input"));
-        assert!(rendered.contains("step=approve"));
-        assert!(rendered.contains("prompt=approval"));
-        assert!(rendered.contains("choices=yes, no"));
-        assert!(rendered.contains("\nApprove?"));
-        assert!(!rendered.contains("prompt: approval"));
-        assert!(!rendered.contains("message: Approve?"));
-        assert!(!rendered.contains("╭─ Waiting for input ─╮"));
-        assert!(!rendered.contains("╰──────────────────────╯"));
-        assert!(!rendered.contains("│"));
-        let first_event = rendered
-            .lines()
-            .find(|line| line.contains("Waiting for input"))
-            .unwrap();
-        assert_eq!(first_event.chars().nth(2), Some(':'));
-        assert_eq!(first_event.chars().nth(5), Some(':'));
+        assert!(
+            rendered.contains("◔ Waiting for input · ↳ approve · ▶ run-2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("├─── Choices "), "{rendered}");
+        assert!(rendered.contains("yes · no"), "{rendered}");
+        assert!(rendered.contains("Approve?"), "{rendered}");
+        assert!(!rendered.contains("step="), "{rendered}");
+        assert!(!rendered.contains("prompt="), "{rendered}");
+        assert!(!rendered.contains("choices="), "{rendered}");
+        assert!(!rendered.contains("┌"), "{rendered}");
+        assert!(!rendered.contains("└"), "{rendered}");
     }
 
     #[test]
-    fn prompt_card_splits_multiline_message() {
+    fn prompt_card_splits_multiline_message_and_deduplicates_pending_prompt() {
         let mut state = test_state();
         state.apply_workflow_event(WorkflowEvent::new(
             "run-2",
@@ -328,30 +343,26 @@ mod tests {
         ));
         state.push_card("Notice", ["keep prompt visible".to_string()]);
 
-        let rendered_lines = lines(&state, 100, usize::MAX)
+        let rendered_lines = lines(&state, 100, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(rendered_lines.iter().all(|line| !line.contains('\n')));
         let rendered = rendered_lines.join("\n");
-        assert!(rendered.contains("Waiting for input"), "{rendered}");
-        assert!(rendered.contains("step=confirm_plan"), "{rendered}");
-        assert!(rendered.contains("prompt=approval"), "{rendered}");
-        assert!(rendered.contains("choices=<freeform>"), "{rendered}");
-        assert!(
-            rendered.contains("\nReview plan\n- first item"),
+        assert_eq!(
+            rendered.matches("Waiting for input").count(),
+            1,
             "{rendered}"
         );
-        assert!(rendered.contains("\n- second item"), "{rendered}");
+        assert!(rendered.contains("Review plan"), "{rendered}");
+        assert!(rendered.contains("- first item"), "{rendered}");
+        assert!(rendered.contains("- second item"), "{rendered}");
+        assert!(rendered.contains("◔ Notice"), "{rendered}");
         assert!(!rendered.contains("message:"), "{rendered}");
-        assert!(
-            !rendered.contains("                - first item"),
-            "{rendered}"
-        );
     }
 
     #[test]
-    fn events_render_in_chronological_order() {
+    fn events_render_in_chronological_order_with_tool_coalescing() {
         let mut state = test_state();
 
         state.apply_workflow_event(WorkflowEvent::new(
@@ -420,34 +431,23 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 100, usize::MAX)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let rendered = rendered_text(&state, 100, 80);
         let run_started = rendered.find("Run started").unwrap();
         let step_started = rendered.find("Step started").unwrap();
         let session_ready = rendered.find("Agent session ready").unwrap();
         let prompt = rendered.find("Prompt sent to agent").unwrap();
         let thought = rendered.find("Agent thinking").unwrap();
-        let tool_call = rendered.find("Agent tool call").unwrap();
-        let tool_update = rendered.find("Agent tool update").unwrap();
+        let tool = rendered.find("• Reading app state").unwrap();
         let response = rendered.find("Agent response").unwrap();
 
         assert!(run_started < step_started);
         assert!(step_started < session_ready);
         assert!(session_ready < prompt);
         assert!(prompt < thought);
-        assert!(thought < tool_call);
-        assert!(tool_call < tool_update);
-        assert!(tool_update < response);
-        assert!(rendered.contains("\nthinking"));
-        assert!(rendered.contains("\ndone"));
-        assert!(rendered.contains("\nready"));
-        assert!(!rendered.contains("thought: thinking"));
-        assert!(!rendered.contains("content: done"));
-        assert!(!rendered.contains("content: ready"));
-        assert!(!rendered.contains("id:"), "{rendered}");
+        assert!(thought < tool);
+        assert!(tool < response);
+        assert!(rendered.contains("done"));
+        assert!(rendered.contains("ready"));
         assert!(!rendered.contains("call_1"), "{rendered}");
         assert!(!rendered.contains("{\"text\""), "{rendered}");
     }
@@ -463,10 +463,10 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 20, usize::MAX);
+        let rendered = lines(&state, 20, 80);
         let thought_line = rendered
             .iter()
-            .find(|line| line.to_string() == "thinking")
+            .find(|line| line.to_string().contains("thinking"))
             .unwrap();
 
         assert!(thought_line.spans.iter().any(|span| {
@@ -485,7 +485,7 @@ mod tests {
             },
         ));
 
-        let rendered = lines(&state, 3, 6)
+        let rendered = lines(&state, 6, 12)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -495,8 +495,13 @@ mod tests {
             "{rendered:?}"
         );
         assert!(
-            rendered.iter().all(|line| !line.contains("aaaaa")),
+            rendered.iter().any(|line| line.contains("╰")),
             "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .all(|line| UnicodeWidthStr::width(line.as_str()) <= 12)
         );
     }
 
@@ -510,7 +515,7 @@ mod tests {
 
         state.push_card("Notice", ["TAIL_MARKER".to_string()]);
 
-        let rendered = lines(&state, 6, usize::MAX)
+        let rendered = lines(&state, 6, 80)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
@@ -548,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn scroll_offsets_apply_to_wrapped_visual_rows() {
+    fn scroll_offsets_apply_to_card_visual_rows() {
         let mut state = test_state();
         state.apply_workflow_event(WorkflowEvent::new(
             "run-2",
@@ -558,40 +563,39 @@ mod tests {
             },
         ));
 
-        let following = lines(&state, 4, 4)
+        let following = lines(&state, 5, 16)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            following.iter().any(|line| line.contains("TAIL")),
-            "{following:?}"
-        );
-        assert!(
-            following.iter().all(|line| !line.contains("0000")),
+            following.iter().any(|line| line.contains("TA"))
+                && following.iter().any(|line| line.contains("IL")),
             "{following:?}"
         );
 
         state.scroll_events_up();
-        let scrolled = lines(&state, 4, 4)
+        let scrolled = lines(&state, 5, 16)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            scrolled.iter().any(|line| line.contains("0000")),
+            scrolled.iter().any(|line| line.contains("Agent respons")),
             "{scrolled:?}"
         );
         assert!(
-            scrolled.iter().all(|line| !line.contains("TAIL")),
+            !(scrolled.iter().any(|line| line.contains("TA"))
+                && scrolled.iter().any(|line| line.contains("IL"))),
             "{scrolled:?}"
         );
 
         state.scroll_events_down();
-        let refollowing = lines(&state, 4, 4)
+        let refollowing = lines(&state, 5, 16)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         assert!(
-            refollowing.iter().any(|line| line.contains("TAIL")),
+            refollowing.iter().any(|line| line.contains("TA"))
+                && refollowing.iter().any(|line| line.contains("IL")),
             "{refollowing:?}"
         );
     }

@@ -1,13 +1,13 @@
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
+use super::controls::chrome::status_icon;
 use super::markup::render_markup;
 use super::styles::{
-    style_accent, style_error, style_for_run_state, style_for_tool_status, style_success,
-    style_transcript_metadata, style_transcript_normal, style_transcript_plan,
-    style_transcript_prompt, style_transcript_thought, style_transcript_tool_pending,
-    style_warning,
+    style_error, style_for_run_state, style_for_tool_status, style_transcript_metadata,
+    style_transcript_normal, style_transcript_plan, style_transcript_prompt,
+    style_transcript_thought, style_warning,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,105 +24,99 @@ impl RenderedWorkflowEvent {
     pub(super) fn text(&self) -> &str {
         &self.text
     }
-
-    #[cfg(test)]
-    fn contains(&self, needle: &str) -> bool {
-        self.text.contains(needle)
-    }
 }
 
 pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEvent {
-    let stamp = elapsed_stamp(event);
-    let mut lines = Vec::new();
+    render_workflow_event_width(event, DEFAULT_CARD_WIDTH)
+}
+
+pub(super) fn render_workflow_event_width(
+    event: &WorkflowEvent,
+    width: usize,
+) -> RenderedWorkflowEvent {
+    let card = workflow_event_card(event);
+    let lines = card.render(width);
+    let text = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    RenderedWorkflowEvent { lines, text }
+}
+
+fn workflow_event_card(event: &WorkflowEvent) -> Card {
     match &event.kind {
         WorkflowEventKind::RunStarted {
             workflow_name,
             current_step,
             ..
-        } => {
-            lines.push(header_line(
-                &stamp,
-                "Run started",
-                style_accent(),
-                vec![
-                    ("run", event.run_id.as_str(), style_transcript_metadata()),
-                    (
-                        "workflow",
-                        workflow_name.as_str(),
-                        style_transcript_normal(),
-                    ),
-                    ("step", current_step.as_str(), style_accent()),
-                ],
-            ));
-        }
+        } => Card::new(status_icon("running"), "Run started", CardTone::Accent).metadata([
+            CardMetadata::step(current_step),
+            CardMetadata::run(&event.run_id),
+            CardMetadata::workflow(workflow_name),
+        ]),
         WorkflowEventKind::StepStarted { step_id } => {
-            lines.push(header_line(
-                &stamp,
-                "Step started",
-                style_accent(),
-                vec![("step", step_id.as_str(), style_accent())],
-            ));
+            Card::new(status_icon("running"), "Step started", CardTone::Accent).metadata([
+                CardMetadata::step(step_id),
+                CardMetadata::run(&event.run_id),
+            ])
         }
         WorkflowEventKind::StepProgress { step_id, message } => {
-            lines.push(header_line(
-                &stamp,
-                "Step progress",
-                style_accent(),
-                vec![("step", step_id.as_str(), style_accent())],
-            ));
-            push_body(&mut lines, message, usize::MAX, style_transcript_normal());
+            Card::new(status_icon("running"), "Step progress", CardTone::Accent)
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(render_markup(
+                    message,
+                    style_transcript_normal(),
+                )))
         }
-        WorkflowEventKind::AgentSessionReady {
-            step_id,
-            role,
-            session_id,
-        } => {
-            lines.push(header_line(
-                &stamp,
-                "Agent session ready",
-                style_accent(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("role", role.as_str(), style_transcript_normal()),
-                    ("session", session_id.as_str(), style_transcript_metadata()),
-                ],
-            ));
-        }
+        WorkflowEventKind::AgentSessionReady { step_id, .. } => Card::new(
+            status_icon("running"),
+            "Agent session ready",
+            CardTone::Accent,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ]),
         WorkflowEventKind::AgentPrompt {
-            step_id,
-            role,
-            session_id,
-            prompt,
-        } => {
-            lines.push(header_line(
-                &stamp,
-                "Prompt sent to agent",
-                style_transcript_prompt(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("role", role.as_str(), style_transcript_prompt()),
-                    ("session", session_id.as_str(), style_transcript_metadata()),
-                ],
-            ));
-            push_body(&mut lines, prompt, usize::MAX, style_transcript_prompt());
-        }
+            step_id, prompt, ..
+        } => Card::new(
+            status_icon("running"),
+            "Prompt sent to agent",
+            CardTone::Prompt,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::named(
+            "Prompt",
+            render_markup(prompt, style_transcript_prompt()),
+        )),
         WorkflowEventKind::AgentResponse { step_id, content } => {
-            lines.push(header_line(
-                &stamp,
-                "Agent response",
-                style_transcript_normal(),
-                vec![("step", step_id.as_str(), style_accent())],
-            ));
-            push_body(&mut lines, content, usize::MAX, style_transcript_normal());
+            Card::new(status_icon("running"), "Agent response", CardTone::Neutral)
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(render_markup(
+                    content,
+                    style_transcript_normal(),
+                )))
         }
         WorkflowEventKind::AgentThought { step_id, content } => {
-            lines.push(header_line(
-                &stamp,
-                "Agent thinking",
-                style_transcript_thought(),
-                vec![("step", step_id.as_str(), style_accent())],
-            ));
-            push_body(&mut lines, content, usize::MAX, style_transcript_thought());
+            Card::new(status_icon("running"), "Agent thinking", CardTone::Thought)
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(render_markup(
+                    content,
+                    style_transcript_thought(),
+                )))
         }
         WorkflowEventKind::AgentToolCall {
             step_id,
@@ -132,17 +126,16 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             ..
         } => {
             let tool = display_tool_title(title, Some(tool_kind));
-            lines.push(header_line(
-                &stamp,
-                "Agent tool call",
-                style_transcript_tool_pending(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("tool", tool.as_str(), style_transcript_tool_pending()),
-                    ("kind", tool_kind.as_str(), style_transcript_metadata()),
-                    ("status", status.as_str(), style_for_tool_status(status)),
-                ],
-            ));
+            Card::new(tool_status_icon(status), tool, CardTone::Tool)
+                .tool_marker()
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(vec![Line::from(vec![
+                    Span::styled("Status: ", style_transcript_metadata()),
+                    Span::styled(status.clone(), style_for_tool_status(status)),
+                ])]))
         }
         WorkflowEventKind::AgentToolCallUpdate {
             step_id,
@@ -152,35 +145,38 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             ..
         } => {
             let tool = display_tool_title(title, None);
-            lines.push(header_line(
-                &stamp,
-                "Agent tool update",
-                style_for_tool_status(status),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("tool", tool.as_str(), style_transcript_tool_pending()),
-                    ("status", status.as_str(), style_for_tool_status(status)),
-                ],
-            ));
+            let mut card = Card::new(tool_status_icon(status), tool, tool_tone(status))
+                .tool_marker()
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(vec![Line::from(vec![
+                    Span::styled("Status: ", style_transcript_metadata()),
+                    Span::styled(status.clone(), style_for_tool_status(status)),
+                ])]));
             if let Some(content) = content {
                 let content = display_tool_update_content(content);
-                push_body(&mut lines, &content, usize::MAX, style_transcript_normal());
+                card = card.section(CardSection::named(
+                    "Output",
+                    render_markup(&content, style_transcript_normal()),
+                ));
             }
+            card
         }
         WorkflowEventKind::AgentPlan { step_id, entries } => {
-            lines.push(header_line(
-                &stamp,
-                "Agent plan",
-                style_transcript_plan(),
-                vec![("step", step_id.as_str(), style_accent())],
-            ));
-            for (index, entry) in entries.iter().enumerate() {
-                if index > 0 {
-                    lines.push(Line::from(""));
-                }
-                let entry = display_json_value(entry);
-                push_body(&mut lines, &entry, usize::MAX, style_transcript_plan());
-            }
+            let lines = entries
+                .iter()
+                .flat_map(|entry| {
+                    render_markup(&display_json_value(entry), style_transcript_plan())
+                })
+                .collect::<Vec<_>>();
+            Card::new(status_icon("running"), "Agent plan", CardTone::Plan)
+                .metadata([
+                    CardMetadata::step(step_id),
+                    CardMetadata::run(&event.run_id),
+                ])
+                .section(CardSection::body(lines))
         }
         WorkflowEventKind::StepCompleted {
             step_id,
@@ -189,175 +185,153 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
             body,
         } => {
             let status_value = status.as_deref().unwrap_or("<none>");
-            let status_style = status
-                .as_deref()
-                .map(style_for_run_state)
-                .unwrap_or_else(style_transcript_metadata);
-            lines.push(header_line(
-                &stamp,
+            Card::new(
+                status_icon("completed"),
                 "Step completed",
-                style_success(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("action", action.as_str(), style_transcript_normal()),
-                    ("status", status_value, status_style),
-                ],
-            ));
-            push_body(&mut lines, body, 8, style_transcript_normal());
+                CardTone::Success,
+            )
+            .metadata([
+                CardMetadata::step(step_id),
+                CardMetadata::run(&event.run_id),
+            ])
+            .section(CardSection::body(vec![Line::from(vec![
+                Span::styled("Action: ", style_transcript_metadata()),
+                Span::styled(action.clone(), style_transcript_normal()),
+                Span::styled(" · Status: ", style_transcript_metadata()),
+                Span::styled(status_value.to_string(), style_for_run_state(status_value)),
+            ])]))
+            .section(
+                CardSection::named("Body", render_markup(body, style_transcript_normal()))
+                    .capped(8),
+            )
         }
         WorkflowEventKind::WaitingForInput {
             step,
-            prompt_id,
             message,
             choices,
+            ..
         } => {
-            let choices = display_choices(choices);
-            lines.push(header_line(
-                &stamp,
+            let mut card = Card::new(
+                status_icon("waiting"),
                 "Waiting for input",
-                style_warning(),
-                vec![
-                    ("step", step.as_str(), style_accent()),
-                    ("prompt", prompt_id.as_str(), style_transcript_metadata()),
-                    ("choices", choices.as_str(), style_warning()),
-                ],
-            ));
-            push_body(&mut lines, message, usize::MAX, style_transcript_normal());
+                CardTone::Warning,
+            )
+            .metadata([CardMetadata::step(step), CardMetadata::run(&event.run_id)])
+            .section(CardSection::body(render_markup(
+                message,
+                style_transcript_normal(),
+            )));
+            if !choices.is_empty() {
+                card = card.section(CardSection::named(
+                    "Choices",
+                    vec![Line::from(Span::styled(
+                        display_choices(choices),
+                        style_warning(),
+                    ))],
+                ));
+            }
+            card
         }
         WorkflowEventKind::RunCompleted => {
-            lines.push(header_line(
-                &stamp,
-                "Run completed",
-                style_success(),
-                vec![("run", event.run_id.as_str(), style_transcript_metadata())],
-            ));
+            Card::new(status_icon("completed"), "Run completed", CardTone::Success)
+                .metadata([CardMetadata::run(&event.run_id)])
         }
         WorkflowEventKind::StepRetrying {
             step_id,
             attempt,
             max_attempts,
             reason,
-        } => {
-            let attempt_label = format!("{attempt}/{max_attempts}");
-            lines.push(header_line(
-                &stamp,
-                "Step retrying",
+        } => Card::new(status_icon("retrying"), "Step retrying", CardTone::Warning)
+            .metadata([
+                CardMetadata::step(step_id),
+                CardMetadata::run(&event.run_id),
+            ])
+            .section(CardSection::body(vec![Line::from(Span::styled(
+                format!("attempt {attempt}/{max_attempts}"),
                 style_warning(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("attempt", attempt_label.as_str(), style_warning()),
-                ],
-            ));
-            push_body(&mut lines, reason, usize::MAX, style_transcript_metadata());
-        }
-        WorkflowEventKind::ManuallyResolved { step_id, status } => {
-            lines.push(header_line(
-                &stamp,
-                "Manually resolved",
-                style_success(),
-                vec![
-                    ("step", step_id.as_str(), style_accent()),
-                    ("status", status.as_str(), style_for_run_state(status)),
-                ],
-            ));
-        }
+            ))]))
+            .section(CardSection::body(render_markup(
+                reason,
+                style_transcript_metadata(),
+            ))),
+        WorkflowEventKind::ManuallyResolved { step_id, status } => Card::new(
+            status_icon("completed"),
+            "Manually resolved",
+            CardTone::Success,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::body(vec![Line::from(vec![
+            Span::styled("Status: ", style_transcript_metadata()),
+            Span::styled(status.clone(), style_for_run_state(status)),
+        ])])),
         WorkflowEventKind::RunFailed { reason } => {
-            lines.push(header_line(
-                &stamp,
-                "Run failed",
-                style_error(),
-                vec![("reason", reason.as_str(), style_error())],
-            ));
-            lines.push(Line::from(""));
-            lines.push(metadata_line("Next action"));
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "List resolvable statuses with ",
-                    style_transcript_metadata(),
-                ),
-                Span::styled(
-                    format!("/resolve {}", event.run_id),
-                    style_transcript_prompt(),
-                ),
-                Span::styled(
-                    ", then resolve with /resolve <run> <status>.",
-                    style_transcript_metadata(),
-                ),
-            ]));
+            Card::new(status_icon("failed"), "Run failed", CardTone::Error)
+                .metadata([CardMetadata::run(&event.run_id)])
+                .section(CardSection::body(render_markup(reason, style_error())))
+                .section(CardSection::named(
+                    "Next action",
+                    vec![Line::from(vec![
+                        Span::styled(
+                            "List resolvable statuses with ",
+                            style_transcript_metadata(),
+                        ),
+                        Span::styled(
+                            format!("/resolve {}", event.run_id),
+                            style_transcript_prompt(),
+                        ),
+                        Span::styled(
+                            ", then resolve with /resolve <run> <status>.",
+                            style_transcript_metadata(),
+                        ),
+                    ])],
+                ))
         }
         WorkflowEventKind::RunCancelled => {
-            lines.push(header_line(
-                &stamp,
-                "Run cancelled",
-                style_error(),
-                vec![("run", event.run_id.as_str(), style_transcript_metadata())],
-            ));
+            Card::new(status_icon("cancelled"), "Run cancelled", CardTone::Error)
+                .metadata([CardMetadata::run(&event.run_id)])
         }
-        WorkflowEventKind::RunStatusChanged { status } => {
-            lines.push(header_line(
-                &stamp,
-                "Run status changed",
-                style_for_run_state(status),
-                vec![("status", status.as_str(), style_for_run_state(status))],
-            ));
-        }
+        WorkflowEventKind::RunStatusChanged { status } => Card::new(
+            status_icon(status),
+            "Run status changed",
+            run_state_tone(status),
+        )
+        .metadata([CardMetadata::run(&event.run_id)])
+        .section(CardSection::body(vec![Line::from(Span::styled(
+            status.clone(),
+            style_for_run_state(status),
+        ))])),
     }
-    let text = lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    RenderedWorkflowEvent { lines, text }
 }
 
-fn elapsed_stamp(event: &WorkflowEvent) -> String {
-    let elapsed_seconds = event.run_active_duration_ms.map_or_else(
-        || {
-            let started_at = event.run_started_at.unwrap_or(event.timestamp);
-            event
-                .timestamp
-                .signed_duration_since(started_at)
-                .num_seconds()
-                .max(0) as u64
-        },
-        |active_ms| active_ms / 1000,
-    );
-    let hours = elapsed_seconds / 3600;
-    let minutes = (elapsed_seconds % 3600) / 60;
-    let seconds = elapsed_seconds % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
-fn header_line(
-    stamp: &str,
-    title: &str,
-    title_style: Style,
-    metadata: Vec<(&str, &str, Style)>,
-) -> Line<'static> {
-    let mut spans = Vec::with_capacity(3 + metadata.len() * 2);
-    spans.push(Span::styled(stamp.to_string(), style_transcript_metadata()));
-    spans.push(Span::styled("  ", style_transcript_metadata()));
-    spans.push(Span::styled(title.to_string(), title_style));
-    for (label, value, value_style) in metadata {
-        spans.push(Span::styled(
-            format!("  {label}="),
-            style_transcript_metadata(),
-        ));
-        spans.push(Span::styled(value.to_string(), value_style));
+fn tool_status_icon(status: &str) -> &'static str {
+    match status.to_ascii_lowercase().as_str() {
+        "completed" | "success" | "succeeded" | "done" => status_icon("completed"),
+        "failed" | "error" => status_icon("failed"),
+        "cancelled" | "canceled" => status_icon("cancelled"),
+        "waiting" | "warning" => status_icon("waiting"),
+        _ => status_icon("running"),
     }
-    Line::from(spans)
 }
 
-fn metadata_line(text: impl Into<String>) -> Line<'static> {
-    Line::from(Span::styled(text.into(), style_transcript_metadata()))
+fn tool_tone(status: &str) -> CardTone {
+    match status.to_ascii_lowercase().as_str() {
+        "completed" | "success" | "succeeded" | "done" => CardTone::Success,
+        "failed" | "error" | "cancelled" | "canceled" => CardTone::Error,
+        "waiting" | "warning" => CardTone::Warning,
+        _ => CardTone::Tool,
+    }
 }
 
-fn push_body(lines: &mut Vec<Line<'static>>, value: &str, max_lines: usize, style: Style) {
-    let rendered = render_markup(value, style);
-    let truncated = rendered.len() > max_lines;
-    lines.extend(rendered.into_iter().take(max_lines));
-    if truncated {
-        lines.push(metadata_line("..."));
+fn run_state_tone(status: &str) -> CardTone {
+    match status {
+        "completed" => CardTone::Success,
+        "waiting" => CardTone::Warning,
+        "failed" | "cancelled" => CardTone::Error,
+        "running" => CardTone::Accent,
+        _ => CardTone::Neutral,
     }
 }
 
@@ -365,10 +339,9 @@ fn display_choices(choices: &[String]) -> String {
     if choices.is_empty() {
         "<freeform>".to_string()
     } else {
-        choices.join(", ")
+        choices.join(" · ")
     }
 }
-
 fn display_tool_title(title: &str, kind: Option<&str>) -> String {
     let title = title.trim();
     if !title.is_empty() {
@@ -465,194 +438,95 @@ fn non_empty(text: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, TimeZone, Utc};
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Style};
 
     use super::*;
     use crate::app::styles::{
         style_error, style_success, style_transcript_thought, style_transcript_tool_pending,
         style_warning,
     };
-    fn run_started_at() -> chrono::DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap()
+
+    fn event(kind: WorkflowEventKind) -> WorkflowEvent {
+        WorkflowEvent::new("run-170dc431-abc", kind)
     }
 
-    fn event_with_elapsed_fallback(seconds: i64, kind: WorkflowEventKind) -> WorkflowEvent {
-        let started_at = run_started_at();
-        WorkflowEvent::with_timing(
-            "run-1",
-            started_at + Duration::seconds(seconds),
-            Some(started_at),
-            None,
-            kind,
-        )
-    }
-
-    fn event_with_active_duration(
-        wall_clock_seconds: i64,
-        active_duration_ms: u64,
-        kind: WorkflowEventKind,
-    ) -> WorkflowEvent {
-        let started_at = run_started_at();
-        WorkflowEvent::with_timing(
-            "run-1",
-            started_at + Duration::seconds(wall_clock_seconds),
-            Some(started_at),
-            Some(active_duration_ms),
-            kind,
-        )
-    }
-
-    fn rendered_header(event: &WorkflowEvent) -> String {
-        render_workflow_event(event).lines()[0].to_string()
-    }
-
-    fn rendered_stamp(event: &WorkflowEvent) -> String {
-        rendered_header(event)
-            .split_once("  ")
-            .map(|(stamp, _)| stamp.to_string())
-            .unwrap()
+    fn rendered_text(kind: WorkflowEventKind) -> String {
+        render_workflow_event(&event(kind)).text().to_string()
     }
 
     #[test]
-    fn renders_active_duration_instead_of_larger_wall_clock_elapsed() {
-        let event = event_with_active_duration(42 * 60, 296_000, WorkflowEventKind::RunCompleted);
-        let header = rendered_header(&event);
-
-        assert!(header.starts_with("00:04:56  Run completed"), "{header}");
-        assert!(!header.starts_with("00:42:00"), "{header}");
-    }
-
-    #[test]
-    fn renders_active_duration_hours_beyond_one_day() {
-        let active_duration_ms = (27 * 3600 + 62) * 1000;
-        let event =
-            event_with_active_duration(60, active_duration_ms, WorkflowEventKind::RunCompleted);
-        let header = rendered_header(&event);
-
-        assert!(header.starts_with("27:01:02  Run completed"), "{header}");
-    }
-
-    #[test]
-    fn missing_active_duration_uses_legacy_wall_clock_elapsed_fallback() {
-        let event = event_with_elapsed_fallback(296, WorkflowEventKind::RunCompleted);
-        let header = rendered_header(&event);
-
-        assert!(header.starts_with("00:04:56  Run completed"), "{header}");
-        assert!(!header.contains("12:34:56"), "{header}");
-    }
-
-    #[test]
-    fn renders_missing_and_negative_elapsed_baselines_as_zero() {
-        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 12, 34, 56).unwrap();
-        let mut missing = WorkflowEvent::new("run-1", WorkflowEventKind::RunCompleted);
-        missing.timestamp = timestamp;
-        let missing_header = render_workflow_event(&missing).lines()[0].to_string();
-
-        let started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 35, 0).unwrap();
-        let mut negative = WorkflowEvent::with_run_started_at(
-            "run-1",
-            started_at,
-            WorkflowEventKind::RunCompleted,
-        );
-        negative.timestamp = timestamp;
-        let negative_header = render_workflow_event(&negative).lines()[0].to_string();
-
-        assert!(
-            missing_header.starts_with("00:00:00  Run completed"),
-            "{missing_header}"
-        );
-        assert!(
-            negative_header.starts_with("00:00:00  Run completed"),
-            "{negative_header}"
-        );
-    }
-
-    #[test]
-    fn transcript_stamps_exclude_waiting_gaps_and_preserve_active_increments() {
+    fn renders_lifecycle_cards_with_icon_metadata() {
         let rendered = [
-            (
-                "pre-wait agent response",
-                event_with_active_duration(
-                    120,
-                    120_000,
-                    WorkflowEventKind::AgentResponse {
-                        step_id: "review".to_string(),
-                        content: "Ready for approval".to_string(),
-                    },
-                ),
-                "00:02:00",
-            ),
-            (
-                "waiting prompt",
-                event_with_active_duration(
-                    125,
-                    125_000,
-                    WorkflowEventKind::WaitingForInput {
-                        step: "review".to_string(),
-                        prompt_id: "approval".to_string(),
-                        message: "Approve?".to_string(),
-                        choices: vec!["yes".to_string(), "no".to_string()],
-                    },
-                ),
-                "00:02:05",
-            ),
-            (
-                "post-answer completion",
-                event_with_active_duration(
-                    45 * 60 + 126,
-                    126_000,
-                    WorkflowEventKind::StepCompleted {
-                        step_id: "review".to_string(),
-                        action: "ask_user".to_string(),
-                        status: Some("approved".to_string()),
-                        body: "approved".to_string(),
-                    },
-                ),
-                "00:02:06",
-            ),
-            (
-                "second-step start",
-                event_with_active_duration(
-                    45 * 60 + 131,
-                    131_000,
-                    WorkflowEventKind::StepStarted {
-                        step_id: "deploy".to_string(),
-                    },
-                ),
-                "00:02:11",
-            ),
-        ];
-
-        let stamps = rendered
-            .iter()
-            .map(|(case, event, _)| (*case, rendered_stamp(event)))
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            stamps,
-            vec![
-                ("pre-wait agent response", "00:02:00".to_string()),
-                ("waiting prompt", "00:02:05".to_string()),
-                ("post-answer completion", "00:02:06".to_string()),
-                ("second-step start", "00:02:11".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn renders_agent_prompt_response_thought_and_tool_events() {
-        let rendered = [
+            WorkflowEventKind::RunStarted {
+                workflow_name: "bugfix".to_string(),
+                current_step: "plan".to_string(),
+                request_topic: None,
+            },
+            WorkflowEventKind::StepStarted {
+                step_id: "implement".to_string(),
+            },
+            WorkflowEventKind::StepProgress {
+                step_id: "implement".to_string(),
+                message: "Running formatter".to_string(),
+            },
             WorkflowEventKind::AgentSessionReady {
                 step_id: "implement".to_string(),
                 role: "developer".to_string(),
                 session_id: "session-1".to_string(),
             },
+            WorkflowEventKind::StepRetrying {
+                step_id: "implement".to_string(),
+                attempt: 2,
+                max_attempts: 3,
+                reason: "missing frontmatter".to_string(),
+            },
+            WorkflowEventKind::ManuallyResolved {
+                step_id: "review".to_string(),
+                status: "approved".to_string(),
+            },
+            WorkflowEventKind::RunCompleted,
+            WorkflowEventKind::RunFailed {
+                reason: "boom".to_string(),
+            },
+            WorkflowEventKind::RunCancelled,
+            WorkflowEventKind::RunStatusChanged {
+                status: "waiting".to_string(),
+            },
+        ]
+        .into_iter()
+        .map(rendered_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        assert!(rendered.contains("● Run started · ↳ plan · ▶ 170dc431 · ⎇ bugfix"));
+        assert!(rendered.contains("● Step started · ↳ implement · ▶ 170dc431"));
+        assert!(rendered.contains("Running formatter"));
+        assert!(rendered.contains("● Agent session ready · ↳ implement · ▶ 170dc431"));
+        assert!(!rendered.contains("Role: developer"), "{rendered}");
+        assert!(!rendered.contains("Session: session-1"), "{rendered}");
+        assert!(rendered.contains("↻ Step retrying · ↳ implement · ▶ 170dc431"));
+        assert!(rendered.contains("attempt 2/3"));
+        assert!(rendered.contains("✓ Manually resolved · ↳ review · ▶ 170dc431"));
+        assert!(rendered.contains("✓ Run completed · ▶ 170dc431"));
+        assert!(rendered.contains("✗ Run failed · ▶ 170dc431"));
+        assert!(rendered.contains("■ Run cancelled · ▶ 170dc431"));
+        assert!(rendered.contains("◔ Run status changed · ▶ 170dc431"));
+        assert!(rendered.contains("╭"));
+        assert!(rendered.contains("╰"));
+        assert!(!rendered.contains("step="), "{rendered}");
+        assert!(!rendered.contains("run="), "{rendered}");
+        assert!(!rendered.contains("workflow="), "{rendered}");
+        assert!(!rendered.contains("tasks="), "{rendered}");
+    }
+
+    #[test]
+    fn renders_agent_prompt_thought_response_and_plan_cards() {
+        let rendered = [
             WorkflowEventKind::AgentPrompt {
                 step_id: "implement".to_string(),
                 role: "developer".to_string(),
                 session_id: "session-1".to_string(),
-                prompt: "Role: developer\nTask: Do work".to_string(),
+                prompt: "Task: Do work".to_string(),
             },
             WorkflowEventKind::AgentThought {
                 step_id: "implement".to_string(),
@@ -662,297 +536,181 @@ mod tests {
                 step_id: "implement".to_string(),
                 content: "partial answer".to_string(),
             },
-            WorkflowEventKind::AgentToolCall {
+            WorkflowEventKind::AgentPlan {
                 step_id: "implement".to_string(),
-                tool_call_id: "call_abc".to_string(),
-                title: "Reading app state".to_string(),
-                tool_kind: "read".to_string(),
-                status: "pending".to_string(),
+                entries: vec![serde_json::json!("- Add card renderer")],
             },
         ]
         .into_iter()
-        .map(|kind| {
-            render_workflow_event(&WorkflowEvent::new("run-1", kind))
-                .text()
-                .to_string()
-        })
+        .map(rendered_text)
         .collect::<Vec<_>>()
         .join("\n");
 
-        assert!(rendered.contains("Agent session ready"));
-        assert!(rendered.contains("role=developer"));
-        assert!(rendered.contains("session=session-1"));
-        assert!(rendered.contains("Prompt sent to agent"));
-        assert!(rendered.contains("Role: developer"));
+        assert!(rendered.contains("● Prompt sent to agent · ↳ implement · ▶ 170dc431"));
+        assert!(rendered.contains("├─── Prompt "), "{rendered}");
+        assert!(!rendered.contains("Role: developer"), "{rendered}");
+        assert!(!rendered.contains("session-1"), "{rendered}");
         assert!(rendered.contains("Task: Do work"));
-        assert!(rendered.contains("Agent thinking"));
+        assert!(rendered.contains("● Agent thinking · ↳ implement · ▶ 170dc431"));
         assert!(rendered.contains("checking approach"));
-        assert!(rendered.contains("Agent response"));
+        assert!(rendered.contains("● Agent response · ↳ implement · ▶ 170dc431"));
         assert!(rendered.contains("partial answer"));
-        assert!(rendered.contains("Agent tool call"));
-        assert!(rendered.contains("tool=Reading app state"));
-        assert!(!rendered.contains("id=call_abc"));
-        assert!(rendered.contains("kind=read"));
-        assert!(rendered.contains("status=pending"));
-        assert!(!rendered.contains("prompt: Role: developer"));
-        assert!(!rendered.contains("thought: checking approach"));
-        assert!(!rendered.contains("content: partial answer"));
-    }
-
-    #[test]
-    fn renders_tool_update_content() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_abc".to_string(),
-                title: "Reading app state".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!({"text":"read complete"})),
-            },
-        ));
-
-        assert!(rendered.contains("Agent tool update"));
-        assert!(rendered.contains("tool=Reading app state"));
-        assert!(!rendered.contains("id=call_abc"));
-        assert!(rendered.contains("status=completed"));
-        assert!(rendered.contains("read complete"));
-        assert!(!rendered.contains("content: read complete"));
-    }
-
-    #[test]
-    fn renders_tool_updates_without_ids_and_with_parsed_nested_content() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_abc".to_string(),
-                title: "Reading app state".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!({
-                    "content": [
-                        {"type": "text", "text": "read complete"},
-                        {"type": "text", "text": "second line"}
-                    ]
-                })),
-            },
-        ));
-
-        assert!(rendered.contains("Agent tool update"));
-        assert!(rendered.contains("tool=Reading app state"));
-        assert!(!rendered.contains("id=call_abc"), "{}", rendered.text());
-        assert!(rendered.contains("read complete"), "{}", rendered.text());
-        assert!(rendered.contains("second line"), "{}", rendered.text());
+        assert!(rendered.contains("● Agent plan · ↳ implement · ▶ 170dc431"));
+        assert!(rendered.contains("- Add card renderer"));
+        assert!(!rendered.contains("role=developer"), "{rendered}");
+        assert!(!rendered.contains("prompt: Task: Do work"), "{rendered}");
         assert!(
-            !rendered.contains("content: read complete"),
-            "{}",
-            rendered.text()
+            !rendered.contains("thought: checking approach"),
+            "{rendered}"
         );
-        assert!(!rendered.contains("{"), "{}", rendered.text());
     }
 
     #[test]
-    fn renders_json_encoded_tool_update_content_as_progress_summary() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_abc".to_string(),
-                title: "Running background task".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!(
-                    r#"{"content":[{"type":"text","text":""}],"details":{"jobs":[{"id":"job-123","type":"task","status":"running","label":"TuiLagRegressionTest","durationMs":123798}]}}"#
-                )),
-            },
-        ));
+    fn renders_tool_cards_with_output_sections_and_suppressed_json() {
+        let pending = render_workflow_event(&event(WorkflowEventKind::AgentToolCall {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_abc".to_string(),
+            title: "Reading app state".to_string(),
+            tool_kind: "read".to_string(),
+            status: "pending".to_string(),
+        }));
+        let completed = render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_abc".to_string(),
+            title: "Reading app state".to_string(),
+            status: "completed".to_string(),
+            content: Some(serde_json::json!({"text":"read complete"})),
+        }));
+        let pending_text = pending.text();
+        let completed_text = completed.text();
 
-        let text = rendered.text();
-        assert!(text.contains("TuiLagRegressionTest"), "{text}");
-        assert!(text.contains("running"), "{text}");
-        assert!(!text.contains("{"), "{text}");
-        assert!(!text.contains("\"durationMs\""), "{text}");
-        assert!(!text.contains("\"details\""), "{text}");
+        assert!(pending_text.contains("● • Reading app state · ↳ implement · ▶ 170dc431"));
+        assert!(completed_text.contains("✓ • Reading app state · ↳ implement · ▶ 170dc431"));
+        assert!(completed_text.contains("├─── Output "));
+        assert!(completed_text.contains("read complete"));
+        assert!(!completed_text.contains("call_abc"), "{completed_text}");
+        assert!(!completed_text.contains("{\"text\""), "{completed_text}");
     }
 
     #[test]
-    fn renders_direct_tool_update_job_details_as_progress_summary() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_abc".to_string(),
-                title: "Waiting on tester".to_string(),
-                status: "in_progress".to_string(),
-                content: Some(serde_json::json!({
-                    "details": {
-                        "jobs": [{
-                            "id": "job-123",
-                            "type": "task",
-                            "status": "running",
-                            "label": "TuiLagRegressionTest",
-                            "durationMs": 123798,
-                        }]
-                    }
-                })),
-            },
-        ));
+    fn renders_tool_update_summaries_without_raw_json() {
+        let encoded = render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_abc".to_string(),
+            title: "Running background task".to_string(),
+            status: "completed".to_string(),
+            content: Some(serde_json::json!(
+                r#"{"content":[{"type":"text","text":""}],"details":{"jobs":[{"id":"job-123","type":"task","status":"running","label":"TuiLagRegressionTest","durationMs":123798}]}}"#
+            )),
+        }));
+        let direct = render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_abc".to_string(),
+            title: "Waiting on tester".to_string(),
+            status: "in_progress".to_string(),
+            content: Some(serde_json::json!({
+                "details": {
+                    "jobs": [{
+                        "id": "job-123",
+                        "type": "task",
+                        "status": "running",
+                        "label": "TuiLagRegressionTest",
+                        "durationMs": 123798,
+                    }]
+                }
+            })),
+        }));
+        let scalar = render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_stdout".to_string(),
+            title: "Running command".to_string(),
+            status: "completed".to_string(),
+            content: Some(serde_json::json!({"stdout":"command output"})),
+        }));
+        let opaque = render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
+            step_id: "implement".to_string(),
+            tool_call_id: "call_opaque".to_string(),
+            title: "Structured result".to_string(),
+            status: "completed".to_string(),
+            content: Some(serde_json::json!({"records":[{"id":1}]})),
+        }));
+        let text = [encoded.text(), direct.text(), scalar.text(), opaque.text()].join("\n");
 
-        let text = rendered.text();
         assert!(text.contains("TuiLagRegressionTest"), "{text}");
         assert!(text.contains("running"), "{text}");
+        assert!(text.contains("command output"), "{text}");
+        assert!(text.contains("<structured tool result>"), "{text}");
         assert!(!text.contains("job-123"), "{text}");
         assert!(!text.contains("durationMs"), "{text}");
-        assert!(!text.contains("details"), "{text}");
+        assert!(!text.contains("records"), "{text}");
         assert!(!text.contains("{"), "{text}");
     }
 
     #[test]
-    fn renders_waiting_prompt_with_inline_metadata_and_unindented_markdown_body() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::WaitingForInput {
-                step: "confirm_plan".to_string(),
-                prompt_id: "plan_confirmation_9".to_string(),
-                message: "Review `plan`\n- first item\n- second item".to_string(),
-                choices: Vec::new(),
-            },
-        ));
+    fn renders_waiting_and_completed_cards_with_sections() {
+        let waiting = render_workflow_event(&event(WorkflowEventKind::WaitingForInput {
+            step: "confirm_plan".to_string(),
+            prompt_id: "plan_confirmation_9".to_string(),
+            message: "Review `plan`\n- first item\n- second item".to_string(),
+            choices: vec!["approve".to_string(), "reject".to_string()],
+        }));
+        let completed = render_workflow_event(&event(WorkflowEventKind::StepCompleted {
+            step_id: "review".to_string(),
+            action: "status".to_string(),
+            status: Some("approved".to_string()),
+            body: (1..=10)
+                .map(|index| format!("body line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }));
+        let waiting_text = waiting.text();
+        let completed_text = completed.text();
 
-        let text = rendered.text();
-        let lines = rendered.lines();
-        let header = lines[0].to_string();
-        assert!(header.contains("Waiting for input"), "{text}");
-        assert!(header.contains("step=confirm_plan"), "{text}");
-        assert!(header.contains("prompt=plan_confirmation_9"), "{text}");
-        assert!(header.contains("choices=<freeform>"), "{text}");
-        assert_eq!(lines[1].to_string(), "Review `plan`");
-        assert_eq!(lines[2].to_string(), "- first item");
-        assert_eq!(lines[3].to_string(), "- second item");
-        assert!(!text.contains("message:"), "{text}");
-        assert!(!text.contains("                "), "{text}");
-        assert!(lines[1].spans.len() > 1, "{:?}", lines[1]);
+        assert!(waiting_text.contains("◔ Waiting for input · ↳ confirm_plan · ▶ 170dc431"));
+        assert!(waiting_text.contains("Review `plan`"));
+        assert!(waiting_text.contains("├─── Choices "));
+        assert!(waiting_text.contains("approve · reject"));
+        assert!(!waiting_text.contains("prompt="), "{waiting_text}");
+        assert!(waiting.lines()[1].to_string().starts_with('╭'));
+        assert!(completed_text.contains("✓ Step completed · ↳ review · ▶ 170dc431"));
+        assert!(completed_text.contains("├─── Body "));
+        assert!(completed_text.contains("body line 1"));
+        assert!(completed_text.contains("body line 8"));
+        assert!(completed_text.contains("… 2 more rows"));
+        assert!(!completed_text.contains("body:"), "{completed_text}");
     }
 
     #[test]
-    fn renders_common_tool_scalar_fields_without_raw_json() {
-        let stdout = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_stdout".to_string(),
-                title: "Running command".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!({"stdout":"command output"})),
-            },
-        ));
-        let result_summary = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_result".to_string(),
-                title: "Summarizing".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!({"result":{"summary":"summary text"}})),
-            },
-        ));
-        let opaque = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
-                step_id: "implement".to_string(),
-                tool_call_id: "call_opaque".to_string(),
-                title: "Structured result".to_string(),
-                status: "completed".to_string(),
-                content: Some(serde_json::json!({"records":[{"id":1}]})),
-            },
-        ));
-
-        assert!(stdout.contains("command output"), "{}", stdout.text());
-        assert!(
-            !stdout.contains("content: command output"),
-            "{}",
-            stdout.text()
-        );
-        assert!(!stdout.contains("{"), "{}", stdout.text());
-        assert!(
-            result_summary.contains("summary text"),
-            "{}",
-            result_summary.text()
-        );
-        assert!(
-            !result_summary.contains("content: summary text"),
-            "{}",
-            result_summary.text()
-        );
-        assert!(!result_summary.contains("{"), "{}", result_summary.text());
-        assert!(
-            opaque.contains("<structured tool result>"),
-            "{}",
-            opaque.text()
-        );
-        assert!(
-            !opaque.contains("content: <structured tool result>"),
-            "{}",
-            opaque.text()
-        );
-        assert!(!opaque.contains("records"), "{}", opaque.text());
-        assert!(!opaque.contains("{"), "{}", opaque.text());
-    }
-
-    #[test]
-    fn applies_key_event_styles() {
-        let thought = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentThought {
-                step_id: "plan".to_string(),
-                content: "thinking".to_string(),
-            },
-        ));
-        let response = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentResponse {
-                step_id: "plan".to_string(),
-                content: "answer".to_string(),
-            },
-        ));
-        let waiting = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::WaitingForInput {
-                step: "plan".to_string(),
-                prompt_id: "approval".to_string(),
-                message: "Approve?".to_string(),
-                choices: Vec::new(),
-            },
-        ));
-        let failed = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::RunFailed {
-                reason: "boom".to_string(),
-            },
-        ));
-        let completed = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::RunCompleted,
-        ));
-        let tool_pending = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCall {
-                step_id: "plan".to_string(),
-                tool_call_id: "call".to_string(),
-                title: "Run command".to_string(),
-                tool_kind: "bash".to_string(),
-                status: "pending".to_string(),
-            },
-        ));
-        let tool_completed = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentToolCallUpdate {
+    fn applies_key_event_styles_inside_cards() {
+        let thought = render_workflow_event(&event(WorkflowEventKind::AgentThought {
+            step_id: "plan".to_string(),
+            content: "thinking".to_string(),
+        }));
+        let waiting = render_workflow_event(&event(WorkflowEventKind::WaitingForInput {
+            step: "plan".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve?".to_string(),
+            choices: Vec::new(),
+        }));
+        let failed = render_workflow_event(&event(WorkflowEventKind::RunFailed {
+            reason: "boom".to_string(),
+        }));
+        let completed = render_workflow_event(&event(WorkflowEventKind::RunCompleted));
+        let tool_pending = render_workflow_event(&event(WorkflowEventKind::AgentToolCall {
+            step_id: "plan".to_string(),
+            tool_call_id: "call".to_string(),
+            title: "Run command".to_string(),
+            tool_kind: "bash".to_string(),
+            status: "pending".to_string(),
+        }));
+        let tool_completed =
+            render_workflow_event(&event(WorkflowEventKind::AgentToolCallUpdate {
                 step_id: "plan".to_string(),
                 tool_call_id: "call".to_string(),
                 title: "Run command".to_string(),
                 status: "completed".to_string(),
-                content: None,
-            },
-        ));
+                content: Some(serde_json::json!({"text":"completed"})),
+            }));
 
         assert!(line_has_style(
             thought.lines(),
@@ -963,11 +721,6 @@ mod tests {
             thought.lines(),
             "thinking",
             style_transcript_thought()
-        ));
-        assert!(line_has_style(
-            response.lines(),
-            "answer",
-            style_transcript_normal()
         ));
         assert!(line_has_style(
             waiting.lines(),
@@ -993,38 +746,11 @@ mod tests {
     }
 
     #[test]
-    fn step_completed_body_is_unindented_and_capped() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::StepCompleted {
-                step_id: "review".to_string(),
-                action: "status".to_string(),
-                status: Some("approved".to_string()),
-                body: (1..=10)
-                    .map(|index| format!("body line {index}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            },
-        ));
-
-        let text = rendered.text();
-        assert!(rendered.lines()[0].to_string().contains("step=review"));
-        assert_eq!(rendered.lines()[1].to_string(), "body line 1");
-        assert_eq!(rendered.lines()[8].to_string(), "body line 8");
-        assert_eq!(rendered.lines()[9].to_string(), "...");
-        assert!(!text.contains("body:"), "{text}");
-        assert!(!text.contains("         "), "{text}");
-    }
-
-    #[test]
-    fn response_fenced_rust_gets_syntect_styles() {
-        let rendered = render_workflow_event(&WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::AgentResponse {
-                step_id: "implement".to_string(),
-                content: "```rust\nfn main() { println!(\"hi\"); }\n```".to_string(),
-            },
-        ));
+    fn response_fenced_rust_gets_syntect_styles_inside_card() {
+        let rendered = render_workflow_event(&event(WorkflowEventKind::AgentResponse {
+            step_id: "implement".to_string(),
+            content: "```rust\nfn main() { println!(\"hi\"); }\n```".to_string(),
+        }));
         let code_line = rendered
             .lines()
             .iter()

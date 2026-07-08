@@ -2,12 +2,12 @@ use anyhow::Result;
 use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
 use tui_input::{Input, InputRequest};
 
-use super::events::render_workflow_event;
+use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
+use super::controls::chrome::status_icon;
+use super::events::{render_workflow_event, render_workflow_event_width};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
 use super::markup::render_markup;
-use super::styles::{
-    style_accent, style_error, style_transcript_metadata, style_transcript_normal, style_warning,
-};
+use super::styles::{style_transcript_normal, style_warning};
 use crate::config::AppConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub(super) struct PendingPrompt {
 }
 
 impl PendingPrompt {
+    pub(in crate::app) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     pub(in crate::app) fn step(&self) -> &str {
         &self.step
     }
@@ -48,19 +52,23 @@ impl TranscriptEntry {
     pub(in crate::app) fn render_lines(&self) -> Vec<ratatui::text::Line<'static>> {
         match self {
             Self::Workflow(event) => render_workflow_event(event).lines().to_vec(),
-            Self::Card { title, details } => render_card_lines(title, details),
-            Self::Plain(text) => text
-                .lines()
-                .map(|line| {
-                    ratatui::text::Line::from(ratatui::text::Span::styled(
-                        line.to_string(),
-                        super::styles::style_transcript_normal(),
-                    ))
-                })
-                .collect(),
+            Self::Card { title, details } => render_card_lines(title, details, DEFAULT_CARD_WIDTH),
+            Self::Plain(text) => render_plain_lines(text),
         }
     }
 
+    pub(in crate::app) fn render_lines_for_width(
+        &self,
+        width: usize,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        match self {
+            Self::Workflow(event) => render_workflow_event_width(event, width).lines().to_vec(),
+            Self::Card { title, details } => render_card_lines(title, details, width),
+            Self::Plain(text) => render_plain_lines(text),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(in crate::app) fn plain_text(&self) -> String {
         match self {
             Self::Workflow(event) => render_workflow_event(event).text().to_string(),
@@ -69,6 +77,7 @@ impl TranscriptEntry {
         }
     }
 
+    #[allow(dead_code)]
     pub(in crate::app) fn contains(&self, needle: &str) -> bool {
         self.plain_text().contains(needle)
     }
@@ -81,54 +90,87 @@ impl TranscriptEntry {
 
 pub(in crate::app) fn render_pending_prompt_lines(
     prompt: &PendingPrompt,
+    width: usize,
 ) -> Vec<ratatui::text::Line<'static>> {
-    let choices = display_prompt_choices(prompt.choices());
-    let mut lines = vec![ratatui::text::Line::from(vec![
-        ratatui::text::Span::styled("Waiting for input", style_warning()),
-        ratatui::text::Span::styled("  step=", style_transcript_metadata()),
-        ratatui::text::Span::styled(prompt.step().to_string(), style_accent()),
-        ratatui::text::Span::styled("  prompt=", style_transcript_metadata()),
-        ratatui::text::Span::styled(prompt.prompt_id().to_string(), style_transcript_metadata()),
-        ratatui::text::Span::styled("  choices=", style_transcript_metadata()),
-        ratatui::text::Span::styled(choices, style_warning()),
-    ])];
-    lines.extend(render_markup(prompt.message(), style_transcript_normal()));
-    lines
+    let mut card = Card::new(
+        status_icon("waiting"),
+        "Waiting for input",
+        CardTone::Warning,
+    )
+    .metadata([
+        CardMetadata::step(prompt.step()),
+        CardMetadata::run(prompt.run_id()),
+    ])
+    .section(CardSection::body(render_markup(
+        prompt.message(),
+        style_transcript_normal(),
+    )));
+
+    if !prompt.choices().is_empty() {
+        card = card.section(CardSection::named(
+            "Choices",
+            vec![ratatui::text::Line::from(ratatui::text::Span::styled(
+                display_prompt_choices(prompt.choices()),
+                style_warning(),
+            ))],
+        ));
+    }
+
+    card.render(width)
 }
 
 fn display_prompt_choices(choices: &[String]) -> String {
     if choices.is_empty() {
         "<freeform>".to_string()
     } else {
-        choices.join(", ")
+        choices.join(" · ")
     }
 }
 
-fn render_card_lines(title: &str, details: &[String]) -> Vec<ratatui::text::Line<'static>> {
-    let title_style = match title {
-        "Cancelled" => style_error(),
-        "Notice" => style_warning(),
-        _ => style_accent(),
-    };
-    let mut lines = vec![ratatui::text::Line::from(ratatui::text::Span::styled(
-        title.to_string(),
-        title_style,
-    ))];
-    lines.extend(details.iter().map(|detail| {
-        ratatui::text::Line::from(ratatui::text::Span::styled(
-            format!("         {detail}"),
-            style_transcript_normal(),
-        ))
-    }));
-    lines
+fn render_card_lines(
+    title: &str,
+    details: &[String],
+    width: usize,
+) -> Vec<ratatui::text::Line<'static>> {
+    app_card(title, details).render(width)
 }
 
+#[allow(dead_code)]
 fn card_plain_text(title: &str, details: &[String]) -> String {
-    let mut lines = vec![title.to_string()];
-    for detail in details {
-        lines.push(format!("         {detail}"));
+    app_card(title, details).plain_text()
+}
+
+fn app_card(title: &str, details: &[String]) -> Card {
+    let (status, tone) = app_card_status_and_tone(title);
+    let body = details
+        .iter()
+        .flat_map(|detail| render_markup(detail, style_transcript_normal()))
+        .collect::<Vec<_>>();
+    Card::new(status, title, tone).section(CardSection::body(body))
+}
+
+fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
+    match title {
+        "Error" => (status_icon("failed"), CardTone::Error),
+        "Cancelled" => (status_icon("cancelled"), CardTone::Error),
+        "Notice" => (status_icon("waiting"), CardTone::Warning),
+        "Exit" | "Improve" | "Resolve" => (status_icon("completed"), CardTone::Success),
+        "Usage" | "Help" | "Workflows" | "Runs" | "Transcript" => {
+            (status_icon("idle"), CardTone::Neutral)
+        }
+        _ => (status_icon("idle"), CardTone::Accent),
     }
-    lines.join("\n")
+}
+
+fn render_plain_lines(text: &str) -> Vec<ratatui::text::Line<'static>> {
+    text.lines()
+        .map(|line| {
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                line.to_string(),
+                super::styles::style_transcript_normal(),
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +195,10 @@ impl ActiveEvent {
                 WorkflowEventKind::AgentThought { content: chunk, .. },
             ) => content.push_str(chunk),
             (
+                WorkflowEventKind::AgentToolCall { .. },
+                WorkflowEventKind::AgentToolCallUpdate { .. },
+            )
+            | (
                 WorkflowEventKind::AgentToolCallUpdate { .. },
                 WorkflowEventKind::AgentToolCallUpdate { .. },
             ) => self.event = event.clone(),
@@ -172,7 +218,12 @@ fn same_active_event_kind(left: &WorkflowEventKind, right: &WorkflowEventKind) -
             WorkflowEventKind::AgentThought { step_id: right, .. },
         ) => left == right,
         (
-            WorkflowEventKind::AgentToolCallUpdate {
+            WorkflowEventKind::AgentToolCall {
+                step_id: left_step,
+                tool_call_id: left_call,
+                ..
+            }
+            | WorkflowEventKind::AgentToolCallUpdate {
                 step_id: left_step,
                 tool_call_id: left_call,
                 ..
@@ -192,8 +243,17 @@ fn is_active_event(kind: &WorkflowEventKind) -> bool {
         kind,
         WorkflowEventKind::AgentResponse { .. }
             | WorkflowEventKind::AgentThought { .. }
+            | WorkflowEventKind::AgentToolCall { .. }
             | WorkflowEventKind::AgentToolCallUpdate { .. }
     )
+}
+
+fn active_event_status_text(event: &WorkflowEvent) -> String {
+    match &event.kind {
+        WorkflowEventKind::AgentResponse { .. } => "Agent response streaming".to_string(),
+        WorkflowEventKind::AgentThought { .. } => "Agent thinking".to_string(),
+        _ => render_workflow_event(event).text().to_string(),
+    }
 }
 
 struct DrainResult {
@@ -553,7 +613,7 @@ impl AppState {
     }
 
     fn try_coalesce_active_event(&mut self, event: &WorkflowEvent) -> bool {
-        let (index, rendered, active_event) = {
+        let (index, status, active_event) = {
             let Some(active) = self.active_event.as_mut() else {
                 return false;
             };
@@ -561,14 +621,11 @@ impl AppState {
                 return false;
             }
             active.merge(event);
-            (
-                active.index,
-                render_workflow_event(&active.event),
-                active.event.clone(),
-            )
+            let status = active_event_status_text(&active.event);
+            (active.index, status, active.event.clone())
         };
 
-        self.status = rendered.text().to_string();
+        self.status = status;
         self.event_log[index] = TranscriptEntry::Workflow(active_event);
         self.apply_workflow_event_metadata(event);
         if self.follow_events {
@@ -949,7 +1006,7 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 1);
         let entry = &state.event_entries()[0];
-        assert_eq!(entry.matches("Agent tool update"), 1);
+        assert_eq!(entry.matches("• Waiting on tester"), 1);
         assert!(
             entry.contains("TuiLagRegressionTest"),
             "{}",
@@ -968,6 +1025,38 @@ mod tests {
         };
         assert!(content.as_ref().is_some_and(|value| value == latest));
         assert!(!content.as_ref().is_some_and(|value| value == first));
+    }
+
+    #[test]
+    fn matching_tool_call_update_replaces_call_card() {
+        let mut state = test_state();
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCall {
+                step_id: "investigate".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Read artifact://1".to_string(),
+                tool_kind: "read".to_string(),
+                status: "pending".to_string(),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "investigate".to_string(),
+                tool_call_id: "call_abc".to_string(),
+                title: "Read artifact://1".to_string(),
+                status: "completed".to_string(),
+                content: Some(serde_json::json!({"text":"read complete"})),
+            },
+        ));
+
+        assert_eq!(state.event_entries().len(), 1);
+        let entry = &state.event_entries()[0];
+        assert_eq!(entry.matches("• Read artifact://1"), 1);
+        assert!(entry.contains("read complete"), "{}", entry.plain_text());
+        assert!(!entry.contains("pending"), "{}", entry.plain_text());
     }
 
     #[test]

@@ -22,6 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::config::AppConfig;
 
+mod card;
 mod commands;
 mod controls;
 mod events;
