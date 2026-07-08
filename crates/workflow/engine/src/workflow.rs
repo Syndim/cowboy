@@ -815,6 +815,7 @@ mod tests {
             resume: serde_json::Value::Null,
             steps_executed: 0,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
         };

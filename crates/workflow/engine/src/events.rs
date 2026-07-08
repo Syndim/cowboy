@@ -11,17 +11,14 @@ pub struct WorkflowEvent {
     pub timestamp: DateTime<Utc>,
     #[serde(default)]
     pub run_started_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_active_duration_ms: Option<u64>,
     pub kind: WorkflowEventKind,
 }
 
 impl WorkflowEvent {
     pub fn new(run_id: impl Into<String>, kind: WorkflowEventKind) -> Self {
-        Self {
-            run_id: run_id.into(),
-            timestamp: Utc::now(),
-            run_started_at: None,
-            kind,
-        }
+        Self::with_timing(run_id, Utc::now(), None, None, kind)
     }
 
     pub fn for_run(run: &WorkflowRun, kind: WorkflowEventKind) -> Self {
@@ -33,10 +30,36 @@ impl WorkflowEvent {
         run_started_at: DateTime<Utc>,
         kind: WorkflowEventKind,
     ) -> Self {
+        Self::with_timing(run_id, Utc::now(), Some(run_started_at), None, kind)
+    }
+
+    pub fn with_active_duration(
+        run_id: impl Into<String>,
+        run_started_at: DateTime<Utc>,
+        run_active_duration_ms: u64,
+        kind: WorkflowEventKind,
+    ) -> Self {
+        Self::with_timing(
+            run_id,
+            Utc::now(),
+            Some(run_started_at),
+            Some(run_active_duration_ms),
+            kind,
+        )
+    }
+
+    pub fn with_timing(
+        run_id: impl Into<String>,
+        timestamp: DateTime<Utc>,
+        run_started_at: Option<DateTime<Utc>>,
+        run_active_duration_ms: Option<u64>,
+        kind: WorkflowEventKind,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
-            timestamp: Utc::now(),
-            run_started_at: Some(run_started_at),
+            timestamp,
+            run_started_at,
+            run_active_duration_ms,
             kind,
         }
     }
@@ -72,7 +95,7 @@ impl WorkflowEvent {
         Self::for_run(run, Self::step_completed_kind(record))
     }
 
-    fn step_completed_kind(record: &StepRecord) -> WorkflowEventKind {
+    pub(crate) fn step_completed_kind(record: &StepRecord) -> WorkflowEventKind {
         let output = record.output.as_ref();
         WorkflowEventKind::StepCompleted {
             step_id: record.step.clone(),
@@ -315,12 +338,13 @@ mod tests {
     }
 
     #[test]
-    fn workflow_event_round_trips_with_run_started_at() {
+    fn workflow_event_round_trips_with_run_active_duration() {
         let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap();
         let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 12, 34, 56).unwrap();
-        let mut event = WorkflowEvent::with_run_started_at(
+        let mut event = WorkflowEvent::with_active_duration(
             "run-1",
             run_started_at,
+            42_500,
             WorkflowEventKind::RunCompleted,
         );
         event.timestamp = timestamp;
@@ -328,25 +352,61 @@ mod tests {
         let raw = serde_json::to_string(&event).unwrap();
         let value: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["run_started_at"], "2026-07-05T12:30:00Z");
+        assert_eq!(value["run_active_duration_ms"], serde_json::json!(42_500));
 
         let reparsed: WorkflowEvent = serde_json::from_str(&raw).unwrap();
         assert_eq!(reparsed, event);
     }
 
     #[test]
-    fn legacy_workflow_event_json_defaults_missing_run_started_at() {
-        let raw = serde_json::json!({
-            "run_id": "run-1",
-            "timestamp": "2026-07-05T12:34:56Z",
-            "kind": { "kind": "run_completed" },
-        })
-        .to_string();
+    fn legacy_workflow_event_json_defaults_missing_active_timing_fields() {
+        let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap();
+        let cases = vec![
+            (
+                "missing active duration only",
+                serde_json::json!({
+                    "run_id": "run-1",
+                    "timestamp": "2026-07-05T12:34:56Z",
+                    "run_started_at": "2026-07-05T12:30:00Z",
+                    "kind": { "kind": "run_completed" },
+                }),
+                Some(run_started_at),
+                None,
+            ),
+            (
+                "missing run start only",
+                serde_json::json!({
+                    "run_id": "run-1",
+                    "timestamp": "2026-07-05T12:34:56Z",
+                    "run_active_duration_ms": 12_345,
+                    "kind": { "kind": "run_completed" },
+                }),
+                None,
+                Some(12_345),
+            ),
+            (
+                "missing active duration and run start",
+                serde_json::json!({
+                    "run_id": "run-1",
+                    "timestamp": "2026-07-05T12:34:56Z",
+                    "kind": { "kind": "run_completed" },
+                }),
+                None,
+                None,
+            ),
+        ];
 
-        let event: WorkflowEvent = serde_json::from_str(&raw).unwrap();
+        for (name, raw, expected_run_started_at, expected_active_duration) in cases {
+            let event: WorkflowEvent = serde_json::from_value(raw).unwrap();
 
-        assert_eq!(event.run_id, "run-1");
-        assert_eq!(event.run_started_at, None);
-        assert_eq!(event.kind, WorkflowEventKind::RunCompleted);
+            assert_eq!(event.run_id, "run-1", "{name}");
+            assert_eq!(event.run_started_at, expected_run_started_at, "{name}");
+            assert_eq!(
+                event.run_active_duration_ms, expected_active_duration,
+                "{name}"
+            );
+            assert_eq!(event.kind, WorkflowEventKind::RunCompleted, "{name}");
+        }
     }
 
     #[test]

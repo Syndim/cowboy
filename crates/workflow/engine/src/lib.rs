@@ -5,6 +5,7 @@
 //! and selector/summarizer adapters. The TUI crate should depend on these
 //! interfaces rather than carrying workflow runtime logic itself.
 
+mod active_clock;
 mod agent_resolver;
 pub mod events;
 pub mod input;

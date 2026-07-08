@@ -7,7 +7,10 @@ use cowboy_workflow_core::{
 };
 use serde_json::{Value, json};
 
-use crate::events::{EventBus, WorkflowEvent, WorkflowEventKind};
+use crate::{
+    active_clock::ActiveRunClock,
+    events::{EventBus, WorkflowEvent, WorkflowEventKind},
+};
 
 /// Runs one workflow until it completes, fails, waits for input, or hits a budget.
 ///
@@ -21,6 +24,7 @@ pub struct WorkflowRunner<S, E, P> {
     events: Arc<EventBus>,
     limits: RunnerLimits,
     request_topic: Option<String>,
+    active_clock: Option<ActiveRunClock>,
 }
 
 impl<S, E, P> WorkflowRunner<S, E, P> {
@@ -32,6 +36,7 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
             events,
             limits: RunnerLimits::default(),
             request_topic: None,
+            active_clock: None,
         }
     }
 
@@ -45,12 +50,38 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
         self
     }
 
+    pub(crate) fn with_active_clock(mut self, active_clock: ActiveRunClock) -> Self {
+        self.active_clock = Some(active_clock);
+        self
+    }
+
     pub fn store(&self) -> &S {
         &self.store
     }
 
     pub fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    fn run_started_event(&self, run: &WorkflowRun) -> WorkflowEvent {
+        match &self.active_clock {
+            Some(clock) => clock.run_started_with_topic(run, self.request_topic.clone()),
+            None => WorkflowEvent::run_started_with_topic(run, self.request_topic.clone()),
+        }
+    }
+
+    fn workflow_event_for_run(&self, run: &WorkflowRun, kind: WorkflowEventKind) -> WorkflowEvent {
+        match &self.active_clock {
+            Some(clock) => clock.event_for_run(run, kind),
+            None => WorkflowEvent::for_run(run, kind),
+        }
+    }
+
+    fn step_completed_event(&self, run: &WorkflowRun, record: &StepRecord) -> WorkflowEvent {
+        match &self.active_clock {
+            Some(clock) => clock.step_completed_for_run(run, record),
+            None => WorkflowEvent::step_completed_for_run(run, record),
+        }
     }
 }
 
@@ -67,15 +98,18 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events.emit(WorkflowEvent::run_started_with_topic(
-            &run,
-            self.request_topic.clone(),
-        ));
+        self.events.emit(self.run_started_event(&run));
 
+        let mut execution = Ok(());
         while matches!(run.status, RunStatus::Running) {
-            self.execute_one(definition, &mut run).await?;
+            if let Err(err) = self.execute_one(definition, &mut run).await {
+                execution = Err(err);
+                break;
+            }
         }
 
+        self.close_active_window(&mut run)?;
+        execution?;
         Ok(run)
     }
 
@@ -87,16 +121,26 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events.emit(WorkflowEvent::run_started_with_topic(
-            &run,
-            self.request_topic.clone(),
-        ));
+        self.events.emit(self.run_started_event(&run));
 
-        if matches!(run.status, RunStatus::Running) {
-            self.execute_one(definition, &mut run).await?;
+        let mut execution = Ok(());
+        if matches!(run.status, RunStatus::Running)
+            && let Err(err) = self.execute_one(definition, &mut run).await
+        {
+            execution = Err(err);
         }
 
+        self.close_active_window(&mut run)?;
+        execution?;
         Ok(run)
+    }
+
+    fn close_active_window(&self, run: &mut WorkflowRun) -> Result<()> {
+        if let Some(clock) = &self.active_clock {
+            clock.close(&self.store, run)?;
+        }
+
+        Ok(())
     }
 
     /// Execute one core step and emit its lifecycle events, returning the
@@ -108,7 +152,7 @@ where
     ) -> Result<RunStatus> {
         let step_id = run.current_step.clone();
         let previous_head = run.head.clone();
-        self.events.emit(WorkflowEvent::for_run(
+        self.events.emit(self.workflow_event_for_run(
             run,
             WorkflowEventKind::StepStarted {
                 step_id: step_id.clone(),
@@ -137,10 +181,9 @@ where
                             reason: reason.clone(),
                         },
                     );
-                    self.events.emit(WorkflowEvent::for_run(
-                        run,
-                        WorkflowEventKind::RunFailed { reason },
-                    ));
+                    self.events.emit(
+                        self.workflow_event_for_run(run, WorkflowEventKind::RunFailed { reason }),
+                    );
                     return Err(err);
                 }
             },
@@ -150,11 +193,10 @@ where
             && let Some(head) = &run.head
         {
             let record = self.store.get_object::<StepRecord>(head)?;
-            self.events
-                .emit(WorkflowEvent::step_completed_for_run(run, &record));
+            self.events.emit(self.step_completed_event(run, &record));
         }
         self.events
-            .emit(WorkflowEvent::run_status_for_run(run, &status));
+            .emit(self.workflow_event_for_run(run, WorkflowEventKind::from(&status)));
 
         Ok(status)
     }
@@ -177,7 +219,7 @@ where
 
         while last_error.recoverable() && attempt <= max_retries {
             attempt += 1;
-            self.events.emit(WorkflowEvent::for_run(
+            self.events.emit(self.workflow_event_for_run(
                 run,
                 WorkflowEventKind::StepRetrying {
                     step_id: step_id.to_string(),
@@ -556,6 +598,7 @@ mod tests {
             resume: Value::Null,
             steps_executed: 0,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
         }
@@ -565,6 +608,8 @@ mod tests {
     async fn runner_executes_until_terminal_status_and_emits_events() {
         let bus = Arc::new(EventBus::new(16));
         let mut events = bus.subscribe();
+        let initial_run = run();
+        let run_started_at = initial_run.created_at;
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             NoopDispatcher,
@@ -582,10 +627,8 @@ mod tests {
             ]),
             bus,
         )
-        .with_request_topic(Some("Add health route".to_string()));
-
-        let initial_run = run();
-        let run_started_at = initial_run.created_at;
+        .with_request_topic(Some("Add health route".to_string()))
+        .with_active_clock(ActiveRunClock::open_at(&initial_run, Utc::now()));
         let run = runner
             .run_until_blocked(&definition(), initial_run)
             .await
@@ -603,6 +646,16 @@ mod tests {
                 .all(|event| event.run_started_at == Some(run_started_at)),
             "{collected_events:#?}"
         );
+        assert!(
+            collected_events
+                .iter()
+                .all(|event| event.run_active_duration_ms.is_some()),
+            "{collected_events:#?}"
+        );
+        assert!(collected_events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::StepStarted { step_id } if step_id == "start"
+        )));
         let kinds = collected_events
             .into_iter()
             .map(|event| event.kind)
@@ -808,7 +861,8 @@ mod tests {
             max_steps_per_run: 5,
             max_visits_per_step: 3,
             max_retries_per_step: 2,
-        });
+        })
+        .with_active_clock(ActiveRunClock::open_at(&agent_run(), Utc::now()));
 
         let run = runner
             .run_until_blocked(&definition(), agent_run())
@@ -823,10 +877,20 @@ mod tests {
         // Retries reuse the same step budget: the step is only visited once.
         assert_eq!(run.step_visits.get("agent").copied().unwrap_or(0), 1);
 
-        let mut kinds = Vec::new();
+        let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
-            kinds.push(event.kind);
+            collected_events.push(event);
         }
+        assert!(
+            collected_events
+                .iter()
+                .all(|event| event.run_active_duration_ms.is_some()),
+            "{collected_events:#?}"
+        );
+        let kinds = collected_events
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
         let retrying = kinds
             .iter()
             .filter(|kind| matches!(kind, WorkflowEventKind::StepRetrying { .. }))
@@ -860,7 +924,8 @@ mod tests {
             max_steps_per_run: 5,
             max_visits_per_step: 3,
             max_retries_per_step: 2,
-        });
+        })
+        .with_active_clock(ActiveRunClock::open_at(&agent_run(), Utc::now()));
 
         let result = runner.run_until_blocked(&definition(), agent_run()).await;
         assert!(result.is_err());
@@ -873,10 +938,20 @@ mod tests {
         // The failed step stays current so it can be resolved manually.
         assert_eq!(stored.current_step, "agent");
 
-        let mut kinds = Vec::new();
+        let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
-            kinds.push(event.kind);
+            collected_events.push(event);
         }
+        assert!(
+            collected_events
+                .iter()
+                .all(|event| event.run_active_duration_ms.is_some()),
+            "{collected_events:#?}"
+        );
+        let kinds = collected_events
+            .into_iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>();
         let retrying = kinds
             .iter()
             .filter(|kind| matches!(kind, WorkflowEventKind::StepRetrying { .. }))

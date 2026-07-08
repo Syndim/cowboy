@@ -311,12 +311,17 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
 }
 
 fn elapsed_stamp(event: &WorkflowEvent) -> String {
-    let started_at = event.run_started_at.unwrap_or(event.timestamp);
-    let elapsed_seconds = event
-        .timestamp
-        .signed_duration_since(started_at)
-        .num_seconds()
-        .max(0);
+    let elapsed_seconds = event.run_active_duration_ms.map_or_else(
+        || {
+            let started_at = event.run_started_at.unwrap_or(event.timestamp);
+            event
+                .timestamp
+                .signed_duration_since(started_at)
+                .num_seconds()
+                .max(0) as u64
+        },
+        |active_ms| active_ms / 1000,
+    );
     let hours = elapsed_seconds / 3600;
     let minutes = (elapsed_seconds % 3600) / 60;
     let seconds = elapsed_seconds % 60;
@@ -468,30 +473,73 @@ mod tests {
         style_error, style_success, style_transcript_thought, style_transcript_tool_pending,
         style_warning,
     };
-    fn rendered_header_for_elapsed(seconds: i64) -> String {
-        let started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap();
-        let mut event = WorkflowEvent::with_run_started_at(
+    fn run_started_at() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 7, 5, 12, 30, 0).unwrap()
+    }
+
+    fn event_with_elapsed_fallback(seconds: i64, kind: WorkflowEventKind) -> WorkflowEvent {
+        let started_at = run_started_at();
+        WorkflowEvent::with_timing(
             "run-1",
-            started_at,
-            WorkflowEventKind::RunCompleted,
-        );
-        event.timestamp = started_at + Duration::seconds(seconds);
-        render_workflow_event(&event).lines()[0].to_string()
+            started_at + Duration::seconds(seconds),
+            Some(started_at),
+            None,
+            kind,
+        )
+    }
+
+    fn event_with_active_duration(
+        wall_clock_seconds: i64,
+        active_duration_ms: u64,
+        kind: WorkflowEventKind,
+    ) -> WorkflowEvent {
+        let started_at = run_started_at();
+        WorkflowEvent::with_timing(
+            "run-1",
+            started_at + Duration::seconds(wall_clock_seconds),
+            Some(started_at),
+            Some(active_duration_ms),
+            kind,
+        )
+    }
+
+    fn rendered_header(event: &WorkflowEvent) -> String {
+        render_workflow_event(event).lines()[0].to_string()
+    }
+
+    fn rendered_stamp(event: &WorkflowEvent) -> String {
+        rendered_header(event)
+            .split_once("  ")
+            .map(|(stamp, _)| stamp.to_string())
+            .unwrap()
     }
 
     #[test]
-    fn renders_elapsed_time_instead_of_utc_timestamp() {
-        let header = rendered_header_for_elapsed(296);
+    fn renders_active_duration_instead_of_larger_wall_clock_elapsed() {
+        let event = event_with_active_duration(42 * 60, 296_000, WorkflowEventKind::RunCompleted);
+        let header = rendered_header(&event);
+
+        assert!(header.starts_with("00:04:56  Run completed"), "{header}");
+        assert!(!header.starts_with("00:42:00"), "{header}");
+    }
+
+    #[test]
+    fn renders_active_duration_hours_beyond_one_day() {
+        let active_duration_ms = (27 * 3600 + 62) * 1000;
+        let event =
+            event_with_active_duration(60, active_duration_ms, WorkflowEventKind::RunCompleted);
+        let header = rendered_header(&event);
+
+        assert!(header.starts_with("27:01:02  Run completed"), "{header}");
+    }
+
+    #[test]
+    fn missing_active_duration_uses_legacy_wall_clock_elapsed_fallback() {
+        let event = event_with_elapsed_fallback(296, WorkflowEventKind::RunCompleted);
+        let header = rendered_header(&event);
 
         assert!(header.starts_with("00:04:56  Run completed"), "{header}");
         assert!(!header.contains("12:34:56"), "{header}");
-    }
-
-    #[test]
-    fn renders_elapsed_hours_beyond_one_day() {
-        let header = rendered_header_for_elapsed(27 * 3600 + 62);
-
-        assert!(header.starts_with("27:01:02  Run completed"), "{header}");
     }
 
     #[test]
@@ -517,6 +565,78 @@ mod tests {
         assert!(
             negative_header.starts_with("00:00:00  Run completed"),
             "{negative_header}"
+        );
+    }
+
+    #[test]
+    fn transcript_stamps_exclude_waiting_gaps_and_preserve_active_increments() {
+        let rendered = [
+            (
+                "pre-wait agent response",
+                event_with_active_duration(
+                    120,
+                    120_000,
+                    WorkflowEventKind::AgentResponse {
+                        step_id: "review".to_string(),
+                        content: "Ready for approval".to_string(),
+                    },
+                ),
+                "00:02:00",
+            ),
+            (
+                "waiting prompt",
+                event_with_active_duration(
+                    125,
+                    125_000,
+                    WorkflowEventKind::WaitingForInput {
+                        step: "review".to_string(),
+                        prompt_id: "approval".to_string(),
+                        message: "Approve?".to_string(),
+                        choices: vec!["yes".to_string(), "no".to_string()],
+                    },
+                ),
+                "00:02:05",
+            ),
+            (
+                "post-answer completion",
+                event_with_active_duration(
+                    45 * 60 + 126,
+                    126_000,
+                    WorkflowEventKind::StepCompleted {
+                        step_id: "review".to_string(),
+                        action: "ask_user".to_string(),
+                        status: Some("approved".to_string()),
+                        body: "approved".to_string(),
+                    },
+                ),
+                "00:02:06",
+            ),
+            (
+                "second-step start",
+                event_with_active_duration(
+                    45 * 60 + 131,
+                    131_000,
+                    WorkflowEventKind::StepStarted {
+                        step_id: "deploy".to_string(),
+                    },
+                ),
+                "00:02:11",
+            ),
+        ];
+
+        let stamps = rendered
+            .iter()
+            .map(|(case, event, _)| (*case, rendered_stamp(event)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stamps,
+            vec![
+                ("pre-wait agent response", "00:02:00".to_string()),
+                ("waiting prompt", "00:02:05".to_string()),
+                ("post-answer completion", "00:02:06".to_string()),
+                ("second-step start", "00:02:11".to_string()),
+            ]
         );
     }
 

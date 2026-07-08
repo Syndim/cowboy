@@ -41,6 +41,9 @@ pub struct WorkflowRun {
     /// Number of times each step has been visited in this run.
     #[serde(default)]
     pub step_visits: BTreeMap<StepId, u32>,
+    /// Persisted milliseconds spent actively executing Cowboy runtime work for this run.
+    #[serde(default)]
+    pub active_duration_ms: u64,
     /// Creation timestamp.
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.

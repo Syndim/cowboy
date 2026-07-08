@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_agent_client::ModelInfo;
@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::active_clock::ActiveRunClock;
 use crate::agent_resolver::AgentResolver;
 use crate::run_lock::RunExecutionLocks;
 use crate::workflow::{AgentRequestTopicGenerator, DeterministicSelector};
@@ -264,6 +265,52 @@ enum RunMode {
     /// Execute exactly one workflow step, then return.
     SingleStep,
 }
+struct ActiveRunExecution {
+    request_topic: Option<String>,
+    events: Vec<WorkflowEvent>,
+    active_clock: ActiveRunClock,
+}
+
+struct ActiveRunCancellationGuard {
+    store: RedbRunStore,
+    run_id: String,
+    active_clock: ActiveRunClock,
+    armed: bool,
+}
+
+impl ActiveRunCancellationGuard {
+    fn new(store: RedbRunStore, run_id: String, active_clock: ActiveRunClock) -> Self {
+        Self {
+            store,
+            run_id,
+            active_clock,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ActiveRunCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        match self.store.load_run(&self.run_id) {
+            Ok(mut run) => {
+                if let Err(err) = self.active_clock.close(&self.store, &mut run) {
+                    tracing::warn!(run_id = %self.run_id, error = %err, "failed to close active run clock during cancellation");
+                }
+            }
+            Err(err) => {
+                tracing::warn!(run_id = %self.run_id, error = %err, "failed to load run during active clock cancellation cleanup");
+            }
+        }
+    }
+}
 
 /// Workflow selection strategy used by [`WorkflowRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,12 +520,14 @@ impl WorkflowRuntime {
             resume: Value::Null,
             steps_executed: 0,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
         };
         let store = self.store()?;
         store.save_run(&run)?;
         store.update_run_head(&run.id, run_head(&run))?;
+        let active_clock = ActiveRunClock::open(&run);
         tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
         let request_topic = self.generate_request_topic(&run.original_request).await;
         if let Some(topic) = &request_topic {
@@ -488,7 +537,7 @@ impl WorkflowRuntime {
             store.update_run_head(&run.id, run_head(&run))?;
         }
 
-        self.run_existing(run, definition, snapshot, mode, request_topic)
+        self.run_existing(run, definition, snapshot, mode, request_topic, active_clock)
             .await
     }
 
@@ -579,12 +628,13 @@ impl WorkflowRuntime {
                 events: Vec::new(),
             });
         }
+        let active_clock = ActiveRunClock::open(&run);
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
-        self.run_existing(run, definition, snapshot, mode, None)
+        self.run_existing(run, definition, snapshot, mode, None, active_clock)
             .await
     }
 
@@ -603,25 +653,27 @@ impl WorkflowRuntime {
         let _run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store()?;
         let mut run = store.load_run(&run_id.to_string())?;
+        let router = ResumeRouter::default();
+        let answer = router.validate_answer(&run, prompt_id, answer)?;
+        let active_clock = ActiveRunClock::open(&run);
+        let result = router.dispatch_validated_answer(answer)?;
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
-
-        let result = ResumeRouter::default().answer(&run, prompt_id, answer)?;
         let mut events = Vec::new();
         let status = match result {
             ActionResult::Completed(record) => {
                 let record = *record;
                 let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
-                events.push(WorkflowEvent::step_completed_for_run(&run, &record));
-                events.push(WorkflowEvent::run_status_for_run(&run, &status));
+                events.push(active_clock.step_completed_for_run(&run, &record));
+                events.push(active_clock.run_status_for_run(&run, &status));
                 status
             }
             ActionResult::Blocked(status) => {
                 let status = apply_run_status(&store, &mut run, status)?;
-                events.push(WorkflowEvent::run_status_for_run(&run, &status));
+                events.push(active_clock.run_status_for_run(&run, &status));
                 status
             }
         };
@@ -636,11 +688,15 @@ impl WorkflowRuntime {
                 definition,
                 snapshot,
                 RunMode::UntilBlocked,
-                None,
-                events,
+                ActiveRunExecution {
+                    request_topic: None,
+                    events,
+                    active_clock,
+                },
             )
             .await
         } else {
+            active_clock.close(&store, &mut run)?;
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
         }
@@ -760,6 +816,7 @@ impl WorkflowRuntime {
             )));
         }
 
+        let active_clock = ActiveRunClock::open(&run);
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -793,15 +850,15 @@ impl WorkflowRuntime {
 
         let mut events = Vec::new();
         let status_result = apply_step_record(&store, &definition, &mut run, record.clone())?;
-        events.push(WorkflowEvent::step_completed_for_run(&run, &record));
-        events.push(WorkflowEvent::for_run(
+        events.push(active_clock.step_completed_for_run(&run, &record));
+        events.push(active_clock.event_for_run(
             &run,
             WorkflowEventKind::ManuallyResolved {
                 step_id: record.step.clone(),
                 status: status.to_string(),
             },
         ));
-        events.push(WorkflowEvent::run_status_for_run(&run, &status_result));
+        events.push(active_clock.run_status_for_run(&run, &status_result));
         for event in &events {
             self.events.emit(event.clone());
         }
@@ -812,11 +869,15 @@ impl WorkflowRuntime {
                 definition,
                 snapshot,
                 RunMode::UntilBlocked,
-                None,
-                events,
+                ActiveRunExecution {
+                    request_topic: None,
+                    events,
+                    active_clock,
+                },
             )
             .await
         } else {
+            active_clock.close(&store, &mut run)?;
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
         }
@@ -903,7 +964,6 @@ impl WorkflowRuntime {
         definition.source_hash = workflow_hash.clone();
         Ok((definition, snapshot, workflow_hash))
     }
-
     async fn run_existing(
         &self,
         run: WorkflowRun,
@@ -911,9 +971,20 @@ impl WorkflowRuntime {
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
         request_topic: Option<String>,
+        active_clock: ActiveRunClock,
     ) -> Result<RunReport> {
-        self.run_existing_with_events(run, definition, snapshot, mode, request_topic, Vec::new())
-            .await
+        self.run_existing_with_events(
+            run,
+            definition,
+            snapshot,
+            mode,
+            ActiveRunExecution {
+                request_topic,
+                events: Vec::new(),
+                active_clock,
+            },
+        )
+        .await
     }
 
     async fn run_existing_with_events(
@@ -922,9 +993,13 @@ impl WorkflowRuntime {
         definition: cowboy_workflow_core::WorkflowDefinition,
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
-        request_topic: Option<String>,
-        mut events: Vec<WorkflowEvent>,
+        execution: ActiveRunExecution,
     ) -> Result<RunReport> {
+        let ActiveRunExecution {
+            request_topic,
+            mut events,
+            active_clock,
+        } = execution;
         tracing::debug!(
             run_id = %run.id,
             workflow = %definition.name,
@@ -934,9 +1009,11 @@ impl WorkflowRuntime {
             "running workflow"
         );
         let run_id = run.id.clone();
-        let run_started_at = run.created_at;
+        let progress_clock = active_clock.clone();
         let mut rx = self.events.subscribe();
         let store = self.store()?;
+        let mut cancellation_guard =
+            ActiveRunCancellationGuard::new(store.clone(), run_id.clone(), active_clock.clone());
         let agent_store = store.clone();
         let progress_events = self.events.clone();
         let agent_config = AgentExecutionConfig {
@@ -945,7 +1022,7 @@ impl WorkflowRuntime {
             progress: Some(Arc::new(move |progress| {
                 progress_events.emit(Self::workflow_event_from_agent_progress(
                     progress,
-                    run_started_at,
+                    &progress_clock,
                 ));
             })),
         };
@@ -954,7 +1031,8 @@ impl WorkflowRuntime {
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
             .with_limits(self.config.limits.into())
-            .with_request_topic(request_topic);
+            .with_request_topic(request_topic)
+            .with_active_clock(active_clock);
         let run_future = async {
             match mode {
                 RunMode::UntilBlocked => runner.run_until_blocked(&definition, run).await,
@@ -966,9 +1044,9 @@ impl WorkflowRuntime {
         if prefix_len > 0 {
             self.persist_events(&run_id, &events)?;
         }
-        let run = loop {
+        let run_result = loop {
             tokio::select! {
-                result = &mut run_future => break result?,
+                result = &mut run_future => break result,
                 received = rx.recv() => match received {
                     Ok(event) => events.push(event),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
@@ -976,24 +1054,34 @@ impl WorkflowRuntime {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         tracing::debug!(run_id = %run_id, "workflow event collector closed");
-                        break (&mut run_future).await?;
+                        break (&mut run_future).await;
                     }
                 }
             }
         };
         drain_available_workflow_events(&mut rx, &mut events);
-        tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
-        self.persist_events(&run.id, &events)?;
+        match &run_result {
+            Ok(run) => {
+                tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
+                self.persist_events(&run.id, &events)?;
+            }
+            Err(err) => {
+                tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error = %err, "workflow events collected before run error");
+                self.persist_events(&run_id, &events)?;
+            }
+        }
+        cancellation_guard.disarm();
+        let run = run_result?;
         Ok(RunReport { run, events })
     }
 
     fn workflow_event_from_agent_progress(
         progress: AgentProgress,
-        run_started_at: DateTime<Utc>,
+        active_clock: &ActiveRunClock,
     ) -> WorkflowEvent {
         let run_id = progress.run_id.clone();
         let kind = Self::workflow_event_kind_from_agent_progress(progress);
-        WorkflowEvent::with_run_started_at(run_id, run_started_at, kind)
+        active_clock.event(run_id, kind)
     }
 
     fn workflow_event_kind_from_agent_progress(progress: AgentProgress) -> WorkflowEventKind {
@@ -1343,6 +1431,7 @@ mod tests {
             resume: Value::Null,
             steps_executed: 0,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
         }
@@ -1493,6 +1582,86 @@ exit 0
         );
     }
 
+    fn runtime_for_inline_workflow(dir: &tempfile::TempDir, source: &str) -> WorkflowRuntime {
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(workflow_dir.join("aaa.lua"), source).unwrap();
+        runtime_for_workflow_dir(dir, workflow_dir)
+    }
+
+    fn prompt_workflow_source() -> &'static str {
+        r#"
+        local ask = step("ask")
+        ask.run = function(ctx)
+          return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, fields = { carried = "ok" } }
+        end
+
+        local decide = step("decide")
+        decide.run = function(ctx)
+          local total = 0
+          for i = 1, 5000000 do total = total + i end
+          local fields = (ctx.prev and ctx.prev.fields) or {}
+          return action.status { status = tostring(fields.answer), fields = { answer = fields.answer, carried = fields.carried, total = tostring(total) }, body = "decided" }
+        end
+
+        local done = step("done")
+        done.run = function(ctx)
+          return action.status { status = "success", body = "done" }
+        end
+
+        ask:on("answered", decide)
+        decide:on("yes", done)
+        return workflow("aaa", ask)
+        "#
+    }
+
+    #[test]
+    fn cancellation_guard_closes_active_window_when_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let mut run = summary_test_run("run-cancel", RunStatus::Running, None);
+        let started_at = Utc::now() - chrono::Duration::hours(1);
+        run.created_at = started_at;
+        run.updated_at = started_at;
+        run.active_duration_ms = 7;
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        let window_started_at = Utc::now() - chrono::Duration::milliseconds(25);
+        let active_clock = ActiveRunClock::open_at(&run, window_started_at);
+
+        drop(ActiveRunCancellationGuard::new(
+            store.clone(),
+            run.id.clone(),
+            active_clock,
+        ));
+
+        let stored = store.load_run(&run.id).unwrap();
+        assert!(
+            stored.active_duration_ms >= 32,
+            "cancel cleanup should add the open active window: {stored:#?}"
+        );
+        assert!(
+            stored.active_duration_ms < 60_000,
+            "cancel cleanup should not charge the full wall-clock age: {stored:#?}"
+        );
+    }
+
+    fn persist_run_active_duration(
+        runtime: &WorkflowRuntime,
+        run_id: &str,
+        active_duration_ms: u64,
+        created_at: chrono::DateTime<Utc>,
+    ) -> WorkflowRun {
+        let store = runtime.store().unwrap();
+        let mut run = store.load_run(&run_id.to_string()).unwrap();
+        run.created_at = created_at;
+        run.updated_at = created_at;
+        run.active_duration_ms = active_duration_ms;
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        run
+    }
     fn first_run_started_topic(report: &RunReport) -> Option<&str> {
         report.events.iter().find_map(|event| match &event.kind {
             WorkflowEventKind::RunStarted { request_topic, .. } => request_topic.as_deref(),
@@ -1755,6 +1924,238 @@ exit 0
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    async fn step_run_closes_active_window_without_counting_idle_before_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(
+            &dir,
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next", body = "first" }
+            end
+
+            local middle = step("middle")
+            middle.run = function(ctx)
+              local total = 0
+              for i = 1, 5000000 do total = total + i end
+              return action.status { status = "more", fields = { total = tostring(total) }, body = "middle" }
+            end
+
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+
+            start:on("next", middle)
+            middle:on("more", finish)
+            return workflow("aaa", start)
+            "#,
+        );
+        let start = runtime.start_run_stepwise("request").await.unwrap();
+        assert_eq!(start.run.status, RunStatus::Running);
+        assert_eq!(start.run.current_step, "middle");
+
+        let active_before_idle_ms = 2_000;
+        persist_run_active_duration(
+            &runtime,
+            &start.run.id,
+            active_before_idle_ms,
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let report = runtime.step_run(&start.run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(report.run.current_step, "finish");
+        let stored = runtime.load_run(&start.run.id).unwrap();
+        assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
+        assert!(
+            stored.active_duration_ms > active_before_idle_ms,
+            "active time must include the current step's execution window: {stored:#?}"
+        );
+        assert!(
+            stored.active_duration_ms < active_before_idle_ms + 60_000,
+            "idle wall-clock gap must not be charged as active time: {stored:#?}"
+        );
+        let max_event_active_ms = report
+            .events
+            .iter()
+            .map(|event| event.run_active_duration_ms.expect("active event duration"))
+            .max()
+            .expect("step_run should emit lifecycle events");
+        assert!(max_event_active_ms >= active_before_idle_ms);
+        assert!(
+            max_event_active_ms <= stored.active_duration_ms,
+            "stored active duration should close after the emitted lifecycle events"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_run_counts_answer_execution_without_counting_prompt_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source());
+        let start = runtime.start_run("request").await.unwrap();
+        assert!(matches!(
+            start.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+
+        let active_before_wait_ms = 3_000;
+        persist_run_active_duration(
+            &runtime,
+            &start.run.id,
+            active_before_wait_ms,
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let report = runtime
+            .answer_run(&start.run.id, "approval", "yes")
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let stored = runtime.load_run(&start.run.id).unwrap();
+        assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
+        assert!(
+            stored.active_duration_ms > active_before_wait_ms,
+            "active time must include answer/resume execution: {stored:#?}"
+        );
+        assert!(
+            stored.active_duration_ms < active_before_wait_ms + 60_000,
+            "prompt wait gap must not be charged as active time: {stored:#?}"
+        );
+        for event in &report.events {
+            let active_ms = event
+                .run_active_duration_ms
+                .expect("answer/resume event active duration");
+            assert!(active_ms >= active_before_wait_ms, "{event:#?}");
+            assert!(
+                active_ms < active_before_wait_ms + 60_000,
+                "prompt wait gap must not be charged to events: {event:#?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_prompt_answers_do_not_advance_active_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source());
+        let start = runtime.start_run("request").await.unwrap();
+        assert!(matches!(
+            start.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        let unchanged_active_ms = 4_000;
+        persist_run_active_duration(
+            &runtime,
+            &start.run.id,
+            unchanged_active_ms,
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let err = runtime
+            .answer_run(&start.run.id, "other-prompt", "yes")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("prompt"), "{err}");
+        assert_eq!(
+            runtime.load_run(&start.run.id).unwrap().active_duration_ms,
+            unchanged_active_ms
+        );
+
+        let err = runtime
+            .answer_run(&start.run.id, "approval", "maybe")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("choice"), "{err}");
+        assert_eq!(
+            runtime.load_run(&start.run.id).unwrap().active_duration_ms,
+            unchanged_active_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_manual_resolution_does_not_advance_active_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![agent("default", "definitely-missing-agent")],
+        );
+        runtime.start_run("do it").await.unwrap_err();
+        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let unchanged_active_ms = 5_000;
+        persist_run_active_duration(
+            &runtime,
+            &run_id,
+            unchanged_active_ms,
+            Utc::now() - chrono::Duration::hours(1),
+        );
+
+        let err = runtime
+            .resolve_run(
+                &run_id,
+                "nope",
+                Some(serde_json::json!({ "summary": "done" })),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Valid statuses"), "{err}");
+        assert_eq!(
+            runtime.load_run(&run_id).unwrap().active_duration_ms,
+            unchanged_active_ms
+        );
+
+        let err = runtime
+            .resolve_run(&run_id, "success", None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("summary"), "{err}");
+        assert_eq!(
+            runtime.load_run(&run_id).unwrap().active_duration_ms,
+            unchanged_active_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runner_events_are_persisted_with_active_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![agent("default", "definitely-missing-agent")],
+        );
+
+        let err = runtime.start_run("do it").await.unwrap_err();
+        assert!(
+            err.to_string().contains("definitely-missing-agent"),
+            "{err}"
+        );
+        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let events = runtime.load_events(&run_id).unwrap();
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, WorkflowEventKind::RunFailed { .. })),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.kind, WorkflowEventKind::StepStarted { .. })),
+            "{events:#?}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.run_active_duration_ms.is_some()),
+            "{events:#?}"
+        );
     }
 
     #[tokio::test]
@@ -3230,6 +3631,7 @@ exit 0
             resume: Value::Null,
             steps_executed: 0,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
         };
@@ -3367,17 +3769,26 @@ exit 0
     }
 
     #[test]
-    fn agent_progress_workflow_events_use_run_creation_timestamp() {
-        let run_started_at = Utc::now();
+    fn agent_progress_workflow_events_use_run_creation_timestamp_and_active_duration() {
+        let run_started_at = Utc::now() - chrono::Duration::hours(1);
+        let mut run = summary_test_run("run-1", RunStatus::Running, None);
+        run.created_at = run_started_at;
+        run.active_duration_ms = 6_000;
+        let active_clock = ActiveRunClock::open_at(&run, Utc::now());
         let event = WorkflowRuntime::workflow_event_from_agent_progress(
             progress(AgentProgressKind::Response {
                 content: "answer".to_string(),
             }),
-            run_started_at,
+            &active_clock,
         );
 
         assert_eq!(event.run_id, "run-1");
         assert_eq!(event.run_started_at, Some(run_started_at));
+        let active_ms = event
+            .run_active_duration_ms
+            .expect("agent progress event active duration");
+        assert!(active_ms >= 6_000, "{event:#?}");
+        assert!(active_ms < 7_000, "{event:#?}");
         assert!(matches!(
             &event.kind,
             WorkflowEventKind::AgentResponse { content, .. } if content == "answer"

@@ -1,5 +1,7 @@
 use chrono::Utc;
-use cowboy_workflow_core::{ActionResult, ResumeInput, RunStatus, WorkflowError, WorkflowRun};
+use cowboy_workflow_core::{
+    ActionResult, ResumeCallback, ResumeInput, RunStatus, WorkflowError, WorkflowRun,
+};
 
 use crate::ResumeCallbackRegistry;
 
@@ -13,6 +15,16 @@ pub struct ResumeRouter {
     registry: ResumeCallbackRegistry,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidatedAnswer {
+    resume_callback: ResumeCallback,
+    step: String,
+    prompt_id: String,
+    message: String,
+    choices: Vec<String>,
+    answer: String,
+}
+
 impl ResumeRouter {
     pub fn new(registry: ResumeCallbackRegistry) -> Self {
         Self { registry }
@@ -22,12 +34,12 @@ impl ResumeRouter {
         Self::new(ResumeCallbackRegistry::default())
     }
 
-    pub fn answer(
+    pub fn validate_answer(
         &self,
         run: &WorkflowRun,
         prompt_id: &str,
         answer: impl Into<String>,
-    ) -> cowboy_workflow_core::Result<ActionResult> {
+    ) -> cowboy_workflow_core::Result<ValidatedAnswer> {
         let answer = answer.into();
         let RunStatus::WaitingForInput {
             step,
@@ -55,17 +67,41 @@ impl ResumeRouter {
             )));
         }
 
+        Ok(ValidatedAnswer {
+            resume_callback: resume_callback.clone(),
+            step: step.clone(),
+            prompt_id: waiting_prompt_id.clone(),
+            message: message.clone(),
+            choices: choices.clone(),
+            answer,
+        })
+    }
+
+    pub fn dispatch_validated_answer(
+        &self,
+        answer: ValidatedAnswer,
+    ) -> cowboy_workflow_core::Result<ActionResult> {
         self.registry.dispatch(
-            resume_callback,
+            &answer.resume_callback,
             ResumeInput {
-                step: step.clone(),
-                prompt_id: waiting_prompt_id.clone(),
-                message: message.clone(),
-                choices: choices.clone(),
-                answer,
+                step: answer.step,
+                prompt_id: answer.prompt_id,
+                message: answer.message,
+                choices: answer.choices,
+                answer: answer.answer,
                 completed_at: Utc::now(),
             },
         )
+    }
+
+    pub fn answer(
+        &self,
+        run: &WorkflowRun,
+        prompt_id: &str,
+        answer: impl Into<String>,
+    ) -> cowboy_workflow_core::Result<ActionResult> {
+        let answer = self.validate_answer(run, prompt_id, answer)?;
+        self.dispatch_validated_answer(answer)
     }
 }
 
@@ -78,9 +114,11 @@ impl Default for ResumeRouter {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::thread;
+    use std::time::Duration;
 
     use chrono::Utc;
-    use cowboy_workflow_core::{ResumeCallback, RunStatus};
+    use cowboy_workflow_core::{ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus};
     use serde_json::{Value, json};
 
     use super::*;
@@ -117,8 +155,22 @@ mod tests {
             resume: Value::Null,
             steps_executed: 1,
             step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    struct SlowHandler;
+
+    impl ResumeCallbackHandler for SlowHandler {
+        fn resume(
+            &self,
+            _callback: &ResumeCallback,
+            _input: ResumeInput,
+        ) -> cowboy_workflow_core::Result<ActionResult> {
+            thread::sleep(Duration::from_millis(20));
+            Ok(ActionResult::blocked(RunStatus::Completed))
         }
     }
 
@@ -147,6 +199,27 @@ mod tests {
         assert_eq!(output.fields["plan"], "ship");
         assert_eq!(output.fields["answer"], "yes");
         assert_eq!(output.raw["prompt_id"], "approval");
+    }
+
+    #[test]
+    fn validated_answer_dispatch_can_be_active_timed() {
+        let mut run = waiting_run();
+        let RunStatus::WaitingForInput {
+            resume_callback, ..
+        } = &mut run.status
+        else {
+            panic!("expected waiting run")
+        };
+        *resume_callback = ResumeCallback::new("slow", Value::Null).unwrap();
+        let mut registry = crate::ResumeCallbackRegistry::new();
+        registry.register("slow", SlowHandler).unwrap();
+        let router = ResumeRouter::new(registry);
+        let answer = router.validate_answer(&run, "approval", "yes").unwrap();
+        let active_clock = crate::active_clock::ActiveRunClock::open_at(&run, Utc::now());
+
+        router.dispatch_validated_answer(answer).unwrap();
+
+        assert!(active_clock.active_duration_at(Utc::now()) >= 20);
     }
 
     #[test]
