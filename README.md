@@ -101,16 +101,9 @@ Recoverable step failures (for example, an agent reply missing its YAML
 frontmatter, or a transient backend error) are retried automatically up to
 `max_retries_per_step` times before the run is marked `Failed`.
 
-## TUI views
+## TUI
 
-The TUI is organized into four vertical views:
-
-| View | Purpose |
-| --- | --- |
-| Header | Shows Cowboy state, active step, short run id, workflow name, and background task count when space allows. |
-| Transcript | Shows the workflow event stream: run/step lifecycle, prompt sent to the agent, agent thinking, agent responses, tool calls, tool updates, step output, waiting-for-input cards, failures, suspensions, and completion. |
-| Status strip | Shows current state plus context-sensitive hints such as scroll keys, pending prompt handling, background tasks, and cancellation. |
-| Composer | Accepts plain workflow requests, slash commands, and prompt answers. It supports multiline input and slash-command suggestions. |
+![Cowboy TUI snapshot](docs/assets/tui-snapshot.svg)
 
 Plain text submitted in the composer starts a workflow run. When a workflow is waiting for input, typing the answer directly submits it to the pending prompt; `/answer` remains available for explicit answers.
 

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="580" viewBox="0 0 880 580" role="img" aria-labelledby="title desc">
+  <title id="title">Cowboy TUI snapshot</title>
+  <desc id="desc">Snapshot captured from the Cowboy terminal UI.</desc>
+  <rect width="880" height="580" rx="14" fill="#0b1020"/>
+  <text x="18" y="28" xml:space="preserve" font-family="DejaVu Sans Mono, Cascadia Mono, Consolas, monospace" font-size="14" line-height="18" fill="#e5e7eb">
+    <tspan x="18" dy="0" font-weight="700">Cowboy</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">┌──────────────────────────────────────────────────────────────────────────────────────────────────┐</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#6b7280">No workflow transcript yet.</tspan><tspan fill="#3b4261">                                                                       │</tspan></tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#ffffff">Type a request below to start the default workflow, or use /help.</tspan><tspan fill="#3b4261">                                 │</tspan></tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#7aa2f7">Examples</tspan><tspan fill="#3b4261">                                                                                          │</tspan></tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#ffffff">  &gt; add a /healthz route</tspan><tspan fill="#3b4261">                                                                          │</tspan></tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#ffffff">  &gt; /run investigate failing tests</tspan><tspan fill="#3b4261">                                                                │</tspan></tspan>
+    <tspan x="18" dy="18"><tspan fill="#3b4261">│</tspan><tspan fill="#ffffff">  &gt; /workflows</tspan><tspan fill="#3b4261">                                                                                    │</tspan></tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">│                                                                                                  │</tspan>
+    <tspan x="18" dy="18" fill="#3b4261">└──────────────────────────────────────────────────────────────────────────────────────────────────┘</tspan>
+    <tspan x="18" dy="18" fill="#7aa2f7">○</tspan>
+    <tspan x="18" dy="18" fill="#7aa2f7">┌ Enter submits ─ Shift/Ctrl-Enter newline ─ type / for commands ──────────────────────────────────┐</tspan>
+    <tspan x="18" dy="18"><tspan fill="#7aa2f7">│</tspan><tspan fill="#ffffff">&gt;</tspan><tspan fill="#7aa2f7">                                                                                                 │</tspan></tspan>
+    <tspan x="18" dy="18" fill="#7aa2f7">└──────────────────────────────────────────────────────────────────────────────────────────────────┘</tspan>
+  </text>
+</svg>
