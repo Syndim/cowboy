@@ -50,29 +50,43 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             workflow_name,
             current_step,
             ..
-        } => Card::new(status_icon("running"), "Run started", CardTone::Accent).metadata([
+        } => workflow_card(
+            event,
+            status_icon("running"),
+            "Run started",
+            CardTone::Accent,
+        )
+        .metadata([
             CardMetadata::step(current_step),
             CardMetadata::run(&event.run_id),
             CardMetadata::workflow(workflow_name),
         ]),
-        WorkflowEventKind::StepStarted { step_id } => {
-            Card::new(status_icon("running"), "Step started", CardTone::Accent).metadata([
-                CardMetadata::step(step_id),
-                CardMetadata::run(&event.run_id),
-            ])
-        }
-        WorkflowEventKind::StepProgress { step_id, message } => {
-            Card::new(status_icon("running"), "Step progress", CardTone::Accent)
-                .metadata([
-                    CardMetadata::step(step_id),
-                    CardMetadata::run(&event.run_id),
-                ])
-                .section(CardSection::body(render_markup(
-                    message,
-                    style_transcript_normal(),
-                )))
-        }
-        WorkflowEventKind::AgentSessionReady { step_id, .. } => Card::new(
+        WorkflowEventKind::StepStarted { step_id } => workflow_card(
+            event,
+            status_icon("running"),
+            "Step started",
+            CardTone::Accent,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ]),
+        WorkflowEventKind::StepProgress { step_id, message } => workflow_card(
+            event,
+            status_icon("running"),
+            "Step progress",
+            CardTone::Accent,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::body(render_markup(
+            message,
+            style_transcript_normal(),
+        ))),
+        WorkflowEventKind::AgentSessionReady { step_id, .. } => workflow_card(
+            event,
             status_icon("running"),
             "Agent session ready",
             CardTone::Accent,
@@ -83,7 +97,8 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         ]),
         WorkflowEventKind::AgentPrompt {
             step_id, prompt, ..
-        } => Card::new(
+        } => workflow_card(
+            event,
             status_icon("running"),
             "Prompt sent to agent",
             CardTone::Prompt,
@@ -96,28 +111,34 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             "Prompt",
             render_markup(prompt, style_transcript_prompt()),
         )),
-        WorkflowEventKind::AgentResponse { step_id, content } => {
-            Card::new(status_icon("running"), "Agent response", CardTone::Neutral)
-                .metadata([
-                    CardMetadata::step(step_id),
-                    CardMetadata::run(&event.run_id),
-                ])
-                .section(CardSection::body(render_markup(
-                    content,
-                    style_transcript_normal(),
-                )))
-        }
-        WorkflowEventKind::AgentThought { step_id, content } => {
-            Card::new(status_icon("running"), "Agent thinking", CardTone::Thought)
-                .metadata([
-                    CardMetadata::step(step_id),
-                    CardMetadata::run(&event.run_id),
-                ])
-                .section(CardSection::body(render_markup(
-                    content,
-                    style_transcript_thought(),
-                )))
-        }
+        WorkflowEventKind::AgentResponse { step_id, content } => workflow_card(
+            event,
+            status_icon("running"),
+            "Agent response",
+            CardTone::Neutral,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::body(render_markup(
+            content,
+            style_transcript_normal(),
+        ))),
+        WorkflowEventKind::AgentThought { step_id, content } => workflow_card(
+            event,
+            status_icon("running"),
+            "Agent thinking",
+            CardTone::Thought,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::body(render_markup(
+            content,
+            style_transcript_thought(),
+        ))),
         WorkflowEventKind::AgentToolCall {
             step_id,
             title,
@@ -126,7 +147,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             ..
         } => {
             let tool = display_tool_title(title, Some(tool_kind));
-            Card::new(tool_status_icon(status), tool, CardTone::Tool)
+            workflow_card(event, tool_status_icon(status), tool, CardTone::Tool)
                 .tool_marker()
                 .metadata([
                     CardMetadata::step(step_id),
@@ -145,7 +166,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             ..
         } => {
             let tool = display_tool_title(title, None);
-            let mut card = Card::new(tool_status_icon(status), tool, tool_tone(status))
+            let mut card = workflow_card(event, tool_status_icon(status), tool, tool_tone(status))
                 .tool_marker()
                 .metadata([
                     CardMetadata::step(step_id),
@@ -171,7 +192,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                     render_markup(&display_json_value(entry), style_transcript_plan())
                 })
                 .collect::<Vec<_>>();
-            Card::new(status_icon("running"), "Agent plan", CardTone::Plan)
+            workflow_card(event, status_icon("running"), "Agent plan", CardTone::Plan)
                 .metadata([
                     CardMetadata::step(step_id),
                     CardMetadata::run(&event.run_id),
@@ -185,7 +206,8 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             body,
         } => {
             let status_value = status.as_deref().unwrap_or("<none>");
-            Card::new(
+            workflow_card(
+                event,
                 status_icon("completed"),
                 "Step completed",
                 CardTone::Success,
@@ -211,7 +233,8 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             choices,
             ..
         } => {
-            let mut card = Card::new(
+            let mut card = workflow_card(
+                event,
                 status_icon("waiting"),
                 "Waiting for input",
                 CardTone::Warning,
@@ -232,29 +255,38 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             }
             card
         }
-        WorkflowEventKind::RunCompleted => {
-            Card::new(status_icon("completed"), "Run completed", CardTone::Success)
-                .metadata([CardMetadata::run(&event.run_id)])
-        }
+        WorkflowEventKind::RunCompleted => workflow_card(
+            event,
+            status_icon("completed"),
+            "Run completed",
+            CardTone::Success,
+        )
+        .metadata([CardMetadata::run(&event.run_id)]),
         WorkflowEventKind::StepRetrying {
             step_id,
             attempt,
             max_attempts,
             reason,
-        } => Card::new(status_icon("retrying"), "Step retrying", CardTone::Warning)
-            .metadata([
-                CardMetadata::step(step_id),
-                CardMetadata::run(&event.run_id),
-            ])
-            .section(CardSection::body(vec![Line::from(Span::styled(
-                format!("attempt {attempt}/{max_attempts}"),
-                style_warning(),
-            ))]))
-            .section(CardSection::body(render_markup(
-                reason,
-                style_transcript_metadata(),
-            ))),
-        WorkflowEventKind::ManuallyResolved { step_id, status } => Card::new(
+        } => workflow_card(
+            event,
+            status_icon("retrying"),
+            "Step retrying",
+            CardTone::Warning,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ])
+        .section(CardSection::body(vec![Line::from(Span::styled(
+            format!("attempt {attempt}/{max_attempts}"),
+            style_warning(),
+        ))]))
+        .section(CardSection::body(render_markup(
+            reason,
+            style_transcript_metadata(),
+        ))),
+        WorkflowEventKind::ManuallyResolved { step_id, status } => workflow_card(
+            event,
             status_icon("completed"),
             "Manually resolved",
             CardTone::Success,
@@ -268,7 +300,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             Span::styled(status.clone(), style_for_run_state(status)),
         ])])),
         WorkflowEventKind::RunFailed { reason } => {
-            Card::new(status_icon("failed"), "Run failed", CardTone::Error)
+            workflow_card(event, status_icon("failed"), "Run failed", CardTone::Error)
                 .metadata([CardMetadata::run(&event.run_id)])
                 .section(CardSection::body(render_markup(reason, style_error())))
                 .section(CardSection::named(
@@ -289,11 +321,15 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                     ])],
                 ))
         }
-        WorkflowEventKind::RunCancelled => {
-            Card::new(status_icon("cancelled"), "Run cancelled", CardTone::Error)
-                .metadata([CardMetadata::run(&event.run_id)])
-        }
-        WorkflowEventKind::RunStatusChanged { status } => Card::new(
+        WorkflowEventKind::RunCancelled => workflow_card(
+            event,
+            status_icon("cancelled"),
+            "Run cancelled",
+            CardTone::Error,
+        )
+        .metadata([CardMetadata::run(&event.run_id)]),
+        WorkflowEventKind::RunStatusChanged { status } => workflow_card(
+            event,
             status_icon(status),
             "Run status changed",
             run_state_tone(status),
@@ -304,6 +340,44 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             style_for_run_state(status),
         ))])),
     }
+}
+
+fn workflow_card(
+    event: &WorkflowEvent,
+    status: &'static str,
+    title: impl Into<String>,
+    tone: CardTone,
+) -> Card {
+    let card = Card::new(status, title, tone);
+    match elapsed_stamp(event) {
+        Some(elapsed) => card.title_prefix(elapsed),
+        None => card,
+    }
+}
+
+fn elapsed_stamp(event: &WorkflowEvent) -> Option<String> {
+    let elapsed_ms = match event.run_active_duration_ms {
+        Some(elapsed_ms) => elapsed_ms,
+        None => {
+            let run_started_at = event.run_started_at?;
+            event
+                .timestamp
+                .signed_duration_since(run_started_at)
+                .num_milliseconds()
+                .max(0) as u64
+        }
+    };
+
+    Some(format_elapsed_ms(elapsed_ms))
+}
+
+fn format_elapsed_ms(elapsed_ms: u64) -> String {
+    let total_seconds = elapsed_ms / 1_000;
+    let hours = total_seconds / 3_600;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn tool_status_icon(status: &str) -> &'static str {
@@ -438,6 +512,7 @@ fn non_empty(text: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{TimeZone, Utc};
     use ratatui::style::{Color, Style};
 
     use super::*;
@@ -452,6 +527,62 @@ mod tests {
 
     fn rendered_text(kind: WorkflowEventKind) -> String {
         render_workflow_event(&event(kind)).text().to_string()
+    }
+
+    #[test]
+    fn run_completed_title_uses_active_elapsed_duration() {
+        let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 0, 0).unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 13, 23, 45).unwrap();
+        let event = WorkflowEvent::with_timing(
+            "run-170dc431-abc",
+            timestamp,
+            Some(run_started_at),
+            Some(296_000),
+            WorkflowEventKind::RunCompleted,
+        );
+
+        let rendered = render_workflow_event(&event);
+        let title = rendered.lines()[0].to_string();
+
+        assert!(title.contains("✓ Run completed"), "{title}");
+        assert!(title.contains("00:04:56"), "{title}");
+        assert!(!title.contains("01:23:45"), "{title}");
+    }
+
+    #[test]
+    fn run_completed_title_falls_back_to_wall_clock_elapsed_duration() {
+        let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 0, 0).unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 13, 23, 45).unwrap();
+        let event = WorkflowEvent::with_timing(
+            "run-170dc431-abc",
+            timestamp,
+            Some(run_started_at),
+            None,
+            WorkflowEventKind::RunCompleted,
+        );
+
+        let rendered = render_workflow_event(&event);
+        let title = rendered.lines()[0].to_string();
+
+        assert_eq!(title, "01:23:45 · ✓ Run completed · ▶ 170dc431");
+    }
+
+    #[test]
+    fn run_completed_title_clamps_negative_wall_clock_elapsed_duration() {
+        let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 13, 0, 0).unwrap();
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 12, 59, 59).unwrap();
+        let event = WorkflowEvent::with_timing(
+            "run-170dc431-abc",
+            timestamp,
+            Some(run_started_at),
+            None,
+            WorkflowEventKind::RunCompleted,
+        );
+
+        let rendered = render_workflow_event(&event);
+        let title = rendered.lines()[0].to_string();
+
+        assert_eq!(title, "00:00:00 · ✓ Run completed · ▶ 170dc431");
     }
 
     #[test]
