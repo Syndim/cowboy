@@ -147,16 +147,28 @@ impl Card {
     pub(super) fn render(&self, width: usize) -> Vec<Line<'static>> {
         let width = width.clamp(MIN_CARD_WIDTH, DEFAULT_CARD_WIDTH);
         let interior_width = width.saturating_sub(2);
+        let rendered_sections = self
+            .sections
+            .iter()
+            .map(|section| (section, section_wrapped_lines(section, interior_width)))
+            .collect::<Vec<_>>();
+        let has_content = rendered_sections
+            .iter()
+            .any(|(_, wrapped)| !wrapped.is_empty());
         let mut rows = Vec::new();
         rows.push(self.title_line(width));
+
+        if !has_content {
+            return rows;
+        }
+
         rows.push(border_line('╭', '╮', width));
 
-        for section in &self.sections {
+        for (section, wrapped) in rendered_sections {
             if let Some(label) = section.label.as_deref() {
                 rows.push(section_divider(label, width));
             }
 
-            let wrapped = section_wrapped_lines(section, interior_width);
             rows.extend(
                 wrapped
                     .into_iter()
@@ -382,6 +394,42 @@ mod tests {
         assert!(!text.contains("run="), "{text}");
         assert!(!text.contains("workflow="), "{text}");
         assert!(!text.contains("tasks="), "{text}");
+    }
+
+    #[test]
+    fn renders_empty_card_without_border_chrome() {
+        let rows = Card::new("●", "Idle tool", CardTone::Tool).render(80);
+        let text = rows
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("● Idle tool"), "{text}");
+        assert!(!text.contains('╭'), "{text}");
+        assert!(!text.contains('╮'), "{text}");
+        assert!(!text.contains('╰'), "{text}");
+        assert!(!text.contains('╯'), "{text}");
+        assert!(!text.contains('│'), "{text}");
+    }
+
+    #[test]
+    fn renders_empty_body_section_without_border_chrome() {
+        let rows = Card::new("●", "Idle tool", CardTone::Tool)
+            .section(CardSection::body(Vec::new()))
+            .render(80);
+        let text = rows
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("● Idle tool"), "{text}");
+        assert!(!text.contains('╭'), "{text}");
+        assert!(!text.contains('╮'), "{text}");
+        assert!(!text.contains('╰'), "{text}");
+        assert!(!text.contains('╯'), "{text}");
+        assert!(!text.contains('│'), "{text}");
     }
 
     #[test]

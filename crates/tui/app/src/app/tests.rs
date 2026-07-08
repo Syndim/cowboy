@@ -331,8 +331,8 @@ fn draw_uses_rounded_cards_without_outer_transcript_border() {
         rendered.contains("● Run started · ↳ plan · ▶ 170dc431 · ⎇ bugfix"),
         "{rendered}"
     );
-    assert!(rendered.contains("╭"), "{rendered}");
-    assert!(rendered.contains("╰"), "{rendered}");
+    assert!(!rendered.contains("╭"), "{rendered}");
+    assert!(!rendered.contains("╰"), "{rendered}");
     assert!(rows[composer_row].starts_with('┌'), "{rendered}");
     assert!(
         rows[..composer_row]
