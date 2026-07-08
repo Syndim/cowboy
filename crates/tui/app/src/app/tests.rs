@@ -407,7 +407,10 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
     assert!(!title_row.contains("input disabled"), "{rendered}");
     assert!(rendered.contains("● ─ ◷ 1"), "{rendered}");
     assert!(!rendered.contains("draft allowed"), "{rendered}");
-    assert!(!rendered.contains("Enter waits for active run"), "{rendered}");
+    assert!(
+        !rendered.contains("Enter waits for active run"),
+        "{rendered}"
+    );
     assert!(
         !rendered.contains("input disabled while run active"),
         "{rendered}"

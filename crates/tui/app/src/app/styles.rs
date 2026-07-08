@@ -88,7 +88,6 @@ pub(super) fn style_for_tool_status(status: &str) -> Style {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,8 +67,10 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events
-            .emit(WorkflowEvent::run_started_with_topic(&run, self.request_topic.clone()));
+        self.events.emit(WorkflowEvent::run_started_with_topic(
+            &run,
+            self.request_topic.clone(),
+        ));
 
         while matches!(run.status, RunStatus::Running) {
             self.execute_one(definition, &mut run).await?;
@@ -85,8 +87,10 @@ where
         definition: &WorkflowDefinition,
         mut run: WorkflowRun,
     ) -> Result<WorkflowRun> {
-        self.events
-            .emit(WorkflowEvent::run_started_with_topic(&run, self.request_topic.clone()));
+        self.events.emit(WorkflowEvent::run_started_with_topic(
+            &run,
+            self.request_topic.clone(),
+        ));
 
         if matches!(run.status, RunStatus::Running) {
             self.execute_one(definition, &mut run).await?;
@@ -538,6 +542,7 @@ mod tests {
             workflow_hash: "source".to_string(),
             workflow_sources: BTreeMap::new(),
             original_request: "do it".to_string(),
+            request_topic: None,
             status: RunStatus::Running,
             current_step: "start".to_string(),
             head: None,

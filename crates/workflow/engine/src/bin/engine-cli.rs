@@ -33,8 +33,8 @@ use std::path::PathBuf;
 use cowboy_agent_acp::BackendPreset;
 use cowboy_workflow_core::{Result as CoreResult, RunStatus};
 use cowboy_workflow_engine::{
-    AgentRuntimeConfig, RunReport, RunnerLimitsConfig, RuntimeConfig, WorkflowEvent,
-    WorkflowEventKind, WorkflowRuntime,
+    AgentRuntimeConfig, RunReport, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig,
+    WorkflowEvent, WorkflowEventKind, WorkflowRuntime,
 };
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -219,16 +219,45 @@ fn runs(rt: &WorkflowRuntime) -> CliResult {
     let runs = rt.list_runs()?;
     println!("runs ({})", runs.len());
     for run in &runs {
-        println!(
-            "- {} workflow={} status={} step={} head={}",
-            run.run_id,
-            run.workflow_name,
-            status_label(&run.status),
-            run.current_step,
-            run.head_step.as_deref().unwrap_or("<none>"),
-        );
+        print_run_summary(run);
     }
     Ok(())
+}
+
+fn print_run_summary(run: &RunSummaryLine) {
+    println!("- {}", run.run_id);
+    if let Some(topic) = &run.topic {
+        println!("  topic: {topic}");
+    }
+
+    println!("  workflow: {}", run.workflow_name);
+    println!("  current_step: {}", run.current_step);
+    println!("  head: {}", run.head_step.as_deref().unwrap_or("<none>"));
+    println!("  status: {}", run.status_detail.state.as_str());
+    if let Some(reason) = &run.status_detail.reason {
+        println!("  status.reason: {reason}");
+    }
+
+    if let Some(waiting_step) = &run.status_detail.waiting_step {
+        println!("  status.waiting_step: {waiting_step}");
+    }
+
+    if let Some(prompt_id) = &run.status_detail.prompt_id {
+        println!("  status.prompt_id: {prompt_id}");
+    }
+
+    if let Some(message) = &run.status_detail.message {
+        println!("  status.message: {message}");
+    }
+
+    if run.status_detail.state.as_str() == "waiting_for_input" {
+        let choices = if run.status_detail.choices.is_empty() {
+            "<free-form>".to_string()
+        } else {
+            run.status_detail.choices.join(", ")
+        };
+        println!("  status.choices: {choices}");
+    }
 }
 
 fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {

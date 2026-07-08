@@ -126,9 +126,96 @@ pub struct RunReport {
 pub struct RunSummaryLine {
     pub run_id: String,
     pub workflow_name: String,
+    pub topic: Option<String>,
     pub status: RunStatus,
+    pub status_detail: RunStatusDetail,
     pub current_step: String,
     pub head_step: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatusState {
+    Running,
+    WaitingForInput,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl RunStatusState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::WaitingForInput => "waiting_for_input",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStatusDetail {
+    pub state: RunStatusState,
+    pub reason: Option<String>,
+    pub waiting_step: Option<String>,
+    pub prompt_id: Option<String>,
+    pub message: Option<String>,
+    pub choices: Vec<String>,
+}
+
+impl RunStatusDetail {
+    pub fn from_status(status: &RunStatus) -> Self {
+        match status {
+            RunStatus::Running => Self {
+                state: RunStatusState::Running,
+                reason: None,
+                waiting_step: None,
+                prompt_id: None,
+                message: None,
+                choices: Vec::new(),
+            },
+            RunStatus::WaitingForInput {
+                step,
+                prompt_id,
+                message,
+                choices,
+                ..
+            } => Self {
+                state: RunStatusState::WaitingForInput,
+                reason: None,
+                waiting_step: Some(step.clone()),
+                prompt_id: Some(prompt_id.clone()),
+                message: Some(message.clone()),
+                choices: choices.clone(),
+            },
+            RunStatus::Completed => Self {
+                state: RunStatusState::Completed,
+                reason: None,
+                waiting_step: None,
+                prompt_id: None,
+                message: None,
+                choices: Vec::new(),
+            },
+            RunStatus::Failed { reason } => Self {
+                state: RunStatusState::Failed,
+                reason: Some(reason.clone()),
+                waiting_step: None,
+                prompt_id: None,
+                message: None,
+                choices: Vec::new(),
+            },
+            RunStatus::Cancelled => Self {
+                state: RunStatusState::Cancelled,
+                reason: None,
+                waiting_step: None,
+                prompt_id: None,
+                message: None,
+                choices: Vec::new(),
+            },
+        }
+    }
 }
 
 /// Guided choices for manually resolving a run stopped on a failed step.
@@ -240,16 +327,31 @@ impl WorkflowRuntime {
         let mut runs = Vec::new();
         for head in store.list_runs()? {
             if let Ok(run) = store.load_run(&head.run_id) {
+                let topic = self.summary_topic(&run);
+                let status_detail = RunStatusDetail::from_status(&head.status);
                 runs.push(RunSummaryLine {
                     run_id: run.id,
                     workflow_name: run.workflow_name,
+                    topic,
                     status: head.status,
+                    status_detail,
                     current_step: run.current_step,
                     head_step: head.head_step,
                 });
             }
         }
         Ok(runs)
+    }
+
+    fn summary_topic(&self, run: &WorkflowRun) -> Option<String> {
+        run.request_topic.clone().or_else(|| {
+            self.load_events(&run.id).ok().and_then(|events| {
+                events.into_iter().find_map(|event| match event.kind {
+                    WorkflowEventKind::RunStarted { request_topic, .. } => request_topic,
+                    _ => None,
+                })
+            })
+        })
     }
 
     pub fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
@@ -357,13 +459,14 @@ impl WorkflowRuntime {
             "workflow source compiled"
         );
         let now = Utc::now();
-        let run = WorkflowRun {
+        let mut run = WorkflowRun {
             id: run_id,
             workflow_name: definition.name.clone(),
             workflow_api_version: 1,
             workflow_hash,
             workflow_sources: snapshot.files.clone(),
             original_request: request,
+            request_topic: None,
             status: RunStatus::Running,
             current_step: definition.head.clone(),
             head: None,
@@ -378,6 +481,13 @@ impl WorkflowRuntime {
         store.update_run_head(&run.id, run_head(&run))?;
         tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
         let request_topic = self.generate_request_topic(&run.original_request).await;
+        if let Some(topic) = &request_topic {
+            run.request_topic = Some(topic.clone());
+            run.updated_at = Utc::now();
+            store.save_run(&run)?;
+            store.update_run_head(&run.id, run_head(&run))?;
+        }
+
         self.run_existing(run, definition, snapshot, mode, request_topic)
             .await
     }
@@ -474,7 +584,8 @@ impl WorkflowRuntime {
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
-        self.run_existing(run, definition, snapshot, mode, None).await
+        self.run_existing(run, definition, snapshot, mode, None)
+            .await
     }
 
     pub async fn answer_run(
@@ -520,8 +631,15 @@ impl WorkflowRuntime {
         tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
 
         if matches!(status, RunStatus::Running) {
-            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, None, events)
-                .await
+            self.run_existing_with_events(
+                run,
+                definition,
+                snapshot,
+                RunMode::UntilBlocked,
+                None,
+                events,
+            )
+            .await
         } else {
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
@@ -689,8 +807,15 @@ impl WorkflowRuntime {
         }
 
         if matches!(status_result, RunStatus::Running) {
-            self.run_existing_with_events(run, definition, snapshot, RunMode::UntilBlocked, None, events)
-                .await
+            self.run_existing_with_events(
+                run,
+                definition,
+                snapshot,
+                RunMode::UntilBlocked,
+                None,
+                events,
+            )
+            .await
         } else {
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
@@ -1112,7 +1237,7 @@ fn run_head(run: &WorkflowRun) -> RunHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowboy_workflow_core::{RunStatus, StepAction};
+    use cowboy_workflow_core::{ResumeCallback, RunStatus, StepAction};
     fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             name: name.to_string(),
@@ -1181,6 +1306,46 @@ mod tests {
         .with_deterministic_selector()
     }
 
+    fn runtime_for_empty_state(dir: &tempfile::TempDir) -> WorkflowRuntime {
+        WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            agents: vec![agent("default", "unused-agent")],
+            limits: RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                max_retries_per_step: 2,
+            },
+        })
+    }
+
+    fn summary_test_run(
+        run_id: &str,
+        status: RunStatus,
+        request_topic: Option<&str>,
+    ) -> WorkflowRun {
+        let now = Utc::now();
+        WorkflowRun {
+            id: run_id.to_string(),
+            workflow_name: "aaa".to_string(),
+            workflow_api_version: 1,
+            workflow_hash: "hash".to_string(),
+            workflow_sources: BTreeMap::new(),
+            original_request: "do it".to_string(),
+            request_topic: request_topic.map(str::to_string),
+            status,
+            current_step: "start".to_string(),
+            head: None,
+            resume: Value::Null,
+            steps_executed: 0,
+            step_visits: BTreeMap::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     fn runtime_for_topic_workflow(dir: &tempfile::TempDir, topic: &str) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("topic-workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -1212,6 +1377,189 @@ mod tests {
         })
     }
 
+    #[test]
+    fn run_summary_legacy_workflow_run_json_defaults_missing_request_topic() {
+        let mut raw = serde_json::to_value(summary_test_run(
+            "legacy-run",
+            RunStatus::Running,
+            Some("discarded topic"),
+        ))
+        .unwrap();
+        let object = raw.as_object_mut().unwrap();
+        assert!(object.remove("request_topic").is_some());
+
+        let run: WorkflowRun = serde_json::from_value(raw).unwrap();
+
+        assert_eq!(run.id, "legacy-run");
+        assert_eq!(run.request_topic, None);
+        assert_eq!(run.status, RunStatus::Running);
+    }
+
+    #[test]
+    fn run_summary_list_runs_projects_structured_status_detail_for_every_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let waiting = RunStatus::WaitingForInput {
+            step: "review".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve deployment?".to_string(),
+            choices: vec!["yes".to_string(), "no".to_string()],
+            resume_callback: ResumeCallback::new(
+                "ask_user",
+                serde_json::json!({ "prompt_id": "approval" }),
+            )
+            .unwrap(),
+        };
+        let cases = vec![
+            (
+                "running-run",
+                RunStatus::Running,
+                serde_json::json!({
+                    "state": "running",
+                    "reason": null,
+                    "waiting_step": null,
+                    "prompt_id": null,
+                    "message": null,
+                    "choices": [],
+                }),
+            ),
+            (
+                "completed-run",
+                RunStatus::Completed,
+                serde_json::json!({
+                    "state": "completed",
+                    "reason": null,
+                    "waiting_step": null,
+                    "prompt_id": null,
+                    "message": null,
+                    "choices": [],
+                }),
+            ),
+            (
+                "failed-run",
+                RunStatus::Failed {
+                    reason: "agent exited 2".to_string(),
+                },
+                serde_json::json!({
+                    "state": "failed",
+                    "reason": "agent exited 2",
+                    "waiting_step": null,
+                    "prompt_id": null,
+                    "message": null,
+                    "choices": [],
+                }),
+            ),
+            (
+                "cancelled-run",
+                RunStatus::Cancelled,
+                serde_json::json!({
+                    "state": "cancelled",
+                    "reason": null,
+                    "waiting_step": null,
+                    "prompt_id": null,
+                    "message": null,
+                    "choices": [],
+                }),
+            ),
+            (
+                "waiting-run",
+                waiting,
+                serde_json::json!({
+                    "state": "waiting_for_input",
+                    "reason": null,
+                    "waiting_step": "review",
+                    "prompt_id": "approval",
+                    "message": "Approve deployment?",
+                    "choices": ["yes", "no"],
+                }),
+            ),
+        ];
+        for (run_id, status, _) in &cases {
+            let run = summary_test_run(run_id, status.clone(), None);
+            store.save_run(&run).unwrap();
+            store.update_run_head(&run.id, run_head(&run)).unwrap();
+        }
+
+        let summaries = runtime.list_runs().unwrap();
+
+        for (run_id, _, expected_detail) in cases {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary.run_id == run_id)
+                .unwrap_or_else(|| panic!("missing summary for {run_id}"));
+            assert_eq!(
+                serde_json::to_value(&summary.status_detail).unwrap(),
+                expected_detail,
+                "{run_id}"
+            );
+            let rendered_detail = serde_json::to_string(&summary.status_detail).unwrap();
+            for debug_fragment in ["WaitingForInput {", "Failed {", "resume_callback"] {
+                assert!(
+                    !rendered_detail.contains(debug_fragment),
+                    "{run_id} rendered status detail with Rust Debug fragment {debug_fragment:?}: {rendered_detail}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_summary_start_run_persists_generated_topic_on_run_and_list_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Persisted generated topic");
+
+        let report = runtime.start_run("add a health endpoint").await.unwrap();
+        let run_id = report.run.id.clone();
+
+        assert_eq!(
+            report.run.request_topic.as_deref(),
+            Some("Persisted generated topic")
+        );
+        let persisted = runtime.load_run(&run_id).unwrap();
+        assert_eq!(
+            persisted.request_topic.as_deref(),
+            Some("Persisted generated topic")
+        );
+        runtime.persist_events(&run_id, &[]).unwrap();
+        let summary = runtime
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.run_id == run_id)
+            .expect("run summary");
+        assert_eq!(summary.topic.as_deref(), Some("Persisted generated topic"));
+    }
+
+    #[test]
+    fn run_summary_list_runs_backfills_topic_from_persisted_run_started_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let run = summary_test_run("legacy-event-run", RunStatus::Completed, None);
+        let run_id = run.id.clone();
+        let store = runtime.store().unwrap();
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        runtime
+            .persist_events(
+                &run.id,
+                &[WorkflowEvent::run_started_with_topic(
+                    &run,
+                    Some("Recovered event topic".to_string()),
+                )],
+            )
+            .unwrap();
+
+        let summary = runtime
+            .list_runs()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.run_id == run_id)
+            .expect("run summary");
+
+        assert_eq!(summary.topic.as_deref(), Some("Recovered event topic"));
+        assert_eq!(runtime.load_run(&run_id).unwrap().request_topic, None);
+    }
+
     #[tokio::test]
     async fn start_run_attaches_generated_topic_to_runner_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -1227,10 +1575,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_topic_workflow(&dir, "Plan implementation");
 
-        let report = runtime.start_run_stepwise("plan implementation").await.unwrap();
+        let report = runtime
+            .start_run_stepwise("plan implementation")
+            .await
+            .unwrap();
 
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(first_run_started_topic(&report), Some("Plan implementation"));
+        assert_eq!(
+            first_run_started_topic(&report),
+            Some("Plan implementation")
+        );
     }
 
     #[tokio::test]
@@ -1273,7 +1627,10 @@ mod tests {
         assert_eq!(first_run_started_topic(&report), None);
         assert!(report.events.iter().any(|event| matches!(
             &event.kind,
-            WorkflowEventKind::RunStarted { request_topic: None, .. }
+            WorkflowEventKind::RunStarted {
+                request_topic: None,
+                ..
+            }
         )));
     }
 
@@ -1422,10 +1779,17 @@ mod tests {
         assert_eq!(output.fields["prev_status"], "planned");
         assert_eq!(output.fields["summary"], "did the thing");
         assert_eq!(output.body, "manual body");
-        assert!(report.events.iter().any(|event| matches!(
-            &event.kind,
-            WorkflowEventKind::RunStarted { request_topic: None, .. }
-        )), "{:#?}", report.events);
+        assert!(
+            report.events.iter().any(|event| matches!(
+                &event.kind,
+                WorkflowEventKind::RunStarted {
+                    request_topic: None,
+                    ..
+                }
+            )),
+            "{:#?}",
+            report.events
+        );
 
         // A ManuallyResolved event is persisted in the run's event log.
         let events = runtime.load_events(&run_id).unwrap();
@@ -1921,7 +2285,10 @@ mod tests {
             RunStatus::WaitingForInput { .. }
         ));
         let steps_before_answer = start.run.steps_executed;
-        assert_eq!(first_run_started_topic(&start), Some("Initial prompt topic"));
+        assert_eq!(
+            first_run_started_topic(&start),
+            Some("Initial prompt topic")
+        );
         let report = runtime
             .answer_run(&start.run.id, "approval", "yes")
             .await
@@ -1950,10 +2317,17 @@ mod tests {
             "{:#?}",
             report.events
         );
-        assert!(report.events.iter().any(|event| matches!(
-            &event.kind,
-            WorkflowEventKind::RunStarted { request_topic: None, .. }
-        )), "{:#?}", report.events);
+        assert!(
+            report.events.iter().any(|event| matches!(
+                &event.kind,
+                WorkflowEventKind::RunStarted {
+                    request_topic: None,
+                    ..
+                }
+            )),
+            "{:#?}",
+            report.events
+        );
 
         let persisted = runtime.load_events(&report.run.id).unwrap();
         assert_eq!(persisted, report.events);
@@ -2726,6 +3100,7 @@ mod tests {
                 ),
             ]),
             original_request: "do it".to_string(),
+            request_topic: None,
             status: RunStatus::Running,
             current_step: "start".to_string(),
             head: None,

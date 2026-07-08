@@ -23,6 +23,9 @@ pub struct WorkflowRun {
     pub workflow_sources: BTreeMap<String, String>,
     /// Original user request that started the run.
     pub original_request: String,
+    /// Short generated topic shown in run listings when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_topic: Option<String>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
     /// Step id that should run next when the run resumes.

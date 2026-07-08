@@ -395,6 +395,7 @@ mod tests {
             workflow_hash: "hash".into(),
             workflow_sources: Default::default(),
             original_request: "do it".into(),
+            request_topic: None,
             status: RunStatus::Running,
             current_step: "step-1".into(),
             head: None,

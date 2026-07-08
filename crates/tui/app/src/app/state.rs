@@ -590,7 +590,8 @@ impl AppState {
                         self.current_topic_run_id = Some(event.run_id.clone());
                         self.current_run_topic = Some(topic.clone());
                     }
-                    None if self.current_topic_run_id.as_deref() == Some(event.run_id.as_str()) => {}
+                    None if self.current_topic_run_id.as_deref() == Some(event.run_id.as_str()) => {
+                    }
                     None => {
                         self.current_topic_run_id = None;
                         self.current_run_topic = None;
@@ -1042,10 +1043,7 @@ mod tests {
                 request_topic: Some("Review changes".to_string()),
             },
         ));
-        state.apply_workflow_event(WorkflowEvent::new(
-            "run-2",
-            WorkflowEventKind::RunCompleted,
-        ));
+        state.apply_workflow_event(WorkflowEvent::new("run-2", WorkflowEventKind::RunCompleted));
         assert_eq!(state.current_run_topic(), Some("Review changes"));
     }
 

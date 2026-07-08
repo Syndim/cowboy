@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod config;
+pub mod run_summary;
 
 pub use app::run_tui;
 pub use config::{AppConfig, default_config_path, load_config};

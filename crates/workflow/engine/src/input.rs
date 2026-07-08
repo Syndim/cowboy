@@ -94,6 +94,7 @@ mod tests {
             workflow_hash: "hash".to_string(),
             workflow_sources: BTreeMap::new(),
             original_request: "do it".to_string(),
+            request_topic: None,
             status: RunStatus::WaitingForInput {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),

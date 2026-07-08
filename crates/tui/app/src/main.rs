@@ -99,14 +99,9 @@ async fn run_shared_command(
         }
         SharedCommand::Runs => {
             for run in runtime.list_runs()? {
-                println!(
-                    "{} workflow={} status={:?} step={} head={}",
-                    run.run_id,
-                    run.workflow_name,
-                    run.status,
-                    run.current_step,
-                    run.head_step.as_deref().unwrap_or("<none>")
-                );
+                for line in cowboy::run_summary::render_run_summary_lines(&run) {
+                    println!("{line}");
+                }
             }
             Ok(())
         }

@@ -27,3 +27,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+cowboy-workflow-core.workspace = true
+cowboy-workflow-store.workspace = true

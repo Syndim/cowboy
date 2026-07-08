@@ -8,7 +8,6 @@ use super::super::state::AppState;
 use super::super::styles::style_for_run_state;
 use super::chrome::truncate_to_display_width;
 
-
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     frame.render_widget(Paragraph::new(line(state, area.width)), area);
 }
@@ -60,7 +59,19 @@ mod tests {
     }
 
     fn assert_no_metadata_text(header: &str) {
-        for metadata in ["●", "○", "◔", "↳", "▶", "⎇", "◷", "step:", "run:", "workflow:", "tasks:"] {
+        for metadata in [
+            "●",
+            "○",
+            "◔",
+            "↳",
+            "▶",
+            "⎇",
+            "◷",
+            "step:",
+            "run:",
+            "workflow:",
+            "tasks:",
+        ] {
             assert!(!header.contains(metadata), "{metadata} leaked in {header}");
         }
     }
@@ -97,11 +108,13 @@ mod tests {
         assert_no_metadata_text(&header);
     }
 
-
     #[test]
     fn header_truncates_long_topic() {
         let mut state = test_state();
-        apply_started_run(&mut state, Some("Add a health check route with detailed diagnostics"));
+        apply_started_run(
+            &mut state,
+            Some("Add a health check route with detailed diagnostics"),
+        );
 
         let header = text(&state, 24);
 

@@ -701,9 +701,15 @@ mod tests {
         let client = generator.client.lock().await;
         assert_eq!(client.prompts.len(), 1);
         let prompt = &client.prompts[0];
-        assert!(prompt.contains("Create a compact title-bar topic"), "{prompt}");
+        assert!(
+            prompt.contains("Create a compact title-bar topic"),
+            "{prompt}"
+        );
         assert!(prompt.contains("do NOT run tools"), "{prompt}");
-        assert!(prompt.contains("Respond with ONLY a single JSON object"), "{prompt}");
+        assert!(
+            prompt.contains("Respond with ONLY a single JSON object"),
+            "{prompt}"
+        );
         assert!(prompt.contains(r#"{"topic": "<short topic>"}"#), "{prompt}");
         assert!(prompt.contains("Add compact UI chrome"), "{prompt}");
     }
@@ -712,7 +718,10 @@ mod tests {
     fn request_topic_response_rejects_invalid_title_bar_topics() {
         for (raw, expected) in [
             (r#"{"topic":"   "}"#, "request topic is empty"),
-            (r#"{"topic":"first\nsecond"}"#, "request topic must be a single line"),
+            (
+                r#"{"topic":"first\nsecond"}"#,
+                "request topic must be a single line",
+            ),
             (
                 r#"{"topic":"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabc"}"#,
                 "request topic must be at most 80 characters",
@@ -761,15 +770,15 @@ mod tests {
 
     #[tokio::test]
     async fn request_topic_generator_rejects_invalid_json() {
-        let generator = AgentRequestTopicGenerator::new(
-            FakeClient::new("not json"),
-            ".",
-            ModelInfo::default(),
-        );
+        let generator =
+            AgentRequestTopicGenerator::new(FakeClient::new("not json"), ".", ModelInfo::default());
 
         let err = generator.generate("fix it").await.unwrap_err();
 
-        assert!(err.to_string().contains("request topic response missing JSON"));
+        assert!(
+            err.to_string()
+                .contains("request topic response missing JSON")
+        );
     }
 
     #[test]
@@ -799,6 +808,7 @@ mod tests {
             workflow_hash: "hash".to_string(),
             workflow_sources: BTreeMap::new(),
             original_request: "do it".to_string(),
+            request_topic: None,
             status: RunStatus::Completed,
             current_step: "finish".to_string(),
             head: None,

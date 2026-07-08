@@ -386,7 +386,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(with_topic["request_topic"], "Add health route");
-        assert!(without_topic.get("request_topic").is_none(), "{without_topic}");
+        assert!(
+            without_topic.get("request_topic").is_none(),
+            "{without_topic}"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::run_summary::render_run_summary_lines;
 use anyhow::Result;
 use cowboy_command_parser::{
     SharedCommand, SlashCommand, SlashParseError, parse_slash_command, slash_command_usage,
@@ -356,10 +357,7 @@ fn show_runs(state: &mut AppState, runtime: &WorkflowRuntime) -> Result<()> {
     state.set_status(format!("{} run(s)", runs.len()));
     let mut details = vec![format!("known runs: {}", runs.len())];
     for run in runs {
-        details.push(run.run_id);
-        details.push(format!("  workflow: {}", run.workflow_name));
-        details.push(format!("  status: {:?}", run.status));
-        details.push(format!("  step: {}", run.current_step));
+        details.extend(render_run_summary_lines(&run));
     }
     state.push_card("Runs", details);
     Ok(())
@@ -369,7 +367,11 @@ fn show_runs(state: &mut AppState, runtime: &WorkflowRuntime) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use chrono::Utc;
+    use cowboy_workflow_core::{ResumeCallback, RunHead, RunStatus, WorkflowRun};
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use cowboy_workflow_store::RedbRunStore;
+    use serde_json::Value;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -397,6 +399,60 @@ mod tests {
         (dir, runtime, state)
     }
 
+    fn rendered_entries(state: &AppState) -> String {
+        state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.plain_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn workflow_run(
+        id: &str,
+        topic: Option<&str>,
+        status: RunStatus,
+        current_step: &str,
+        head: Option<&str>,
+    ) -> WorkflowRun {
+        let now = Utc::now();
+        WorkflowRun {
+            id: id.to_string(),
+            workflow_name: "deploy".to_string(),
+            workflow_api_version: 1,
+            workflow_hash: format!("hash-{id}"),
+            workflow_sources: Default::default(),
+            original_request: format!("request for {id}"),
+            request_topic: topic.map(ToString::to_string),
+            status,
+            current_step: current_step.to_string(),
+            head: head.map(ToString::to_string),
+            resume: Value::Null,
+            steps_executed: 0,
+            step_visits: Default::default(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn seed_run(store: &RedbRunStore, run: WorkflowRun) {
+        let head = RunHead {
+            run_id: run.id.clone(),
+            workflow_hash: run.workflow_hash.clone(),
+            head_step: run.head.clone(),
+            status: run.status.clone(),
+            updated_at: run.updated_at,
+        };
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, head).unwrap();
+    }
+
+    fn assert_rendered_contains(rendered: &str, expected: &str) {
+        assert!(
+            rendered.contains(expected),
+            "rendered /runs card was missing {expected:?}:\n{rendered}"
+        );
+    }
     #[test]
     fn help_uses_generated_slash_command_rows() {
         let mut state = test_state();
@@ -443,6 +499,99 @@ mod tests {
         assert!(rendered.contains("description:"));
         assert!(rendered.contains("entry:"));
         assert!(rendered.contains("root:"));
+    }
+
+    #[test]
+    fn runs_command_renders_structured_runtime_summaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let store = RedbRunStore::create(&config.workflow_store).unwrap();
+        let mut state = AppState::new(config);
+
+        seed_run(
+            &store,
+            workflow_run(
+                "run-completed",
+                Some("Ship deployment"),
+                RunStatus::Completed,
+                "done",
+                Some("record-completed"),
+            ),
+        );
+        seed_run(
+            &store,
+            workflow_run(
+                "run-waiting",
+                Some("Approve release"),
+                RunStatus::WaitingForInput {
+                    step: "approval".to_string(),
+                    prompt_id: "prompt-42".to_string(),
+                    message: "Approve the deployment?".to_string(),
+                    choices: vec!["yes".to_string(), "no".to_string()],
+                    resume_callback: ResumeCallback::new(
+                        "ask_user",
+                        serde_json::json!({ "prompt_id": "prompt-42" }),
+                    )
+                    .unwrap(),
+                },
+                "approval",
+                Some("record-waiting"),
+            ),
+        );
+        seed_run(
+            &store,
+            workflow_run(
+                "run-failed",
+                Some("Diagnose failure"),
+                RunStatus::Failed {
+                    reason: "agent command exited 2".to_string(),
+                },
+                "deploy",
+                Some("record-failed"),
+            ),
+        );
+
+        show_runs(&mut state, &runtime).unwrap();
+
+        assert_eq!(state.status(), "3 run(s)");
+        let rendered = rendered_entries(&state);
+        for expected in [
+            "Runs",
+            "known runs: 3",
+            "run-completed",
+            "topic: Ship deployment",
+            "workflow: deploy",
+            "current_step: done",
+            "head: record-completed",
+            "status: completed",
+            "run-waiting",
+            "topic: Approve release",
+            "status: waiting_for_input",
+            "status.waiting_step: approval",
+            "status.prompt_id: prompt-42",
+            "status.message: Approve the deployment?",
+            "status.choices: yes, no",
+            "run-failed",
+            "topic: Diagnose failure",
+            "status: failed",
+            "status.reason: agent command exited 2",
+        ] {
+            assert_rendered_contains(&rendered, expected);
+        }
+        for debug_fragment in ["WaitingForInput {", "Failed {", "resume_callback:"] {
+            assert!(
+                !rendered.contains(debug_fragment),
+                "rendered /runs card leaked Rust debug fragment {debug_fragment:?}:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -616,10 +765,10 @@ mod tests {
         for (input, expected_status) in [
             ("do work", "submitted run: do work"),
             ("/run do work", "submitted run: do work"),
-            ("/run-step do work", "submitted run-step: do work"),
+            ("/run --step do work", "submitted run --step: do work"),
             (
-                "/run-workflow review do work",
-                "submitted run-workflow review: do work",
+                "/run --workflow review do work",
+                "submitted run --workflow review: do work",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state();
