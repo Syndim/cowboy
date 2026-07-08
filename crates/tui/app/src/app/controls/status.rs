@@ -67,7 +67,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● ─ ↳ implement ─ ▶ 170dc431 ─ ⎇ agent/00-feature"
+            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
         );
         assert!(!rendered.contains("draft allowed"));
         assert!(!rendered.contains("Enter waits for active run"));
@@ -89,7 +89,7 @@ mod tests {
 
         let rendered = rendered_text(&state, 160);
 
-        assert_eq!(rendered, "◔ ─ ↳ confirm ─ ▶ 170dc431 ─ ⎇ agent/00-feature");
+        assert_eq!(rendered, "◔ · ↳ confirm · ▶ 170dc431 · ⎇ agent/00-feature");
         assert!(!rendered.contains("answer prompt"));
     }
 
@@ -106,7 +106,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● ─ ↳ implement ─ ▶ 170dc431 ─ ⎇ agent/00-feature ─ ◷ 1"
+            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature · ◷ 1"
         );
         state.cancel_background_tasks();
     }
@@ -122,7 +122,7 @@ mod tests {
 
         let rendered = rendered_text(&state, 42);
 
-        assert_eq!(rendered, "● ─ ↳ implement ─ ▶ 170dc431");
+        assert_eq!(rendered, "● · ↳ implement · ▶ 170dc431");
         state.cancel_background_tasks();
     }
 }

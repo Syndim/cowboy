@@ -96,11 +96,11 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 
 pub(in crate::app) fn title(state: &AppState) -> String {
     if state.pending_prompt().is_some() {
-        " Enter answers active prompt ─ Shift/Ctrl-Enter newline ".to_string()
+        " Enter answers active prompt · Shift/Ctrl-Enter newline ".to_string()
     } else if !state.composer_accepts_submit() {
-        " Run active ─ type draft, Enter waits ─ Esc cancels ".to_string()
+        " Run active · type draft, Enter waits · Esc cancels ".to_string()
     } else {
-        " Enter submits ─ Shift/Ctrl-Enter newline ─ type / for commands ".to_string()
+        " Enter submits · Shift/Ctrl-Enter newline · type / for commands ".to_string()
     }
 }
 
@@ -490,6 +490,35 @@ mod tests {
         assert!(rendered.contains("No matching command. Try /help."));
     }
 
+    #[test]
+    fn idle_composer_title_uses_middle_dot_and_preserves_key_hyphen() {
+        let state = test_state();
+
+        let title = title(&state);
+
+        assert_eq!(
+            title,
+            " Enter submits · Shift/Ctrl-Enter newline · type / for commands "
+        );
+        assert!(title.contains("Shift/Ctrl-Enter"));
+        assert!(!title.contains(" ─ "));
+    }
+
+    #[test]
+    fn pending_prompt_composer_title_uses_middle_dot_and_preserves_key_hyphen() {
+        let mut state = test_state();
+        apply_waiting_prompt(&mut state);
+
+        let title = title(&state);
+
+        assert_eq!(
+            title,
+            " Enter answers active prompt · Shift/Ctrl-Enter newline "
+        );
+        assert!(title.contains("Shift/Ctrl-Enter"));
+        assert!(!title.contains(" ─ "));
+    }
+
     #[tokio::test]
     async fn active_run_composer_uses_draft_title_and_hides_submit_affordances() {
         let mut state = test_state();
@@ -511,7 +540,7 @@ mod tests {
 
         assert_eq!(
             title(&state),
-            " Run active ─ type draft, Enter waits ─ Esc cancels "
+            " Run active · type draft, Enter waits · Esc cancels "
         );
         assert_eq!(height(&state, 10, 80), 3);
         assert!(rendered.contains("> /"));

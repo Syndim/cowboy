@@ -2,7 +2,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::state::AppState;
 
-const SEPARATOR: &str = " ─ ";
+const SEPARATOR: &str = " · ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MetadataPartKind {

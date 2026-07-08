@@ -794,7 +794,7 @@ mod tests {
             assert_eq!(state.current_run_topic(), Some("Agent supplied topic"));
             assert_eq!(
                 crate::app::header::text(&state, 120),
-                "Cowboy - Agent supplied topic"
+                "Cowboy · Agent supplied topic"
             );
             state.cancel_background_tasks();
         }

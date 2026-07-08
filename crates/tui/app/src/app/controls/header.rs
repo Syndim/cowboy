@@ -21,7 +21,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
 
 pub(in crate::app) fn text(state: &AppState, width: usize) -> String {
     let title = match state.current_run_topic() {
-        Some(topic) => format!("Cowboy - {topic}"),
+        Some(topic) => format!("Cowboy · {topic}"),
         None => "Cowboy".to_string(),
     };
 
@@ -83,7 +83,7 @@ mod tests {
 
         let header = text(&state, 120);
 
-        assert_eq!(header, "Cowboy - Add health route");
+        assert_eq!(header, "Cowboy · Add health route");
         assert_no_metadata_text(&header);
     }
 
@@ -118,7 +118,7 @@ mod tests {
 
         let header = text(&state, 24);
 
-        assert_eq!(header, "Cowboy - Add a health c…");
+        assert_eq!(header, "Cowboy · Add a health c…");
         assert_eq!(unicode_width::UnicodeWidthStr::width(header.as_str()), 24);
     }
 
@@ -133,7 +133,7 @@ mod tests {
 
         let header = text(&state, 120);
 
-        assert_eq!(header, "Cowboy - Background topic");
+        assert_eq!(header, "Cowboy · Background topic");
         assert_no_metadata_text(&header);
         state.cancel_background_tasks();
     }
@@ -145,7 +145,7 @@ mod tests {
 
         let header = text(&state, 16);
 
-        assert_eq!(header, "Cowboy - 重要任…");
+        assert_eq!(header, "Cowboy · 重要任…");
         assert_eq!(unicode_width::UnicodeWidthStr::width(header.as_str()), 16);
     }
 }

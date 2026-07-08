@@ -435,7 +435,7 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
         .unwrap_or_else(|| panic!("{rendered}"));
     assert!(title_row.contains("type draft"), "{rendered}");
     assert!(!title_row.contains("input disabled"), "{rendered}");
-    assert!(rendered.contains("● ─ ◷ 1"), "{rendered}");
+    assert!(rendered.contains("● · ◷ 1"), "{rendered}");
     assert!(!rendered.contains("draft allowed"), "{rendered}");
     assert!(
         !rendered.contains("Enter waits for active run"),
