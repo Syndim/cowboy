@@ -1,5 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
@@ -9,7 +10,7 @@ const CONTINUATION_PROMPT: &str = "  ";
 const PROMPT_WIDTH: usize = 2;
 
 use super::super::state::AppState;
-use super::super::styles::{style_accent, style_border_accent, style_muted};
+use super::super::styles::{style_accent, style_border_accent, style_muted, style_warning};
 use cowboy_command_parser::{slash_query, slash_suggestions};
 
 const MAX_SLASH_SUGGESTIONS: usize = 6;
@@ -47,15 +48,45 @@ fn slash_suggestion_line_count(input: &str) -> usize {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerVisualState {
+    Initial,
+    SubmitDisabled,
+    WaitingForInput,
+}
+
+fn composer_visual_state(state: &AppState) -> ComposerVisualState {
+    if state.pending_prompt().is_some() {
+        ComposerVisualState::WaitingForInput
+    } else if !state.composer_accepts_submit() {
+        ComposerVisualState::SubmitDisabled
+    } else {
+        ComposerVisualState::Initial
+    }
+}
+
+fn composer_style_for_state(visual_state: ComposerVisualState) -> Style {
+    match visual_state {
+        ComposerVisualState::Initial => style_border_accent(),
+        ComposerVisualState::SubmitDisabled => style_muted(),
+        ComposerVisualState::WaitingForInput => style_warning(),
+    }
+}
+
+fn composer_style(state: &AppState) -> Style {
+    composer_style_for_state(composer_visual_state(state))
+}
+
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let visible_height = area.height.saturating_sub(2) as usize;
     let content_width = input_content_width(area.width);
     let rendered = rendered_input(state, visible_height, content_width);
+    let style = composer_style(state);
     let composer = Paragraph::new(lines_from_rendered(state, visible_height, &rendered)).block(
         Block::default()
-            .title(title(state))
+            .title(Line::styled(title(state), style))
             .borders(Borders::ALL)
-            .border_style(style_border_accent()),
+            .border_style(style),
     );
     frame.render_widget(composer, area);
     if state.composer_accepts_edits() {
@@ -332,6 +363,7 @@ mod tests {
     use super::*;
     use crate::app::state::AppState;
     use crate::config::AppConfig;
+    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -351,6 +383,50 @@ mod tests {
         });
         assert!(state.composer_accepts_edits());
         assert!(!state.composer_accepts_submit());
+    }
+
+    fn apply_waiting_prompt(state: &mut AppState) {
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm_result".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: Vec::new(),
+            },
+        ));
+        assert!(state.pending_prompt().is_some());
+    }
+
+    #[test]
+    fn idle_composer_style_uses_border_accent() {
+        let state = test_state();
+
+        assert!(state.composer_accepts_submit());
+        assert_eq!(composer_style(&state).fg, style_border_accent().fg);
+    }
+
+    #[tokio::test]
+    async fn active_background_run_without_prompt_uses_muted_style() {
+        let mut state = test_state();
+        lock_composer_with_pending_task(&mut state);
+
+        assert!(state.pending_prompt().is_none());
+        assert_eq!(composer_style(&state).fg, style_muted().fg);
+
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn pending_prompt_uses_warning_style_and_wins_over_active_background_task() {
+        let mut state = test_state();
+        lock_composer_with_pending_task(&mut state);
+        apply_waiting_prompt(&mut state);
+
+        assert_eq!(state.background_task_count(), 1);
+        assert_eq!(composer_style(&state).fg, style_warning().fg);
+
+        state.cancel_background_tasks();
     }
 
     #[test]

@@ -4,7 +4,9 @@ use ratatui::layout::Position;
 
 use super::state::AppState;
 use super::*;
-use crate::app::styles::style_transcript_thought;
+use crate::app::styles::{
+    style_border_accent, style_muted, style_transcript_thought, style_warning,
+};
 use crate::config::AppConfig;
 
 fn test_state() -> AppState {
@@ -44,6 +46,34 @@ fn rendered_rows(state: &AppState, width: u16, height: u16) -> Vec<String> {
         .chunks(width)
         .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
         .collect()
+}
+
+fn composer_border_fg_for_title(
+    state: &AppState,
+    width: u16,
+    height: u16,
+    title_marker: &str,
+) -> ratatui::style::Color {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, state)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let width = buffer.area.width as usize;
+    let mut rendered_rows = Vec::new();
+
+    for row in buffer.content.chunks(width) {
+        let text = row.iter().map(|cell| cell.symbol()).collect::<String>();
+        if text.contains(title_marker) {
+            assert_eq!(row[0].symbol(), "┌", "{text}");
+            return row[0].fg;
+        }
+        rendered_rows.push(text);
+    }
+
+    panic!(
+        "composer title containing `{title_marker}` not found in rendered buffer:\n{}",
+        rendered_rows.join("\n")
+    );
 }
 
 #[test]
@@ -425,6 +455,41 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
         "{rendered}"
     );
     assert!(!rendered.contains("/resume <run-id>"), "{rendered}");
+    state.cancel_background_tasks();
+}
+
+#[tokio::test]
+async fn draw_composer_border_color_tracks_visual_state() {
+    let mut state = test_state();
+
+    assert_eq!(
+        composer_border_fg_for_title(&state, 100, 14, "Enter submits"),
+        style_border_accent().fg.unwrap()
+    );
+
+    state.spawn_report_task("pending".to_string(), async {
+        std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+            .await
+    });
+    assert_eq!(
+        composer_border_fg_for_title(&state, 100, 14, "Run active"),
+        style_muted().fg.unwrap()
+    );
+
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::WaitingForInput {
+            step: "confirm_result".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve?".to_string(),
+            choices: Vec::new(),
+        },
+    ));
+    assert_eq!(
+        composer_border_fg_for_title(&state, 100, 14, "Enter answers active prompt"),
+        style_warning().fg.unwrap()
+    );
+
     state.cancel_background_tasks();
 }
 
