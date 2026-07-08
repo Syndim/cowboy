@@ -355,11 +355,14 @@ pub(in crate::app) fn show_workflows(
 fn show_runs(state: &mut AppState, runtime: &WorkflowRuntime) -> Result<()> {
     let runs = runtime.list_runs()?;
     state.set_status(format!("{} run(s)", runs.len()));
-    let mut details = vec![format!("known runs: {}", runs.len())];
-    for run in runs {
-        details.extend(render_run_summary_lines(&run));
+    if runs.is_empty() {
+        state.push_card("Runs", ["known runs: 0".to_string()]);
+    } else {
+        for run in runs {
+            state.push_card("Run", render_run_summary_lines(&run));
+        }
     }
-    state.push_card("Runs", details);
+
     Ok(())
 }
 
@@ -563,36 +566,117 @@ mod tests {
         show_runs(&mut state, &runtime).unwrap();
 
         assert_eq!(state.status(), "3 run(s)");
-        let rendered = rendered_entries(&state);
+        let run_cards = state
+            .event_entries()
+            .iter()
+            .map(|entry| entry.plain_text())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            run_cards.len(),
+            3,
+            "expected one card per run: {run_cards:#?}"
+        );
+
+        let completed_card = run_cards
+            .iter()
+            .find(|card| card.contains("run-completed"))
+            .map(String::as_str)
+            .expect("completed run card missing");
+        let waiting_card = run_cards
+            .iter()
+            .find(|card| card.contains("run-waiting"))
+            .map(String::as_str)
+            .expect("waiting run card missing");
+        let failed_card = run_cards
+            .iter()
+            .find(|card| card.contains("run-failed"))
+            .map(String::as_str)
+            .expect("failed run card missing");
+
         for expected in [
-            "Runs",
-            "known runs: 3",
             "run-completed",
             "topic: Ship deployment",
             "workflow: deploy",
             "current_step: done",
             "head: record-completed",
             "status: completed",
+        ] {
+            assert_rendered_contains(completed_card, expected);
+        }
+
+        for unexpected in ["run-waiting", "run-failed"] {
+            assert!(
+                !completed_card.contains(unexpected),
+                "completed card leaked {unexpected:?}:\n{completed_card}"
+            );
+        }
+
+        for expected in [
             "run-waiting",
             "topic: Approve release",
+            "workflow: deploy",
+            "current_step: approval",
+            "head: record-waiting",
             "status: waiting_for_input",
             "status.waiting_step: approval",
             "status.prompt_id: prompt-42",
             "status.message: Approve the deployment?",
             "status.choices: yes, no",
+        ] {
+            assert_rendered_contains(waiting_card, expected);
+        }
+
+        for unexpected in ["run-completed", "run-failed"] {
+            assert!(
+                !waiting_card.contains(unexpected),
+                "waiting card leaked {unexpected:?}:\n{waiting_card}"
+            );
+        }
+
+        for expected in [
             "run-failed",
             "topic: Diagnose failure",
+            "workflow: deploy",
+            "current_step: deploy",
+            "head: record-failed",
             "status: failed",
             "status.reason: agent command exited 2",
         ] {
-            assert_rendered_contains(&rendered, expected);
+            assert_rendered_contains(failed_card, expected);
         }
-        for debug_fragment in ["WaitingForInput {", "Failed {", "resume_callback:"] {
+
+        for unexpected in ["run-completed", "run-waiting"] {
             assert!(
-                !rendered.contains(debug_fragment),
-                "rendered /runs card leaked Rust debug fragment {debug_fragment:?}:\n{rendered}"
+                !failed_card.contains(unexpected),
+                "failed card leaked {unexpected:?}:\n{failed_card}"
             );
         }
+
+        for card in [completed_card, waiting_card, failed_card] {
+            for debug_fragment in ["WaitingForInput {", "Failed {", "resume_callback:"] {
+                assert!(
+                    !card.contains(debug_fragment),
+                    "rendered /runs card leaked Rust debug fragment {debug_fragment:?}:\n{card}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runs_command_renders_empty_state_card() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+
+        show_runs(&mut state, &runtime).unwrap();
+
+        assert_eq!(state.status(), "0 run(s)");
+        assert_eq!(state.event_entries().len(), 1);
+        let rendered = rendered_entries(&state);
+        assert_rendered_contains(&rendered, "Runs");
+        assert_rendered_contains(&rendered, "known runs: 0");
+        assert!(
+            !rendered.contains("run-"),
+            "empty runs card should not render a per-run card:\n{rendered}"
+        );
     }
 
     #[test]

@@ -155,7 +155,7 @@ fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
         "Cancelled" => (status_icon("cancelled"), CardTone::Error),
         "Notice" => (status_icon("waiting"), CardTone::Warning),
         "Exit" | "Improve" | "Resolve" => (status_icon("completed"), CardTone::Success),
-        "Usage" | "Help" | "Workflows" | "Runs" | "Transcript" => {
+        "Usage" | "Help" | "Workflows" | "Runs" | "Run" | "Transcript" => {
             (status_icon("idle"), CardTone::Neutral)
         }
         _ => (status_icon("idle"), CardTone::Accent),
