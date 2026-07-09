@@ -152,7 +152,7 @@ impl Card {
     }
 
     pub(super) fn render(&self, width: usize) -> Vec<Line<'static>> {
-        let width = width.clamp(MIN_CARD_WIDTH, DEFAULT_CARD_WIDTH);
+        let width = width.max(MIN_CARD_WIDTH);
         let interior_width = width.saturating_sub(2);
         let rendered_sections = self
             .sections
@@ -402,6 +402,19 @@ mod tests {
         assert!(!text.contains("run="), "{text}");
         assert!(!text.contains("workflow="), "{text}");
         assert!(!text.contains("tasks="), "{text}");
+    }
+
+    #[test]
+    fn wide_cards_expand_to_available_width() {
+        let rows = Card::new("●", "Wide card", CardTone::Accent)
+            .section(CardSection::body(vec![Line::from("content")]))
+            .render(120);
+
+        let border_width = UnicodeWidthStr::width(rows[1].to_string().as_str());
+        assert_eq!(
+            border_width, 120,
+            "card border should consume the available transcript width"
+        );
     }
 
     #[test]
