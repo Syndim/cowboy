@@ -4,7 +4,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use super::{StdioConfig, Transport};
 
-/// Stdio Transport — 本地 subprocess，直接 JSON-RPC over stdin/stdout
+/// Stdio transport: a local subprocess using direct JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
     writer: BufWriter<ChildStdin>,
     reader: Lines<BufReader<ChildStdout>>,

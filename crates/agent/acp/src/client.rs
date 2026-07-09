@@ -7,22 +7,22 @@ use super::messages::*;
 use super::transport::{Transport, TransportConfig};
 use async_trait::async_trait;
 
-/// ACP 客户端 — 管理与单个 Agent 的 JSON-RPC 通信（通过 Transport 抽象层）
+/// ACP client — manages JSON-RPC communication with a single agent through the Transport abstraction.
 ///
-/// Orchestrator 作为 ACP Client，每个 Agent subprocess 是 ACP Server。
-/// 通信基于 JSON-RPC 2.0，通过 Transport trait 抽象底层 I/O。
+/// The orchestrator acts as the ACP client; each agent subprocess is an ACP server.
+/// Communication uses JSON-RPC 2.0, with the Transport trait abstracting the underlying I/O.
 #[derive(Serialize, Deserialize)]
 pub struct Client {
-    /// 底层传输层（stdio / Zellij 等）
+    /// Underlying transport (stdio, Zellij, etc.)
     #[serde(skip)]
     transport: Option<Box<dyn Transport>>,
     /// Transport config for reconnecting after deserialization
     transport_config: TransportConfig,
-    /// JSON-RPC request ID 计数器（单调递增）
+    /// JSON-RPC request ID counter (monotonically increasing)
     next_id: u64,
-    /// Agent 声明的能力（从 initialize 响应获取）
+    /// Capabilities advertised by the agent (from the initialize response)
     pub agent_capabilities: Option<Value>,
-    /// Agent 信息（名称、版本等）
+    /// Agent information (name, version, etc.)
     pub agent_info: Option<AgentInfo>,
     /// Current ACP session ID (set by new_session / load_session)
     session_id: Option<String>,
@@ -286,9 +286,7 @@ impl Client {
         }
     }
 
-    /// 通过 TransportConfig 连接 Agent 并完成 ACP 初始化握手
-    ///
-    /// Creates the transport from config, then runs the ACP initialize handshake.
+    /// Connect to the agent with TransportConfig and complete the ACP initialize handshake.
     pub async fn connect(transport_config: TransportConfig) -> anyhow::Result<Self> {
         let transport = Self::create_transport(&transport_config, None).await?;
         Self::connect_with_transport(transport, transport_config).await
@@ -318,11 +316,11 @@ impl Client {
         self.transport.is_some()
     }
 
-    /// 创建新 ACP Session
+    /// Create a new ACP session.
     ///
-    /// 通过 ACP 扩展字段 `_meta` 传递模型配置给 Agent。
-    /// 支持 ACP 的 Agent 会从 `_meta.model` 读取模型设置。
-    /// 不支持的 Agent 会忽略 `_meta` 字段（符合 ACP 规范）。
+    /// Passes model configuration to the agent through the ACP `_meta` extension field.
+    /// ACP-aware agents read model settings from `_meta.model`.
+    /// Agents that do not support it ignore the `_meta` field, as allowed by the ACP spec.
     pub async fn new_session(
         &mut self,
         cwd: &str,
@@ -364,11 +362,11 @@ impl Client {
         self.session_id.as_deref()
     }
 
-    /// 发送 prompt 并收集所有 session/update 直到 turn 结束
+    /// Send a prompt and collect all session/update events until the turn ends.
     ///
-    /// 收集 streaming 的 session/update 通知并交给 event_handler 处理。
-    /// 自动授予 Agent 的 permission 请求（Executor/Reviewer 都有完整权限）。
-    /// 当收到匹配的 JSON-RPC response 时，提取 stopReason 并返回。
+    /// Collects streaming session/update notifications and forwards them to event_handler.
+    /// Automatically grants agent permission requests; executor and reviewer roles both have full permissions.
+    /// When the matching JSON-RPC response arrives, extracts and returns stopReason.
     ///
     /// Per the ACP spec, `end_turn` means the agent finished its response for
     /// this turn. Some agents split exploration (tool calls + thinking) and
@@ -577,7 +575,7 @@ impl Client {
         saw_text
     }
 
-    /// 检查 Agent 是否支持 session/load（从 initialize 时的 agentCapabilities 判断）
+    /// Check whether the agent supports session/load, based on agentCapabilities from initialize.
     pub fn supports_load_session(&self) -> bool {
         self.agent_capabilities
             .as_ref()
@@ -586,10 +584,10 @@ impl Client {
             .unwrap_or(false)
     }
 
-    /// 恢复已有 Session（ACP session/load）
+    /// Resume an existing session with ACP session/load.
     ///
-    /// Agent 通过 session/update 通知回放完整对话历史，
-    /// 收到 result 后即可继续发送 session/prompt。
+    /// The agent replays the full conversation history through session/update notifications;
+    /// once the result arrives, session/prompt can continue.
     pub async fn load_session(
         &mut self,
         session_id: &str,
@@ -641,12 +639,12 @@ impl Client {
                     );
                     return Ok(history);
                 }
-                _ => {} // 忽略 session/load 回放期间的非匹配消息
+                _ => {} // Ignore non-matching messages during session/load replay.
             }
         }
     }
 
-    /// 发送 JSON-RPC request 并等待 response
+    /// Send a JSON-RPC request and wait for its response.
     async fn send_request<P: Serialize>(
         &mut self,
         method: &'static str,
@@ -667,12 +665,12 @@ impl Client {
                     }
                     return Ok(result.unwrap_or(Value::Null));
                 }
-                _ => {} // 跳过初始化期间的非匹配消息
+                _ => {} // Skip non-matching messages while waiting for this response.
             }
         }
     }
 
-    /// 发送 JSON-RPC request 但不等待 response（返回 request id）
+    /// Send a JSON-RPC request without waiting for a response, returning the request ID.
     async fn send_request_no_wait<P: Serialize>(
         &mut self,
         method: &'static str,
@@ -687,7 +685,7 @@ impl Client {
         Ok(id)
     }
 
-    /// 发送 JSON-RPC response（回复 Agent 的 request，如 permission）
+    /// Send a JSON-RPC response to an agent request, such as a permission request.
     async fn send_rpc_response<R: Serialize>(&mut self, id: u64, result: R) -> anyhow::Result<()> {
         let response = JsonRpcResponse::new(id, result);
         let line = serde_json::to_string(&response)?;
@@ -696,10 +694,10 @@ impl Client {
         Ok(())
     }
 
-    /// 从 Transport 接收并解析下一条 ACP 消息
+    /// Receive and parse the next ACP message from the transport.
     ///
-    /// 持续读取直到得到一条可解析的 ACP 消息。
-    /// 跳过空行和无法识别的消息格式。
+    /// Keeps reading until it gets one parseable ACP message.
+    /// Skips empty lines and unrecognized message formats.
     async fn recv_message(&mut self) -> anyhow::Result<Message> {
         loop {
             // Check pushback buffer first
@@ -762,7 +760,7 @@ impl Client {
         }
     }
 
-    /// 关闭连接
+    /// Close the connection.
     pub async fn close(&mut self) -> anyhow::Result<()> {
         tracing::debug!(
             transport = transport_kind(&self.transport_config),
@@ -829,7 +827,7 @@ impl cowboy_agent_client::Client for Client {
     }
 }
 
-/// Orchestrator 在 ACP initialize 时声明的 Client Capabilities
+/// Client capabilities declared by the orchestrator during ACP initialize.
 ///
 /// Cowboy currently observes agent tool progress via `session/update`, but it does
 /// not implement ACP's inbound `fs/*` or `terminal/*` client methods. Do not

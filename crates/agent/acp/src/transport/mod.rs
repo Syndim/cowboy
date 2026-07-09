@@ -4,14 +4,14 @@ pub mod zellij;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-/// ACP 传输层 — 抽象底层 I/O 通道
+/// ACP transport layer, abstracting the underlying I/O channel.
 #[async_trait]
 pub trait Transport: Send + Sync {
-    /// 发送一行 JSON-RPC 消息
+    /// Send one JSON-RPC message line.
     async fn send(&mut self, message: &str) -> anyhow::Result<()>;
-    /// 接收下一行消息（阻塞直到可用）
+    /// Receive the next message line, blocking until one is available.
     async fn recv(&mut self) -> anyhow::Result<Option<String>>;
-    /// 关闭连接
+    /// Close the connection.
     async fn close(&mut self) -> anyhow::Result<()>;
 }
 
@@ -38,14 +38,14 @@ pub struct ZellijConfig {
     pub env: Vec<(String, String)>,
 }
 
-/// 传输方式配置
+/// Transport configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TransportConfig {
-    /// 本地 subprocess — 直接 JSON-RPC over stdio
+    /// Local subprocess with direct JSON-RPC over stdio.
     #[serde(rename = "stdio")]
     Stdio(StdioConfig),
-    /// 远程 Agent via Zellij — ACP over Zellij Web Remote Attach
+    /// Remote agent via Zellij, using ACP over Zellij Web Remote Attach.
     #[serde(rename = "zellij")]
     Zellij(ZellijConfig),
     /// Mock transport for testing

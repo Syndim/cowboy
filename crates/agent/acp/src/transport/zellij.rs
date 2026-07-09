@@ -1,10 +1,10 @@
-//! ZellijTransport — 通过 Zellij 终端多路复用器与远程 Agent 通信
+//! ZellijTransport: communicates with a remote agent through the Zellij terminal multiplexer.
 //!
-//! 通信流程：
-//! 1. attach 到 Zellij session（本地或远程）
-//! 2. 创建 pane 运行 Agent 命令
-//! 3. 发送：zellij action write-chars → Agent stdin
-//! 4. 接收：zellij action dump-screen → 解析 Agent stdout 中的 JSON-RPC
+//! Communication flow:
+//! 1. Attach to a Zellij session, local or remote.
+//! 2. Create a pane that runs the agent command.
+//! 3. Send input with `zellij action write-chars` to the agent stdin.
+//! 4. Receive output with `zellij action dump-screen`, then parse JSON-RPC from the agent stdout.
 
 use std::collections::VecDeque;
 
@@ -21,14 +21,14 @@ impl std::fmt::Debug for ZellijTransport {
     }
 }
 
-/// ZellijTransport — Zellij pane I/O 传输
+/// ZellijTransport: Zellij pane I/O transport.
 pub struct ZellijTransport {
     session: String,
     pane_id: String,
     zellij_command: String,
-    /// 已接收但未消费的 JSON-RPC 消息缓冲
+    /// Received JSON-RPC messages that have not been consumed yet.
     message_buffer: VecDeque<String>,
-    /// 上次 dump-screen 已处理的行数（避免重复解析）
+    /// Number of dump-screen lines already processed, used to avoid duplicate parsing.
     last_seen_line: usize,
 }
 
