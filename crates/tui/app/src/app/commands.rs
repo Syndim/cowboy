@@ -160,7 +160,7 @@ fn spawn_start_run_from_args(
 
 fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
     let runtime = runtime.clone();
-    state.spawn_report_task(format!("submitted run: {request}"), async move {
+    state.spawn_card_report_task("Run", format!("submitted run: {request}"), async move {
         runtime
             .start_run(request)
             .await
@@ -457,6 +457,23 @@ mod tests {
             "rendered /runs card was missing {expected:?}:\n{rendered}"
         );
     }
+
+    #[tokio::test]
+    async fn plain_request_submission_renders_initial_input_as_card() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+        state.push_input("build health route");
+
+        submit_input(&mut state, &runtime).await;
+
+        let rendered = rendered_entries(&state);
+        assert!(rendered.contains("◌ Run"), "{rendered}");
+        assert!(
+            rendered.contains("│submitted run: build health route"),
+            "{rendered}"
+        );
+        assert!(!rendered.starts_with("submitted run:"), "{rendered}");
+    }
+
     #[test]
     fn help_uses_generated_slash_command_rows() {
         let mut state = test_state();

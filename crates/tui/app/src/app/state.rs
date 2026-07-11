@@ -155,7 +155,8 @@ fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
         "Cancelled" => (status_icon("cancelled"), CardTone::Error),
         "Notice" => (status_icon("waiting"), CardTone::Warning),
         "Exit" | "Improve" | "Resolve" => (status_icon("completed"), CardTone::Success),
-        "Usage" | "Help" | "Workflows" | "Runs" | "Run" | "Transcript" => {
+        "Run" => ("◌", CardTone::Neutral),
+        "Usage" | "Help" | "Workflows" | "Runs" | "Transcript" => {
             (status_icon("idle"), CardTone::Neutral)
         }
         _ => (status_icon("idle"), CardTone::Accent),
@@ -571,9 +572,34 @@ impl AppState {
     where
         F: Future<Output = Result<RunReport, String>> + Send + 'static,
     {
-        self.status = label.clone();
+        self.spawn_report_task_with_entry(label.clone(), TranscriptEntry::Plain(label), future);
+    }
+
+    pub(in crate::app) fn spawn_card_report_task<F>(
+        &mut self,
+        title: &str,
+        label: String,
+        future: F,
+    ) where
+        F: Future<Output = Result<RunReport, String>> + Send + 'static,
+    {
+        self.spawn_report_task_with_entry(
+            label.clone(),
+            TranscriptEntry::Card {
+                title: title.to_string(),
+                details: vec![label],
+            },
+            future,
+        );
+    }
+
+    fn spawn_report_task_with_entry<F>(&mut self, status: String, entry: TranscriptEntry, future: F)
+    where
+        F: Future<Output = Result<RunReport, String>> + Send + 'static,
+    {
+        self.status = status;
         self.run_state = "running".to_string();
-        self.push_event(TranscriptEntry::Plain(label));
+        self.push_event(entry);
         self.background.push(tokio::spawn(future));
     }
 
