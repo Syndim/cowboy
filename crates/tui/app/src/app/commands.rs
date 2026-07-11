@@ -160,12 +160,21 @@ fn spawn_start_run_from_args(
 
 fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
     let runtime = runtime.clone();
-    state.spawn_card_report_task("Run", format!("submitted run: {request}"), async move {
-        runtime
-            .start_run(request)
-            .await
-            .map_err(|err| err.to_string())
-    });
+    let label = format!("submitted run: {request}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Run",
+        ["00:00:00".to_string()],
+        ["submitted run".to_string()],
+        label,
+        [body],
+        async move {
+            runtime
+                .start_run(request)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
@@ -466,12 +475,16 @@ mod tests {
         submit_input(&mut state, &runtime).await;
 
         let rendered = rendered_entries(&state);
-        assert!(rendered.contains("◌ Run"), "{rendered}");
-        assert!(
-            rendered.contains("│submitted run: build health route"),
+        let mut lines = rendered.lines();
+        assert_eq!(
+            lines.next(),
+            Some("00:00:00 · ◌ Run · submitted run"),
             "{rendered}"
         );
+        assert!(rendered.contains("│build health route"), "{rendered}");
+        assert!(!rendered.contains("│submitted run:"), "{rendered}");
         assert!(!rendered.starts_with("submitted run:"), "{rendered}");
+        assert_eq!(state.status(), "submitted run: build health route");
     }
 
     #[test]

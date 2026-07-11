@@ -113,6 +113,7 @@ pub(super) struct Card {
     title: String,
     tone: CardTone,
     title_prefix: Vec<String>,
+    title_suffix: Vec<String>,
     metadata: Vec<CardMetadata>,
     tool_marker: bool,
     sections: Vec<CardSection>,
@@ -125,6 +126,7 @@ impl Card {
             title: title.into(),
             tone,
             title_prefix: Vec::new(),
+            title_suffix: Vec::new(),
             metadata: Vec::new(),
             tool_marker: false,
             sections: Vec::new(),
@@ -138,6 +140,11 @@ impl Card {
 
     pub(super) fn title_prefix(mut self, text: impl Into<String>) -> Self {
         self.title_prefix.push(text.into());
+        self
+    }
+
+    pub(super) fn title_suffix(mut self, text: impl Into<String>) -> Self {
+        self.title_suffix.push(text.into());
         self
     }
 
@@ -198,9 +205,12 @@ impl Card {
     fn title_line(&self, width: usize) -> Line<'static> {
         let marker = if self.tool_marker { " • " } else { " " };
         let leading = format!("{}{}{}", self.status, marker, self.title);
-        let mut parts = Vec::with_capacity(self.title_prefix.len() + self.metadata.len() + 1);
+        let mut parts = Vec::with_capacity(
+            self.title_prefix.len() + self.title_suffix.len() + self.metadata.len() + 1,
+        );
         parts.extend(self.title_prefix.iter().cloned());
         parts.push(leading);
+        parts.extend(self.title_suffix.iter().cloned());
         parts.extend(self.metadata.iter().map(|metadata| metadata.text.clone()));
         let title = truncate_to_display_width(parts.join(METADATA_SEPARATOR), width);
         Line::from(Span::styled(title, self.tone.title_style()))

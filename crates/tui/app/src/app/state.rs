@@ -44,7 +44,12 @@ impl PendingPrompt {
 #[derive(Debug, Clone)]
 pub(super) enum TranscriptEntry {
     Workflow(WorkflowEvent),
-    Card { title: String, details: Vec<String> },
+    Card {
+        title: String,
+        title_prefix: Vec<String>,
+        title_suffix: Vec<String>,
+        details: Vec<String>,
+    },
     Plain(String),
 }
 
@@ -52,7 +57,18 @@ impl TranscriptEntry {
     pub(in crate::app) fn render_lines(&self) -> Vec<ratatui::text::Line<'static>> {
         match self {
             Self::Workflow(event) => render_workflow_event(event).lines().to_vec(),
-            Self::Card { title, details } => render_card_lines(title, details, DEFAULT_CARD_WIDTH),
+            Self::Card {
+                title,
+                title_prefix,
+                title_suffix,
+                details,
+            } => render_card_lines(
+                title,
+                title_prefix,
+                title_suffix,
+                details,
+                DEFAULT_CARD_WIDTH,
+            ),
             Self::Plain(text) => render_plain_lines(text),
         }
     }
@@ -63,7 +79,12 @@ impl TranscriptEntry {
     ) -> Vec<ratatui::text::Line<'static>> {
         match self {
             Self::Workflow(event) => render_workflow_event_width(event, width).lines().to_vec(),
-            Self::Card { title, details } => render_card_lines(title, details, width),
+            Self::Card {
+                title,
+                title_prefix,
+                title_suffix,
+                details,
+            } => render_card_lines(title, title_prefix, title_suffix, details, width),
             Self::Plain(text) => render_plain_lines(text),
         }
     }
@@ -72,7 +93,12 @@ impl TranscriptEntry {
     pub(in crate::app) fn plain_text(&self) -> String {
         match self {
             Self::Workflow(event) => render_workflow_event(event).text().to_string(),
-            Self::Card { title, details } => card_plain_text(title, details),
+            Self::Card {
+                title,
+                title_prefix,
+                title_suffix,
+                details,
+            } => card_plain_text(title, title_prefix, title_suffix, details),
             Self::Plain(text) => text.clone(),
         }
     }
@@ -129,24 +155,44 @@ fn display_prompt_choices(choices: &[String]) -> String {
 
 fn render_card_lines(
     title: &str,
+    title_prefix: &[String],
+    title_suffix: &[String],
     details: &[String],
     width: usize,
 ) -> Vec<ratatui::text::Line<'static>> {
-    app_card(title, details).render(width)
+    app_card(title, title_prefix, title_suffix, details).render(width)
 }
 
 #[allow(dead_code)]
-fn card_plain_text(title: &str, details: &[String]) -> String {
-    app_card(title, details).plain_text()
+fn card_plain_text(
+    title: &str,
+    title_prefix: &[String],
+    title_suffix: &[String],
+    details: &[String],
+) -> String {
+    app_card(title, title_prefix, title_suffix, details).plain_text()
 }
 
-fn app_card(title: &str, details: &[String]) -> Card {
+fn app_card(
+    title: &str,
+    title_prefix: &[String],
+    title_suffix: &[String],
+    details: &[String],
+) -> Card {
     let (status, tone) = app_card_status_and_tone(title);
     let body = details
         .iter()
         .flat_map(|detail| render_markup(detail, style_transcript_normal()))
         .collect::<Vec<_>>();
-    Card::new(status, title, tone).section(CardSection::body(body))
+    let card = title_prefix
+        .iter()
+        .fold(Card::new(status, title, tone), |card, prefix| {
+            card.title_prefix(prefix.clone())
+        });
+    let card = title_suffix
+        .iter()
+        .fold(card, |card, suffix| card.title_suffix(suffix.clone()));
+    card.section(CardSection::body(body))
 }
 
 fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
@@ -504,6 +550,8 @@ impl AppState {
     ) {
         self.push_event(TranscriptEntry::Card {
             title: title.to_string(),
+            title_prefix: Vec::new(),
+            title_suffix: Vec::new(),
             details: details.into_iter().collect(),
         });
     }
@@ -578,16 +626,21 @@ impl AppState {
     pub(in crate::app) fn spawn_card_report_task<F>(
         &mut self,
         title: &str,
-        label: String,
+        title_prefix: impl IntoIterator<Item = String>,
+        title_suffix: impl IntoIterator<Item = String>,
+        status: String,
+        details: impl IntoIterator<Item = String>,
         future: F,
     ) where
         F: Future<Output = Result<RunReport, String>> + Send + 'static,
     {
         self.spawn_report_task_with_entry(
-            label.clone(),
+            status,
             TranscriptEntry::Card {
                 title: title.to_string(),
-                details: vec![label],
+                title_prefix: title_prefix.into_iter().collect(),
+                title_suffix: title_suffix.into_iter().collect(),
+                details: details.into_iter().collect(),
             },
             future,
         );
