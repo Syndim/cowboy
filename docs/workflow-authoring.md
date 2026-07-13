@@ -112,6 +112,20 @@ Runtime context passed to `run(ctx)`:
 | `ctx.resume` | Inactive legacy state retained for old serialized runs; do not use for new workflows. |
 | `ctx.prev` | Latest completed step output, including completed ask-user answers, or `nil` on the first step. |
 | `ctx.steps_executed` | Number of already-executed steps in the run. |
+| `ctx.system.os` | Host operating system (`std::env::consts::OS`), e.g. `linux`. |
+| `ctx.system.arch` | Host CPU architecture (`std::env::consts::ARCH`), e.g. `x86_64`. |
+| `ctx.system.family` | Host OS family (`std::env::consts::FAMILY`), e.g. `unix`. |
+| `ctx.system.hostname` | Machine hostname, or `nil` if unavailable. |
+| `ctx.system.username` | Current user name, or `nil` if unavailable. |
+| `ctx.system.home_dir` | Home directory (`HOME`/`USERPROFILE`), or `nil` if unavailable. |
+| `ctx.system.cwd` | Process working directory, or `nil` if unavailable. |
+
+`ctx.system` is a curated, read-only, best-effort snapshot of the execution
+environment (modelled on the identity data `chezmoi` exposes to templates). Any
+field that cannot be determined is `nil`; gathering context never fails a step.
+Only this fixed allow-list is exposed — the full process environment is
+intentionally **not** provided, because environment variables often contain
+secrets that would otherwise leak into persisted run records and event logs.
 
 `ctx.prev` has this shape when a previous step completed:
 

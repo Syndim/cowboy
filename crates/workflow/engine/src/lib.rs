@@ -12,6 +12,7 @@ pub mod input;
 mod run_lock;
 pub mod runner;
 pub mod runtime;
+mod system;
 pub mod workflow;
 
 pub use cowboy_workflow_actions::{

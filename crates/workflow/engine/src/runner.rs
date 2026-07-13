@@ -351,6 +351,7 @@ impl StepActionProvider for LuaStepActionProvider {
             "resume": Value::Null,
             "prev": previous_step_context(prev),
             "steps_executed": run.steps_executed,
+            "system": crate::system::system_context(),
         });
         cowboy_workflow_lua::run_step(&self.source_bundle, &step.id, ctx)
             .map(|result| result.action)
@@ -898,6 +899,40 @@ mod tests {
         };
         assert_eq!(action.status, "success");
         assert_eq!(action.body, "do it");
+    }
+
+    #[tokio::test]
+    async fn lua_provider_exposes_system_context() {
+        let source_bundle = WorkflowSourceSnapshot {
+            root: None,
+            entry: "main.lua".to_string(),
+            files: BTreeMap::from([(
+                "main.lua".to_string(),
+                r#"
+                local implement = step("start")
+                implement.run = function(ctx)
+                  return action.status { status = "success", body = ctx.system.os }
+                end
+                return workflow("wf", implement)
+                "#
+                .to_string(),
+            )]),
+        };
+        let definition = cowboy_workflow_lua::compile_snapshot(&source_bundle).unwrap();
+        let runner = WorkflowRunner::new(
+            MemoryStore::default(),
+            NoopDispatcher,
+            LuaStepActionProvider::new(source_bundle),
+            Arc::new(EventBus::new(16)),
+        );
+
+        let run = runner.run_until_blocked(&definition, run()).await.unwrap();
+
+        assert_eq!(run.status, RunStatus::Completed);
+        let head = run.head.as_ref().expect("final step should be persisted");
+        let record = runner.store().get_object::<StepRecord>(head).unwrap();
+        let output = record.output.expect("final step should have output");
+        assert_eq!(output.body, std::env::consts::OS);
     }
 
     fn agent_run() -> WorkflowRun {
