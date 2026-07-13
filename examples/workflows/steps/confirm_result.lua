@@ -9,11 +9,11 @@ return function(id)
       if answer and tostring(answer) ~= "" then
         local normalized = string.lower(tostring(answer))
         if normalized == "yes" or normalized == "y" or normalized == "approve" or normalized == "approved" then
-          return action.status { status = "confirmed", fields = { work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test }, body = "user approved implementation" }
+          return action.status { status = "confirmed", fields = { goal = fields.goal, validation = fields.validation, work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test }, body = "user approved implementation" }
         end
         return action.status {
           status = "changes_requested",
-          fields = { feedback = tostring(answer), work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },
+          fields = { feedback = tostring(answer), goal = fields.goal, validation = fields.validation, work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },
           body = "user requested implementation changes",
         }
       end
@@ -25,7 +25,7 @@ return function(id)
       id = prompt_id,
       message = "Review the implementation summary below. Type 'yes' to approve and commit it, or describe the changes you want before committing.\n" .. tostring(review),
       choices = {},
-      fields = { work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },
+      fields = { goal = fields.goal, validation = fields.validation, work_dir = fields.work_dir, plan_doc = fields.plan_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },
     }
   end
   return confirm

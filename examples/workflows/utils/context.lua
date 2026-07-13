@@ -21,6 +21,8 @@ function M.previous_step_context(ctx, heading)
   local fields = prev.fields or {}
   if fields.summary then table.insert(lines, "Summary: " .. tostring(fields.summary)) end
   if fields.feedback then table.insert(lines, "Feedback: " .. tostring(fields.feedback)) end
+  if fields.goal then table.insert(lines, "Goal: " .. tostring(fields.goal)) end
+  if fields.validation then table.insert(lines, "Validation: " .. tostring(fields.validation)) end
   if fields.work_dir then table.insert(lines, "Work dir: " .. tostring(fields.work_dir)) end
   if fields.plan_doc then table.insert(lines, "Plan doc: " .. tostring(fields.plan_doc)) end
   if fields.rca_doc then table.insert(lines, "RCA doc: " .. tostring(fields.rca_doc)) end

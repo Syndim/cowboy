@@ -538,6 +538,162 @@ mod tests {
     }
 
     #[test]
+    fn dev_loop_gates_review_on_user_validation() {
+        let definition = load_example_workflow("dev-loop");
+
+        assert_eq!(definition.name, "dev-loop");
+        assert_eq!(definition.head, "collect_validation");
+        assert_step_transition(
+            "dev-loop",
+            &definition,
+            "collect_validation",
+            "answered",
+            "collect_validation_answer",
+        );
+        assert_step_transition(
+            "dev-loop",
+            &definition,
+            "collect_validation_answer",
+            "captured",
+            "plan",
+        );
+        assert_step_transition("dev-loop", &definition, "test", "passed", "validate");
+        assert_step_transition("dev-loop", &definition, "validate", "achieved", "review");
+        assert_step_transition(
+            "dev-loop",
+            &definition,
+            "validate",
+            "not_achieved",
+            "revise",
+        );
+        assert_step_transition(
+            "dev-loop",
+            &definition,
+            "review",
+            "approved",
+            "confirm_result",
+        );
+        assert_expected_role_agents(
+            "dev-loop",
+            &definition,
+            &[
+                ("planner", "default"),
+                ("implementer", "default"),
+                ("validator", "reviewer"),
+                ("reviewer", "reviewer"),
+            ],
+        );
+    }
+
+    #[test]
+    fn dev_loop_captures_exact_goal_and_validation_method() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let goal = "Add deterministic cache invalidation";
+        let validation = "cargo test -p cache invalidation_is_deterministic";
+        let result = run_step(
+            &compiled.source_bundle,
+            "collect_validation",
+            serde_json::json!({ "request": goal }),
+        )
+        .unwrap();
+
+        let StepAction::AskUser(action) = result.action else {
+            panic!("dev-loop should ask for the user's validation method")
+        };
+        assert!(action.message.contains(goal));
+        assert_eq!(action.fields["goal"], goal);
+
+        let result = run_step(
+            &compiled.source_bundle,
+            "collect_validation_answer",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "collect_validation",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "goal": goal,
+                        "answer": validation
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let StepAction::Status(action) = result.action else {
+            panic!("dev-loop should capture the answered validation method")
+        };
+        assert_eq!(action.status, "captured");
+        assert_eq!(action.fields["goal"], goal);
+        assert_eq!(action.fields["validation"], validation);
+    }
+
+    #[test]
+    fn dev_loop_plan_and_validator_require_user_method() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let goal = "Add deterministic cache invalidation";
+        let validation = "cargo test -p cache invalidation_is_deterministic";
+        let context = serde_json::json!({
+            "request": goal,
+            "prev": {
+                "step": "collect_validation_answer",
+                "action": "status",
+                "status": "captured",
+                "fields": {
+                    "goal": goal,
+                    "validation": validation
+                }
+            }
+        });
+        let plan_result = run_step(&compiled.source_bundle, "plan", context).unwrap();
+        let StepAction::Agent(plan_action) = plan_result.action else {
+            panic!("dev-loop plan should request an agent action")
+        };
+
+        assert!(plan_action.prompt.contains(validation));
+        assert!(plan_action.prompt.contains("do not replace it"));
+
+        let validate_result = run_step(
+            &compiled.source_bundle,
+            "validate",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "test",
+                    "action": "agent",
+                    "status": "passed",
+                    "fields": {
+                        "summary": "focused tests passed",
+                        "goal": goal,
+                        "validation": validation,
+                        "plan_doc": "docs/plans/deterministic_cache_invalidation.md"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(validate_action) = validate_result.action else {
+            panic!("dev-loop validator should request an agent action")
+        };
+
+        assert_eq!(validate_action.role, "validator");
+        assert!(validate_action.prompt.contains(goal));
+        assert!(validate_action.prompt.contains(validation));
+        assert!(
+            validate_action
+                .prompt
+                .contains("Execute the user-provided Validation method exactly")
+        );
+        let output = validate_action
+            .output
+            .expect("dev-loop validator should declare output");
+        for status in ["achieved", "not_achieved", "blocked"] {
+            assert!(output.statuses.iter().any(|candidate| candidate == status));
+        }
+    }
+
+    #[test]
     fn compiles_roles_steps_and_transitions() {
         let source = snapshot(
             r#"

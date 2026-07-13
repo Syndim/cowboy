@@ -1,5 +1,6 @@
 return function(id)
-  local triage = step(id or "triage_blocked")
+  local opts = type(id) == "table" and id or { id = id }
+  local triage = step(opts.id or "triage_blocked")
   triage.run = function(ctx)
     local fields = (ctx.prev and ctx.prev.fields) or {}
     local response = tostring(fields.blocked_response or "")
@@ -13,6 +14,8 @@ return function(id)
       next_step = "plan"
     elseif blocked_from_step == "revise" or string.match(normalized, "revise") or string.match(normalized, "review feedback") then
       next_step = "revise"
+    elseif opts.validation_step and (blocked_from_step == opts.validation_step or string.match(normalized, "validat")) then
+      next_step = opts.validation_step
     end
 
     return action.status {
@@ -20,6 +23,8 @@ return function(id)
       fields = {
         summary = "Blocked workflow triaged to " .. next_step,
         feedback = response,
+        goal = fields.goal,
+        validation = fields.validation,
         work_dir = fields.work_dir,
         plan_doc = fields.plan_doc,
         rca_doc = fields.rca_doc,

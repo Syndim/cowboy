@@ -230,6 +230,12 @@ mkdir -p ~/.config/cowboy/workflows
 cp -R examples/workflows/* ~/.config/cowboy/workflows/
 ```
 
+The starter set includes `feature`, `bugfix`, and `dev-loop`. The `dev-loop`
+workflow treats the run request as the Goal, asks the user for the exact
+validation method, requires the plan to preserve that method, and gates agent
+and human review on a validator successfully using it. After copying the
+examples, start it with `cowboy run --workflow workflows/dev-loop <goal>`.
+
 Read [Workflow authoring](docs/workflow-authoring.md) for the Lua API, runtime context, step actions, transitions, imports, examples, and debugging tools.
 
 ## Persistence and logs

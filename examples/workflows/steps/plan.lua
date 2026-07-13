@@ -4,12 +4,18 @@ return function(roles, opts)
   opts = opts or {}
   local plan = step(opts.id or "plan", { role = roles.planner })
   local kind = opts.kind or "change"
+  local validation_guidance = ""
+  if opts.require_user_validation then
+    validation_guidance = [[
+
+The prior context contains `Goal: ...` and `Validation: ...` values supplied by the user. Treat the Goal as the implementation contract. Copy the user's Validation method exactly into the plan's `How to verify` section; do not replace it with a preferred test strategy. Additional tests may supplement, but never substitute for, that method. Preserve both values exactly in the `goal` and `validation` output fields.]]
+  end
   plan.run = function(ctx)
     return action.agent {
       role = roles.planner,
       prompt = [[Create a concrete plan for this ]] .. kind .. [[ request:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. [[
 
 If previous feedback includes `Plan doc: ...`, update that existing plan document instead of creating a separate plan path, preserve the same `plan_doc` value exactly in output fields, and include that same path in `files`.
 
@@ -31,7 +37,7 @@ The TODO section must contain every implementation work item as Markdown task-li
 Return status "ready" when the request is specific enough to implement, or "unclear" when more user context is needed.]],
       output = {
         status = { "ready", "unclear" },
-        fields = { summary = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },
+        fields = { summary = "string", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },
       },
     }
   end
