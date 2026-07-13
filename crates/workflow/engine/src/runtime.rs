@@ -16,10 +16,11 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ActionResult, ExecutionContext, ObjectKind, Result, RoleDefinition, RunHead, RunStatus,
-    RunnerLimits, StatusAction, StepAction, StepActionProvider, StepRecord, WorkflowCatalog,
-    WorkflowError, WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
-    WorkflowSummarizer, apply_run_status, apply_step_record,
+    ActionResult, DEFAULT_CONFIG_SET_NAME, ExecutionContext, ObjectKind, ResolvedConfigSet, Result,
+    RoleDefinition, RunHead, RunStatus, RunnerLimits, StatusAction, StepAction, StepActionProvider,
+    StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowSelector,
+    WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status,
+    apply_step_record,
 };
 use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
     pub agents: Vec<AgentRuntimeConfig>,
-    pub limits: RunnerLimitsConfig,
+    pub config_sets: BTreeMap<String, RunnerLimitsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,12 +60,20 @@ pub struct AgentRuntimeConfig {
 pub struct RunnerLimitsConfig {
     pub max_steps_per_run: u32,
     pub max_visits_per_step: u32,
-    #[serde(default = "default_max_retries_per_step")]
+    pub max_retries_per_run: u32,
     pub max_retries_per_step: u32,
 }
 
-fn default_max_retries_per_step() -> u32 {
-    2
+impl Default for RunnerLimitsConfig {
+    fn default() -> Self {
+        let limits = RunnerLimits::default();
+        Self {
+            max_steps_per_run: limits.max_steps_per_run,
+            max_visits_per_step: limits.max_visits_per_step,
+            max_retries_per_run: limits.max_retries_per_run,
+            max_retries_per_step: limits.max_retries_per_step,
+        }
+    }
 }
 
 impl AgentRuntimeConfig {
@@ -94,7 +103,7 @@ impl RuntimeConfig {
         workflow_store: PathBuf,
         workflow_dirs: Vec<PathBuf>,
         agents: Vec<AgentRuntimeConfig>,
-        limits: RunnerLimitsConfig,
+        config_sets: BTreeMap<String, RunnerLimitsConfig>,
     ) -> Self {
         Self {
             cwd,
@@ -102,7 +111,7 @@ impl RuntimeConfig {
             workflow_store,
             workflow_dirs,
             agents,
-            limits,
+            config_sets,
         }
     }
 }
@@ -112,6 +121,7 @@ impl From<RunnerLimitsConfig> for RunnerLimits {
         Self {
             max_steps_per_run: value.max_steps_per_run,
             max_visits_per_step: value.max_visits_per_step,
+            max_retries_per_run: value.max_retries_per_run,
             max_retries_per_step: value.max_retries_per_step,
         }
     }
@@ -498,6 +508,7 @@ impl WorkflowRuntime {
             .get(workflow_id)
             .ok_or_else(|| WorkflowError::InvalidAction("selected workflow missing".to_string()))?;
         let (definition, snapshot, workflow_hash) = self.compile_source(source_ref)?;
+        let config_set = self.resolve_config_set(&definition)?;
         tracing::debug!(
             workflow_id = %workflow_id,
             source_entry = %source_ref.entry,
@@ -514,10 +525,13 @@ impl WorkflowRuntime {
             workflow_sources: snapshot.files.clone(),
             original_request: request,
             request_topic: None,
+            config_set,
             status: RunStatus::Running,
             current_step: definition.head.clone(),
             head: None,
             resume: Value::Null,
+            retries_used: 0,
+            step_retries_used: BTreeMap::new(),
             steps_executed: 0,
             step_visits: BTreeMap::new(),
             active_duration_ms: 0,
@@ -539,6 +553,31 @@ impl WorkflowRuntime {
 
         self.run_existing(run, definition, snapshot, mode, request_topic, active_clock)
             .await
+    }
+
+    fn resolve_config_set(&self, definition: &WorkflowDefinition) -> Result<ResolvedConfigSet> {
+        let name = definition
+            .config_set
+            .as_deref()
+            .unwrap_or(DEFAULT_CONFIG_SET_NAME);
+        let Some(config_set) = self.config.config_sets.get(name).copied() else {
+            let available = self
+                .config
+                .config_sets
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WorkflowError::InvalidAction(format!(
+                "workflow {:?} requested unknown config set {name:?}; available config sets: {available}",
+                definition.name
+            )));
+        };
+
+        Ok(ResolvedConfigSet {
+            name: name.to_string(),
+            limits: config_set.into(),
+        })
     }
 
     async fn select_workflow(
@@ -1030,7 +1069,6 @@ impl WorkflowRuntime {
         let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
-            .with_limits(self.config.limits.into())
             .with_request_topic(request_topic)
             .with_active_clock(active_clock);
         let run_future = async {
@@ -1371,27 +1409,47 @@ mod tests {
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents,
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector()
     }
 
     fn runtime_for_workflow_dir(dir: &tempfile::TempDir, workflow_dir: PathBuf) -> WorkflowRuntime {
+        runtime_for_workflow_dir_with_config_sets(
+            dir,
+            workflow_dir,
+            BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        )
+    }
+
+    fn runtime_for_workflow_dir_with_config_sets(
+        dir: &tempfile::TempDir,
+        workflow_dir: PathBuf,
+        config_sets: BTreeMap<String, RunnerLimitsConfig>,
+    ) -> WorkflowRuntime {
         WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets,
         })
         .with_deterministic_selector()
     }
@@ -1403,11 +1461,15 @@ mod tests {
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
     }
 
@@ -1425,10 +1487,13 @@ mod tests {
             workflow_sources: BTreeMap::new(),
             original_request: "do it".to_string(),
             request_topic: request_topic.map(str::to_string),
+            config_set: Default::default(),
             status,
             current_step: "start".to_string(),
             head: None,
             resume: Value::Null,
+            retries_used: 0,
+            step_retries_used: BTreeMap::new(),
             steps_executed: 0,
             step_visits: BTreeMap::new(),
             active_duration_ms: 0,
@@ -1587,6 +1652,250 @@ exit 0
         fs::create_dir(&workflow_dir).unwrap();
         fs::write(workflow_dir.join("aaa.lua"), source).unwrap();
         runtime_for_workflow_dir(dir, workflow_dir)
+    }
+
+    fn config_sets_with_careful(
+        careful: Option<RunnerLimitsConfig>,
+    ) -> BTreeMap<String, RunnerLimitsConfig> {
+        let mut config_sets =
+            BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]);
+        if let Some(careful) = careful {
+            config_sets.insert("careful".to_string(), careful);
+        }
+
+        config_sets
+    }
+
+    fn successful_workflow(config: &str) -> String {
+        format!(
+            r#"
+            local start = step("start")
+            start.run = function(ctx) return action.status {{ status = "success" }} end
+            return workflow("declared", start{config})
+            "#
+        )
+    }
+
+    #[tokio::test]
+    async fn start_resolves_explicit_and_default_config_sets_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("explicit.lua"),
+            successful_workflow(", { config_set = \"careful\" }"),
+        )
+        .unwrap();
+        fs::write(workflow_dir.join("implicit.lua"), successful_workflow("")).unwrap();
+        let careful = RunnerLimitsConfig {
+            max_steps_per_run: 9,
+            max_visits_per_step: 8,
+            max_retries_per_run: 7,
+            max_retries_per_step: 6,
+        };
+        let runtime = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir,
+            config_sets_with_careful(Some(careful)),
+        );
+
+        let explicit = runtime
+            .start_run_with_workflow("explicit", "do it")
+            .await
+            .unwrap();
+        assert_eq!(explicit.run.config_set.name, "careful");
+        assert_eq!(explicit.run.config_set.limits, careful.into());
+
+        let implicit = runtime
+            .start_run_with_workflow("implicit", "do it")
+            .await
+            .unwrap();
+        assert_eq!(implicit.run.config_set.name, "default");
+        assert_eq!(implicit.run.config_set.limits, RunnerLimits::default());
+    }
+
+    #[tokio::test]
+    async fn unknown_config_set_fails_before_run_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("unknown.lua"),
+            successful_workflow(", { config_set = \"missing\" }"),
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir,
+            config_sets_with_careful(Some(RunnerLimitsConfig::default())),
+        );
+
+        let err = runtime
+            .start_run_with_workflow("unknown", "do it")
+            .await
+            .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("workflow \"unknown\""), "{message}");
+        assert!(
+            message.contains("unknown config set \"missing\""),
+            "{message}"
+        );
+        assert!(message.contains("careful, default"), "{message}");
+        assert!(runtime.list_runs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn step_and_resume_use_snapshot_after_config_set_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("multi.lua"),
+            r#"
+            local first = step("first")
+            first.run = function(ctx) return action.status { status = "next" } end
+            local second = step("second")
+            second.run = function(ctx) return action.status { status = "next" } end
+            local third = step("third")
+            third.run = function(ctx) return action.status { status = "success" } end
+            first:on("next", second)
+            second:on("next", third)
+            return workflow("multi", first, { config_set = "careful" })
+            "#,
+        )
+        .unwrap();
+        let original = RunnerLimitsConfig {
+            max_steps_per_run: 5,
+            max_visits_per_step: 5,
+            max_retries_per_run: 5,
+            max_retries_per_step: 2,
+        };
+        let creator = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir.clone(),
+            config_sets_with_careful(Some(original)),
+        );
+        let started = creator
+            .start_run_with_workflow_stepwise("multi", "do it")
+            .await
+            .unwrap();
+        assert_eq!(started.run.steps_executed, 1);
+
+        let changed = RunnerLimitsConfig {
+            max_steps_per_run: 1,
+            ..original
+        };
+        let resumed_runtime = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir,
+            config_sets_with_careful(Some(changed)),
+        );
+        let stepped = resumed_runtime.step_run(&started.run.id).await.unwrap();
+        assert_eq!(stepped.run.steps_executed, 2);
+        assert_eq!(stepped.run.status, RunStatus::Running);
+        assert_eq!(stepped.run.config_set.limits, original.into());
+
+        let resumed = resumed_runtime.resume_run(&started.run.id).await.unwrap();
+        assert_eq!(resumed.run.status, RunStatus::Completed);
+        assert_eq!(resumed.run.steps_executed, 3);
+        assert_eq!(resumed.run.config_set.limits, original.into());
+    }
+
+    #[tokio::test]
+    async fn answer_resolve_and_options_use_snapshot_after_set_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("answer.lua"),
+            r#"
+            local ask = step("ask")
+            ask.run = function(ctx)
+              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes" } }
+            end
+            local done = step("done")
+            done.run = function(ctx) return action.status { status = "success" } end
+            ask:on("answered", done)
+            return workflow("answer", ask, { config_set = "careful" })
+            "#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("resolve.lua"),
+            r#"
+            local broken = step("broken")
+            broken.run = function(ctx) return action.fail { reason = "broken" } end
+            local done = step("done")
+            done.run = function(ctx) return action.status { status = "success" } end
+            broken:on("fixed", done)
+            return workflow("resolve", broken, { config_set = "careful" })
+            "#,
+        )
+        .unwrap();
+        let current_default = RunnerLimitsConfig {
+            max_steps_per_run: 1,
+            ..RunnerLimitsConfig::default()
+        };
+        let careful = RunnerLimitsConfig {
+            max_steps_per_run: 2,
+            ..RunnerLimitsConfig::default()
+        };
+        let creator = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir.clone(),
+            BTreeMap::from([
+                ("default".to_string(), current_default),
+                ("careful".to_string(), careful),
+            ]),
+        );
+        let waiting = creator
+            .start_run_with_workflow("answer", "do it")
+            .await
+            .unwrap();
+        assert!(matches!(
+            waiting.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        assert_eq!(waiting.run.steps_executed, 1);
+        assert_eq!(waiting.run.config_set.limits.max_steps_per_run, 2);
+        let failed = creator
+            .start_run_with_workflow("resolve", "do it")
+            .await
+            .unwrap();
+        assert!(matches!(failed.run.status, RunStatus::Failed { .. }));
+        assert_eq!(failed.run.steps_executed, 1);
+        assert_eq!(failed.run.config_set.limits.max_steps_per_run, 2);
+
+        let without_careful = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir,
+            BTreeMap::from([("default".to_string(), current_default)]),
+        );
+        let answered = without_careful
+            .answer_run(&waiting.run.id, "approval", "yes")
+            .await
+            .unwrap();
+        assert_eq!(answered.run.status, RunStatus::Completed);
+        assert_eq!(answered.run.config_set.name, "careful");
+        assert_eq!(answered.run.steps_executed, 2);
+        assert_eq!(answered.run.config_set.limits.max_steps_per_run, 2);
+
+        let options = without_careful.resolution_options(&failed.run.id).unwrap();
+        assert!(
+            options
+                .statuses
+                .iter()
+                .any(|status| status.status == "fixed")
+        );
+        let resolved = without_careful
+            .resolve_run(&failed.run.id, "fixed", None, None)
+            .await
+            .unwrap();
+        assert_eq!(resolved.run.status, RunStatus::Completed);
+        assert_eq!(resolved.run.config_set.name, "careful");
+        assert_eq!(resolved.run.steps_executed, 2);
+        assert_eq!(resolved.run.config_set.limits.max_steps_per_run, 2);
     }
 
     fn prompt_workflow_source() -> &'static str {
@@ -2172,24 +2481,30 @@ exit 0
                 args: Vec::new(),
                 model: ModelInfo::default(),
             }],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector();
 
         let err = runtime.start_run("do it").await.unwrap_err();
-        // A missing agent command surfaces as a transient (recoverable) client
-        // error; the runner retries it and gives up with a recoverable error.
-        assert!(matches!(err, WorkflowError::RecoverableAction(_)));
+        // A missing agent command is retried until the snapshotted per-step
+        // budget is exhausted, then reported as a distinct policy failure.
+        assert!(err.to_string().contains("exhausted retry budget for step"));
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
         // The give-up path persists a clean Failed status for later resolution.
         let run = runtime
             .load_run(&runtime.list_runs().unwrap()[0].run_id)
             .unwrap();
         assert!(matches!(run.status, RunStatus::Failed { .. }));
+        assert_eq!(run.retries_used, 2);
+        assert_eq!(run.step_retries_used.values().copied().sum::<u32>(), 2);
     }
 
     #[tokio::test]
@@ -2271,11 +2586,15 @@ exit 0
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "definitely-missing-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector()
         .with_request_topic_for_tests("Original topic");
@@ -2403,11 +2722,15 @@ exit 0
                 args: Vec::new(),
                 model: ModelInfo::default(),
             }],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector();
 
@@ -2574,11 +2897,15 @@ exit 0
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector();
 
@@ -2643,11 +2970,15 @@ exit 0
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         };
         let runtime_a = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
         let runtime_b = WorkflowRuntime::new(config).with_deterministic_selector();
@@ -2680,11 +3011,15 @@ exit 0
             workflow_store: state_dir.join("workflow.redb"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector();
 
@@ -2732,11 +3067,15 @@ exit 0
             workflow_store: dir.path().join("shared/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         };
         let runtime = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
         let report = runtime.start_run_stepwise("request").await.unwrap();
@@ -2794,11 +3133,15 @@ exit 0
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector()
         .with_request_topic_for_tests("Initial prompt topic");
@@ -2886,11 +3229,15 @@ exit 0
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         })
         .with_deterministic_selector();
 
@@ -3583,11 +3930,15 @@ exit 0
                 args: Vec::new(),
                 model: ModelInfo::default(),
             }],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         });
 
         let catalog = runtime.catalog().unwrap();
@@ -3615,17 +3966,20 @@ exit 0
                 (
                     "workflows/feature.lua".to_string(),
                     r#"
-                    local planner = require("roles/planner.lua")
-                    local start = step("start", { role = planner })
-                    start.run = function(ctx) return action.status { status = "success" } end
-                    return workflow("feature", start)
-                    "#
+                local planner = require("roles/planner.lua")
+                local start = step("start", { role = planner })
+                start.run = function(ctx) return action.status { status = "success" } end
+                return workflow("feature", start)
+                "#
                     .to_string(),
                 ),
             ]),
             original_request: "do it".to_string(),
             request_topic: None,
+            config_set: Default::default(),
             status: RunStatus::Running,
+            retries_used: 0,
+            step_retries_used: Default::default(),
             current_step: "start".to_string(),
             head: None,
             resume: Value::Null,
@@ -3655,11 +4009,15 @@ exit 0
                 args: Vec::new(),
                 model: ModelInfo::default(),
             }],
-            limits: RunnerLimitsConfig {
-                max_steps_per_run: 5,
-                max_visits_per_step: 5,
-                max_retries_per_step: 2,
-            },
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
         });
         assert!(runtime.list_runs().unwrap().is_empty());
     }

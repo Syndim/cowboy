@@ -390,8 +390,14 @@ mod tests {
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
             workflow_store: dir.path().join("workflow.redb"),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         })
     }
@@ -402,8 +408,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
@@ -436,10 +448,13 @@ mod tests {
             workflow_sources: Default::default(),
             original_request: format!("request for {id}"),
             request_topic: topic.map(ToString::to_string),
+            config_set: Default::default(),
             status,
             current_step: current_step.to_string(),
             head: head.map(ToString::to_string),
             resume: Value::Null,
+            retries_used: 0,
+            step_retries_used: Default::default(),
             steps_executed: 0,
             step_visits: Default::default(),
             active_duration_ms: 0,
@@ -512,8 +527,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
@@ -542,8 +563,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
@@ -771,8 +798,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
-            max_steps_per_run: 5,
-            max_visits_per_step: 5,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
@@ -858,8 +891,14 @@ mod tests {
                 state_dir: dir.path().join("state"),
                 workflow_store: dir.path().join("state/workflow.redb"),
                 workflow_dirs: Vec::new(),
-                max_steps_per_run: 1,
-                max_visits_per_step: 1,
+                config_sets: std::collections::BTreeMap::from([(
+                    "default".to_string(),
+                    crate::config::ConfigSetConfig {
+                        max_steps_per_run: 1,
+                        max_visits_per_step: 1,
+                        ..Default::default()
+                    },
+                )]),
                 ..AppConfig::default()
             };
             let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
@@ -990,8 +1029,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
@@ -1017,8 +1062,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
@@ -1046,8 +1097,14 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: Vec::new(),
-            max_steps_per_run: 1,
-            max_visits_per_step: 1,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));

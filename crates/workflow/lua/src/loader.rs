@@ -693,16 +693,17 @@ mod tests {
     }
 
     #[test]
-    fn captures_workflow_description_from_config_table() {
+    fn captures_workflow_config_set_with_description() {
         let source = snapshot(
             r#"
             local start = step("start")
             start.run = function(ctx) return action.status { status = "success" } end
-            return workflow("wf", start, { description = "does a thing" })
+            return workflow("wf", start, { description = "does a thing", config_set = "careful" })
             "#,
         );
         let definition = compile_snapshot(&source).unwrap();
         assert_eq!(definition.description.as_deref(), Some("does a thing"));
+        assert_eq!(definition.config_set.as_deref(), Some("careful"));
     }
 
     #[test]
@@ -716,10 +717,11 @@ mod tests {
         );
         let definition = compile_snapshot(&source).unwrap();
         assert_eq!(definition.description.as_deref(), Some("short desc"));
+        assert_eq!(definition.config_set, None);
     }
 
     #[test]
-    fn workflow_without_config_has_no_description() {
+    fn workflow_without_config_uses_no_explicit_config_set() {
         let source = snapshot(
             r#"
             local start = step("start")
@@ -729,6 +731,43 @@ mod tests {
         );
         let definition = compile_snapshot(&source).unwrap();
         assert_eq!(definition.description, None);
+        assert_eq!(definition.config_set, None);
+    }
+
+    #[test]
+    fn workflow_config_set_must_be_a_nonblank_string() {
+        for config_set in ["\"   \"", "42"] {
+            let source = snapshot(&format!(
+                r#"
+                local start = step("start")
+                start.run = function(ctx) return action.status {{ status = "success" }} end
+                return workflow("wf", start, {{ config_set = {config_set} }})
+                "#
+            ));
+            let err = compile_snapshot(&source).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("workflow config_set must be a non-empty string"),
+                "{err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_definition_without_config_set_deserializes_compatibly() {
+        let source = snapshot(
+            r#"
+            local start = step("start")
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("wf", start, { config_set = "careful" })
+            "#,
+        );
+        let definition = compile_snapshot(&source).unwrap();
+        let mut serialized = serde_json::to_value(definition).unwrap();
+        serialized.as_object_mut().unwrap().remove("config_set");
+
+        let definition: WorkflowDefinition = serde_json::from_value(serialized).unwrap();
+        assert_eq!(definition.config_set, None);
     }
 
     #[test]

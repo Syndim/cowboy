@@ -26,6 +26,7 @@
 //!   COWBOY_ENGINE_PROVIDER   override the provider, "" clears (preset default)
 //!   COWBOY_ENGINE_SELECTOR  "agent" or "deterministic"       (agent)
 
+use std::collections::BTreeMap;
 use std::env;
 use std::future::Future;
 use std::path::PathBuf;
@@ -124,6 +125,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
     let limits = RunnerLimitsConfig {
         max_steps_per_run: 100,
         max_visits_per_step: 20,
+        max_retries_per_run: 200,
         max_retries_per_step: 2,
     };
     let selector = env_or("COWBOY_ENGINE_SELECTOR", "agent");
@@ -157,7 +159,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         workflow_store,
         workflow_dirs,
         vec![agent],
-        limits,
+        BTreeMap::from([("default".to_string(), limits)]),
     ));
     match selector.as_str() {
         "agent" => Ok(runtime),

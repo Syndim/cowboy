@@ -33,11 +33,13 @@ pub(crate) fn workflow_from_value(
     let head: String = head_table.get("id")?;
 
     let description = optional_string(&table, "description")?;
+    let config_set = optional_workflow_config_set(&table)?;
     let roles = roles_from_registry(lua)?;
     let steps = steps_from_registry(lua)?;
     Ok(WorkflowDefinition {
         name,
         description,
+        config_set,
         source_hash,
         head,
         roles,
@@ -225,6 +227,21 @@ fn required_string(table: &Table, action: &str, field: &str) -> Result<String> {
         action: action.to_string(),
         field: field.to_string(),
     })
+}
+
+fn optional_workflow_config_set(table: &Table) -> Result<Option<String>> {
+    match table.get::<Value>("config_set")? {
+        Value::Nil => Ok(None),
+        Value::String(value) => {
+            let value = value.to_str()?.to_string();
+            if value.trim().is_empty() {
+                return Err(Error::InvalidWorkflowConfigSet);
+            }
+
+            Ok(Some(value))
+        }
+        _ => Err(Error::InvalidWorkflowConfigSet),
+    }
 }
 
 fn optional_string(table: &Table, field: &str) -> Result<Option<String>> {

@@ -98,8 +98,10 @@ cowboy resolve <run-id> <status> [--fields '<json object>'] [--body <text>]
 ```
 
 Recoverable step failures (for example, an agent reply missing its YAML
-frontmatter, or a transient backend error) are retried automatically up to
-`max_retries_per_step` times before the run is marked `Failed`.
+frontmatter, or a transient backend error) consume both the run-wide
+`max_retries_per_run` budget and the current step id's cumulative
+`max_retries_per_step` budget. Initial attempts do not count as retries, and
+retries do not consume step or visit budgets.
 
 ## TUI
 
@@ -165,9 +167,17 @@ Example config:
 state_dir = "~/.local/state/cowboy"
 workflow_store = "~/.local/state/cowboy/workflow.redb"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
+
+[config_sets.default]
 max_steps_per_run = 100
 max_visits_per_step = 20
+max_retries_per_run = 200
 max_retries_per_step = 2
+
+[config_sets.careful]
+# Omitted fields independently inherit 100, 20, 200, and 2.
+max_retries_per_run = 20
+max_retries_per_step = 4
 
 [[agents]]
 name = "default"
@@ -187,6 +197,25 @@ args = ["--acp"]
 id = "gpt-5.5-1m"
 provider = "github-copilot"
 ```
+
+Every config-set field is optional and defaults independently to the values
+shown above. The built-in `default` set always exists, even when the file only
+declares custom sets. Set either retry limit to `0` to disable that retry
+scope; `max_steps_per_run` and `max_visits_per_step` must be greater than zero.
+Blank set names and unknown fields are rejected.
+
+Workflows select a set with
+`workflow(name, head, { config_set = "careful" })`; omission selects `default`.
+An unknown selection fails before the new run is persisted. Cowboy snapshots
+the selected name and all four effective limits into the run, so resume, step,
+answer, resolve, and resolution-option operations keep working after runtime
+configuration changes or removal. Retry counters are durable and cumulative
+across visits to the same step id. Retry events retain visit-local attempt
+numbers (`2..=max_attempts`) and use one fixed `max_attempts` for that visit.
+
+This is a clean cutover: old top-level `max_steps_per_run`,
+`max_visits_per_step`, and `max_retries_per_step` keys are rejected. Move them
+under `[config_sets.default]`.
 
 Any ACP-compatible coding-agent CLI can be used by changing an `[[agents]]` entry's `command` and `args`. Roles may select a named agent with `agent = "name"`.
 
@@ -225,6 +254,7 @@ COWBOY_LOG="info,cowboy_agent_acp=debug" cowboy
 CLI/TUI request
   -> workflow catalog selects a Lua workflow
   -> Lua source is snapshotted and compiled into a WorkflowDefinition
+  -> engine resolves config_set (or default) and snapshots effective limits
   -> WorkflowRun is persisted through redb
   -> WorkflowRunner executes steps until completed/failed/waiting
   -> agent steps go through ACP and parse YAML-frontmatter output

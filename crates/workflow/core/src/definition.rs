@@ -47,6 +47,9 @@ pub struct WorkflowDefinition {
     /// Optional human-readable description declared by the workflow source.
     #[serde(default)]
     pub description: Option<String>,
+    /// Optional runtime config-set name selected by the workflow source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_set: Option<String>,
     /// Hash of the workflow source bundle used to compile this definition.
     pub source_hash: String,
     /// Step id where new runs begin.
@@ -268,6 +271,7 @@ mod tests {
         WorkflowDefinition {
             name: "default".to_string(),
             description: None,
+            config_set: None,
             source_hash: "hash".to_string(),
             head: "plan".to_string(),
             roles: BTreeMap::new(),

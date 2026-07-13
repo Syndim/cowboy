@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,19 +14,68 @@ pub struct AppConfig {
     pub state_dir: PathBuf,
     /// Redb file that will back workflow run storage once the runner is wired in.
     pub workflow_store: PathBuf,
-    /// Maximum workflow actions handled in one run.
-    pub max_steps_per_run: u32,
-    /// Maximum visits to one workflow step in a single run.
-    pub max_visits_per_step: u32,
-    /// Maximum recoverable retries for a single workflow step attempt.
-    #[serde(default = "default_max_retries_per_step")]
-    pub max_retries_per_step: u32,
+    /// Named workflow runner policies. The built-in `default` set is always present.
+    ///
+    /// ```toml
+    /// [config_sets.default]
+    /// max_steps_per_run = 100
+    /// max_visits_per_step = 20
+    /// max_retries_per_run = 200
+    /// max_retries_per_step = 2
+    ///
+    /// [config_sets.careful]
+    /// max_retries_per_run = 20
+    /// max_retries_per_step = 4
+    /// ```
+    #[serde(
+        default = "default_config_sets",
+        deserialize_with = "deserialize_config_sets"
+    )]
+    pub config_sets: BTreeMap<String, ConfigSetConfig>,
     /// Additional workflow roots scanned for `.lua` workflows.
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
     /// ACP-compatible agent commands used by workflow agent actions.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
+}
+
+/// Effective values for one named workflow runner policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConfigSetConfig {
+    pub max_steps_per_run: u32,
+    pub max_visits_per_step: u32,
+    pub max_retries_per_run: u32,
+    pub max_retries_per_step: u32,
+}
+
+impl Default for ConfigSetConfig {
+    fn default() -> Self {
+        Self {
+            max_steps_per_run: 100,
+            max_visits_per_step: 20,
+            max_retries_per_run: 200,
+            max_retries_per_step: 2,
+        }
+    }
+}
+
+fn default_config_sets() -> BTreeMap<String, ConfigSetConfig> {
+    BTreeMap::from([("default".to_string(), ConfigSetConfig::default())])
+}
+
+fn deserialize_config_sets<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, ConfigSetConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut config_sets = BTreeMap::<String, ConfigSetConfig>::deserialize(deserializer)?;
+    config_sets
+        .entry("default".to_string())
+        .or_insert_with(ConfigSetConfig::default);
+    Ok(config_sets)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,10 +113,6 @@ fn default_agents() -> Vec<AgentConfig> {
     vec![AgentConfig::default()]
 }
 
-fn default_max_retries_per_step() -> u32 {
-    2
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
@@ -89,9 +135,7 @@ impl Default for AppConfig {
         Self {
             workflow_store: state_dir.join("workflow.redb"),
             state_dir,
-            max_steps_per_run: 100,
-            max_visits_per_step: 20,
-            max_retries_per_step: default_max_retries_per_step(),
+            config_sets: default_config_sets(),
             workflow_dirs: vec![config_root().join("workflows")],
             agents: default_agents(),
         }
@@ -137,8 +181,26 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("failed to parse config {}", path.display()))?;
     validate_agents(&config.agents)
         .with_context(|| format!("invalid agent config in {}", path.display()))?;
+    validate_config_sets(&config.config_sets)
+        .with_context(|| format!("invalid config set in {}", path.display()))?;
     config.expand_paths();
     Ok(config)
+}
+
+fn validate_config_sets(config_sets: &BTreeMap<String, ConfigSetConfig>) -> Result<()> {
+    for (name, config_set) in config_sets {
+        if name.trim().is_empty() {
+            anyhow::bail!("config set name must not be empty");
+        }
+        if config_set.max_steps_per_run == 0 {
+            anyhow::bail!("config set {name:?} max_steps_per_run must be greater than zero");
+        }
+        if config_set.max_visits_per_step == 0 {
+            anyhow::bail!("config set {name:?} max_visits_per_step must be greater than zero");
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
@@ -158,6 +220,25 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
 
 impl AppConfig {
     pub fn runtime_config(&self, cwd: PathBuf) -> RuntimeConfig {
+        let mut config_sets = self
+            .config_sets
+            .iter()
+            .map(|(name, config_set)| {
+                (
+                    name.clone(),
+                    RunnerLimitsConfig {
+                        max_steps_per_run: config_set.max_steps_per_run,
+                        max_visits_per_step: config_set.max_visits_per_step,
+                        max_retries_per_run: config_set.max_retries_per_run,
+                        max_retries_per_step: config_set.max_retries_per_step,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        config_sets
+            .entry("default".to_string())
+            .or_insert_with(RunnerLimitsConfig::default);
+
         RuntimeConfig::new(
             cwd,
             self.state_dir.clone(),
@@ -175,11 +256,7 @@ impl AppConfig {
                     )
                 })
                 .collect(),
-            RunnerLimitsConfig {
-                max_steps_per_run: self.max_steps_per_run,
-                max_visits_per_step: self.max_visits_per_step,
-                max_retries_per_step: self.max_retries_per_step,
-            },
+            config_sets,
         )
     }
 
@@ -212,36 +289,173 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_config_uses_defaults() {
+    fn missing_config_uses_default_config_set() {
         let dir = tempfile::tempdir().unwrap();
         let config = load_config(&dir.path().join("missing.toml")).unwrap();
-        assert_eq!(config.max_steps_per_run, 100);
-        assert_eq!(config.max_visits_per_step, 20);
+        assert_eq!(config.config_sets.len(), 1);
+        assert_eq!(
+            config.config_sets["default"],
+            ConfigSetConfig {
+                max_steps_per_run: 100,
+                max_visits_per_step: 20,
+                max_retries_per_run: 200,
+                max_retries_per_step: 2,
+            }
+        );
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "default");
         assert_eq!(config.agents[0].command, "copilot");
     }
 
     #[test]
-    fn parses_config_file() {
+    fn documented_config_sets_parse_with_independent_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
             r#"
-state_dir = "/tmp/cowboy-state"
-workflow_store = "/tmp/cowboy-state/workflow.redb"
-max_steps_per_run = 7
-max_visits_per_step = 3
+[config_sets.default]
+max_steps_per_run = 100
+max_visits_per_step = 20
+max_retries_per_run = 200
+max_retries_per_step = 2
+
+[config_sets.careful]
+# Omitted step/visit fields inherit 100 and 20.
+max_retries_per_run = 20
+max_retries_per_step = 4
 "#,
         )
         .unwrap();
 
         let config = load_config(&path).unwrap();
-        assert_eq!(config.max_steps_per_run, 7);
-        assert_eq!(config.max_visits_per_step, 3);
-        assert_eq!(config.agents.len(), 1);
-        assert_eq!(config.agents[0].name, "default");
+        assert_eq!(config.config_sets.len(), 2);
+        assert_eq!(
+            config.config_sets["careful"],
+            ConfigSetConfig {
+                max_retries_per_run: 20,
+                max_retries_per_step: 4,
+                ..ConfigSetConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn partial_default_override_and_custom_only_sets_retain_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_path = dir.path().join("default.toml");
+        fs::write(
+            &default_path,
+            "[config_sets.default]\nmax_steps_per_run = 7\n",
+        )
+        .unwrap();
+        let config = load_config(&default_path).unwrap();
+        assert_eq!(config.config_sets["default"].max_steps_per_run, 7);
+        assert_eq!(config.config_sets["default"].max_visits_per_step, 20);
+
+        let custom_path = dir.path().join("custom.toml");
+        fs::write(
+            &custom_path,
+            "[config_sets.fast]\nmax_retries_per_step = 0\n",
+        )
+        .unwrap();
+        let config = load_config(&custom_path).unwrap();
+        assert_eq!(config.config_sets["default"], ConfigSetConfig::default());
+        assert_eq!(config.config_sets["fast"].max_steps_per_run, 100);
+        assert_eq!(config.config_sets["fast"].max_retries_per_run, 200);
+        assert_eq!(config.config_sets["fast"].max_retries_per_step, 0);
+    }
+
+    #[test]
+    fn runtime_conversion_preserves_all_named_sets() {
+        let config = AppConfig {
+            config_sets: BTreeMap::from([
+                ("default".to_string(), ConfigSetConfig::default()),
+                (
+                    "careful".to_string(),
+                    ConfigSetConfig {
+                        max_steps_per_run: 9,
+                        max_visits_per_step: 8,
+                        max_retries_per_run: 7,
+                        max_retries_per_step: 6,
+                    },
+                ),
+            ]),
+            ..AppConfig::default()
+        };
+
+        let runtime = config.runtime_config(PathBuf::from("."));
+        assert_eq!(runtime.config_sets.len(), 2);
+        assert_eq!(runtime.config_sets["careful"].max_steps_per_run, 9);
+        assert_eq!(runtime.config_sets["careful"].max_visits_per_step, 8);
+        assert_eq!(runtime.config_sets["careful"].max_retries_per_run, 7);
+        assert_eq!(runtime.config_sets["careful"].max_retries_per_step, 6);
+    }
+
+    #[test]
+    fn config_set_validation_rejects_names_fields_and_nonpositive_execution_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "blank.toml",
+                "[config_sets.\"   \"]\nmax_retries_per_step = 0\n",
+                "config set name must not be empty",
+            ),
+            (
+                "unknown.toml",
+                "[config_sets.default]\nunknown = 1\n",
+                "unknown field `unknown`",
+            ),
+            (
+                "steps.toml",
+                "[config_sets.default]\nmax_steps_per_run = 0\n",
+                "max_steps_per_run must be greater than zero",
+            ),
+            (
+                "visits.toml",
+                "[config_sets.default]\nmax_visits_per_step = 0\n",
+                "max_visits_per_step must be greater than zero",
+            ),
+        ];
+
+        for (name, raw, expected) in cases {
+            let path = dir.path().join(name);
+            fs::write(&path, raw).unwrap();
+            let err = load_config(&path).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn removed_top_level_limits_are_rejected_with_config_sets_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        for field in [
+            "max_steps_per_run",
+            "max_visits_per_step",
+            "max_retries_per_step",
+        ] {
+            let path = dir.path().join(format!("{field}.toml"));
+            fs::write(&path, format!("{field} = 1\n")).unwrap();
+            let err = load_config(&path).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(&format!("unknown field `{field}`")));
+            assert!(message.contains("config_sets"));
+        }
+    }
+
+    #[test]
+    fn shipped_demo_config_matches_config_set_contract() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("demo-config.toml");
+
+        let config = load_config(&path).unwrap();
+
+        assert_eq!(config.config_sets["default"], ConfigSetConfig::default());
+        assert_eq!(config.config_sets["careful"].max_steps_per_run, 100);
+        assert_eq!(config.config_sets["careful"].max_visits_per_step, 20);
+        assert_eq!(config.config_sets["careful"].max_retries_per_run, 20);
+        assert_eq!(config.config_sets["careful"].max_retries_per_step, 4);
     }
 
     #[test]

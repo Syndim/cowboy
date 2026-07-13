@@ -20,6 +20,8 @@ pub enum Error {
     MissingWorkflow,
     #[error("workflow name must not be empty")]
     EmptyWorkflowName,
+    #[error("workflow config_set must be a non-empty string")]
+    InvalidWorkflowConfigSet,
     #[error("workflow head step is missing or invalid")]
     MissingHead,
     #[error("role id must be a non-empty string")]

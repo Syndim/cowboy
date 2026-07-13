@@ -141,6 +141,10 @@ Accepted forms:
 workflow("feature-flow", implement)
 workflow("feature-flow", implement, "Description")
 workflow("feature-flow", implement, { description = "Description" })
+workflow("feature-flow", implement, {
+  description = "Description",
+  config_set = "careful"
+})
 ```
 
 Rules:
@@ -148,7 +152,41 @@ Rules:
 - `name` must be non-empty.
 - `head` must be a declared step table.
 - `description` is optional and used by workflow selection/catalog display.
+- `config_set` is optional, must be a nonblank string, and defaults to `default` when omitted.
 - All declared steps are compiled; validation rejects an unknown head, unknown roles, unknown transition targets, and empty transition statuses.
+
+### Runtime config sets
+
+The host config defines named runner policies:
+
+```toml
+[config_sets.default]
+max_steps_per_run = 100
+max_visits_per_step = 20
+max_retries_per_run = 200
+max_retries_per_step = 2
+
+[config_sets.careful]
+# Omitted fields independently inherit 100, 20, 200, and 2.
+max_retries_per_run = 20
+max_retries_per_step = 4
+```
+
+The built-in `default` set always exists. Each omitted field inherits its shown
+built-in value. Retry limits may be `0`; step and visit limits must be greater
+than zero. Blank names and unknown fields are rejected. An unknown workflow
+selection fails before a new run is persisted and reports the available sets.
+
+Cowboy snapshots the selected set name and all four effective limits into a
+new run. Later resume, step, answer, resolve, and resolution-option operations
+use that snapshot even if the host config changes or removes the set. Retry
+dispatches are durable and cumulative across the run and across every visit to
+the same step id; initial attempts do not count, and retries consume neither
+step nor visit budgets. `StepRetrying` events keep visit-local attempts and a
+fixed `max_attempts` computed from both remaining retry ceilings.
+
+Top-level runner-limit keys from older configs are no longer accepted. Move
+them under `[config_sets.default]`.
 
 ## Actions
 

@@ -35,7 +35,7 @@ This crate owns config loading, logging setup, runtime dispatch, and terminal re
 | --- | --- |
 | `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. |
 | `lib.rs` | Public exports for the TUI app crate: config and `run_tui`. |
-| `config.rs` | Load TOML config and convert it into engine `RuntimeConfig`. |
+| `config.rs` | Load and validate TOML, materialize named config sets (including built-in `default`), and convert them into engine `RuntimeConfig`. |
 | `app.rs` | Terminal startup, event loop, and top-level vertical layout only. |
 | `app/commands.rs` | Slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
@@ -81,10 +81,10 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs, recoverable-retry give-up persistence, wire store/catalog/Lua/action dispatch/agent execution, persist event logs. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config sets before new-run persistence; run existing workflows from their durable policy snapshot; wire store/catalog/Lua/action dispatch/agent execution; persist event logs. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
-| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits events and owns the bounded recoverable-retry loop (`max_retries_per_step`), persisting `Failed` on give-up. Also `LuaStepActionProvider`. |
+| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, and persists `Failed` on give-up. Also `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
 
@@ -95,6 +95,15 @@ Important seams:
 - `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
 - `ResumeRouter` does not mutate `WorkflowRun.resume`; it validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
+
+Runner-policy contract: TOML uses `[config_sets.<name>]` with
+`max_steps_per_run`, `max_visits_per_step`, `max_retries_per_run`, and
+`max_retries_per_step`, independently defaulting to `100`, `20`, `200`, and
+`2`. `default` always exists; retry limits may be zero; step/visit limits may
+not. Lua selects a nonblank name through `workflow(..., { config_set = ... })`.
+Resolution happens before new-run persistence, then the name, effective limits,
+and cumulative retry counters remain durable for all lifecycle paths. Old
+top-level runner-limit keys are rejected.
 
 ## Crate: `cowboy-workflow-catalog`
 
@@ -115,12 +124,12 @@ Owns workflow domain data and pure execution rules.
 | Module | Responsibility |
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
-| `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`, roles, steps, transitions, validation. |
+| `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
 | `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `fail`. |
-| `state.rs` | Durable `WorkflowRun`, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
+| `state.rs` | Durable `WorkflowRun`, resolved config-set snapshot, retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates: loader, selector, executor, summarizer, run store. |
-| `engine.rs` | `execute_step` and budget enforcement. |
+| `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, and step/visit budget enforcement. |
 | `error.rs` | `WorkflowError` and `Result`. |
 
 Core must remain independent of TUI, Lua, storage backends, and agent protocols.
@@ -191,6 +200,7 @@ CLI/TUI command
   -> cowboy-workflow-engine WorkflowRuntime
   -> catalog chooses/loads workflow source
   -> workflow-lua compiles/snapshots workflow source
+  -> engine resolves workflow config_set (or default) and snapshots effective limits
   -> WorkflowRun persisted through RunStore
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction

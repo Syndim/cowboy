@@ -57,6 +57,7 @@ Workflow definitions are authored as Lua files. The Lua loader compiles them int
 WorkflowSourceRef
   -> WorkflowSourceSnapshot
   -> WorkflowDefinition
+       optional config_set selector
        roles: RoleDefinition
        steps: StepDefinition
        transitions: status -> next step
@@ -71,11 +72,12 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - run id
 - workflow id/hash/source snapshot
 - original request
+- resolved config-set name and all four effective runner limits
 - current step
 - latest step-record hash
 - run status, including pending ask-user metadata when blocked for input
 - inactive legacy resume data retained for old serialized runs
-- step budget counters
+- step/visit counters and durable total/per-step retry counters
 
 `RunHead` is the small mutable pointer for quick lookup/resume. Immutable step/turn/source objects are stored by content hash in `cowboy-workflow-store`.
 
@@ -106,6 +108,29 @@ current WorkflowRun
   -> ActionResult::Blocked   -> apply_run_status persists waiting/failed status
   -> EventBus emits WorkflowEvent
 ```
+
+### Config-set resolution and retry policy
+
+`cowboy` parses `[config_sets.<name>]`; each set independently defaults
+`max_steps_per_run`, `max_visits_per_step`, `max_retries_per_run`, and
+`max_retries_per_step` to `100`, `20`, `200`, and `2`. The built-in `default`
+set is always present. Retry limits may be zero, while step and visit limits
+must be nonzero. The old top-level runner-limit keys are rejected.
+
+After Lua compilation, `WorkflowRuntime` resolves the workflow's optional
+`config_set` (or `default`) before persisting a new `WorkflowRun`. Unknown sets
+fail before run persistence. The resolved name and limits are durable run
+state, so every later resume, step, answer, resolve, and resolution-options
+path is independent of current process configuration.
+
+`WorkflowRunner` reserves each recoverable retry by incrementing the run-wide
+and per-step-id counters and saving the run before emitting `StepRetrying` or
+dispatching. Both budgets are cumulative; repeated visits share the per-step
+remainder. Initial attempts and non-recoverable failures consume no retry
+budget, and retries consume no step/visit budget. Event attempts stay local to
+the current visit, with one fixed `max_attempts` derived from the smaller
+remaining retry budget. Run-budget exhaustion takes precedence when both
+ceilings are exhausted.
 
 ### Agent execution
 
@@ -160,9 +185,9 @@ cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]  # resolve a 
 cowboy runs                             # list workflow runs
 ```
 
-Recoverable step failures are auto-retried up to `max_retries_per_step` before a
-run gives up as `Failed`; the failed step stays current so `cowboy resolve` can
-route it to a valid status and continue the run.
+Recoverable step failures consume the snapshotted cumulative run-wide and
+per-step-id retry budgets described above. Exhaustion persists `Failed` while
+keeping the current step available to `cowboy resolve`.
 
 ## TUI
 

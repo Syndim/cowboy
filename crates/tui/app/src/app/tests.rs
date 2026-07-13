@@ -14,8 +14,14 @@ fn test_state() -> AppState {
     AppState::new(AppConfig {
         state_dir: dir.path().to_path_buf(),
         workflow_store: dir.path().join("workflow.redb"),
-        max_steps_per_run: 1,
-        max_visits_per_step: 1,
+        config_sets: std::collections::BTreeMap::from([(
+            "default".to_string(),
+            crate::config::ConfigSetConfig {
+                max_steps_per_run: 1,
+                max_visits_per_step: 1,
+                ..Default::default()
+            },
+        )]),
         ..AppConfig::default()
     })
 }
@@ -84,8 +90,14 @@ fn idle_draw_hides_debug_paths() {
     let state = AppState::new(AppConfig {
         state_dir: state_dir.clone(),
         workflow_store: workflow_store.clone(),
-        max_steps_per_run: 1,
-        max_visits_per_step: 1,
+        config_sets: std::collections::BTreeMap::from([(
+            "default".to_string(),
+            crate::config::ConfigSetConfig {
+                max_steps_per_run: 1,
+                max_visits_per_step: 1,
+                ..Default::default()
+            },
+        )]),
         ..AppConfig::default()
     });
 
@@ -677,8 +689,14 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         state_dir: dir.path().join("state"),
         workflow_store: dir.path().join("state/workflow.redb"),
         workflow_dirs: vec![workflow_dir],
-        max_steps_per_run: 5,
-        max_visits_per_step: 5,
+        config_sets: std::collections::BTreeMap::from([(
+            "default".to_string(),
+            crate::config::ConfigSetConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                ..Default::default()
+            },
+        )]),
         ..AppConfig::default()
     };
     let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))

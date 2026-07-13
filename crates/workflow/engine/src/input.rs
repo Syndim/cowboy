@@ -133,6 +133,7 @@ mod tests {
             workflow_sources: BTreeMap::new(),
             original_request: "do it".to_string(),
             request_topic: None,
+            config_set: Default::default(),
             status: RunStatus::WaitingForInput {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
@@ -150,6 +151,8 @@ mod tests {
                 )
                 .unwrap(),
             },
+            retries_used: 0,
+            step_retries_used: Default::default(),
             current_step: "approve".to_string(),
             head: None,
             resume: Value::Null,

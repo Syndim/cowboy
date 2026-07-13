@@ -1,4 +1,5 @@
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ActionDispatcher, ActionResult, ObjectKind, Result, RunHead, RunStatus, RunStore, StepAction,
@@ -6,13 +7,16 @@ use crate::{
 };
 
 /// Safety budgets enforced by the workflow runner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunnerLimits {
     /// Maximum number of handled step actions in one run.
     pub max_steps_per_run: u32,
     /// Maximum number of visits to the same step in one run.
     pub max_visits_per_step: u32,
-    /// Maximum number of recoverable retries for a single step attempt.
+    /// Maximum number of recoverable retries across one durable run.
+    pub max_retries_per_run: u32,
+    /// Maximum number of recoverable retries for one step id across all visits.
     pub max_retries_per_step: u32,
 }
 
@@ -21,6 +25,7 @@ impl Default for RunnerLimits {
         Self {
             max_steps_per_run: 100,
             max_visits_per_step: 20,
+            max_retries_per_run: 200,
             max_retries_per_step: 2,
         }
     }
@@ -60,7 +65,7 @@ pub async fn retry_current_step<S, D, P>(
     provider: &P,
     definition: &WorkflowDefinition,
     run: &mut WorkflowRun,
-    attempt: u32,
+    attempt: u64,
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
 where
@@ -86,7 +91,7 @@ async fn dispatch_current_step<S, D, P>(
     provider: &P,
     definition: &WorkflowDefinition,
     run: &mut WorkflowRun,
-    attempt: u32,
+    attempt: u64,
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
 where
@@ -483,6 +488,7 @@ mod tests {
         WorkflowDefinition {
             name: "wf".to_string(),
             description: None,
+            config_set: None,
             source_hash: "source".to_string(),
             head: "start".to_string(),
             roles: BTreeMap::from([(
@@ -516,6 +522,9 @@ mod tests {
             current_step: "start".to_string(),
             head: None,
             resume: Value::Null,
+            config_set: crate::ResolvedConfigSet::default(),
+            retries_used: 0,
+            step_retries_used: BTreeMap::new(),
             steps_executed: 0,
             step_visits: BTreeMap::new(),
             active_duration_ms: 0,
@@ -776,6 +785,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_does_not_consume_step_or_visit_budgets() {
+        let store = MemoryStore::default();
+        let executor = NoopDispatcher::default();
+        let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
+            status: "success".to_string(),
+            fields: Value::Null,
+            body: String::new(),
+        })]);
+        let mut run = run();
+        run.steps_executed = 1;
+        run.step_visits.insert("start".to_string(), 1);
+
+        let status = retry_current_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut run,
+            2,
+            Some("retry".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(status, RunStatus::Completed);
+        assert_eq!(run.steps_executed, 1);
+        assert_eq!(run.step_visits["start"], 1);
+    }
+
+    #[tokio::test]
     async fn max_step_budget_is_enforced() {
         let store = MemoryStore::default();
         let executor = NoopDispatcher::default();
@@ -796,6 +835,7 @@ mod tests {
             &RunnerLimits {
                 max_steps_per_run: 1,
                 max_visits_per_step: 10,
+                max_retries_per_run: 200,
                 max_retries_per_step: 0,
             },
         )

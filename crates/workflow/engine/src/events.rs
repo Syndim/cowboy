@@ -168,8 +168,8 @@ pub enum WorkflowEventKind {
     },
     StepRetrying {
         step_id: String,
-        attempt: u32,
-        max_attempts: u32,
+        attempt: u64,
+        max_attempts: u64,
         reason: String,
     },
     ManuallyResolved {

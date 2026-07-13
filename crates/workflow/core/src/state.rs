@@ -5,8 +5,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError, WorkflowId,
+    ObjectHash, RecordId, Result, RoleId, RunId, RunnerLimits, Status, StepId, TurnId,
+    WorkflowError, WorkflowId,
 };
+
+/// Name used when a workflow does not explicitly select a config set.
+pub const DEFAULT_CONFIG_SET_NAME: &str = "default";
+
+/// Runner policy resolved when a run is created and retained for its lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedConfigSet {
+    /// Name selected by the workflow, or `default` when none was declared.
+    pub name: String,
+    /// Effective limits copied from the selected runtime config set.
+    pub limits: RunnerLimits,
+}
+
+impl Default for ResolvedConfigSet {
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_CONFIG_SET_NAME.to_string(),
+            limits: RunnerLimits::default(),
+        }
+    }
+}
 
 /// Durable state of a workflow run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +48,9 @@ pub struct WorkflowRun {
     /// Short generated topic shown in run listings when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_topic: Option<String>,
+    /// Config set and effective limits resolved before this run was persisted.
+    #[serde(default)]
+    pub config_set: ResolvedConfigSet,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
     /// Step id that should run next when the run resumes.
@@ -41,6 +66,12 @@ pub struct WorkflowRun {
     /// Number of times each step has been visited in this run.
     #[serde(default)]
     pub step_visits: BTreeMap<StepId, u32>,
+    /// Recoverable retry dispatches reserved across the entire run.
+    #[serde(default)]
+    pub retries_used: u32,
+    /// Recoverable retry dispatches reserved for each step id across all visits.
+    #[serde(default)]
+    pub step_retries_used: BTreeMap<StepId, u32>,
     /// Persisted milliseconds spent actively executing Cowboy runtime work for this run.
     #[serde(default)]
     pub active_duration_ms: u64,
@@ -303,5 +334,88 @@ mod tests {
         assert_eq!(value["resume_callback"]["kind"], "ask_user");
         assert!(value.get("record_id").is_none());
         assert!(value.get("output_fields").is_none());
+    }
+
+    #[test]
+    fn runner_limits_have_stable_built_in_defaults() {
+        assert_eq!(
+            RunnerLimits::default(),
+            RunnerLimits {
+                max_steps_per_run: 100,
+                max_visits_per_step: 20,
+                max_retries_per_run: 200,
+                max_retries_per_step: 2,
+            }
+        );
+
+        let partial: RunnerLimits = serde_json::from_value(serde_json::json!({
+            "max_retries_per_step": 0
+        }))
+        .unwrap();
+        assert_eq!(partial.max_steps_per_run, 100);
+        assert_eq!(partial.max_visits_per_step, 20);
+        assert_eq!(partial.max_retries_per_run, 200);
+        assert_eq!(partial.max_retries_per_step, 0);
+    }
+
+    #[test]
+    fn legacy_run_defaults_resolved_config_and_retry_counters() {
+        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "workflow_name": "wf",
+            "workflow_api_version": 1,
+            "workflow_hash": "hash",
+            "workflow_sources": {},
+            "original_request": "do it",
+            "status": { "status": "running" },
+            "current_step": "start",
+            "head": null,
+            "resume": null,
+            "steps_executed": 1,
+            "step_visits": { "start": 1 },
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert_eq!(run.config_set, ResolvedConfigSet::default());
+        assert_eq!(run.retries_used, 0);
+        assert!(run.step_retries_used.is_empty());
+    }
+
+    #[test]
+    fn retry_counters_and_resolved_config_round_trip() {
+        let mut run: WorkflowRun = serde_json::from_value(serde_json::json!({
+            "id": "run",
+            "workflow_name": "wf",
+            "workflow_api_version": 1,
+            "workflow_hash": "hash",
+            "workflow_sources": {},
+            "original_request": "do it",
+            "status": { "status": "running" },
+            "current_step": "start",
+            "head": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        run.config_set = ResolvedConfigSet {
+            name: "careful".to_string(),
+            limits: RunnerLimits {
+                max_steps_per_run: 9,
+                max_visits_per_step: 8,
+                max_retries_per_run: 7,
+                max_retries_per_step: 6,
+            },
+        };
+        run.retries_used = 3;
+        run.step_retries_used.insert("start".to_string(), 2);
+
+        let round_trip: WorkflowRun =
+            serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        assert_eq!(round_trip.config_set.name, "careful");
+        assert_eq!(round_trip.config_set.limits.max_retries_per_run, 7);
+        assert_eq!(round_trip.retries_used, 3);
+        assert_eq!(round_trip.step_retries_used["start"], 2);
     }
 }

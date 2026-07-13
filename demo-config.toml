@@ -4,8 +4,17 @@
 state_dir = ".cowboy/demo-state"
 workflow_store = ".cowboy/demo-state/workflow.redb"
 workflow_dirs = ["crates/workflow/engine/test_files"]
+
+[config_sets.default]
 max_steps_per_run = 100
 max_visits_per_step = 20
+max_retries_per_run = 200
+max_retries_per_step = 2
+
+[config_sets.careful]
+# Omitted step/visit fields inherit 100 and 20.
+max_retries_per_run = 20
+max_retries_per_step = 4
 
 [[agents]]
 name = "default"

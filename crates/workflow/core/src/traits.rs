@@ -42,7 +42,7 @@ pub struct ExecutionContext {
     /// Role metadata for agent actions, when the action targets a compiled role.
     pub role: Option<RoleDefinition>,
     /// 1-based attempt number for the current step (increments on recoverable retry).
-    pub attempt: u32,
+    pub attempt: u64,
     /// Reason the previous attempt failed, when this is a corrective retry.
     pub retry_reason: Option<String>,
 }

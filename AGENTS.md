@@ -49,8 +49,9 @@ cowboy runs                             # list workflow runs
 `--workflow <workflow-id>` uses the catalog id shown by `/workflows` or other catalog listings, not necessarily the Lua-declared workflow name.
 
 Recoverable step failures (missing agent frontmatter, transient backend errors)
-are auto-retried up to `max_retries_per_step` before a run gives up as `Failed`;
-the failed step stays current so `cowboy resolve` can continue the run.
+consume both the cumulative run-wide and per-step-id retry budgets. Initial
+attempts do not count; retries do not consume step/visit budgets. Give-up keeps
+the failed step current so `cowboy resolve` can continue the run.
 
 ## TUI Interface
 
@@ -188,8 +189,8 @@ Owns:
 
 Important modules:
 
-- `runtime.rs` — `WorkflowRuntime`, runtime config, start/resume/step/answer/improve/resolve/list operations, recoverable-retry give-up persistence, catalog/store/Lua/action/agent wiring, and event-log persistence.
-- `runner.rs` — `WorkflowRunner<S, D, P>` over `cowboy-workflow-core::execute_step`; owns event emission and the bounded recoverable-retry loop (`max_retries_per_step`); persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`.
+- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default resolution, durable policy snapshots, start/resume/step/answer/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
+- `runner.rs` — `WorkflowRunner<S, D, P>` over `cowboy-workflow-core::execute_step`; owns event emission and cumulative run/per-step retry enforcement, reserves retry counters before dispatch, and persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`.
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `ResumeRouter` for `RunStatus::WaitingForInput` answers and persisted resume callbacks.
 - `workflow.rs` — deterministic/agent selectors and agent summarizer.
@@ -239,9 +240,9 @@ Owns:
 - `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
 - `StepAction`: `agent`, `command`, `status`, `ask_user`, `fail`
-- `WorkflowRun`, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
-- `ResumeCallback`, `ActionResult`, `ExecutionContext`, `RunStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
-- `execute_step`, budget enforcement, and step-record/status application helpers
+- `WorkflowRun`, durable resolved config-set snapshots and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
+- `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, `RunStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
+- `execute_step`, step/visit budget enforcement, and step-record/status application helpers
 
 Important modules:
 
@@ -367,6 +368,7 @@ CLI argv or TUI composer input
   -> cowboy app dispatches to cowboy-workflow-engine::WorkflowRuntime
   -> catalog loads/selects WorkflowSourceRef
   -> workflow-lua compiles/snapshots Lua source
+  -> engine resolves workflow config_set (or default) and snapshots effective limits
   -> WorkflowRun is saved through RunStore
   -> WorkflowRunner loops execute_step until terminal/waiting/failed
   -> ActionDispatcher maps StepAction to ActionResult
@@ -410,10 +412,13 @@ legacy serialized state.
 
 ```text
 Recoverable step failure (e.g. MissingFrontmatter, transient Client error)
-  -> WorkflowRunner retries the current step up to max_retries_per_step
-       (budget-safe: retries don't consume max_visits_per_step)
+  -> WorkflowRunner computes one visit allowance from remaining run + step-id retries
+  -> before each retry, increments both durable counters and saves WorkflowRun
+  -> StepRetrying uses visit-local attempt 2..=max_attempts with fixed max_attempts
+       (retries don't consume max_steps_per_run or max_visits_per_step)
        (agent retries append a corrective frontmatter nudge, reusing the session)
   -> on success: run continues
+  -> on exhaustion: distinct run/step policy error; run scope wins when both exhaust
   -> on give-up: run persisted RunStatus::Failed { reason }, current_step retained
 
 cowboy resolve <run-id>                 # list resolvable statuses + required fields
@@ -432,9 +437,17 @@ Example `~/.config/cowboy/config.toml`:
 state_dir = "~/.local/state/cowboy"
 workflow_store = "~/.local/state/cowboy/workflow.redb"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
+
+[config_sets.default]
 max_steps_per_run = 100
 max_visits_per_step = 20
+max_retries_per_run = 200
 max_retries_per_step = 2
+
+[config_sets.careful]
+# Omitted fields independently inherit 100, 20, 200, and 2.
+max_retries_per_run = 20
+max_retries_per_step = 4
 
 [[agents]]
 name = "default"
@@ -445,6 +458,22 @@ args = ["--acp"]
 id = "claude-sonnet-4.5"
 provider = "anthropic"
 ```
+
+Every config-set field is optional. The built-in `default` set is always
+materialized. Retry limits accept `0`; step and visit limits must be nonzero.
+Blank names and unknown fields are rejected. Workflows select a set with
+`workflow(name, head, { config_set = "careful" })`; omission selects `default`,
+and unknown names fail before a run is persisted.
+
+New runs snapshot the resolved set name and all four effective limits. Resume,
+step, answer, resolve, and resolution-option paths use the snapshot even after
+the process config changes or removes the named set. Retry counters are durable
+and cumulative across a run and across repeated visits to one step id; events
+keep visit-local attempt numbering with a fixed per-visit `max_attempts`.
+
+The config migration is a clean cutover: top-level `max_steps_per_run`,
+`max_visits_per_step`, and `max_retries_per_step` are rejected. Move them under
+`[config_sets.default]`.
 
 `workflow_dirs` are optional. The built-in default workflow is always available.
 
