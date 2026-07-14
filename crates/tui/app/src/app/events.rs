@@ -30,6 +30,13 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
     render_workflow_event_width(event, DEFAULT_CARD_WIDTH)
 }
 
+/// A completed step whose status hands control back to the user for input should
+/// show its full body (no row cap) so the user has the full context to answer.
+/// Currently only `blocked` routes back to the user via ask-user/blocked routing.
+fn body_should_expand(status: &str) -> bool {
+    matches!(status, "blocked")
+}
+
 pub(super) fn render_workflow_event_width(
     event: &WorkflowEvent,
     width: usize,
@@ -222,10 +229,15 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 Span::styled(" · Status: ", style_transcript_metadata()),
                 Span::styled(status_value.to_string(), style_for_run_state(status_value)),
             ])]))
-            .section(
-                CardSection::named("Body", render_markup(body, style_transcript_normal()))
-                    .capped(8),
-            )
+            .section({
+                let body_section =
+                    CardSection::named("Body", render_markup(body, style_transcript_normal()));
+                if body_should_expand(status_value) {
+                    body_section
+                } else {
+                    body_section.capped(8)
+                }
+            })
         }
         WorkflowEventKind::WaitingForInput {
             step,
@@ -809,6 +821,29 @@ mod tests {
         assert!(completed_text.contains("body line 8"));
         assert!(completed_text.contains("… 2 more rows"));
         assert!(!completed_text.contains("body:"), "{completed_text}");
+    }
+
+    #[test]
+    fn blocked_step_completed_body_shows_full_context_for_user_input() {
+        // A step that returns status "blocked" asks the user for direction. The
+        // completed-step body carries the agent's full "why blocked / unblock
+        // path" explanation, so it must not be truncated away from the user.
+        let body = (1..=20)
+            .map(|index| format!("blocked body line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let completed = render_workflow_event(&event(WorkflowEventKind::StepCompleted {
+            step_id: "implement".to_string(),
+            action: "agent".to_string(),
+            status: Some("blocked".to_string()),
+            body,
+        }));
+        let text = completed.text();
+
+        assert!(text.contains("Status: blocked"), "{text}");
+        assert!(text.contains("blocked body line 1"), "{text}");
+        assert!(text.contains("blocked body line 20"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
     }
 
     #[test]
