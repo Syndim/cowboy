@@ -6,7 +6,7 @@ use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH}
 use super::controls::chrome::status_icon;
 use super::events::{render_workflow_event, render_workflow_event_width};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
-use super::markup::render_markup;
+use super::markup::{ContentFormat, render_content};
 use super::styles::{style_transcript_normal, style_warning};
 use crate::config::AppConfig;
 
@@ -127,9 +127,10 @@ pub(in crate::app) fn render_pending_prompt_lines(
         CardMetadata::step(prompt.step()),
         CardMetadata::run(prompt.run_id()),
     ])
-    .section(CardSection::body(render_markup(
+    .section(CardSection::body(render_content(
         prompt.message(),
         style_transcript_normal(),
+        ContentFormat::LiteralWithCodeHighlighting,
     )));
 
     if !prompt.choices().is_empty() {
@@ -182,7 +183,13 @@ fn app_card(
     let (status, tone) = app_card_status_and_tone(title);
     let body = details
         .iter()
-        .flat_map(|detail| render_markup(detail, style_transcript_normal()))
+        .flat_map(|detail| {
+            render_content(
+                detail,
+                style_transcript_normal(),
+                ContentFormat::LiteralWithCodeHighlighting,
+            )
+        })
         .collect::<Vec<_>>();
     let card = title_prefix
         .iter()
@@ -970,6 +977,48 @@ mod tests {
 
         WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
             .with_deterministic_selector()
+    }
+
+    #[test]
+    fn pending_prompt_message_preserves_markdown_punctuation() {
+        let prompt = PendingPrompt {
+            run_id: "run-1".to_string(),
+            step: "confirm".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve **literal** `plan`?".to_string(),
+            choices: Vec::new(),
+        };
+        let rendered = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Approve **literal** `plan`?"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn application_card_details_preserve_markdown_punctuation() {
+        let entry = TranscriptEntry::Card {
+            title: "Notice".to_string(),
+            title_prefix: Vec::new(),
+            title_suffix: Vec::new(),
+            details: vec!["Result: **literal** `detail`".to_string()],
+        };
+        let rendered = entry
+            .render_lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            rendered.contains("Result: **literal** `detail`"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ chrono = { workspace = true, features = ["serde"] }
 crossterm = "0"
 fs2.workspace = true
 dirs = "6"
+pulldown-cmark = "0.13"
 ratatui = { version = "0", features = ["unstable-rendered-line-info"] }
 tui-input = { version = "0", default-features = false, features = ["crossterm"] }
 unicode-width = "0"

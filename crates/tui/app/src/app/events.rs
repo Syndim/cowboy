@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
 use super::controls::chrome::status_icon;
-use super::markup::render_markup;
+use super::markup::{ContentFormat, render_content};
 use super::styles::{
     style_error, style_for_run_state, style_for_tool_status, style_transcript_metadata,
     style_transcript_normal, style_transcript_plan, style_transcript_prompt,
@@ -88,9 +88,10 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             CardMetadata::step(step_id),
             CardMetadata::run(&event.run_id),
         ])
-        .section(CardSection::body(render_markup(
+        .section(CardSection::body(render_content(
             message,
             style_transcript_normal(),
+            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::AgentSessionReady { step_id, .. } => workflow_card(
             event,
@@ -116,7 +117,11 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         ])
         .section(CardSection::named(
             "Prompt",
-            render_markup(prompt, style_transcript_prompt()),
+            render_content(
+                prompt,
+                style_transcript_prompt(),
+                ContentFormat::LiteralWithCodeHighlighting,
+            ),
         )),
         WorkflowEventKind::AgentResponse { step_id, content } => workflow_card(
             event,
@@ -128,9 +133,10 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             CardMetadata::step(step_id),
             CardMetadata::run(&event.run_id),
         ])
-        .section(CardSection::body(render_markup(
+        .section(CardSection::body(render_content(
             content,
             style_transcript_normal(),
+            ContentFormat::Markdown,
         ))),
         WorkflowEventKind::AgentThought { step_id, content } => workflow_card(
             event,
@@ -142,9 +148,10 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             CardMetadata::step(step_id),
             CardMetadata::run(&event.run_id),
         ])
-        .section(CardSection::body(render_markup(
+        .section(CardSection::body(render_content(
             content,
             style_transcript_thought(),
+            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::AgentToolCall {
             step_id,
@@ -187,7 +194,11 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 let content = display_tool_update_content(content);
                 card = card.section(CardSection::named(
                     "Output",
-                    render_markup(&content, style_transcript_normal()),
+                    render_content(
+                        &content,
+                        style_transcript_normal(),
+                        ContentFormat::LiteralWithCodeHighlighting,
+                    ),
                 ));
             }
             card
@@ -196,7 +207,11 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             let lines = entries
                 .iter()
                 .flat_map(|entry| {
-                    render_markup(&display_json_value(entry), style_transcript_plan())
+                    render_content(
+                        &display_json_value(entry),
+                        style_transcript_plan(),
+                        ContentFormat::LiteralWithCodeHighlighting,
+                    )
                 })
                 .collect::<Vec<_>>();
             workflow_card(event, status_icon("running"), "Agent plan", CardTone::Plan)
@@ -230,8 +245,14 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 Span::styled(status_value.to_string(), style_for_run_state(status_value)),
             ])]))
             .section({
-                let body_section =
-                    CardSection::named("Body", render_markup(body, style_transcript_normal()));
+                let body_section = CardSection::named(
+                    "Body",
+                    render_content(
+                        body,
+                        style_transcript_normal(),
+                        ContentFormat::LiteralWithCodeHighlighting,
+                    ),
+                );
                 if body_should_expand(status_value) {
                     body_section
                 } else {
@@ -252,9 +273,10 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 CardTone::Warning,
             )
             .metadata([CardMetadata::step(step), CardMetadata::run(&event.run_id)])
-            .section(CardSection::body(render_markup(
+            .section(CardSection::body(render_content(
                 message,
                 style_transcript_normal(),
+                ContentFormat::LiteralWithCodeHighlighting,
             )));
             if !choices.is_empty() {
                 card = card.section(CardSection::named(
@@ -293,9 +315,10 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             format!("attempt {attempt}/{max_attempts}"),
             style_warning(),
         ))]))
-        .section(CardSection::body(render_markup(
+        .section(CardSection::body(render_content(
             reason,
             style_transcript_metadata(),
+            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::ManuallyResolved { step_id, status } => workflow_card(
             event,
@@ -314,7 +337,11 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         WorkflowEventKind::RunFailed { reason } => {
             workflow_card(event, status_icon("failed"), "Run failed", CardTone::Error)
                 .metadata([CardMetadata::run(&event.run_id)])
-                .section(CardSection::body(render_markup(reason, style_error())))
+                .section(CardSection::body(render_content(
+                    reason,
+                    style_error(),
+                    ContentFormat::LiteralWithCodeHighlighting,
+                )))
                 .section(CardSection::named(
                     "Next action",
                     vec![Line::from(vec![
@@ -525,7 +552,7 @@ fn non_empty(text: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use ratatui::style::{Color, Style};
+    use ratatui::style::{Color, Modifier, Style};
 
     use super::*;
     use crate::app::styles::{
@@ -909,6 +936,50 @@ mod tests {
             "completed",
             style_success()
         ));
+    }
+
+    #[test]
+    fn step_progress_uses_literal_with_code_highlighting() {
+        let rendered = render_workflow_event(&event(WorkflowEventKind::StepProgress {
+            step_id: "implement".to_string(),
+            message: "Still **working**.".to_string(),
+        }));
+        let body_line = rendered
+            .lines()
+            .iter()
+            .find(|line| line.to_string().contains("working"))
+            .expect("step progress body should be rendered");
+
+        assert!(body_line.to_string().contains("**working**"));
+        assert!(!body_line.spans.iter().any(|span| {
+            span.content == "working" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn agent_response_renders_markdown_instead_of_raw_syntax() {
+        let rendered = render_workflow_event(&event(WorkflowEventKind::AgentResponse {
+            step_id: "implement".to_string(),
+            content: "Implemented **successfully**.".to_string(),
+        }));
+        let body_line = rendered
+            .lines()
+            .iter()
+            .find(|line| line.to_string().contains("Implemented"))
+            .expect("agent response body should be rendered");
+
+        let body_text = body_line.to_string();
+        assert!(
+            body_text.contains("Implemented successfully."),
+            "{body_text}"
+        );
+        assert!(!body_text.contains("**"), "{body_text}");
+        assert!(
+            body_line.spans.iter().any(|span| {
+                span.content == "successfully" && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "markdown strong text should render in bold: {body_line:?}"
+        );
     }
 
     #[test]
