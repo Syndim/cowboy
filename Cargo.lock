@@ -384,6 +384,7 @@ dependencies = [
  "toml",
  "tracing",
  "tui-input",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

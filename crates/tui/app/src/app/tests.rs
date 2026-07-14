@@ -245,6 +245,21 @@ fn draw_wraps_long_input_into_visible_continuation_row() {
 }
 
 #[test]
+fn draw_moves_whole_word_to_continuation_row() {
+    let mut state = test_state();
+    state.push_input("hello bananas");
+
+    let rows = rendered_rows(&state, 16, 10);
+
+    assert!(
+        rows.iter().any(|row| row.contains("> hello       "))
+            && rows.iter().any(|row| row.contains("  bananas     ")),
+        "expected the whole word on the continuation row; rendered rows:\n{}",
+        rows.join("\n")
+    );
+}
+
+#[test]
 fn draw_places_cursor_at_wrapped_input_end() {
     let mut state = test_state();
     state.push_input("abcdefghijklmnop");

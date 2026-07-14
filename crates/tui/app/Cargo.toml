@@ -18,6 +18,7 @@ pulldown-cmark = "0.13"
 ratatui = { version = "0", features = ["unstable-rendered-line-info"] }
 tui-input = { version = "0", default-features = false, features = ["crossterm"] }
 unicode-width = "0"
+unicode-segmentation = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 syntect = "5"
