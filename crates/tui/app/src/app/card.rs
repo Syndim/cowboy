@@ -4,14 +4,13 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controls::chrome::{METADATA_SEPARATOR, truncate_to_display_width};
 use super::styles::{
-    style_accent, style_border, style_error, style_success, style_transcript_metadata,
-    style_transcript_normal, style_transcript_plan, style_transcript_prompt,
-    style_transcript_thought, style_transcript_tool_pending, style_warning,
+    style_accent, style_border, style_error, style_success, style_transcript_normal,
+    style_transcript_plan, style_transcript_prompt, style_transcript_thought,
+    style_transcript_tool_pending, style_warning,
 };
 
 pub(super) const DEFAULT_CARD_WIDTH: usize = 80;
 const MIN_CARD_WIDTH: usize = 2;
-const SECTION_BODY_LIMIT: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CardTone {
@@ -81,29 +80,18 @@ impl CardMetadata {
 pub(super) struct CardSection {
     label: Option<String>,
     lines: Vec<Line<'static>>,
-    max_lines: usize,
 }
 
 impl CardSection {
     pub(super) fn body(lines: Vec<Line<'static>>) -> Self {
-        Self {
-            label: None,
-            lines,
-            max_lines: SECTION_BODY_LIMIT,
-        }
+        Self { label: None, lines }
     }
 
     pub(super) fn named(label: impl Into<String>, lines: Vec<Line<'static>>) -> Self {
         Self {
             label: Some(label.into()),
             lines,
-            max_lines: SECTION_BODY_LIMIT,
         }
-    }
-
-    pub(super) fn capped(mut self, max_lines: usize) -> Self {
-        self.max_lines = max_lines;
-        self
     }
 }
 
@@ -222,34 +210,12 @@ fn section_wrapped_lines(section: &CardSection, interior_width: usize) -> Vec<Li
         return Vec::new();
     }
 
-    let wrapped = section
+    section
         .lines
         .iter()
         .cloned()
         .flat_map(|line| wrap_line(line, interior_width))
-        .collect::<Vec<_>>();
-    let truncated = wrapped.len() > section.max_lines;
-    let mut lines = wrapped
-        .into_iter()
-        .take(section.max_lines)
-        .collect::<Vec<_>>();
-
-    if truncated {
-        let omitted = section
-            .lines
-            .iter()
-            .cloned()
-            .flat_map(|line| wrap_line(line, interior_width))
-            .count()
-            .saturating_sub(section.max_lines);
-        let marker = truncate_to_display_width(format!("… {omitted} more rows"), interior_width);
-        lines.push(Line::from(Span::styled(
-            marker,
-            style_transcript_metadata(),
-        )));
-    }
-
-    lines
+        .collect()
 }
 
 fn border_line(left: char, right: char, width: usize) -> Line<'static> {
@@ -479,19 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn wraps_body_lines_inside_borders_and_marks_truncation() {
+    fn wraps_body_lines_inside_borders_without_collapsing() {
         let rows = Card::new("✓", "Done", CardTone::Success)
-            .section(
-                CardSection::named(
-                    "Body",
-                    vec![
-                        Line::from("1234567890"),
-                        Line::from("line 2"),
-                        Line::from("line 3"),
-                    ],
-                )
-                .capped(2),
-            )
+            .section(CardSection::named(
+                "Body",
+                vec![
+                    Line::from("1234567890"),
+                    Line::from("line 2"),
+                    Line::from("line 3"),
+                ],
+            ))
             .render(8);
         let text = rows
             .iter()
@@ -501,7 +464,9 @@ mod tests {
 
         assert!(text.contains("│123456│"), "{text}");
         assert!(text.contains("│7890  │"), "{text}");
-        assert!(text.contains("… 2 m…"), "{text}");
+        assert!(text.contains("│line 2│"), "{text}");
+        assert!(text.contains("│line 3│"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
         assert!(
             rows.iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 8)
@@ -509,12 +474,12 @@ mod tests {
     }
 
     #[test]
-    fn caps_sections_after_visual_wrapping() {
+    fn retains_all_visual_rows_after_wrapping() {
         let rows = Card::new("●", "Long output", CardTone::Tool)
-            .section(
-                CardSection::named("Output", vec![Line::from("abcdefghijklmnopqrstuvwxyz")])
-                    .capped(2),
-            )
+            .section(CardSection::named(
+                "Output",
+                vec![Line::from("abcdefghijklmnopqrstuvwxyz")],
+            ))
             .render(10);
         let text = rows
             .iter()
@@ -524,12 +489,59 @@ mod tests {
 
         assert!(text.contains("│abcdefgh│"), "{text}");
         assert!(text.contains("│ijklmnop│"), "{text}");
-        assert!(text.contains("… 2 mor…"), "{text}");
-        assert!(!text.contains("qrstuvwx"), "{text}");
-        assert!(rows.len() <= 7, "{rows:?}");
+        assert!(text.contains("│qrstuvwx│"), "{text}");
+        assert!(text.contains("│yz      │"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
+        assert_eq!(rows.len(), 8, "{rows:?}");
         assert!(
             rows.iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 10)
+        );
+    }
+
+    #[test]
+    fn renders_more_than_120_body_rows_without_collapsing() {
+        let lines = (1..=121)
+            .map(|index| Line::from(format!("body row {index}")))
+            .collect();
+        let rows = Card::new("●", "Long body", CardTone::Tool)
+            .section(CardSection::body(lines))
+            .render(80);
+        let text = rows
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("body row 121"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
+        assert_eq!(rows.len(), 124, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 80)
+        );
+    }
+
+    #[test]
+    fn renders_more_than_120_named_rows_without_collapsing() {
+        let lines = (1..=121)
+            .map(|index| Line::from(format!("named row {index}")))
+            .collect();
+        let rows = Card::new("●", "Long named section", CardTone::Tool)
+            .section(CardSection::named("Output", lines))
+            .render(80);
+        let text = rows
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("named row 121"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
+        assert_eq!(rows.len(), 125, "{rows:?}");
+        assert!(
+            rows.iter()
+                .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 80)
         );
     }
 }

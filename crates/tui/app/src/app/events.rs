@@ -30,13 +30,6 @@ pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEv
     render_workflow_event_width(event, DEFAULT_CARD_WIDTH)
 }
 
-/// A completed step whose status hands control back to the user for input should
-/// show its full body (no row cap) so the user has the full context to answer.
-/// Currently only `blocked` routes back to the user via ask-user/blocked routing.
-fn body_should_expand(status: &str) -> bool {
-    matches!(status, "blocked")
-}
-
 pub(super) fn render_workflow_event_width(
     event: &WorkflowEvent,
     width: usize,
@@ -244,21 +237,14 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 Span::styled(" · Status: ", style_transcript_metadata()),
                 Span::styled(status_value.to_string(), style_for_run_state(status_value)),
             ])]))
-            .section({
-                let body_section = CardSection::named(
-                    "Body",
-                    render_content(
-                        body,
-                        style_transcript_normal(),
-                        ContentFormat::LiteralWithCodeHighlighting,
-                    ),
-                );
-                if body_should_expand(status_value) {
-                    body_section
-                } else {
-                    body_section.capped(8)
-                }
-            })
+            .section(CardSection::named(
+                "Body",
+                render_content(
+                    body,
+                    style_transcript_normal(),
+                    ContentFormat::LiteralWithCodeHighlighting,
+                ),
+            ))
         }
         WorkflowEventKind::WaitingForInput {
             step,
@@ -845,9 +831,27 @@ mod tests {
         assert!(completed_text.contains("✓ Step completed · ↳ review · ▶ 170dc431"));
         assert!(completed_text.contains("├─── Body "));
         assert!(completed_text.contains("body line 1"));
-        assert!(completed_text.contains("body line 8"));
-        assert!(completed_text.contains("… 2 more rows"));
+        assert!(completed_text.contains("body line 10"));
+        assert!(!completed_text.contains("more rows"), "{completed_text}");
         assert!(!completed_text.contains("body:"), "{completed_text}");
+    }
+
+    #[test]
+    fn step_completed_card_does_not_collapse_body_without_expand_control() {
+        let body = (1..=10)
+            .map(|index| format!("body line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let completed = render_workflow_event(&event(WorkflowEventKind::StepCompleted {
+            step_id: "review".to_string(),
+            action: "status".to_string(),
+            status: Some("approved".to_string()),
+            body,
+        }));
+        let text = completed.text();
+
+        assert!(text.contains("body line 10"), "{text}");
+        assert!(!text.contains("more rows"), "{text}");
     }
 
     #[test]
