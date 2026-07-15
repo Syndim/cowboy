@@ -42,9 +42,14 @@ cowboy resume <run-id>                  # continue a run until it blocks, fails,
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
-cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]  # resolve a failed step
+cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 ```
+
+Repeat `--field` for each output field. Field names are exact; quote names with
+spaces, `=`, or a leading `-`. Plain text stays a string, while valid JSON
+literals preserve their types, for example `--field summary "manual resolution"`,
+`--field retry false`, and `--field files '["src/a.rs"]'`.
 
 `--workflow <workflow-id>` uses the catalog id shown by `/workflows` or other catalog listings, not necessarily the Lua-declared workflow name.
 
@@ -71,7 +76,7 @@ Built-in slash commands:
 /answer <run-id> <prompt-id> <answer>
 /improve <run-id>
 /resolve <run-id>
-/resolve <run-id> <status> [fields-json]
+/resolve <run-id> <status> [--field <name> <value>]... [--body <text>]
 /runs
 /workflows
 /cancel
@@ -422,7 +427,7 @@ Recoverable step failure (e.g. MissingFrontmatter, transient Client error)
   -> on give-up: run persisted RunStatus::Failed { reason }, current_step retained
 
 cowboy resolve <run-id>                 # list resolvable statuses + required fields
-cowboy resolve <run-id> <status> [--fields <json>] [--body <text>]
+cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]
   -> WorkflowRuntime::resolution_options recomputes the failed step's action
        (via LuaStepActionProvider) to recover valid statuses + OutputSpec fields
   -> resolve_run validates status routes via next_step and required fields present

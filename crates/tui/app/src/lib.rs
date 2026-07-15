@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod config;
+pub mod resolution;
 pub mod run_summary;
 
 pub use app::run_tui;

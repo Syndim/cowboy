@@ -7,6 +7,7 @@
 //! runtime, ratatui, terminal input, config loading, or app state.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use clap::{Arg, ArgAction, Args, Command, CommandFactory, Parser, Subcommand};
@@ -159,6 +160,67 @@ impl AnswerArgs {
     }
 }
 
+/// Validation error for resolve field pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveFieldError {
+    message: String,
+}
+
+impl ResolveFieldError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for ResolveFieldError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ResolveFieldError {}
+
+fn parse_field_value(name: &str, raw_value: &str) -> Result<serde_json::Value, ResolveFieldError> {
+    match serde_json::from_str(raw_value) {
+        Ok(value) => Ok(value),
+        Err(err) if looks_like_structured_json(raw_value) => Err(ResolveFieldError::new(format!(
+            "field {name:?} has malformed JSON value: {err}"
+        ))),
+        Err(_) => Ok(serde_json::Value::String(raw_value.to_string())),
+    }
+}
+
+/// Assemble raw name/value pairs into the object expected by the runtime.
+pub fn resolve_fields_object(
+    field_values: Vec<String>,
+) -> Result<Option<serde_json::Value>, ResolveFieldError> {
+    if field_values.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = serde_json::Map::new();
+    let mut pairs = field_values.chunks_exact(2);
+    for pair in &mut pairs {
+        let name = &pair[0];
+        if fields.contains_key(name) {
+            return Err(ResolveFieldError::new(format!(
+                "field {name:?} was provided more than once"
+            )));
+        }
+
+        fields.insert(name.clone(), parse_field_value(name, &pair[1])?);
+    }
+
+    debug_assert!(pairs.remainder().is_empty());
+    Ok(Some(serde_json::Value::Object(fields)))
+}
+
+fn looks_like_structured_json(raw_value: &str) -> bool {
+    matches!(raw_value.trim_start().chars().next(), Some('[' | '{' | '"'))
+}
+
 /// Arguments for resolving a failed run.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct ResolveArgs {
@@ -169,28 +231,20 @@ pub struct ResolveArgs {
     #[arg(value_name = "status", allow_hyphen_values = true)]
     pub status: Option<String>,
 
-    /// JSON object of output fields for the chosen status.
-    #[arg(long, value_name = "json", conflicts_with = "fields_json")]
-    pub fields: Option<String>,
+    /// Output field name and value. Repeat for multiple fields.
+    #[arg(
+        long = "field",
+        value_names = ["name", "value"],
+        num_args = 2,
+        action = ArgAction::Append,
+        allow_hyphen_values = true,
+        requires = "status"
+    )]
+    pub fields: Vec<String>,
 
     /// Human-readable body for the synthesized step record.
-    #[arg(long, value_name = "text")]
+    #[arg(long, value_name = "text", requires = "status")]
     pub body: Option<String>,
-
-    #[arg(
-        value_name = "fields-json",
-        allow_hyphen_values = true,
-        conflicts_with = "fields",
-        hide = true
-    )]
-    pub fields_json: Option<String>,
-}
-
-impl ResolveArgs {
-    /// Return fields JSON supplied through either the CLI option or slash positional form.
-    pub fn into_fields(self) -> Option<String> {
-        self.fields.or(self.fields_json)
-    }
 }
 
 /// Parsed TUI slash command.
@@ -333,11 +387,7 @@ fn slash_usage(command: &Command) -> String {
 }
 
 fn arg_usage(arg: &Arg) -> Option<String> {
-    if arg.is_hide_set() && arg.get_id() != "fields_json" {
-        return None;
-    }
-
-    if matches!(arg.get_id().as_str(), "fields" | "body") {
+    if arg.is_hide_set() {
         return None;
     }
 
@@ -345,10 +395,14 @@ fn arg_usage(arg: &Arg) -> Option<String> {
         let usage = if matches!(arg.get_action(), ArgAction::SetTrue | ArgAction::SetFalse) {
             format!("--{long}")
         } else {
-            format!("--{long} <{}>", value_name(arg))
+            format!("--{long} {}", value_names(arg))
         };
+        let mut usage = optional_usage(arg, usage);
+        if matches!(arg.get_action(), ArgAction::Append) {
+            usage.push_str("...");
+        }
 
-        return Some(optional_usage(arg, usage));
+        return Some(usage);
     }
 
     let usage = match arg.get_id().as_str() {
@@ -370,11 +424,16 @@ fn optional_usage(arg: &Arg, usage: String) -> String {
     }
 }
 
-fn value_name(arg: &Arg) -> String {
+fn value_names(arg: &Arg) -> String {
     arg.get_value_names()
-        .and_then(|names| names.first())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| arg.get_id().as_str().replace('_', "-"))
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| format!("<{name}>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_else(|| format!("<{}>", arg.get_id().as_str().replace('_', "-")))
 }
 
 fn tokenize_slash_input(input: &str) -> Result<Vec<String>, SlashParseError> {
@@ -604,44 +663,217 @@ mod tests {
     }
 
     #[test]
-    fn resolve_parses_cli_options_and_slash_positional_fields() {
-        match shared_cli_command([
+    fn resolve_parses_identically_for_cli_and_slash_commands() {
+        assert_eq!(
+            shared_cli_command(["cowboy", "resolve", "run-1"]),
+            shared_slash_command("/resolve run-1")
+        );
+        assert_eq!(
+            shared_cli_command([
+                "cowboy",
+                "resolve",
+                "run-1",
+                "approved",
+                "--field",
+                "summary",
+                "work completed",
+                "--body",
+                "looks good",
+            ]),
+            shared_slash_command(
+                r#"/resolve run-1 approved --field summary "work completed" --body "looks good""#,
+            )
+        );
+
+        let command = shared_cli_command([
             "cowboy",
             "resolve",
             "run-1",
-            "approved",
-            "--fields",
-            r#"{"summary":"done"}"#,
+            "failed",
+            "--field",
+            "reason",
+            "needs work",
+            "--field",
+            "link",
+            "https://example.test?a=b=c",
+        ]);
+        assert_eq!(
+            command,
+            shared_slash_command(
+                r#"/resolve run-1 failed --field reason "needs work" --field link https://example.test?a=b=c"#,
+            )
+        );
+
+        let SharedCommand::Resolve(args) = command else {
+            panic!("expected resolve command");
+        };
+        assert_eq!(
+            resolve_fields_object(args.fields).unwrap(),
+            Some(serde_json::json!({
+                "link": "https://example.test?a=b=c",
+                "reason": "needs work",
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_field_pairs_preserve_json_types_and_plain_strings() {
+        let command = shared_cli_command([
+            "cowboy",
+            "resolve",
+            "run-1",
+            "success",
+            "--field",
+            "summary",
+            "done",
+            "--field",
+            "retry",
+            "false",
+            "--field",
+            "count",
+            "3",
+            "--field",
+            "files",
+            r#"["src/a.rs"]"#,
+            "--field",
+            "metadata",
+            r#"{"owner":"dev"}"#,
+            "--field",
+            "note",
+            "null",
+        ]);
+        let SharedCommand::Resolve(args) = command else {
+            panic!("expected resolve command");
+        };
+
+        assert_eq!(
+            resolve_fields_object(args.fields).unwrap(),
+            Some(serde_json::json!({
+                "summary": "done",
+                "retry": false,
+                "count": 3,
+                "files": ["src/a.rs"],
+                "metadata": {"owner": "dev"},
+                "note": null,
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_preserves_boundary_names_and_hyphen_values() {
+        let arguments = [
+            "cowboy",
+            "resolve",
+            "run-1",
+            "success",
+            "--field",
+            "foo=bar",
+            "value=with=equals",
+            "--field",
+            "-review",
+            "-declined",
+            "--field",
+            " review ",
+            " spaced value ",
+            "--field",
+            "",
+            "empty name",
+            "--field",
             "--body",
-            "looks good",
-        ]) {
-            SharedCommand::Resolve(args) => {
-                assert_eq!(args.run_id, "run-1");
-                assert_eq!(args.status.as_deref(), Some("approved"));
-                assert_eq!(args.fields.as_deref(), Some(r#"{"summary":"done"}"#));
-                assert_eq!(args.body.as_deref(), Some("looks good"));
-                assert_eq!(args.fields_json, None);
-            }
-            other => panic!("expected resolve command, got {other:?}"),
+            "--field",
+        ];
+        let command = shared_cli_command(arguments);
+        assert_eq!(
+            command,
+            shared_slash_command(
+                r#"/resolve run-1 success --field foo=bar value=with=equals --field -review -declined --field " review " " spaced value " --field "" "empty name" --field --body --field"#,
+            )
+        );
+        let SharedCommand::Resolve(args) = command else {
+            panic!("expected resolve command");
+        };
+
+        assert_eq!(
+            resolve_fields_object(args.fields).unwrap(),
+            Some(serde_json::json!({
+                "foo=bar": "value=with=equals",
+                "-review": "-declined",
+                " review ": " spaced value ",
+                "": "empty name",
+                "--body": "--field",
+            }))
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_values_and_exact_duplicate_names() {
+        for (name, value) in [
+            ("files", "[\"private-file-name\""),
+            ("credentials", "{\"token\":\"private-token\""),
+            ("quoted", "\"private-content"),
+        ] {
+            let SharedCommand::Resolve(args) = shared_cli_command([
+                "cowboy", "resolve", "run-1", "success", "--field", name, value,
+            ]) else {
+                panic!("expected resolve command");
+            };
+            let err = resolve_fields_object(args.fields).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(&format!("field {name:?} has malformed JSON value:")));
+            assert!(message.contains("line 1 column"), "{message}");
+            assert!(!message.contains(value), "{message}");
+            assert!(!message.contains("private-"), "{message}");
         }
 
-        match shared_slash_command(
-            r#"/resolve run-1 failed '{"reason":"needs work","retry":false}'"#,
-        ) {
-            SharedCommand::Resolve(args) => {
-                assert_eq!(args.run_id, "run-1");
-                assert_eq!(args.status.as_deref(), Some("failed"));
-                assert_eq!(
-                    args.fields_json.as_deref(),
-                    Some("{\"reason\":\"needs work\",\"retry\":false}")
-                );
-            }
-            other => panic!("expected resolve command, got {other:?}"),
+        let SharedCommand::Resolve(args) = shared_cli_command([
+            "cowboy", "resolve", "run-1", "success", "--field", "summary", "first", "--field",
+            "summary", "second",
+        ]) else {
+            panic!("expected resolve command");
+        };
+        let err = resolve_fields_object(args.fields).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "field \"summary\" was provided more than once"
+        );
+
+        assert_eq!(
+            resolve_fields_object(vec![
+                " summary".to_string(),
+                "one".to_string(),
+                "summary".to_string(),
+                "two".to_string(),
+            ])
+            .unwrap(),
+            Some(serde_json::json!({" summary": "one", "summary": "two"}))
+        );
+    }
+
+    #[test]
+    fn resolve_fields_and_body_require_status_on_both_surfaces() {
+        for args in [
+            vec!["cowboy", "resolve", "run-1", "--field", "summary", "one"],
+            vec!["cowboy", "resolve", "run-1", "--body", "details"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+            assert!(err.to_string().contains("<status>"), "{err}");
+        }
+
+        for input in [
+            "/resolve run-1 --field summary one",
+            "/resolve run-1 --body details",
+        ] {
+            let Err(SlashParseError::Validation { message, .. }) = parse_slash_command(input)
+            else {
+                panic!("resolve payload without status unexpectedly parsed: {input}");
+            };
+            assert!(message.contains("<status>"), "{message}");
         }
     }
 
     #[test]
-    fn cli_resolve_help_advertises_cli_options() {
+    fn resolve_help_and_removed_forms_match_clean_cutover() {
         let mut command = Cli::command();
         let resolve = command
             .find_subcommand_mut("resolve")
@@ -650,29 +882,44 @@ mod tests {
         resolve.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("--fields <json>"), "{help}");
+        assert!(help.contains("--field <name> <value>"), "{help}");
         assert!(help.contains("--body <text>"), "{help}");
-    }
+        assert!(!help.contains("name=value"), "{help}");
+        assert!(!help.contains("--fields"), "{help}");
+        assert!(!help.contains("fields-json"), "{help}");
 
-    #[test]
-    fn resolve_list_and_status_forms_parse() {
-        match shared_slash_command("/resolve run-1") {
-            SharedCommand::Resolve(args) => {
-                assert_eq!(args.run_id, "run-1");
-                assert_eq!(args.status, None);
-                assert_eq!(args.fields_json, None);
-            }
-            other => panic!("expected resolve command, got {other:?}"),
+        for args in [
+            vec![
+                "cowboy",
+                "resolve",
+                "run-1",
+                "success",
+                "--field",
+                "summary=value",
+            ],
+            vec!["cowboy", "resolve", "run-1", "success", "--fields", "{}"],
+            vec!["cowboy", "resolve", "run-1", "success", "{}"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
         }
 
-        match shared_slash_command("/resolve run-1 failed") {
-            SharedCommand::Resolve(args) => {
-                assert_eq!(args.run_id, "run-1");
-                assert_eq!(args.status.as_deref(), Some("failed"));
-                assert_eq!(args.fields_json, None);
-            }
-            other => panic!("expected resolve command, got {other:?}"),
+        for input in [
+            "/resolve run-1 success --field summary=value",
+            "/resolve run-1 success --fields '{}'",
+            "/resolve run-1 success '{}'",
+        ] {
+            assert!(
+                matches!(
+                    parse_slash_command(input),
+                    Err(SlashParseError::Validation { .. })
+                ),
+                "removed syntax unexpectedly parsed: {input}"
+            );
         }
+        assert_eq!(
+            slash_command_usage("resolve").as_deref(),
+            Some("/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]")
+        );
     }
 
     #[test]
@@ -734,13 +981,16 @@ mod tests {
     }
 
     #[test]
-    fn slash_suggestions_include_required_resume_usage() {
+    fn slash_suggestions_include_resolve_and_resume_usage() {
         let suggestions = slash_suggestions("/res")
             .into_iter()
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(&"/resume <run-id>".to_string()));
+        assert!(suggestions.contains(
+            &"/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]".to_string()
+        ));
     }
 
     #[test]
@@ -754,9 +1004,10 @@ mod tests {
         }));
         assert!(rows.iter().any(|row| {
             row.name == "/resolve"
-                && row.usage == "/resolve <run-id> [status] [fields-json]"
-                && !row.usage.contains("--fields")
-                && !row.usage.contains("--body")
+                && row.usage
+                    == "/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+                && row.description == "list or resolve a failed step"
+                && row.takes_arguments
         }));
         assert!(rows.iter().any(|row| {
             row.name == "/help"

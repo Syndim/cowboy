@@ -849,9 +849,14 @@ impl WorkflowRuntime {
             .cloned()
             .collect();
         if !missing.is_empty() {
+            let required_fields = missing
+                .iter()
+                .map(|field| format!("{field:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(WorkflowError::InvalidAction(format!(
-                "status {status:?} requires field(s): {}. Provide them via --fields '<json object>'.",
-                missing.join(", ")
+                "status {status:?} requires field(s): {required_fields}. Provide them via {}.",
+                resolution_field_arguments(&missing)
             )));
         }
 
@@ -1281,13 +1286,31 @@ fn action_output_shape(action: Option<&StepAction>) -> (Vec<String>, Vec<String>
     }
 }
 
-/// Whether `field` is present and non-null in a supplied `--fields` value.
+/// Whether `field` is present and non-null in supplied manual-resolution fields.
 fn field_present(fields: &Value, field: &str) -> bool {
     fields
         .as_object()
         .and_then(|map| map.get(field))
         .map(|value| !value.is_null())
         .unwrap_or(false)
+}
+
+fn resolution_field_arguments(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            format!(
+                "--field {} {}",
+                quote_command_argument(field),
+                quote_command_argument("...")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_command_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Human-readable list of valid statuses and their required fields for errors.
@@ -2507,6 +2530,21 @@ exit 0
         assert_eq!(run.step_retries_used.values().copied().sum::<u32>(), 2);
     }
 
+    #[test]
+    fn resolution_field_guidance_quotes_boundary_names() {
+        let fields = vec![
+            "foo=bar".to_string(),
+            "-review".to_string(),
+            " review ".to_string(),
+            "quote ' $(printf unsafe)".to_string(),
+        ];
+
+        assert_eq!(
+            resolution_field_arguments(&fields),
+            r#"--field 'foo=bar' '...' --field '-review' '...' --field ' review ' '...' --field 'quote '"'"' $(printf unsafe)' '...'"#
+        );
+    }
+
     #[tokio::test]
     async fn resolution_options_discovers_statuses_and_required_fields() {
         let dir = tempfile::tempdir().unwrap();
@@ -2537,7 +2575,12 @@ exit 0
             .resolve_run(&run_id, "success", None, None)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("summary"), "{err}");
+        assert!(
+            err.to_string().contains(
+                "requires field(s): \"summary\". Provide them via --field 'summary' '...'"
+            ),
+            "{err}"
+        );
 
         // An unroutable status lists the valid options.
         let err = runtime

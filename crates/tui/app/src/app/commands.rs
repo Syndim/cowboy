@@ -1,8 +1,9 @@
+use crate::resolution::resolution_command;
 use crate::run_summary::render_run_summary_lines;
 use anyhow::Result;
 use cowboy_command_parser::{
-    SharedCommand, SlashCommand, SlashParseError, parse_slash_command, slash_command_usage,
-    slash_help_rows, slash_suggestions,
+    SharedCommand, SlashCommand, SlashParseError, parse_slash_command, resolve_fields_object,
+    slash_command_usage, slash_help_rows, slash_suggestions,
 };
 use cowboy_workflow_engine::WorkflowRuntime;
 
@@ -22,17 +23,25 @@ pub(in crate::app) fn complete_slash_suggestion(state: &mut AppState) {
 }
 
 fn show_slash_parse_error(state: &mut AppState, err: SlashParseError) {
-    let status = match err {
-        SlashParseError::UnmatchedQuote => "usage: unmatched quote in slash command".to_string(),
-        SlashParseError::Validation { command, message } => command
-            .as_deref()
-            .and_then(slash_command_usage)
-            .map(|usage| format!("usage: {usage}"))
-            .unwrap_or_else(|| first_error_line(&message)),
+    let (status, details) = match err {
+        SlashParseError::UnmatchedQuote => {
+            let status = "usage: unmatched quote in slash command".to_string();
+            (status.clone(), vec![status])
+        }
+        SlashParseError::Validation { command, message } => {
+            let reason = first_error_line(&message);
+            match command.as_deref().and_then(slash_command_usage) {
+                Some(usage) => {
+                    let usage = format!("usage: {usage}");
+                    (usage.clone(), vec![reason, usage])
+                }
+                None => (reason.clone(), vec![reason]),
+            }
+        }
     };
 
     state.set_status(status);
-    state.push_card("Usage", [state.status().to_string()]);
+    state.push_card("Usage", details);
 }
 
 fn first_error_line(message: &str) -> String {
@@ -125,9 +134,21 @@ async fn dispatch_shared_command(
                 status,
                 fields,
                 body,
-                fields_json,
             } = args;
-            resolve_run(state, runtime, run_id, status, fields.or(fields_json), body).await?;
+            let fields = match resolve_fields_object(fields) {
+                Ok(fields) => fields,
+                Err(err) => {
+                    show_slash_parse_error(
+                        state,
+                        SlashParseError::Validation {
+                            command: Some("resolve".to_string()),
+                            message: err.to_string(),
+                        },
+                    );
+                    return Ok(());
+                }
+            };
+            resolve_run(state, runtime, run_id, status, fields, body).await?;
         }
     }
 
@@ -275,7 +296,7 @@ async fn resolve_run(
     runtime: &WorkflowRuntime,
     run_id: String,
     status: Option<String>,
-    fields_raw: Option<String>,
+    fields: Option<serde_json::Value>,
     body: Option<String>,
 ) -> Result<()> {
     match status {
@@ -298,22 +319,15 @@ async fn resolve_run(
                     target,
                     status.required_fields.join(", ")
                 ));
+                details.push(format!(
+                    "    resolve with: {}",
+                    resolution_command("/resolve", &options.run_id, status)
+                ));
             }
-            details.push(format!(
-                "resolve with: /resolve {} <status> [fields-json]",
-                options.run_id
-            ));
             state.push_card("Resolve", details);
             Ok(())
         }
         Some(status) => {
-            let fields = match fields_raw {
-                Some(raw) => Some(
-                    serde_json::from_str(&raw)
-                        .map_err(|err| anyhow::anyhow!("invalid fields JSON: {err}"))?,
-                ),
-                None => None,
-            };
             let runtime = runtime.clone();
             state.spawn_report_task(
                 format!("submitted resolve: {run_id} {status}"),
@@ -378,9 +392,9 @@ fn show_runs(state: &mut AppState, runtime: &WorkflowRuntime) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{AgentConfig, AppConfig};
     use chrono::Utc;
-    use cowboy_workflow_core::{ResumeCallback, RunHead, RunStatus, WorkflowRun};
+    use cowboy_workflow_core::{ResumeCallback, RunHead, RunStatus, StepRecord, WorkflowRun};
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::RedbRunStore;
     use serde_json::Value;
@@ -510,7 +524,8 @@ mod tests {
         let rendered = state
             .event_entries()
             .iter()
-            .map(|entry| entry.plain_text())
+            .flat_map(|entry| entry.render_lines_for_width(160))
+            .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
 
@@ -835,7 +850,10 @@ mod tests {
                 "/answer <run-id> <prompt-id> <answer>",
             ),
             ("/improve", "/improve <run-id>"),
-            ("/resolve", "/resolve <run-id> [status] [fields-json]"),
+            (
+                "/resolve",
+                "/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]",
+            ),
             (
                 "/run --workflow review",
                 "/run [--step] [--workflow <workflow-id>] <request>",
@@ -860,6 +878,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slash_resolve_forwards_typed_fields_and_renders_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        std::fs::create_dir(&workflow_dir).unwrap();
+        std::fs::write(
+            workflow_dir.join("resolve-smoke.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = {
+                  status = { "planned" },
+                  fields = {
+                    summary = "string",
+                    retry = "boolean",
+                    files = "array",
+                    ["foo=bar"] = "string",
+                    ["-review"] = "string",
+                    [" review "] = "string"
+                  }
+                }
+              }
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              local fields = ctx.prev.fields
+              return action.status {
+                status = "success",
+                fields = {
+                  summary = fields.summary,
+                  retry = fields.retry,
+                  first_file = fields.files[1],
+                  equals_name = fields["foo=bar"],
+                  hyphen_name = fields["-review"],
+                  spaced_name = fields[" review "]
+                },
+                body = ctx.prev.body
+              }
+            end
+            start:on("planned", finish)
+            return workflow("resolve-smoke", start)
+            "#,
+        )
+        .unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    ..Default::default()
+                },
+            )]),
+            agents: vec![AgentConfig {
+                command: "definitely-missing-agent".to_string(),
+                args: Vec::new(),
+                ..AgentConfig::default()
+            }],
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let mut state = AppState::new(config);
+
+        runtime
+            .start_run_with_workflow("resolve-smoke", "do it")
+            .await
+            .unwrap_err();
+        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+
+        let options_input = format!("/resolve {run_id}");
+        state.push_input(&options_input);
+        submit_input(&mut state, &runtime).await;
+        let rendered = state
+            .event_entries()
+            .iter()
+            .flat_map(|entry| entry.render_lines_for_width(240))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains(&format!("/resolve '{run_id}'")),
+            "{rendered}"
+        );
+        assert!(rendered.contains("'planned'"), "{rendered}");
+        for field in [
+            "files", "retry", "summary", "foo=bar", "-review", " review ",
+        ] {
+            assert!(
+                rendered.contains(&format!("field '{field}' '...'")),
+                "{rendered}"
+            );
+        }
+
+        let resolve_input = format!(
+            "/resolve {run_id} planned --field summary \"manual resolution\" \
+             --field retry false --field files '[\"src/a.rs\"]' \
+             --field foo=bar equals-value --field -review -declined \
+             --field \" review \" \" spaced value \" --body \"manual body\""
+        );
+
+        state.push_input(&resolve_input);
+        submit_input(&mut state, &runtime).await;
+        assert_eq!(state.background_task_count(), 1);
+        assert!(state.status().contains("submitted resolve"));
+        tokio::task::yield_now().await;
+        assert!(state.drain_background_tasks().await);
+        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+
+        let run = runtime.load_run(&run_id).unwrap();
+        assert_eq!(run.status, RunStatus::Completed);
+        let store = RedbRunStore::create(dir.path().join("state/workflow.redb")).unwrap();
+        let record = store
+            .get_object::<StepRecord>(run.head.as_ref().unwrap())
+            .unwrap();
+        let output = record.output.unwrap();
+        assert_eq!(output.fields["summary"], "manual resolution");
+        assert_eq!(output.fields["retry"], false);
+        assert_eq!(output.fields["first_file"], "src/a.rs");
+        assert_eq!(output.fields["equals_name"], "equals-value");
+        assert_eq!(output.fields["hyphen_name"], "-declined");
+        assert_eq!(output.fields["spaced_name"], " spaced value ");
+        assert_eq!(output.body, "manual body");
+    }
+
+    #[tokio::test]
     async fn parser_errors_show_usage_without_starting_plain_text_run() {
         let (_dir, runtime, mut state) = test_runtime_state();
 
@@ -877,6 +1025,71 @@ mod tests {
         assert!(rendered.contains("Usage"));
         assert!(rendered.contains("usage: unmatched quote in slash command"));
         assert!(!rendered.contains("submitted run:"));
+    }
+
+    #[tokio::test]
+    async fn malformed_resolve_field_shows_reason_and_usage() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+
+        state
+            .push_input(r#"/resolve run-1 success --field credentials '{"token":"private-token"'"#);
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(
+            state.status(),
+            "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+        );
+        assert_eq!(state.background_task_count(), 0);
+        let rendered = rendered_entries(&state);
+        assert!(
+            rendered.contains("field \"credentials\" has malformed JSON value:"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("EOF while parsing an object"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("usage: /resolve"), "{rendered}");
+        assert!(!rendered.contains("private-token"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn resolve_payload_without_status_is_rejected_before_dispatch() {
+        for input in [
+            "/resolve run-1 --field summary one --field summary two",
+            "/resolve run-1 --body details",
+        ] {
+            let (_dir, runtime, mut state) = test_runtime_state();
+
+            state.push_input(input);
+            submit_input(&mut state, &runtime).await;
+
+            assert_eq!(
+                state.status(),
+                "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+            );
+            assert_eq!(state.background_task_count(), 0);
+            let rendered = rendered_entries(&state);
+            assert!(rendered.contains("required arguments"), "{rendered}");
+            assert!(rendered.contains("usage: /resolve"), "{rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_resolve_fields_with_status_are_actionable() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+
+        state.push_input("/resolve run-1 success --field summary one --field summary two");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(
+            state.status(),
+            "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+        );
+        assert_eq!(state.background_task_count(), 0);
+        let rendered = rendered_entries(&state);
+        assert!(rendered.contains("provided more than once"), "{rendered}");
+        assert!(rendered.contains("usage: /resolve"), "{rendered}");
     }
 
     #[tokio::test]

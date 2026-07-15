@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use cowboy_command_parser::{Cli, CliCommand, SharedCommand};
+use anyhow::Result;
+use cowboy_command_parser::{Cli, CliCommand, SharedCommand, resolve_fields_object};
 
 #[tokio::main]
 async fn main() {
@@ -111,8 +111,8 @@ async fn run_shared_command(
                 status,
                 fields,
                 body,
-                fields_json,
             } = args;
+            let fields = resolve_fields_object(fields)?;
             match status {
                 None => {
                     let options = runtime.resolution_options(&run_id)?;
@@ -120,13 +120,6 @@ async fn run_shared_command(
                     Ok(())
                 }
                 Some(status) => {
-                    let fields = match fields.or(fields_json) {
-                        Some(raw) => Some(
-                            serde_json::from_str(&raw)
-                                .with_context(|| format!("invalid fields JSON: {raw}"))?,
-                        ),
-                        None => None,
-                    };
                     let report = runtime.resolve_run(&run_id, &status, fields, body).await?;
                     print_report(&report);
                     Ok(())
@@ -154,11 +147,11 @@ fn print_resolution_options(options: &cowboy_workflow_engine::ResolutionOptions)
             status.optional_fields.join(", "),
             status.body_expected
         );
+        println!(
+            "    resolve with: {}",
+            cowboy::resolution::resolution_command("cowboy resolve", &options.run_id, status)
+        );
     }
-    println!(
-        "resolve with: cowboy resolve {} <status> [--fields '<json>'] [--body <text>]",
-        options.run_id
-    );
 }
 
 fn print_report(report: &cowboy_workflow_engine::RunReport) {
