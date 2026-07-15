@@ -185,7 +185,7 @@ fn draw_places_cursor_at_input_end() {
 async fn draw_places_cursor_in_active_run_draft_input() {
     let mut state = test_state();
     state.push_input("abc");
-    state.spawn_report_task("pending".to_string(), async {
+    state.spawn_test_card_report_task("pending".to_string(), async {
         std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
             .await
     });
@@ -205,7 +205,7 @@ async fn paste_appends_to_active_run_draft_input() {
     let mut state = test_state();
     state.push_input("ad");
     state.set_input_cursor(1);
-    state.spawn_report_task("pending".to_string(), async {
+    state.spawn_test_card_report_task("pending".to_string(), async {
         std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
             .await
     });
@@ -600,7 +600,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
 async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
     let mut state = test_state();
     state.push_input("/");
-    state.spawn_report_task("pending".to_string(), async {
+    state.spawn_test_card_report_task("pending".to_string(), async {
         std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
             .await
     });
@@ -646,7 +646,7 @@ async fn draw_composer_border_color_tracks_visual_state() {
         style_border_accent().fg.unwrap()
     );
 
-    state.spawn_report_task("pending".to_string(), async {
+    state.spawn_test_card_report_task("pending".to_string(), async {
         std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
             .await
     });
@@ -726,7 +726,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         WorkflowEventKind::WaitingForInput { prompt_id, .. } if prompt_id == "approval"
     )));
     let mut state = AppState::new(config);
-    state.spawn_report_task("seed waiting run".to_string(), async move { Ok(start) });
+    state.spawn_test_card_report_task("seed waiting run".to_string(), async move { Ok(start) });
     tokio::task::yield_now().await;
     assert!(state.drain_background_tasks().await);
     assert_eq!(

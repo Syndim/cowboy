@@ -2,7 +2,7 @@ use anyhow::Result;
 use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
 use tui_input::{Input, InputRequest};
 
-use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
+use super::card::{Card, CardMetadata, CardSection, CardTone};
 use super::controls::chrome::status_icon;
 use super::events::{render_workflow_event, render_workflow_event_width};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
@@ -50,29 +50,9 @@ pub(super) enum TranscriptEntry {
         title_suffix: Vec<String>,
         details: Vec<String>,
     },
-    Plain(String),
 }
 
 impl TranscriptEntry {
-    pub(in crate::app) fn render_lines(&self) -> Vec<ratatui::text::Line<'static>> {
-        match self {
-            Self::Workflow(event) => render_workflow_event(event).lines().to_vec(),
-            Self::Card {
-                title,
-                title_prefix,
-                title_suffix,
-                details,
-            } => render_card_lines(
-                title,
-                title_prefix,
-                title_suffix,
-                details,
-                DEFAULT_CARD_WIDTH,
-            ),
-            Self::Plain(text) => render_plain_lines(text),
-        }
-    }
-
     pub(in crate::app) fn render_lines_for_width(
         &self,
         width: usize,
@@ -85,7 +65,6 @@ impl TranscriptEntry {
                 title_suffix,
                 details,
             } => render_card_lines(title, title_prefix, title_suffix, details, width),
-            Self::Plain(text) => render_plain_lines(text),
         }
     }
 
@@ -99,7 +78,6 @@ impl TranscriptEntry {
                 title_suffix,
                 details,
             } => card_plain_text(title, title_prefix, title_suffix, details),
-            Self::Plain(text) => text.clone(),
         }
     }
 
@@ -180,7 +158,7 @@ fn app_card(
     title_suffix: &[String],
     details: &[String],
 ) -> Card {
-    let (status, tone) = app_card_status_and_tone(title);
+    let (status, tone) = app_card_status_and_tone(title, title_suffix);
     let body = details
         .iter()
         .flat_map(|detail| {
@@ -202,7 +180,15 @@ fn app_card(
     card.section(CardSection::body(body))
 }
 
-fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
+fn app_card_status_and_tone(title: &str, title_suffix: &[String]) -> (&'static str, CardTone) {
+    if title == "Resolve"
+        && title_suffix
+            .iter()
+            .any(|suffix| suffix == "submitted resolve")
+    {
+        return (status_icon("running"), CardTone::Accent);
+    }
+
     match title {
         "Error" => (status_icon("failed"), CardTone::Error),
         "Cancelled" => (status_icon("cancelled"), CardTone::Error),
@@ -214,17 +200,6 @@ fn app_card_status_and_tone(title: &str) -> (&'static str, CardTone) {
         }
         _ => (status_icon("idle"), CardTone::Accent),
     }
-}
-
-fn render_plain_lines(text: &str) -> Vec<ratatui::text::Line<'static>> {
-    text.lines()
-        .map(|line| {
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                line.to_string(),
-                super::styles::style_transcript_normal(),
-            ))
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -623,13 +598,6 @@ impl AppState {
         }
     }
 
-    pub(in crate::app) fn spawn_report_task<F>(&mut self, label: String, future: F)
-    where
-        F: Future<Output = Result<RunReport, String>> + Send + 'static,
-    {
-        self.spawn_report_task_with_entry(label.clone(), TranscriptEntry::Plain(label), future);
-    }
-
     pub(in crate::app) fn spawn_card_report_task<F>(
         &mut self,
         title: &str,
@@ -651,6 +619,14 @@ impl AppState {
             },
             future,
         );
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn spawn_test_card_report_task<F>(&mut self, status: String, future: F)
+    where
+        F: Future<Output = Result<RunReport, String>> + Send + 'static,
+    {
+        self.spawn_card_report_task("Task", [], [], status.clone(), [status], future);
     }
 
     fn spawn_report_task_with_entry<F>(&mut self, status: String, entry: TranscriptEntry, future: F)
@@ -837,16 +813,16 @@ impl AppState {
                     Ok(Ok(report)) => self.apply_report(report),
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
-                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
+                        self.push_card("Error", [self.status.clone()]);
                     }
                     Err(err) if err.is_cancelled() => {
                         self.status = "background task cancelled".to_string();
                         self.run_state = "cancelled".to_string();
-                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
+                        self.push_card("Cancelled", [self.status.clone()]);
                     }
                     Err(err) => {
                         self.status = format!("background task failed: {err}");
-                        self.push_event(TranscriptEntry::Plain(self.status.clone()));
+                        self.push_card("Error", [self.status.clone()]);
                     }
                 }
             } else {
@@ -920,6 +896,7 @@ mod tests {
     use fs2::FileExt;
 
     use super::*;
+    use crate::app::card::DEFAULT_CARD_WIDTH;
     use crate::config::AppConfig;
 
     fn test_state() -> AppState {
@@ -939,8 +916,24 @@ mod tests {
         })
     }
 
+    fn assert_last_entry_is_card(state: &AppState, expected_title: &str, expected_body: &str) {
+        let rendered = state
+            .event_entries()
+            .last()
+            .expect("feedback should append a transcript entry")
+            .plain_text();
+        assert_eq!(rendered.lines().next(), Some(expected_title), "{rendered}");
+        for border in ['╭', '╮', '╰', '╯'] {
+            assert!(rendered.contains(border), "{rendered}");
+        }
+        assert!(
+            rendered.contains(&format!("│{expected_body}")),
+            "{rendered}"
+        );
+    }
+
     fn spawn_pending_report_task(state: &mut AppState) {
-        state.spawn_report_task("pending".to_string(), async {
+        state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<RunReport, String>>().await
         });
     }
@@ -1009,7 +1002,7 @@ mod tests {
             details: vec!["Result: **literal** `detail`".to_string()],
         };
         let rendered = entry
-            .render_lines()
+            .render_lines_for_width(DEFAULT_CARD_WIDTH)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
@@ -1312,7 +1305,7 @@ mod tests {
 
         assert!(!state.drain_background_tasks().await);
 
-        state.spawn_report_task("pending".to_string(), std::future::pending());
+        state.spawn_test_card_report_task("pending".to_string(), std::future::pending());
 
         assert!(!state.drain_background_tasks().await);
         assert_eq!(state.background_task_count(), 1);
@@ -1361,7 +1354,8 @@ mod tests {
         assert!(waiting_state.composer_accepts_submit());
 
         let mut drained_state = test_state();
-        drained_state.spawn_report_task("finished".to_string(), async { Err("boom".to_string()) });
+        drained_state
+            .spawn_test_card_report_task("finished".to_string(), async { Err("boom".to_string()) });
         tokio::task::yield_now().await;
         assert!(drained_state.drain_background_tasks().await);
         assert_eq!(drained_state.background_task_count(), 0);
@@ -1383,22 +1377,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_task_drain_returns_true_when_task_finished() {
+    async fn runtime_error_completion_renders_error_card() {
         let mut state = test_state();
-        state.spawn_report_task("finished".to_string(), async { Err("boom".to_string()) });
+        state
+            .spawn_test_card_report_task("finished".to_string(), async { Err("boom".to_string()) });
         tokio::task::yield_now().await;
 
         assert!(state.drain_background_tasks().await);
 
         assert_eq!(state.background_task_count(), 0);
         assert_eq!(state.status(), "error: boom");
+        assert_eq!(state.display_state(), "running");
+        assert_last_entry_is_card(&state, "✗ Error", "error: boom");
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_renders_cancelled_card_and_state() {
+        let mut state = test_state();
+        state.spawn_test_card_report_task("pending".to_string(), async {
+            std::future::pending::<Result<RunReport, String>>().await
+        });
+        state.background[0].abort();
+        tokio::task::yield_now().await;
+
+        assert!(state.drain_background_tasks().await);
+
+        assert_eq!(state.background_task_count(), 0);
+        assert_eq!(state.status(), "background task cancelled");
+        assert_eq!(state.display_state(), "cancelled");
+        assert_last_entry_is_card(&state, "■ Cancelled", "background task cancelled");
+    }
+
+    #[tokio::test]
+    async fn failed_join_renders_error_card_without_changing_run_state() {
+        let mut state = test_state();
+        state.spawn_test_card_report_task("panicking".to_string(), async {
+            if true {
+                panic!("join boom");
+            }
+
+            Err("unreachable".to_string())
+        });
+        tokio::task::yield_now().await;
+
+        assert!(state.drain_background_tasks().await);
+
+        assert_eq!(state.background_task_count(), 0);
         assert!(
-            state
-                .event_entries()
-                .last()
-                .unwrap()
-                .contains("error: boom")
+            state.status().starts_with("background task failed: "),
+            "{}",
+            state.status()
         );
+        assert_eq!(state.display_state(), "running");
+        let status = state.status().to_string();
+        assert_last_entry_is_card(&state, "✗ Error", &status);
     }
 
     #[tokio::test]

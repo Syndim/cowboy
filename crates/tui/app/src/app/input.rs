@@ -118,7 +118,7 @@ mod tests {
     }
 
     fn lock_composer_with_pending_task(state: &mut AppState) {
-        state.spawn_report_task("pending".to_string(), async {
+        state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
                 .await
         });

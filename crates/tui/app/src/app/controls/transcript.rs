@@ -128,7 +128,6 @@ fn entry_tail_visual_rows(
                 .unwrap_or_else(|| entry.render_lines_for_width(wrap_width))
         }
         TranscriptEntry::Card { .. } => entry.render_lines_for_width(wrap_width),
-        TranscriptEntry::Plain(_) => visual_rows(entry.render_lines(), wrap_width),
     }
 }
 

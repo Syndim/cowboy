@@ -103,7 +103,7 @@ mod tests {
     async fn background_task_status_adds_task_count() {
         let mut state = test_state();
         apply_started_run(&mut state);
-        state.spawn_report_task("pending".to_string(), async {
+        state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
                 .await
         });
@@ -121,7 +121,7 @@ mod tests {
     async fn narrow_status_drops_lower_priority_metadata_first() {
         let mut state = test_state();
         apply_started_run(&mut state);
-        state.spawn_report_task("pending".to_string(), async {
+        state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
                 .await
         });

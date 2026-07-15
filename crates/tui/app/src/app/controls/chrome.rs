@@ -201,7 +201,9 @@ mod tests {
                 request_topic: None,
             },
         ));
-        state.spawn_report_task("background".to_string(), async { Err("held".to_string()) });
+        state.spawn_test_card_report_task("background".to_string(), async {
+            Err("held".to_string())
+        });
 
         let metadata = status_metadata_text(&state, 80);
 

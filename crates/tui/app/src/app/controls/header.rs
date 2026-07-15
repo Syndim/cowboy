@@ -132,7 +132,7 @@ mod tests {
     async fn background_task_metadata_does_not_render_in_header() {
         let mut state = test_state();
         apply_started_run(&mut state, Some("Background topic"));
-        state.spawn_report_task("pending".to_string(), async {
+        state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
                 .await
         });

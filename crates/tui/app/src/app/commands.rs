@@ -200,12 +200,21 @@ fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: Str
 
 fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
     let runtime = runtime.clone();
-    state.spawn_report_task(format!("submitted run --step: {request}"), async move {
-        runtime
-            .start_run_stepwise(request)
-            .await
-            .map_err(|err| err.to_string())
-    });
+    let label = format!("submitted run --step: {request}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Run",
+        ["00:00:00".to_string()],
+        ["submitted run --step".to_string()],
+        label,
+        [body],
+        async move {
+            runtime
+                .start_run_stepwise(request)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_start_run_with_workflow(
@@ -215,8 +224,15 @@ fn spawn_start_run_with_workflow(
     request: String,
 ) {
     let runtime = runtime.clone();
-    state.spawn_report_task(
-        format!("submitted run --workflow {workflow_id}: {request}"),
+    let label = format!("submitted run --workflow {workflow_id}: {request}");
+    let title_suffix = format!("submitted run --workflow {workflow_id}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Run",
+        ["00:00:00".to_string()],
+        [title_suffix],
+        label,
+        [body],
         async move {
             runtime
                 .start_run_with_workflow(workflow_id, request)
@@ -233,8 +249,15 @@ fn spawn_start_run_with_workflow_stepwise(
     request: String,
 ) {
     let runtime = runtime.clone();
-    state.spawn_report_task(
-        format!("submitted run --step --workflow {workflow_id}: {request}"),
+    let label = format!("submitted run --step --workflow {workflow_id}: {request}");
+    let title_suffix = format!("submitted run --step --workflow {workflow_id}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Run",
+        ["00:00:00".to_string()],
+        [title_suffix],
+        label,
+        [body],
         async move {
             runtime
                 .start_run_with_workflow_stepwise(workflow_id, request)
@@ -246,22 +269,40 @@ fn spawn_start_run_with_workflow_stepwise(
 
 fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
     let runtime = runtime.clone();
-    state.spawn_report_task(format!("submitted step: {run_id}"), async move {
-        runtime
-            .step_run(&run_id)
-            .await
-            .map_err(|err| err.to_string())
-    });
+    let label = format!("submitted step: {run_id}");
+    let body = run_id.clone();
+    state.spawn_card_report_task(
+        "Step",
+        [],
+        ["submitted step".to_string()],
+        label,
+        [body],
+        async move {
+            runtime
+                .step_run(&run_id)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
     let runtime = runtime.clone();
-    state.spawn_report_task(format!("submitted resume: {run_id}"), async move {
-        runtime
-            .resume_run(&run_id)
-            .await
-            .map_err(|err| err.to_string())
-    });
+    let label = format!("submitted resume: {run_id}");
+    let body = run_id.clone();
+    state.spawn_card_report_task(
+        "Resume",
+        [],
+        ["submitted resume".to_string()],
+        label,
+        [body],
+        async move {
+            runtime
+                .resume_run(&run_id)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_answer_task(
@@ -272,9 +313,15 @@ fn spawn_answer_task(
     answer: String,
 ) {
     let runtime = runtime.clone();
+    let label = format!("submitted answer: {run_id} {prompt_id}");
+    let details = [run_id.clone(), prompt_id.clone()];
     state.clear_pending_prompt();
-    state.spawn_report_task(
-        format!("submitted answer: {run_id} {prompt_id}"),
+    state.spawn_card_report_task(
+        "Answer",
+        [],
+        ["submitted answer".to_string()],
+        label,
+        details,
         async move {
             runtime
                 .answer_run(&run_id, &prompt_id, &answer)
@@ -329,8 +376,14 @@ async fn resolve_run(
         }
         Some(status) => {
             let runtime = runtime.clone();
-            state.spawn_report_task(
-                format!("submitted resolve: {run_id} {status}"),
+            let label = format!("submitted resolve: {run_id} {status}");
+            let details = [run_id.clone(), status.clone()];
+            state.spawn_card_report_task(
+                "Resolve",
+                [],
+                ["submitted resolve".to_string()],
+                label,
+                details,
                 async move {
                     runtime
                         .resolve_run(&run_id, &status, fields, body)
@@ -446,6 +499,30 @@ mod tests {
             .join("\n")
     }
 
+    fn assert_last_entry_is_card(
+        state: &AppState,
+        expected_title: &str,
+        expected_body: &[&str],
+    ) -> String {
+        let rendered = state
+            .event_entries()
+            .last()
+            .expect("submission should append a transcript entry")
+            .plain_text();
+        assert_eq!(rendered.lines().next(), Some(expected_title), "{rendered}");
+        for border in ['╭', '╮', '╰', '╯'] {
+            assert!(rendered.contains(border), "{rendered}");
+        }
+        for detail in expected_body {
+            assert!(rendered.contains(&format!("│{detail}")), "{rendered}");
+        }
+        assert!(
+            !rendered.lines().any(|line| line.starts_with("submitted ")),
+            "{rendered}"
+        );
+        rendered
+    }
+
     fn workflow_run(
         id: &str,
         topic: Option<&str>,
@@ -503,17 +580,87 @@ mod tests {
 
         submit_input(&mut state, &runtime).await;
 
-        let rendered = rendered_entries(&state);
-        let mut lines = rendered.lines();
-        assert_eq!(
-            lines.next(),
-            Some("00:00:00 · ◌ Run · submitted run"),
-            "{rendered}"
+        let rendered = assert_last_entry_is_card(
+            &state,
+            "00:00:00 · ◌ Run · submitted run",
+            &["build health route"],
         );
-        assert!(rendered.contains("│build health route"), "{rendered}");
         assert!(!rendered.contains("│submitted run:"), "{rendered}");
-        assert!(!rendered.starts_with("submitted run:"), "{rendered}");
         assert_eq!(state.status(), "submitted run: build health route");
+        assert_eq!(state.background_task_count(), 1);
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn slash_run_variants_render_initial_input_as_cards() {
+        for (input, expected_title, expected_status) in [
+            (
+                "/run build health route",
+                "00:00:00 · ◌ Run · submitted run",
+                "submitted run: build health route",
+            ),
+            (
+                "/run --step build health route",
+                "00:00:00 · ◌ Run · submitted run --step",
+                "submitted run --step: build health route",
+            ),
+            (
+                "/run --workflow test-failure-fix build health route",
+                "00:00:00 · ◌ Run · submitted run --workflow test-failure-fix",
+                "submitted run --workflow test-failure-fix: build health route",
+            ),
+            (
+                "/run --step --workflow test-failure-fix build health route",
+                "00:00:00 · ◌ Run · submitted run --step --workflow test-failure-fix",
+                "submitted run --step --workflow test-failure-fix: build health route",
+            ),
+        ] {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            state.push_input(input);
+
+            submit_input(&mut state, &runtime).await;
+
+            let rendered =
+                assert_last_entry_is_card(&state, expected_title, &["build health route"]);
+            assert!(!rendered.contains("│submitted run"), "{rendered}");
+            assert_eq!(state.status(), expected_status);
+            assert_eq!(state.background_task_count(), 1);
+            state.cancel_background_tasks();
+        }
+    }
+
+    #[tokio::test]
+    async fn run_control_submissions_render_action_cards() {
+        for (input, expected_title, expected_status, expected_body) in [
+            (
+                "/step run-123",
+                "○ Step · submitted step",
+                "submitted step: run-123",
+                vec!["run-123"],
+            ),
+            (
+                "/resume run-123",
+                "○ Resume · submitted resume",
+                "submitted resume: run-123",
+                vec!["run-123"],
+            ),
+            (
+                "/resolve run-123 accepted",
+                "● Resolve · submitted resolve",
+                "submitted resolve: run-123 accepted",
+                vec!["run-123", "accepted"],
+            ),
+        ] {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            state.push_input(input);
+
+            submit_input(&mut state, &runtime).await;
+
+            assert_last_entry_is_card(&state, expected_title, &expected_body);
+            assert_eq!(state.status(), expected_status);
+            assert_eq!(state.background_task_count(), 1);
+            state.cancel_background_tasks();
+        }
     }
 
     #[test]
@@ -962,6 +1109,7 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
+        assert_eq!(rendered.lines().next(), Some("✓ Resolve"), "{rendered}");
         assert!(
             rendered.contains(&format!("/resolve '{run_id}'")),
             "{rendered}"
@@ -986,7 +1134,15 @@ mod tests {
         state.push_input(&resolve_input);
         submit_input(&mut state, &runtime).await;
         assert_eq!(state.background_task_count(), 1);
-        assert!(state.status().contains("submitted resolve"));
+        assert_eq!(
+            state.status(),
+            format!("submitted resolve: {run_id} planned")
+        );
+        assert_last_entry_is_card(
+            &state,
+            "● Resolve · submitted resolve",
+            &[&run_id, "planned"],
+        );
         tokio::task::yield_now().await;
         assert!(state.drain_background_tasks().await);
         assert_eq!(runtime.list_runs().unwrap().len(), 1);
@@ -1189,12 +1345,13 @@ mod tests {
         assert_eq!(state.status(), "submitted answer: pending-run prompt-42");
         assert_eq!(state.background_task_count(), 1);
         assert_eq!(state.pending_prompt_answer_target(), None);
-        assert!(
-            state
-                .event_entries()
-                .last()
-                .is_some_and(|entry| entry.contains("submitted answer: pending-run prompt-42"))
+        let rendered = assert_last_entry_is_card(
+            &state,
+            "○ Answer · submitted answer",
+            &["pending-run", "prompt-42"],
         );
+        assert!(!rendered.contains("answer with spaces"), "{rendered}");
+        state.cancel_background_tasks();
     }
 
     #[tokio::test]
@@ -1219,11 +1376,13 @@ mod tests {
         );
         assert_eq!(state.background_task_count(), 1);
         assert_eq!(state.pending_prompt_answer_target(), None);
-        assert!(
-            state.event_entries().last().is_some_and(
-                |entry| entry.contains("submitted answer: explicit-run explicit-prompt")
-            )
+        let rendered = assert_last_entry_is_card(
+            &state,
+            "○ Answer · submitted answer",
+            &["explicit-run", "explicit-prompt"],
         );
+        assert!(!rendered.contains("answer with spaces"), "{rendered}");
+        state.cancel_background_tasks();
     }
     #[test]
     fn complete_slash_suggestion_updates_input() {
@@ -1233,39 +1392,6 @@ mod tests {
         complete_slash_suggestion(&mut state);
 
         assert_eq!(state.input(), "/run ");
-    }
-
-    #[tokio::test]
-    async fn explicit_resume_spawns_resume_labeled_background_task() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig {
-            state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
-            workflow_dirs: Vec::new(),
-            config_sets: std::collections::BTreeMap::from([(
-                "default".to_string(),
-                crate::config::ConfigSetConfig {
-                    max_steps_per_run: 1,
-                    max_visits_per_step: 1,
-                    ..Default::default()
-                },
-            )]),
-            ..AppConfig::default()
-        };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
-        let mut state = AppState::new(config);
-
-        state.push_input("/resume run-123");
-        submit_input(&mut state, &runtime).await;
-
-        assert_eq!(state.status(), "submitted resume: run-123");
-        assert_eq!(state.background_task_count(), 1);
-        assert!(
-            state
-                .event_entries()
-                .last()
-                .is_some_and(|entry| entry.contains("submitted resume: run-123"))
-        );
     }
 
     #[tokio::test]
