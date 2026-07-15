@@ -354,6 +354,518 @@ mod tests {
     }
 
     #[test]
+    fn examples_workflows_capture_cumulative_confirmation_feedback() {
+        fn assert_common_context(fields: &serde_json::Value) {
+            assert_eq!(fields["goal"], "Keep command behavior stable");
+            assert_eq!(fields["validation"], "cargo test -p cowboy");
+            assert_eq!(fields["work_dir"], "docs/plans/example");
+            assert_eq!(fields["plan_doc"], "docs/plans/example/plan.md");
+            assert_eq!(fields["rca_doc"], "docs/plans/example/rca.md");
+            assert_eq!(
+                fields["repro_test"],
+                "crates/workflow/lua/src/loader.rs::confirmation_repro"
+            );
+        }
+
+        fn assert_rca_context(fields: &serde_json::Value) {
+            assert_eq!(fields["summary"], "Race reproduced");
+            assert_eq!(fields["work_dir"], "docs/plans/example");
+            assert_eq!(fields["rca_doc"], "docs/plans/example/rca.md");
+            assert_eq!(
+                fields["repro_test"],
+                "crates/workflow/lua/src/loader.rs::confirmation_repro"
+            );
+            assert_eq!(
+                fields["files"],
+                serde_json::json!(["docs/plans/example/rca.md", "src/lib.rs"])
+            );
+            assert_eq!(fields["command"], "cargo test confirmation_repro");
+            assert_eq!(
+                fields["commands"],
+                serde_json::json!(["cargo test confirmation_repro", "cargo test"])
+            );
+            assert_eq!(fields["failure"], "assertion failed");
+            assert_eq!(
+                fields["failures"],
+                serde_json::json!(["assertion failed", "exit status 101"])
+            );
+        }
+
+        let existing = serde_json::json!([
+            "Plan confirmation: Preserve the public API",
+            "Result confirmation: Include the TUI path"
+        ]);
+        let feature = load_example_compiled_workflow("feature");
+        let result = run_step(
+            &feature.source_bundle,
+            "confirm_plan_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_plan",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "Keep the command syntax stable",
+                        "plan": "Reviewed plan body",
+                        "user_feedback": existing,
+                        "goal": "Keep command behavior stable",
+                        "validation": "cargo test -p cowboy",
+                        "work_dir": "docs/plans/example",
+                        "plan_doc": "docs/plans/example/plan.md",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("plan confirmation should capture feedback")
+        };
+
+        assert_eq!(action.status, "changes_requested");
+        assert_eq!(action.fields["feedback"], "Keep the command syntax stable");
+        assert_eq!(
+            action.fields["user_feedback"],
+            serde_json::json!([
+                "Plan confirmation: Preserve the public API",
+                "Result confirmation: Include the TUI path",
+                "Plan confirmation: Keep the command syntax stable"
+            ])
+        );
+        assert_common_context(&action.fields);
+
+        let result = run_step(
+            &feature.source_bundle,
+            "confirm_plan_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_plan",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "yes",
+                        "plan": "Reviewed plan body",
+                        "user_feedback": existing,
+                        "goal": "Keep command behavior stable",
+                        "validation": "cargo test -p cowboy",
+                        "work_dir": "docs/plans/example",
+                        "plan_doc": "docs/plans/example/plan.md",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("plan confirmation should record approval")
+        };
+
+        assert_eq!(action.status, "confirmed");
+        assert_eq!(action.fields["plan"], "Reviewed plan body");
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_common_context(&action.fields);
+
+        let result = run_step(
+            &feature.source_bundle,
+            "confirm_result_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_result",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "Also update the interactive help",
+                        "user_feedback": existing,
+                        "goal": "Keep command behavior stable",
+                        "validation": "cargo test -p cowboy",
+                        "work_dir": "docs/plans/example",
+                        "plan_doc": "docs/plans/example/plan.md",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("result confirmation should capture feedback")
+        };
+
+        assert_eq!(action.status, "changes_requested");
+        assert_eq!(
+            action.fields["feedback"],
+            "Also update the interactive help"
+        );
+        assert_eq!(
+            action.fields["user_feedback"],
+            serde_json::json!([
+                "Plan confirmation: Preserve the public API",
+                "Result confirmation: Include the TUI path",
+                "Result confirmation: Also update the interactive help"
+            ])
+        );
+        assert_common_context(&action.fields);
+
+        let result = run_step(
+            &feature.source_bundle,
+            "confirm_result_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_result",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "approved",
+                        "user_feedback": existing,
+                        "goal": "Keep command behavior stable",
+                        "validation": "cargo test -p cowboy",
+                        "work_dir": "docs/plans/example",
+                        "plan_doc": "docs/plans/example/plan.md",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("result confirmation should record approval")
+        };
+
+        assert_eq!(action.status, "confirmed");
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_common_context(&action.fields);
+
+        let bugfix = load_example_compiled_workflow("bugfix");
+        let result = run_step(
+            &bugfix.source_bundle,
+            "confirm_rca_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_rca",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "Explain why the race is deterministic",
+                        "user_feedback": existing,
+                        "summary": "Race reproduced",
+                        "work_dir": "docs/plans/example",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
+                        "files": ["docs/plans/example/rca.md", "src/lib.rs"],
+                        "command": "cargo test confirmation_repro",
+                        "commands": ["cargo test confirmation_repro", "cargo test"],
+                        "failure": "assertion failed",
+                        "failures": ["assertion failed", "exit status 101"]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("RCA confirmation should capture feedback")
+        };
+
+        assert_eq!(action.status, "changes_requested");
+        assert_eq!(
+            action.fields["feedback"],
+            "Explain why the race is deterministic"
+        );
+        assert_eq!(
+            action.fields["user_feedback"],
+            serde_json::json!([
+                "Plan confirmation: Preserve the public API",
+                "Result confirmation: Include the TUI path",
+                "RCA confirmation: Explain why the race is deterministic"
+            ])
+        );
+        assert_rca_context(&action.fields);
+
+        let result = run_step(
+            &bugfix.source_bundle,
+            "confirm_rca_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_rca",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": "y",
+                        "user_feedback": existing,
+                        "summary": "Race reproduced",
+                        "work_dir": "docs/plans/example",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
+                        "files": ["docs/plans/example/rca.md", "src/lib.rs"],
+                        "command": "cargo test confirmation_repro",
+                        "commands": ["cargo test confirmation_repro", "cargo test"],
+                        "failure": "assertion failed",
+                        "failures": ["assertion failed", "exit status 101"]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("RCA confirmation should record approval")
+        };
+
+        assert_eq!(action.status, "confirmed");
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_rca_context(&action.fields);
+    }
+
+    #[test]
+    fn examples_workflows_agent_steps_preserve_and_render_user_feedback() {
+        let cases: [(&str, &[&str]); 3] = [
+            (
+                "feature",
+                &[
+                    "plan",
+                    "review_plan",
+                    "implement",
+                    "test",
+                    "review",
+                    "review_result_feedback",
+                    "revise",
+                    "commit",
+                ],
+            ),
+            (
+                "bugfix",
+                &[
+                    "investigate",
+                    "review_rca",
+                    "plan",
+                    "review_plan",
+                    "implement",
+                    "test",
+                    "review",
+                    "review_result_feedback",
+                    "revise",
+                    "commit",
+                ],
+            ),
+            (
+                "dev-loop",
+                &[
+                    "plan",
+                    "review_plan",
+                    "implement",
+                    "test",
+                    "validate",
+                    "review",
+                    "review_result_feedback",
+                    "revise",
+                    "commit",
+                ],
+            ),
+        ];
+
+        for (workflow_name, step_ids) in cases {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            for step_id in step_ids {
+                let result = run_step(
+                    &compiled.source_bundle,
+                    step_id,
+                    serde_json::json!({
+                        "request": "Preserve cumulative feedback",
+                        "prev": {
+                            "step": "handoff",
+                            "status": "ready",
+                            "fields": {
+                                "user_feedback": [
+                                    "Plan confirmation: Preserve the public API",
+                                    "Result confirmation: Include the TUI path"
+                                ],
+                                "goal": "Preserve cumulative feedback",
+                                "validation": "cargo test",
+                                "plan_doc": "docs/plans/example.md",
+                                "work_dir": "docs/plans/example",
+                                "rca_doc": "docs/plans/example/rca.md",
+                                "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
+                                "commands": ["cargo test"]
+                            }
+                        }
+                    }),
+                )
+                .unwrap();
+
+                let StepAction::Agent(action) = result.action else {
+                    panic!("{workflow_name} {step_id} should request an agent action")
+                };
+
+                let output = action.output.unwrap_or_else(|| {
+                    panic!("{workflow_name} {step_id} should declare agent output")
+                });
+
+                assert_eq!(
+                    output.fields["user_feedback"], "array",
+                    "{workflow_name} {step_id} should declare user_feedback"
+                );
+                if *step_id == "commit" {
+                    for field in ["work_dir", "plan_doc", "rca_doc", "repro_test"] {
+                        assert_eq!(
+                            output.fields[field], "string",
+                            "commit should declare {field}"
+                        );
+                    }
+
+                    for label in ["Work dir", "Plan doc", "RCA doc", "Repro test"] {
+                        assert!(
+                            action.prompt.contains(&format!("`{label}: ...`")),
+                            "commit should require exact preservation of {label}"
+                        );
+                    }
+                }
+
+                assert!(
+                    action.prompt.contains(
+                        "Preserve `user_feedback` exactly in output fields when present."
+                    ),
+                    "{workflow_name} {step_id} should require exact feedback preservation"
+                );
+                let first = action
+                    .prompt
+                    .find("- Plan confirmation: Preserve the public API")
+                    .unwrap_or_else(|| {
+                        panic!("{workflow_name} {step_id} should render plan feedback")
+                    });
+
+                let second = action
+                    .prompt
+                    .find("- Result confirmation: Include the TUI path")
+                    .unwrap_or_else(|| {
+                        panic!("{workflow_name} {step_id} should render result feedback")
+                    });
+
+                assert!(
+                    first < second,
+                    "{workflow_name} {step_id} should preserve feedback order"
+                );
+
+                if matches!(
+                    *step_id,
+                    "review_rca" | "review_plan" | "review" | "review_result_feedback"
+                ) {
+                    assert!(
+                        action.prompt.contains(
+                            "Evaluate the revised work against the complete user feedback history"
+                        ),
+                        "{workflow_name} {step_id} should review against user feedback"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_detours_preserve_user_feedback_without_relabeling_input() {
+        fn assert_artifact_context(fields: &serde_json::Value) {
+            assert_eq!(fields["goal"], "Preserve clarification context");
+            assert_eq!(
+                fields["validation"],
+                "cargo test -p cowboy-workflow-lua clarification_context"
+            );
+            assert_eq!(fields["work_dir"], "docs/plans/example");
+            assert_eq!(fields["plan_doc"], "docs/plans/example/plan.md");
+            assert_eq!(fields["rca_doc"], "docs/plans/example/rca.md");
+            assert_eq!(
+                fields["repro_test"],
+                "crates/workflow/lua/src/loader.rs::clarification_repro"
+            );
+        }
+
+        let compiled = load_example_compiled_workflow("feature");
+        let existing = serde_json::json!([
+            "Plan confirmation: Preserve the public API",
+            "Result confirmation: Include the TUI path"
+        ]);
+        let result = run_step(
+            &compiled.source_bundle,
+            "clarify",
+            serde_json::json!({
+                "steps_executed": 3,
+                "prev": {
+                    "step": "plan",
+                    "status": "unclear",
+                    "fields": {
+                        "user_feedback": existing,
+                        "goal": "Preserve clarification context",
+                        "validation": "cargo test -p cowboy-workflow-lua clarification_context",
+                        "work_dir": "docs/plans/example",
+                        "plan_doc": "docs/plans/example/plan.md",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::clarification_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(action) = result.action else {
+            panic!("clarify should ask the user for context")
+        };
+
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_artifact_context(&action.fields);
+        let mut answered_fields = action.fields.clone();
+        answered_fields["answer"] = serde_json::json!("The entrypoint is the TUI composer");
+
+        let result = run_step(
+            &compiled.source_bundle,
+            "clarify_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "clarify",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": answered_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("clarify_answer should record the clarification")
+        };
+
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_artifact_context(&action.fields);
+        assert_eq!(
+            action.fields["clarification"],
+            "The entrypoint is the TUI composer"
+        );
+
+        let result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked_answer",
+                    "status": "triaged",
+                    "fields": {
+                        "blocked_response": "Credentials are available; continue implementation",
+                        "blocked_from_step": "implement",
+                        "user_feedback": existing
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("triage_blocked should route the recovered workflow")
+        };
+
+        assert_eq!(action.status, "implement");
+        assert_eq!(action.fields["user_feedback"], existing);
+        assert_eq!(
+            action.fields["feedback"],
+            "Credentials are available; continue implementation"
+        );
+    }
+
+    #[test]
     fn examples_workflows_review_replans_when_approved_plan_is_unsound() {
         for workflow_name in ["feature", "bugfix"] {
             let definition = load_example_workflow(workflow_name);

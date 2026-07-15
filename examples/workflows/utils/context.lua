@@ -1,5 +1,34 @@
 local M = {}
 
+function M.copy_user_feedback(fields)
+  local copied = {}
+  local user_feedback = fields and fields.user_feedback
+  if type(user_feedback) == "table" then
+    for index, entry in ipairs(user_feedback) do
+      copied[index] = entry
+    end
+  end
+  return copied
+end
+
+function M.append_user_feedback(fields, stage, feedback)
+  local appended = M.copy_user_feedback(fields)
+  table.insert(appended, tostring(stage) .. ": " .. tostring(feedback))
+  return appended
+end
+
+function M.preserve_user_feedback_guidance()
+  return [[
+
+Preserve `user_feedback` exactly in output fields when present. It is cumulative raw user direction; do not add agent- or reviewer-generated feedback to it.]]
+end
+
+function M.review_user_feedback_guidance()
+  return [[
+
+Evaluate the revised work against the complete user feedback history above as well as repository rules, document constraints, and test or validation evidence.]]
+end
+
 function M.clarification_context(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
   if fields.clarification and tostring(fields.clarification) ~= "" then
@@ -19,6 +48,12 @@ function M.previous_step_context(ctx, heading)
   if prev.step then table.insert(lines, "Step: " .. tostring(prev.step)) end
   if prev.status then table.insert(lines, "Status: " .. tostring(prev.status)) end
   local fields = prev.fields or {}
+  if fields.user_feedback and #fields.user_feedback > 0 then
+    table.insert(lines, "User feedback history:")
+    for _, feedback in ipairs(fields.user_feedback) do
+      table.insert(lines, "- " .. tostring(feedback))
+    end
+  end
   if fields.summary then table.insert(lines, "Summary: " .. tostring(fields.summary)) end
   if fields.feedback then table.insert(lines, "Feedback: " .. tostring(fields.feedback)) end
   if fields.goal then table.insert(lines, "Goal: " .. tostring(fields.goal)) end

@@ -29,4 +29,5 @@ whoami = "1"
 
 [dev-dependencies]
 parking_lot.workspace = true
+mockall = "0.15"
 tempfile.workspace = true

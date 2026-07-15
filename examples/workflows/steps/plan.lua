@@ -15,7 +15,7 @@ The prior context contains `Goal: ...` and `Validation: ...` values supplied by 
       role = roles.planner,
       prompt = [[Create a concrete plan for this ]] .. kind .. [[ request:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. context.preserve_user_feedback_guidance() .. [[
 
 If previous feedback includes `Plan doc: ...`, update that existing plan document instead of creating a separate plan path, preserve the same `plan_doc` value exactly in output fields, and include that same path in `files`.
 
@@ -37,7 +37,7 @@ The TODO section must contain every implementation work item as Markdown task-li
 Return status "ready" when the request is specific enough to implement, or "unclear" when more user context is needed.]],
       output = {
         status = { "ready", "unclear" },
-        fields = { summary = "string", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },
+        fields = { summary = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },
       },
     }
   end

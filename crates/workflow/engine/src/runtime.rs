@@ -3,22 +3,19 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
-use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_agent::{
-    AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind, ClientFactory,
-    ResolvedAgentClient,
+    AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind,
 };
 use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
     ActionResult, DEFAULT_CONFIG_SET_NAME, ExecutionContext, ObjectKind, ResolvedConfigSet, Result,
-    RoleDefinition, RunHead, RunStatus, RunnerLimits, StatusAction, StepAction, StepActionProvider,
-    StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowSelector,
+    RunHead, RunStatus, RunnerLimits, StatusAction, StepAction, StepActionProvider, StepRecord,
+    WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowSelector,
     WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status,
     apply_step_record,
 };
@@ -30,7 +27,10 @@ use uuid::Uuid;
 use crate::active_clock::ActiveRunClock;
 use crate::agent_resolver::AgentResolver;
 use crate::run_lock::RunExecutionLocks;
-use crate::workflow::{AgentRequestTopicGenerator, DeterministicSelector};
+use crate::runtime_dependencies::{
+    ProductionRuntimeDependencies, RuntimeDependencies, transport_for,
+};
+use crate::workflow::DeterministicSelector;
 use crate::{
     EngineActionDispatcher, EventBus, LuaStepActionProvider, ResumeRouter, WorkflowEvent,
     WorkflowEventKind, WorkflowRunner,
@@ -263,8 +263,7 @@ pub struct WorkflowRuntime {
     events: Arc<EventBus>,
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
-    #[cfg(test)]
-    request_topic_override: Option<String>,
+    dependencies: Arc<dyn RuntimeDependencies>,
 }
 
 /// How far [`WorkflowRuntime`] drives a run in a single call.
@@ -324,7 +323,7 @@ impl Drop for ActiveRunCancellationGuard {
 
 /// Workflow selection strategy used by [`WorkflowRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectorMode {
+pub(crate) enum SelectorMode {
     /// Ask the configured ACP agent to choose a workflow from the catalog.
     Agent,
     /// Pick the first catalog workflow by id; used by tests with no live agent.
@@ -333,13 +332,19 @@ enum SelectorMode {
 
 impl WorkflowRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
+        Self::with_dependencies(config, Arc::new(ProductionRuntimeDependencies))
+    }
+
+    fn with_dependencies(
+        config: RuntimeConfig,
+        dependencies: Arc<dyn RuntimeDependencies>,
+    ) -> Self {
         Self {
             run_locks: RunExecutionLocks::new(config.workflow_store.clone()),
             config,
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
-            #[cfg(test)]
-            request_topic_override: None,
+            dependencies,
         }
     }
 
@@ -352,12 +357,6 @@ impl WorkflowRuntime {
 
     pub fn events(&self) -> Arc<EventBus> {
         self.events.clone()
-    }
-
-    #[cfg(test)]
-    fn with_request_topic_for_tests(mut self, topic: impl Into<String>) -> Self {
-        self.request_topic_override = Some(topic.into());
-        self
     }
 
     pub fn catalog(&self) -> Result<WorkflowCatalog> {
@@ -607,36 +606,9 @@ impl WorkflowRuntime {
     }
 
     async fn generate_request_topic(&self, request: &str) -> Option<String> {
-        #[cfg(test)]
-        if let Some(topic) = &self.request_topic_override {
-            return Some(topic.clone());
-        }
-
-        if matches!(self.selector, SelectorMode::Deterministic) {
-            return None;
-        }
-
-        match self.generate_request_topic_result(request).await {
-            Ok(topic) => Some(topic),
-            Err(err) => {
-                tracing::warn!(error = %err, "request topic generation failed");
-                None
-            }
-        }
-    }
-
-    async fn generate_request_topic_result(&self, request: &str) -> Result<String> {
-        let resolver = AgentResolver::new(self.config.agents.clone())?;
-        let agent = resolver.resolve_default()?;
-        let client = AcpClient::connect(transport_for(agent))
+        self.dependencies
+            .generate_request_topic(&self.config, self.selector, request)
             .await
-            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        let generator = AgentRequestTopicGenerator::new(
-            client,
-            self.config.cwd.to_string_lossy().to_string(),
-            agent.model.clone(),
-        );
-        generator.generate(request).await
     }
 
     pub async fn resume_run(&self, run_id: &str) -> Result<RunReport> {
@@ -1070,7 +1042,8 @@ impl WorkflowRuntime {
                 ));
             })),
         };
-        let executor = AgentExecutor::new(self.agent_factory()?, agent_store, agent_config);
+        let factory = self.dependencies.agent_factory(&self.config)?;
+        let executor = AgentExecutor::new(factory, agent_store, agent_config);
         let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
@@ -1183,16 +1156,6 @@ impl WorkflowRuntime {
         }
     }
 
-    fn agent_factory(&self) -> Result<AcpClientFactory> {
-        tracing::debug!(
-            agents = self.config.agents.len(),
-            "ACP client factory configured"
-        );
-        Ok(AcpClientFactory {
-            resolver: AgentResolver::new(self.config.agents.clone())?,
-        })
-    }
-
     fn store(&self) -> Result<RedbRunStore> {
         tracing::debug!(path = %self.config.workflow_store.display(), "opening workflow store");
         let store =
@@ -1240,19 +1203,6 @@ fn drain_available_workflow_events(
             | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct AcpClientFactory {
-    resolver: AgentResolver,
-}
-
-fn transport_for(agent: &AgentRuntimeConfig) -> TransportConfig {
-    TransportConfig::Stdio(StdioConfig {
-        command: agent.command.clone(),
-        args: agent.args.clone(),
-        env: Vec::new(),
-    })
 }
 
 /// A run can be manually resolved only when it is stopped on a step, i.e. it is
@@ -1330,31 +1280,6 @@ fn describe_resolution_options(options: &ResolutionOptions) -> String {
     format!("Valid statuses: {}", parts.join("; "))
 }
 
-#[async_trait]
-impl ClientFactory for AcpClientFactory {
-    async fn create_client(
-        &self,
-        role: &RoleDefinition,
-    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
-        let agent = self.resolver.resolve(role)?;
-        tracing::debug!(
-            role = %role.id,
-            agent = %agent.name,
-            command = %agent.command,
-            args = ?agent.args,
-            model_id = %agent.model.id,
-            provider = ?agent.model.provider,
-            "resolving ACP client for role"
-        );
-        let client = AcpClient::connect(transport_for(agent)).await?;
-        Ok(ResolvedAgentClient {
-            client: Box::new(client),
-            model: agent.model.clone(),
-            backend: agent.name.clone(),
-        })
-    }
-}
-
 fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
     let workflow_entry = format!("{}.lua", run.workflow_name);
     let entry = if run.workflow_sources.contains_key(&workflow_entry) {
@@ -1386,7 +1311,13 @@ fn run_head(run: &WorkflowRun) -> RunHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowboy_workflow_core::{ResumeCallback, RunStatus, StepAction};
+    use crate::runtime_dependencies::{MockRuntimeDependencies, SharedClientFactory};
+    use async_trait::async_trait;
+    use cowboy_agent_client::{AgentInfo, Client, Event, PromptContent, StopReason};
+    use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
+    use cowboy_workflow_core::{ResumeCallback, RoleDefinition, RunStatus, StepAction};
+    use parking_lot::Mutex as SyncMutex;
+    use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
 
     fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
@@ -1395,6 +1326,291 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             model: ModelInfo::default(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedAgentState {
+        responses: VecDeque<String>,
+        prompts: Vec<String>,
+        next_session: usize,
+        created_roles: Vec<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ScriptedAgentFactory {
+        state: Arc<SyncMutex<ScriptedAgentState>>,
+    }
+
+    impl ScriptedAgentFactory {
+        fn new(responses: Vec<String>) -> Self {
+            Self {
+                state: Arc::new(SyncMutex::new(ScriptedAgentState {
+                    responses: responses.into(),
+                    prompts: Vec::new(),
+                    next_session: 0,
+                    created_roles: Vec::new(),
+                })),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.state.lock().prompts.clone()
+        }
+
+        fn created_roles(&self) -> Vec<String> {
+            self.state.lock().created_roles.clone()
+        }
+
+        fn assert_exhausted(&self) {
+            assert!(
+                self.state.lock().responses.is_empty(),
+                "scripted agent responses should all be consumed"
+            );
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedAgentClient {
+        state: Arc<SyncMutex<ScriptedAgentState>>,
+        session_id: Option<String>,
+    }
+
+    #[async_trait]
+    impl Client for ScriptedAgentClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn agent_info(&self) -> Option<&AgentInfo> {
+            None
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            self.session_id.as_deref()
+        }
+
+        async fn new_session(
+            &mut self,
+            _cwd: &str,
+            _mcp_servers: &[Value],
+            _model: &ModelInfo,
+        ) -> anyhow::Result<String> {
+            let mut state = self.state.lock();
+            state.next_session += 1;
+            let session_id = format!("scripted-session-{}", state.next_session);
+            self.session_id = Some(session_id.clone());
+            Ok(session_id)
+        }
+
+        fn supports_load_session(&self) -> bool {
+            true
+        }
+
+        async fn load_session(
+            &mut self,
+            session_id: &str,
+            _cwd: &str,
+            _mcp_servers: &[Value],
+        ) -> anyhow::Result<Vec<Event>> {
+            self.session_id = Some(session_id.to_string());
+            Ok(Vec::new())
+        }
+
+        async fn prompt(
+            &mut self,
+            _session_id: &str,
+            prompt_content: Vec<PromptContent>,
+            event_handler: &mut (dyn FnMut(Event) + Send),
+        ) -> anyhow::Result<StopReason> {
+            let prompt = prompt_content
+                .into_iter()
+                .map(|content| content.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let response = {
+                let mut state = self.state.lock();
+                state.prompts.push(prompt);
+                state
+                    .responses
+                    .pop_front()
+                    .ok_or_else(|| anyhow::anyhow!("scripted agent response queue exhausted"))?
+            };
+
+            event_handler(Event::MessageChunk {
+                content: serde_json::json!({ "text": response }),
+            });
+            Ok(StopReason::EndTurn)
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ClientFactory for ScriptedAgentFactory {
+        async fn create_client(
+            &self,
+            role: &RoleDefinition,
+        ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+            self.state.lock().created_roles.push(role.id.clone());
+            Ok(ResolvedAgentClient {
+                client: Box::new(ScriptedAgentClient {
+                    state: self.state.clone(),
+                    session_id: None,
+                }),
+                model: ModelInfo {
+                    id: "scripted-model".to_string(),
+                    provider: Some("test".to_string()),
+                },
+                backend: "scripted-agent".to_string(),
+            })
+        }
+    }
+
+    fn mock_runtime_dependencies(
+        topic: Option<&str>,
+        factory: Option<ScriptedAgentFactory>,
+    ) -> Arc<dyn RuntimeDependencies> {
+        let mut dependencies = MockRuntimeDependencies::new();
+        let topic = topic.map(str::to_string);
+        dependencies
+            .expect_generate_request_topic()
+            .times(1)
+            .withf(|_, selector, request| {
+                *selector == SelectorMode::Deterministic && !request.is_empty()
+            })
+            .returning(move |_, _, _| topic.clone());
+
+        match factory {
+            Some(factory) => {
+                let factory = SharedClientFactory::new(factory);
+                dependencies
+                    .expect_agent_factory()
+                    .returning(move |_| Ok(factory.clone()));
+            }
+            None => {
+                dependencies
+                    .expect_agent_factory()
+                    .returning(|config| ProductionRuntimeDependencies.agent_factory(config));
+            }
+        }
+
+        Arc::new(dependencies)
+    }
+
+    #[tokio::test]
+    async fn shared_client_factory_forwards_role_and_resolved_client() {
+        let scripted = ScriptedAgentFactory::new(Vec::new());
+        let factory = SharedClientFactory::new(scripted.clone());
+        let role = RoleDefinition {
+            id: "reviewer".to_string(),
+            instructions: "Review changes".to_string(),
+            agent: None,
+            properties: Value::Null,
+        };
+
+        let resolved = factory.create_client(&role).await.unwrap();
+
+        assert_eq!(resolved.backend, "scripted-agent");
+        assert_eq!(scripted.created_roles(), ["reviewer"]);
+    }
+
+    #[tokio::test]
+    async fn production_request_topic_failure_falls_back_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            agents: vec![agent("default", "definitely-missing-topic-agent")],
+            config_sets: BTreeMap::new(),
+        };
+
+        let topic = ProductionRuntimeDependencies
+            .generate_request_topic(&config, SelectorMode::Agent, "summarize this request")
+            .await;
+
+        assert_eq!(topic, None);
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_propagates_dependency_factory_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success" }
+            end
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        };
+        let mut dependencies = MockRuntimeDependencies::new();
+        dependencies
+            .expect_generate_request_topic()
+            .times(1)
+            .return_const(None);
+        dependencies.expect_agent_factory().times(1).returning(|_| {
+            Err(WorkflowError::InvalidAction(
+                "injected factory failure".to_string(),
+            ))
+        });
+        let runtime = WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
+            .with_deterministic_selector();
+
+        let error = runtime.start_run("request").await.unwrap_err();
+
+        assert!(error.to_string().contains("injected factory failure"));
+    }
+
+    fn runtime_for_example_workflow(
+        dir: &tempfile::TempDir,
+        factory: ScriptedAgentFactory,
+    ) -> WorkflowRuntime {
+        let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows")
+            .canonicalize()
+            .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![examples_root],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 100,
+                    max_visits_per_step: 20,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        };
+        WorkflowRuntime::with_dependencies(config, mock_runtime_dependencies(None, Some(factory)))
+            .with_deterministic_selector()
+    }
+
+    fn waiting_prompt_id(report: &RunReport) -> &str {
+        match &report.run.status {
+            RunStatus::WaitingForInput { prompt_id, .. } => prompt_id,
+            status => panic!("expected waiting run, got {status:?}"),
         }
     }
 
@@ -1546,7 +1762,24 @@ mod tests {
             "#,
         )
         .unwrap();
-        runtime_for_workflow_dir(dir, workflow_dir).with_request_topic_for_tests(topic)
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: vec![agent("default", "unused-agent")],
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        };
+        WorkflowRuntime::with_dependencies(config, mock_runtime_dependencies(Some(topic), None))
+            .with_deterministic_selector()
     }
 
     fn command_script(dir: &tempfile::TempDir) -> PathBuf {
@@ -2623,7 +2856,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::new(RuntimeConfig {
+        let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
@@ -2638,9 +2871,12 @@ exit 0
                     max_retries_per_step: 2,
                 },
             )]),
-        })
-        .with_deterministic_selector()
-        .with_request_topic_for_tests("Original topic");
+        };
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(Some("Original topic"), None),
+        )
+        .with_deterministic_selector();
 
         runtime.start_run("do it").await.unwrap_err();
         let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
@@ -3170,7 +3406,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = WorkflowRuntime::new(RuntimeConfig {
+        let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
@@ -3185,9 +3421,12 @@ exit 0
                     max_retries_per_step: 2,
                 },
             )]),
-        })
-        .with_deterministic_selector()
-        .with_request_topic_for_tests("Initial prompt topic");
+        };
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(Some("Initial prompt topic"), None),
+        )
+        .with_deterministic_selector();
 
         let start = runtime.start_run("request").await.unwrap();
         assert!(matches!(
@@ -3753,6 +3992,404 @@ exit 0
             "fix one more thing"
         );
         assert_eq!(confirm_result_action.fields["plan_doc"], plan_doc);
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_plan_reviewer_receives_persisted_user_feedback() {
+        let responses = vec![
+            r#"---
+status: ready
+summary: Initial plan
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+files: [docs/plans/example.md]
+---
+Initial plan body"#
+                .to_string(),
+            r#"---
+status: approved
+plan: Initial reviewed plan
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+---
+Initial review body"#
+                .to_string(),
+            r#"---
+status: ready
+summary: Revised plan keeps the command syntax
+user_feedback:
+  - "Plan confirmation: Keep the existing command syntax"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+files: [docs/plans/example.md]
+---
+Revised plan body"#
+                .to_string(),
+            r#"---
+status: approved
+plan: Revised reviewed plan
+user_feedback:
+  - "Plan confirmation: Keep the existing command syntax"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+---
+Revised review body"#
+                .to_string(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(responses);
+        let runtime = runtime_for_example_workflow(&dir, factory.clone());
+
+        let start = runtime
+            .start_run_with_workflow("workflows/feature", "preserve feedback for plan reviewers")
+            .await
+            .unwrap();
+        let run_id = start.run.id.clone();
+        let prompt_id = waiting_prompt_id(&start).to_string();
+        let revised = runtime
+            .answer_run(&run_id, &prompt_id, "Keep the existing command syntax")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            revised.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        let persisted_review = command_output_record(&runtime, &revised);
+        assert_eq!(persisted_review.step, "review_plan");
+        assert_eq!(
+            persisted_review.output.unwrap().fields["user_feedback"],
+            serde_json::json!(["Plan confirmation: Keep the existing command syntax"])
+        );
+
+        let prompts = factory.prompts();
+        assert_eq!(prompts.len(), 4);
+        let revised_review_prompt = &prompts[3];
+        assert!(
+            revised_review_prompt.contains("- Plan confirmation: Keep the existing command syntax")
+        );
+        assert!(revised_review_prompt.contains("Plan doc: docs/plans/example.md"));
+        assert!(
+            revised_review_prompt
+                .contains("Evaluate the revised work against the complete user feedback history")
+        );
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_preserves_result_feedback_through_commit_recovery() {
+        let result_feedback = "The TUI help still omits the flag";
+        let responses = vec![
+            r#"---
+status: ready
+summary: Initial plan
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+files: [docs/plans/example.md]
+---
+Initial plan body"#
+                .to_string(),
+            r#"---
+status: approved
+plan: Initial reviewed plan
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+---
+Initial review body"#
+                .to_string(),
+            r#"---
+status: implemented
+summary: Initial implementation
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+files: [src/main.rs]
+---
+Initial implementation body"#
+                .to_string(),
+            r#"---
+status: passed
+summary: Initial tests passed
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+commands: [cargo test -p cowboy-workflow-engine]
+failures: []
+---
+Initial test body"#
+                .to_string(),
+            r#"---
+status: approved
+user_feedback: []
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+---
+Initial implementation review"#
+                .to_string(),
+            r#"---
+status: changes_requested
+feedback: Update the TUI help
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+---
+Result feedback review"#
+                .to_string(),
+            r#"---
+status: implemented
+summary: Updated the TUI help
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+files: [src/main.rs]
+---
+Revised implementation"#
+                .to_string(),
+            r#"---
+status: passed
+summary: Focused TUI tests passed
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+commands: [cargo test -p cowboy]
+failures: []
+---
+Revised tests"#
+                .to_string(),
+            r#"---
+status: approved
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+---
+Revised implementation review"#
+                .to_string(),
+            r#"---
+status: blocked
+summary: Commit backend unavailable
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+---
+Commit blocked"#
+                .to_string(),
+            r#"---
+status: implemented
+summary: Retried implementation after commit recovery
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+files: [src/main.rs]
+---
+Recovered implementation"#
+                .to_string(),
+            r#"---
+status: passed
+summary: Recovery tests passed
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+commands: [cargo test -p cowboy]
+failures: []
+---
+Recovery tests"#
+                .to_string(),
+            r#"---
+status: approved
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+---
+Recovery implementation review"#
+                .to_string(),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(responses);
+        let runtime = runtime_for_example_workflow(&dir, factory.clone());
+
+        let mut report = runtime
+            .start_run_with_workflow(
+                "workflows/feature",
+                "preserve feedback for implementation reviewers",
+            )
+            .await
+            .unwrap();
+        let run_id = report.run.id.clone();
+        let prompt_id = waiting_prompt_id(&report).to_string();
+        report = runtime
+            .answer_run(&run_id, &prompt_id, "yes")
+            .await
+            .unwrap();
+
+        let prompt_id = waiting_prompt_id(&report).to_string();
+        report = runtime
+            .answer_run(&run_id, &prompt_id, result_feedback)
+            .await
+            .unwrap();
+
+        let persisted_review = command_output_record(&runtime, &report);
+        assert_eq!(persisted_review.step, "review");
+        let pre_recovery_prompt = persisted_review.input.prompt.as_deref().unwrap();
+        assert!(pre_recovery_prompt.contains("Goal: Preserve reviewer feedback context"));
+        assert!(pre_recovery_prompt.contains("Validation: cargo test -p cowboy-workflow-engine"));
+        let review_output = persisted_review.output.unwrap();
+        assert_eq!(
+            review_output.fields["user_feedback"],
+            serde_json::json!([format!("Result confirmation: {result_feedback}")])
+        );
+        assert_eq!(
+            review_output.fields["goal"],
+            "Preserve reviewer feedback context"
+        );
+        assert_eq!(
+            review_output.fields["validation"],
+            "cargo test -p cowboy-workflow-engine"
+        );
+
+        let prompt_id = waiting_prompt_id(&report).to_string();
+        report = runtime
+            .answer_run(&run_id, &prompt_id, "yes")
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.run.status,
+            RunStatus::WaitingForInput { ref step, .. } if step == "blocked"
+        ));
+        let persisted_commit = command_output_record(&runtime, &report);
+        assert_eq!(persisted_commit.step, "commit");
+        let commit_output = persisted_commit.output.unwrap();
+        assert_eq!(commit_output.fields["work_dir"], "docs/plans/example");
+        assert_eq!(commit_output.fields["plan_doc"], "docs/plans/example.md");
+        assert_eq!(commit_output.fields["rca_doc"], "docs/plans/example/rca.md");
+        assert_eq!(
+            commit_output.fields["repro_test"],
+            "crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery"
+        );
+
+        let prompts_before_recovery = factory.prompts();
+        let commit_prompt = &prompts_before_recovery[9];
+        assert!(commit_prompt.contains(&format!("- Result confirmation: {result_feedback}")));
+        assert!(
+            commit_prompt
+                .contains("Preserve `user_feedback` exactly in output fields when present.")
+        );
+        for label in ["Work dir", "Plan doc", "RCA doc", "Repro test"] {
+            assert!(
+                commit_prompt.contains(&format!("{label}:")),
+                "commit prompt should contain {label}"
+            );
+        }
+
+        let prompt_id = waiting_prompt_id(&report).to_string();
+        report = runtime
+            .answer_run(
+                &run_id,
+                &prompt_id,
+                "Credentials restored; continue implementation",
+            )
+            .await
+            .unwrap();
+
+        let persisted_recovery_review = command_output_record(&runtime, &report);
+        assert_eq!(persisted_recovery_review.step, "review");
+        let post_recovery_prompt = persisted_recovery_review.input.prompt.as_deref().unwrap();
+        assert!(post_recovery_prompt.contains("Goal: Preserve reviewer feedback context"));
+        assert!(post_recovery_prompt.contains("Validation: cargo test -p cowboy-workflow-engine"));
+        let recovery_output = persisted_recovery_review.output.unwrap();
+        assert_eq!(
+            recovery_output.fields["user_feedback"],
+            serde_json::json!([format!("Result confirmation: {result_feedback}")])
+        );
+        assert_eq!(
+            recovery_output.fields["goal"],
+            "Preserve reviewer feedback context"
+        );
+        assert_eq!(
+            recovery_output.fields["validation"],
+            "cargo test -p cowboy-workflow-engine"
+        );
+        assert_eq!(recovery_output.fields["work_dir"], "docs/plans/example");
+        assert_eq!(recovery_output.fields["plan_doc"], "docs/plans/example.md");
+        assert_eq!(
+            recovery_output.fields["rca_doc"],
+            "docs/plans/example/rca.md"
+        );
+        assert_eq!(
+            recovery_output.fields["repro_test"],
+            "crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery"
+        );
+
+        let prompts = factory.prompts();
+        assert_eq!(prompts.len(), 13);
+        let result_review_prompt = &prompts[8];
+        assert!(
+            result_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
+        );
+        assert!(result_review_prompt.contains("Commands:\n- cargo test -p cowboy"));
+        assert!(result_review_prompt.contains("Plan doc: docs/plans/example.md"));
+        assert!(result_review_prompt.contains("Goal: Preserve reviewer feedback context"));
+        assert!(result_review_prompt.contains("Validation: cargo test -p cowboy-workflow-engine"));
+
+        let recovery_review_prompt = &prompts[12];
+        assert!(
+            recovery_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
+        );
+        assert!(recovery_review_prompt.contains("Commands:\n- cargo test -p cowboy"));
+        assert!(recovery_review_prompt.contains("Goal: Preserve reviewer feedback context"));
+        assert!(
+            recovery_review_prompt.contains("Validation: cargo test -p cowboy-workflow-engine")
+        );
+        assert!(recovery_review_prompt.contains("Work dir: docs/plans/example"));
+        assert!(recovery_review_prompt.contains("Plan doc: docs/plans/example.md"));
+        assert!(recovery_review_prompt.contains("RCA doc: docs/plans/example/rca.md"));
+        assert!(recovery_review_prompt.contains(
+            "Repro test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery"
+        ));
+        factory.assert_exhausted();
     }
 
     #[test]

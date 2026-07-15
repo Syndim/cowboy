@@ -1,3 +1,5 @@
+local context = require("utils/context.lua")
+
 return function(id)
   local clarify = step(id or "clarify")
   clarify.run = function(ctx)
@@ -9,8 +11,13 @@ return function(id)
           status = "clarified",
           fields = {
             clarification = tostring(answer),
+            user_feedback = context.copy_user_feedback(fields),
             goal = fields.goal,
             validation = fields.validation,
+            work_dir = fields.work_dir,
+            plan_doc = fields.plan_doc,
+            rca_doc = fields.rca_doc,
+            repro_test = fields.repro_test,
           },
           body = "received additional context",
         }
@@ -23,7 +30,7 @@ return function(id)
       id = prompt_id,
       message = "Please provide enough context to plan this work: desired behavior, entrypoint, expected output/state changes, constraints, and verification criteria.",
       choices = {},
-      fields = { goal = previous_fields.goal, validation = previous_fields.validation },
+      fields = { user_feedback = context.copy_user_feedback(previous_fields), goal = previous_fields.goal, validation = previous_fields.validation, work_dir = previous_fields.work_dir, plan_doc = previous_fields.plan_doc, rca_doc = previous_fields.rca_doc, repro_test = previous_fields.repro_test },
     }
   end
   return clarify

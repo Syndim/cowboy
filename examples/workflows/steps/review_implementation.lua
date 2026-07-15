@@ -16,12 +16,12 @@ The validator result above must show that the exact user-provided Validation met
       role = roles.reviewer,
       prompt = [[Review the ]] .. review_subject .. [[ for this request:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, evidence_heading) .. validation_guidance .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, evidence_heading) .. validation_guidance .. context.preserve_user_feedback_guidance() .. context.review_user_feedback_guidance() .. [[
 
 Inspect the working tree and plan document at the `Plan doc: ...` path. For bug fixes, also inspect the bug-fix work folder at `Work dir: ...`, the RCA document at `RCA doc: ...`, and the investigator-added regression test identified by `Repro test: ...`; verify that test still validates the original issue and passed in the test step. Verify every checked TODO item is actually completed, require unfinished work items to remain unchecked, preserve the `Work dir`, `Plan doc`, `RCA doc`, and `Repro test` values exactly in output fields when present, and return "approved" only if the change is correct, scoped, sufficiently tested, and all required TODO items are complete. Return "changes_requested" with actionable feedback when the implementation has defects that can be fixed within the approved plan. Return "replan_requested" with actionable feedback for the planner when the implementation follows the approved plan but that plan is incomplete, unsafe, incorrectly scoped, unverifiable, or otherwise not solid.]],
       output = {
         status = { "approved", "changes_requested", "replan_requested" },
-        fields = { feedback = "string", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string" },
+        fields = { feedback = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", rca_doc = "string", repro_test = "string" },
       },
     }
   end

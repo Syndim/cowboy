@@ -8,7 +8,7 @@ return function(roles, opts)
       role = roles.investigator,
       prompt = [[Investigate this bug report before any fix planning:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Investigation feedback:") .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Investigation feedback:") .. context.preserve_user_feedback_guidance() .. [[
 
 Reproduce or otherwise ground the bug in the repository. Before returning "documented", create a bug-fix work folder at `docs/plans/<snake_case_bug_summary>/`; create `docs/plans` if it does not exist. Generate `<snake_case_bug_summary>` from the concise bug summary by lowercasing it, removing punctuation, and joining words with underscores. Write the Root Cause Analysis document to `docs/plans/<snake_case_bug_summary>/rca.md`.
 
@@ -27,7 +27,7 @@ Add one focused regression test that reproduces the bug and fails before the fix
 Return "documented" when the RCA and failing test are ready, "unclear" when more user context is required, or "blocked" if the investigation cannot proceed.]],
       output = {
         status = { "documented", "unclear", "blocked" },
-        fields = { summary = "string", work_dir = "string", rca_doc = "string", repro_test = "string", files = "array", command = "string", failure = "string" },
+        fields = { summary = "string", user_feedback = "array", work_dir = "string", rca_doc = "string", repro_test = "string", files = "array", command = "string", failure = "string" },
       },
     }
   end

@@ -1,3 +1,5 @@
+local context = require("utils/context.lua")
+
 return function(id)
   local opts = type(id) == "table" and id or { id = id }
   local triage = step(opts.id or "triage_blocked")
@@ -23,6 +25,7 @@ return function(id)
       fields = {
         summary = "Blocked workflow triaged to " .. next_step,
         feedback = response,
+        user_feedback = context.copy_user_feedback(fields),
         goal = fields.goal,
         validation = fields.validation,
         work_dir = fields.work_dir,

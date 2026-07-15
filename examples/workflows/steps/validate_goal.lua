@@ -8,7 +8,7 @@ return function(roles, opts)
       role = roles.validator,
       prompt = [[Validate whether the current implementation has achieved the user's Goal:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Current test result:") .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Current test result:") .. context.preserve_user_feedback_guidance() .. [[
 
 Read the exact `Goal: ...` and `Validation: ...` values above. Inspect the current working tree and plan document. Execute the user-provided Validation method exactly as written; do not substitute preferred tests, infer success from implementation details, or treat supplementary checks as equivalent evidence. Return "achieved" only when that method successfully demonstrates the Goal. Return "not_achieved" with actionable feedback and exact evidence when the method runs but does not demonstrate the Goal. Return "blocked" with the concrete blocker when the prescribed method cannot be performed. Preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `RCA doc`, and `Repro test` values exactly in output fields when present.]],
       output = {
@@ -16,6 +16,7 @@ Read the exact `Goal: ...` and `Validation: ...` values above. Inspect the curre
         fields = {
           summary = "string",
           feedback = "string",
+          user_feedback = "array",
           goal = "string",
           validation = "string",
           work_dir = "string",

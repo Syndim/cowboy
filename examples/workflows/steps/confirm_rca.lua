@@ -11,13 +11,13 @@ return function(id)
         if normalized == "yes" or normalized == "y" or normalized == "approve" or normalized == "approved" then
           return action.status {
             status = "confirmed",
-            fields = { summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
+            fields = { user_feedback = context.copy_user_feedback(fields), summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
             body = "user approved RCA",
           }
         end
         return action.status {
           status = "changes_requested",
-          fields = { feedback = tostring(answer), summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
+          fields = { feedback = tostring(answer), user_feedback = context.append_user_feedback(fields, "RCA confirmation", answer), summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
           body = "user requested RCA changes",
         }
       end
@@ -29,7 +29,7 @@ return function(id)
       id = prompt_id,
       message = "The reviewer approved this RCA. Review the RCA below and the RCA document path. Type 'yes' if the RCA makes sense, or describe what should change before planning.\n" .. tostring(rca),
       choices = {},
-      fields = { summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
+      fields = { user_feedback = context.copy_user_feedback(fields), summary = fields.summary, work_dir = fields.work_dir, rca_doc = fields.rca_doc, repro_test = fields.repro_test, files = fields.files, command = fields.command, commands = fields.commands, failure = fields.failure, failures = fields.failures },
     }
   end
   return confirm
