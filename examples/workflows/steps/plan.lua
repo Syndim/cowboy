@@ -14,28 +14,39 @@ The prior context contains `Goal: ...` and `Validation: ...` values supplied by 
   if opts.require_validation_guide then
     validation_guide_guidance = [[
 
-Create or update two durable planning artifacts beside each other:
-- `plan_doc` at `docs/plans/<snake_case_summary>.md`
-- `validation_doc` at `docs/plans/<snake_case_summary>_validation.md`
+For every dev-loop planning pass, create or update one durable planning work folder and two artifacts inside it:
+- `work_dir` at `docs/plans/<snake_case_summary>`
+- `plan_doc` at `<work_dir>/plan.md`
+- `validation_doc` at `<work_dir>/validation.md`
 
-The validation guide must represent the user's exact Goal and Validation contract and contain prerequisites, ordered commands or manual checks, evidence to capture, explicit exit criteria for leaving the development loop, and continue/revise criteria for every failed check. Every exit criterion is mandatory. Include both paths in `files`.
+This nested layout is mandatory for both initial planning and replanning. Reuse an existing tuple only when it already has this exact layout. Never return flat, mismatched, or incomplete dev-loop artifact paths. Return `work_dir`, `plan_doc`, and `validation_doc` exactly as written, and include both document paths in `files`.
 
-Apply one sensitive-data policy to both artifacts: redact, generalize, or omit credentials, secrets, personal data, private paths, and proprietary content. Preserve a redacted Goal or Validation procedure semantically with explicit safe placeholders such as `<REDACTED_VALUE>` or environment-variable references so the guide remains executable without retaining the sensitive literal.
+The validation guide must represent the user's exact Goal and Validation contract and contain prerequisites, ordered commands or manual checks, evidence to capture, explicit exit criteria for leaving the development loop, and continue/revise criteria for every failed check. Every exit criterion is mandatory.
 
-When previous feedback contains both `Plan doc: ...` and `Validation doc: ...`, update those exact existing paths. Do not create replacement or duplicate artifact paths. Preserve both path values exactly in output fields.]]
+Apply one sensitive-data policy to both artifacts: redact, generalize, or omit credentials, secrets, personal data, private paths, and proprietary content. Preserve a redacted Goal or Validation procedure semantically with explicit safe placeholders such as `<REDACTED_VALUE>` or environment-variable references so the guide remains executable without retaining the sensitive literal.]]
+  end
+  local ordinary_plan_guidance = [[
+
+Before returning "ready" for ordinary non-bug-fix work, create or update a Markdown plan document at `docs/plans/<snake_case_summary>.md`. Generate snake_case names by lowercasing the concise summary, removing punctuation, and joining words with underscores. Create `docs/plans` if it does not exist.]]
+  if opts.require_validation_guide then
+    ordinary_plan_guidance = ""
+  end
+  local existing_plan_guidance = [[
+
+If previous feedback includes `Plan doc: ...`, update that existing plan document instead of creating a separate plan path, preserve the same `plan_doc` value exactly in output fields, and include that same path in `files`.]]
+  if opts.require_validation_guide then
+    existing_plan_guidance = [[
+
+If previous feedback includes a valid nested dev-loop `Work dir: ...`, `Plan doc: ...`, and `Validation doc: ...` tuple, update those exact documents and preserve all three values. If the prior tuple is flat, mismatched, or incomplete, replace it with the required nested tuple. Include both current document paths in `files`.]]
   end
   plan.run = function(ctx)
     return action.agent {
       role = roles.planner,
       prompt = [[Create a concrete plan for this ]] .. kind .. [[ request:
 
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. validation_guide_guidance .. context.preserve_user_feedback_guidance() .. [[
+]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. validation_guide_guidance .. context.preserve_user_feedback_guidance() .. existing_plan_guidance .. [[
 
-If previous feedback includes `Plan doc: ...`, update that existing plan document instead of creating a separate plan path, preserve the same `plan_doc` value exactly in output fields, and include that same path in `files`.
-
-For bug fix requests, base the plan on the reviewed RCA document and investigator-added regression test from the prior step. The plan must reference the RCA doc, keep the repro test as an input to the fix, and must not ask the implementer to rewrite or replace that test. If `Work dir: ...` is present above, write the plan to `<work_dir>/plan.md` in that same bug-fix work folder; otherwise create `docs/plans/<snake_case_bug_summary>/plan.md` next to the RCA. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly in output fields when present.
-
-Before returning "ready" for ordinary non-bug-fix work, create or update a Markdown plan document at `docs/plans/<snake_case_summary>.md`. Generate snake_case names by lowercasing the concise summary, removing punctuation, and joining words with underscores. Create `docs/plans` if it does not exist.
+For bug fix requests, base the plan on the reviewed RCA document and investigator-added regression test from the prior step. The plan must reference the RCA doc, keep the repro test as an input to the fix, and must not ask the implementer to rewrite or replace that test. If `Work dir: ...` is present above, write the plan to `<work_dir>/plan.md` in that same bug-fix work folder; otherwise create `docs/plans/<snake_case_bug_summary>/plan.md` next to the RCA. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly in output fields when present.]] .. ordinary_plan_guidance .. [[
 
 The plan document must contain these sections exactly:
 - Plan

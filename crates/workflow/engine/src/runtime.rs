@@ -3228,6 +3228,76 @@ exit 0
     }
 
     #[tokio::test]
+    async fn resume_run_uses_persisted_workflow_source_after_filesystem_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        let workflow_path = workflow_dir.join("aaa.lua");
+        fs::write(
+            &workflow_path,
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next" }
+            end
+
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "original" }
+            end
+
+            start:on("next", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let started = runtime
+            .start_run_with_workflow_stepwise("aaa", "request")
+            .await
+            .unwrap();
+        assert_eq!(started.run.status, RunStatus::Running);
+        assert_eq!(started.run.current_step, "finish");
+        assert!(started.run.workflow_sources["aaa.lua"].contains("body = \"original\""));
+
+        fs::write(
+            &workflow_path,
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "next" }
+            end
+
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "replacement" }
+            end
+
+            start:on("next", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+
+        let resumed = runtime.resume_run(&started.run.id).await.unwrap();
+
+        assert_eq!(resumed.run.status, RunStatus::Completed);
+        assert_eq!(resumed.run.current_step, "finish");
+        assert!(resumed.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::StepCompleted { step_id, status, body, .. }
+                if step_id == "finish"
+                    && status.as_deref() == Some("success")
+                    && body == "original"
+        )));
+        assert!(!resumed.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::StepCompleted { body, .. } if body == "replacement"
+        )));
+    }
+
+    #[tokio::test]
     async fn two_runtimes_start_independent_runs_against_one_store() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
@@ -4203,6 +4273,24 @@ repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_re
 Commit blocked"#
                 .to_string(),
             r#"---
+status: user_required
+blocker_reason: The commit backend requires credentials that are unavailable to the agent
+blocker_resolution: Restore the commit backend credentials
+blocker_statement: Commit blocked
+blocked_from_step: commit
+blocked_from_status: blocked
+user_feedback:
+  - "Result confirmation: The TUI help still omits the flag"
+goal: Preserve reviewer feedback context
+validation: cargo test -p cowboy-workflow-engine
+plan_doc: docs/plans/example.md
+work_dir: docs/plans/example
+rca_doc: docs/plans/example/rca.md
+repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+---
+Commit requires user action"#
+                .to_string(),
+            r#"---
 status: implemented
 summary: Retried implementation after commit recovery
 user_feedback:
@@ -4299,9 +4387,9 @@ Recovery implementation review"#
             report.run.status,
             RunStatus::WaitingForInput { ref step, .. } if step == "blocked"
         ));
-        let persisted_commit = command_output_record(&runtime, &report);
-        assert_eq!(persisted_commit.step, "commit");
-        let commit_output = persisted_commit.output.unwrap();
+        let persisted_blocker_review = command_output_record(&runtime, &report);
+        assert_eq!(persisted_blocker_review.step, "review_blocker");
+        let commit_output = persisted_blocker_review.output.unwrap();
         assert_eq!(commit_output.fields["work_dir"], "docs/plans/example");
         assert_eq!(commit_output.fields["plan_doc"], "docs/plans/example.md");
         assert_eq!(commit_output.fields["rca_doc"], "docs/plans/example/rca.md");
@@ -4326,11 +4414,7 @@ Recovery implementation review"#
 
         let prompt_id = waiting_prompt_id(&report).to_string();
         report = runtime
-            .answer_run(
-                &run_id,
-                &prompt_id,
-                "Credentials restored; continue implementation",
-            )
+            .answer_run(&run_id, &prompt_id, "/route implement")
             .await
             .unwrap();
 
@@ -4364,7 +4448,7 @@ Recovery implementation review"#
         );
 
         let prompts = factory.prompts();
-        assert_eq!(prompts.len(), 13);
+        assert_eq!(prompts.len(), 14);
         let result_review_prompt = &prompts[8];
         assert!(
             result_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
@@ -4374,7 +4458,7 @@ Recovery implementation review"#
         assert!(result_review_prompt.contains("Goal: Preserve reviewer feedback context"));
         assert!(result_review_prompt.contains("Validation: cargo test -p cowboy-workflow-engine"));
 
-        let recovery_review_prompt = &prompts[12];
+        let recovery_review_prompt = &prompts[13];
         assert!(
             recovery_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
         );
@@ -4454,8 +4538,13 @@ Recovery implementation review"#
             panic!("expected blocked step to ask the user")
         };
         assert_eq!(action.id, "blocked_10");
-        assert!(action.message.contains("What should Cowboy do next?"));
+        assert!(
+            action
+                .message
+                .contains("The blocker reviewer determined that user action is required.")
+        );
         assert!(action.message.contains("feature workflow blocked"));
+        assert!(action.message.contains("Required user action:"));
         assert!(action.choices.is_empty());
 
         let blocked_response = "Credentials are available now; continue implementation.";
@@ -4552,7 +4641,7 @@ Recovery implementation review"#
                     "step": "blocked",
                     "status": "answered",
                     "fields": {
-                        "blocked_response": "Change the plan to reduce scope first.",
+                        "blocked_response": "/route plan",
                         "blocked_from_step": "implement"
                     },
                 },
@@ -4560,7 +4649,7 @@ Recovery implementation review"#
         )
         .unwrap();
         let StepAction::Status(action) = result.action else {
-            panic!("expected triage to route to planning")
+            panic!("expected explicit route to return to planning")
         };
         assert_eq!(action.status, "plan");
 

@@ -240,8 +240,9 @@ cp -R examples/workflows/* ~/.config/cowboy/workflows/
 
 The starter set includes `feature`, `bugfix`, and `dev-loop`. The `dev-loop`
 workflow treats the run request as the Goal, asks the user for the exact
-validation method, and creates both an implementation plan and a sibling
-validation guide with ordered checks, evidence requirements, and explicit exit
+validation method, and creates a per-request `docs/plans/<snake_case_summary>/`
+folder containing the implementation plan at `plan.md` and the validation guide
+at `validation.md`, with ordered checks, evidence requirements, and explicit exit
 criteria. Its validator must complete that guide before the loop can finish.
 Across all three starter workflows, blocked agent steps first go to a dedicated
 blocker reviewer; recoverable blockers return to the originating step with

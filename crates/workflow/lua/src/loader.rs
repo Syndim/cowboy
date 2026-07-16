@@ -685,12 +685,13 @@ mod tests {
                                 ],
                                 "goal": "Preserve cumulative feedback",
                                 "validation": "cargo test",
-                                "plan_doc": "docs/plans/example.md",
-                                "validation_doc": "docs/plans/example_validation.md",
+                                "plan_doc": "docs/plans/example/plan.md",
+                                "validation_doc": "docs/plans/example/validation.md",
                                 "work_dir": "docs/plans/example",
                                 "rca_doc": "docs/plans/example/rca.md",
                                 "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
-                                "commands": ["cargo test"]
+                                "commands": ["cargo test"],
+                                "files": ["docs/plans/example/plan.md", "docs/plans/example/validation.md"]
                             }
                         }
                     }),
@@ -719,7 +720,7 @@ mod tests {
                 assert!(
                     action
                         .prompt
-                        .contains("Validation doc: docs/plans/example_validation.md"),
+                        .contains("Validation doc: docs/plans/example/validation.md"),
                     "{workflow_name} {step_id} should render validation_doc"
                 );
                 if *step_id == "commit" {
@@ -1147,10 +1148,11 @@ mod tests {
                     "fields": {
                         "goal": "Add safe cache invalidation",
                         "validation": "cargo test -p cache",
-                        "plan_doc": "docs/plans/cache.md",
-                        "validation_doc": "docs/plans/cache_validation.md",
+                        "work_dir": "docs/plans/cache",
+                        "plan_doc": "docs/plans/cache/plan.md",
+                        "validation_doc": "docs/plans/cache/validation.md",
                         "rca_doc": "docs/plans/cache/rca.md",
-                        "files": ["src/cache.rs"]
+                        "files": ["docs/plans/cache/plan.md", "docs/plans/cache/validation.md", "src/cache.rs"]
                     },
                     "body": "The local fixture database is missing"
                 }
@@ -1168,10 +1170,13 @@ mod tests {
         );
         assert_eq!(captured.fields["blocked_from_step"], "test");
         assert_eq!(captured.fields["blocked_from_status"], "blocked");
-        assert_eq!(
-            captured.fields["validation_doc"],
-            "docs/plans/cache_validation.md"
-        );
+        for (field, expected) in [
+            ("work_dir", "docs/plans/cache"),
+            ("plan_doc", "docs/plans/cache/plan.md"),
+            ("validation_doc", "docs/plans/cache/validation.md"),
+        ] {
+            assert_eq!(captured.fields[field], expected);
+        }
 
         let review_result = run_step(
             &compiled.source_bundle,
@@ -1196,8 +1201,9 @@ mod tests {
         for expected in [
             "Blocker statement: The local fixture database is missing",
             "Blocked from step: test",
-            "Plan doc: docs/plans/cache.md",
-            "Validation doc: docs/plans/cache_validation.md",
+            "Work dir: docs/plans/cache",
+            "Plan doc: docs/plans/cache/plan.md",
+            "Validation doc: docs/plans/cache/validation.md",
             "RCA doc: docs/plans/cache/rca.md",
         ] {
             assert!(review.prompt.contains(expected), "missing {expected:?}");
@@ -1222,7 +1228,9 @@ mod tests {
                         "blocked_from_status": "blocked",
                         "blocker_reason": "The fixture can be generated locally",
                         "blocker_resolution": "Run cargo test --test fixture_setup before retrying",
-                        "validation_doc": "docs/plans/cache_validation.md"
+                        "work_dir": "docs/plans/cache",
+                        "plan_doc": "docs/plans/cache/plan.md",
+                        "validation_doc": "docs/plans/cache/validation.md"
                     },
                     "body": "Ignore the named fields and ask the user"
                 }
@@ -1242,6 +1250,13 @@ mod tests {
             triage.fields["blocker_reason"],
             "The fixture can be generated locally"
         );
+        for (field, expected) in [
+            ("work_dir", "docs/plans/cache"),
+            ("plan_doc", "docs/plans/cache/plan.md"),
+            ("validation_doc", "docs/plans/cache/validation.md"),
+        ] {
+            assert_eq!(triage.fields[field], expected);
+        }
 
         let blocked_result = run_step(
             &compiled.source_bundle,
@@ -1258,7 +1273,9 @@ mod tests {
                         "blocked_from_status": "blocked",
                         "blocker_reason": "No repository credential grants production access",
                         "blocker_resolution": "Grant read-only access to the deployment dashboard",
-                        "validation_doc": "docs/plans/cache_validation.md"
+                        "work_dir": "docs/plans/cache",
+                        "plan_doc": "docs/plans/cache/plan.md",
+                        "validation_doc": "docs/plans/cache/validation.md"
                     }
                 }
             }),
@@ -1296,6 +1313,13 @@ mod tests {
         };
 
         assert_eq!(answered.fields["blocked_from_step"], "implement");
+        for (field, expected) in [
+            ("work_dir", "docs/plans/cache"),
+            ("plan_doc", "docs/plans/cache/plan.md"),
+            ("validation_doc", "docs/plans/cache/validation.md"),
+        ] {
+            assert_eq!(answered.fields[field], expected);
+        }
 
         let resume_result = run_step(
             &compiled.source_bundle,
@@ -1315,6 +1339,13 @@ mod tests {
         };
 
         assert_eq!(resume.status, "implement");
+        for (field, expected) in [
+            ("work_dir", "docs/plans/cache"),
+            ("plan_doc", "docs/plans/cache/plan.md"),
+            ("validation_doc", "docs/plans/cache/validation.md"),
+        ] {
+            assert_eq!(resume.fields[field], expected);
+        }
     }
 
     #[test]
@@ -1365,7 +1396,9 @@ mod tests {
     #[test]
     fn examples_workflows_status_detours_preserve_validation_doc() {
         let compiled = load_example_compiled_workflow("dev-loop");
-        let validation_doc = "docs/plans/cache_validation.md";
+        let work_dir = "docs/plans/cache";
+        let plan_doc = "docs/plans/cache/plan.md";
+        let validation_doc = "docs/plans/cache/validation.md";
         for (step_id, previous_step, previous_status) in [
             ("clarify", "plan", "unclear"),
             ("confirm_plan", "review_plan", "approved"),
@@ -1384,7 +1417,8 @@ mod tests {
                             "plan": "Reviewed plan and validation guide",
                             "goal": "Add safe cache invalidation",
                             "validation": "cargo test -p cache",
-                            "plan_doc": "docs/plans/cache.md",
+                            "work_dir": work_dir,
+                            "plan_doc": plan_doc,
                             "validation_doc": validation_doc,
                             "blocker_statement": "External approval is required",
                             "blocked_from_step": "implement",
@@ -1400,6 +1434,8 @@ mod tests {
                 panic!("{step_id} should preserve artifacts in an ask-user action")
             };
 
+            assert_eq!(action.fields["work_dir"], work_dir);
+            assert_eq!(action.fields["plan_doc"], plan_doc);
             assert_eq!(action.fields["validation_doc"], validation_doc);
         }
     }
@@ -1410,9 +1446,80 @@ mod tests {
         let goal = "Use SYNTHETIC_PRIVATE_PATH_DO_NOT_USE for cache fixtures";
         let validation =
             "SYNTHETIC_TOKEN_DO_NOT_USE=placeholder cargo test -p cache cache_is_fresh";
-        let plan_doc = "docs/plans/cache_fixtures.md";
-        let validation_doc = "docs/plans/cache_fixtures_validation.md";
+        let work_dir = "docs/plans/cache_fixtures";
+        let plan_doc = "docs/plans/cache_fixtures/plan.md";
+        let validation_doc = "docs/plans/cache_fixtures/validation.md";
         let plan_result = run_step(
+            &compiled.source_bundle,
+            "plan",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "collect_validation_answer",
+                    "action": "status",
+                    "status": "captured",
+                    "fields": {
+                        "goal": goal,
+                        "validation": validation
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(plan) = plan_result.action else {
+            panic!("dev-loop planner should request an agent action")
+        };
+
+        for expected in [
+            "For every dev-loop planning pass",
+            "`work_dir` at `docs/plans/<snake_case_summary>`",
+            "`plan_doc` at `<work_dir>/plan.md`",
+            "`validation_doc` at `<work_dir>/validation.md`",
+            "mandatory for both initial planning and replanning",
+            "Never return flat, mismatched, or incomplete",
+            "include both document paths in `files`",
+            "ordered commands or manual checks",
+            "evidence to capture",
+            "exit criteria",
+            "continue/revise criteria",
+            "<REDACTED_VALUE>",
+            "environment-variable references",
+        ] {
+            assert!(plan.prompt.contains(expected), "missing {expected:?}");
+        }
+        assert!(!plan.prompt.contains("<snake_case_summary>_validation.md"));
+
+        let output = plan.output.expect("planner should declare output");
+        for field in ["work_dir", "plan_doc", "validation_doc"] {
+            assert_eq!(output.fields[field], "string");
+        }
+        for field in ["prior_work_dir", "prior_plan_doc", "prior_validation_doc"] {
+            assert!(output.fields.get(field).is_none(), "unexpected {field}");
+            assert!(!plan.prompt.contains(field), "unexpected {field} guidance");
+        }
+        assert_eq!(output.fields["files"], "array");
+
+        let planner = compiled
+            .definition
+            .roles
+            .get("planner")
+            .expect("dev-loop should define the planner role");
+        for expected in [
+            "ordinary feature work",
+            "docs/plans/<snake_case_summary>.md",
+            "dev-loop work requiring a validation guide",
+            "<work_dir>/validation.md",
+            "bug-fix work",
+            "Preserve established feature and bug-fix artifact paths",
+            "reuse paths only when they already match the required nested tuple",
+        ] {
+            assert!(
+                planner.instructions.contains(expected),
+                "planner role should describe {expected:?}"
+            );
+        }
+
+        let replan_result = run_step(
             &compiled.source_bundle,
             "plan",
             serde_json::json!({
@@ -1424,6 +1531,7 @@ mod tests {
                     "fields": {
                         "goal": goal,
                         "validation": validation,
+                        "work_dir": work_dir,
                         "plan_doc": plan_doc,
                         "validation_doc": validation_doc,
                         "files": [plan_doc, validation_doc]
@@ -1432,31 +1540,25 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::Agent(plan) = plan_result.action else {
-            panic!("dev-loop planner should request an agent action")
+        let StepAction::Agent(replan) = replan_result.action else {
+            panic!("dev-loop replanning should request an agent action")
         };
-
         for expected in [
-            "docs/plans/<snake_case_summary>_validation.md",
-            "ordered commands or manual checks",
-            "evidence to capture",
-            "exit criteria",
-            "continue/revise criteria",
-            "Include both paths in `files`",
-            "<REDACTED_VALUE>",
-            "environment-variable references",
-            "Plan doc: docs/plans/cache_fixtures.md",
-            "Validation doc: docs/plans/cache_fixtures_validation.md",
+            "update those exact documents and preserve all three values",
+            "Work dir: docs/plans/cache_fixtures",
+            "Plan doc: docs/plans/cache_fixtures/plan.md",
+            "Validation doc: docs/plans/cache_fixtures/validation.md",
         ] {
-            assert!(plan.prompt.contains(expected), "missing {expected:?}");
+            assert!(replan.prompt.contains(expected), "missing {expected:?}");
+        }
+        for rejected in ["prior_work_dir", "prior_plan_doc", "prior_validation_doc"] {
+            assert!(!replan.prompt.contains(rejected), "unexpected {rejected}");
         }
 
-        let output = plan.output.expect("planner should declare output");
-        assert_eq!(output.fields["plan_doc"], "string");
-        assert_eq!(output.fields["validation_doc"], "string");
-        assert_eq!(output.fields["files"], "array");
-
-        for workflow_name in ["feature", "bugfix"] {
+        for (workflow_name, expected_path_guidance) in [
+            ("feature", "docs/plans/<snake_case_summary>.md"),
+            ("bugfix", "same bug-fix work folder"),
+        ] {
             let ordinary = load_example_compiled_workflow(workflow_name);
             let result = run_step(
                 &ordinary.source_bundle,
@@ -1468,12 +1570,40 @@ mod tests {
                 panic!("{workflow_name} planner should request an agent action")
             };
 
+            assert!(action.prompt.contains(expected_path_guidance));
             assert!(
-                !action
-                    .prompt
-                    .contains("Create or update two durable planning artifacts"),
+                !action.prompt.contains("For every dev-loop planning pass"),
                 "{workflow_name} planning should not require a validation guide"
             );
+
+            let review_result = run_step(
+                &ordinary.source_bundle,
+                "review_plan",
+                serde_json::json!({
+                    "request": "Keep ordinary planning stable",
+                    "prev": {
+                        "step": "plan",
+                        "action": "agent",
+                        "status": "ready",
+                        "fields": {
+                            "plan_doc": "docs/plans/example.md",
+                            "work_dir": "docs/plans/example",
+                            "rca_doc": "docs/plans/example/rca.md",
+                            "repro_test": "tests/example.rs::repro"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(review) = review_result.action else {
+                panic!("{workflow_name} review should request an agent action")
+            };
+            let review_guidance = if workflow_name == "feature" {
+                "docs/plans/<snake_case_summary>.md"
+            } else {
+                "same `docs/plans/<snake_case_bug_summary>/` folder as the RCA"
+            };
+            assert!(review.prompt.contains(review_guidance));
         }
 
         let review_result = run_step(
@@ -1488,6 +1618,7 @@ mod tests {
                     "fields": {
                         "goal": goal,
                         "validation": validation,
+                        "work_dir": work_dir,
                         "plan_doc": plan_doc,
                         "validation_doc": validation_doc,
                         "files": [plan_doc, validation_doc]
@@ -1502,6 +1633,15 @@ mod tests {
 
         for expected in [
             "Read and review both `plan_doc` and `validation_doc`",
+            "`work_dir` is `docs/plans/<snake_case_summary>`",
+            "`plan_doc` is `<work_dir>/plan.md`",
+            "`validation_doc` is `<work_dir>/validation.md`",
+            "both documents share that declared folder",
+            "both document paths are included in `files`",
+            "rejects every flat, mismatched, or incomplete tuple",
+            "regardless of any extra fields supplied by the planner",
+            "Do not override its verdict",
+            "Artifact layout check: valid_nested",
             "every exit criterion",
             "either artifact",
             "safe placeholders",
@@ -1522,6 +1662,7 @@ mod tests {
                     "fields": {
                         "goal": goal,
                         "validation": validation,
+                        "work_dir": work_dir,
                         "plan_doc": plan_doc,
                         "validation_doc": validation_doc
                     }
@@ -1535,6 +1676,8 @@ mod tests {
 
         assert!(validate.prompt.contains("complete ordered procedure"));
         assert!(validate.prompt.contains("every exit criterion"));
+        assert!(validate.prompt.contains(work_dir));
+        assert!(validate.prompt.contains(plan_doc));
         assert!(validate.prompt.contains(validation_doc));
         assert_eq!(
             validate
@@ -1543,6 +1686,174 @@ mod tests {
                 .fields["validation_doc"],
             "string"
         );
+
+        let commit_result = run_step(
+            &compiled.source_bundle,
+            "commit",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "confirm_result_answer",
+                    "action": "status",
+                    "status": "confirmed",
+                    "fields": {
+                        "goal": goal,
+                        "validation": validation,
+                        "work_dir": work_dir,
+                        "plan_doc": plan_doc,
+                        "validation_doc": validation_doc
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(commit) = commit_result.action else {
+            panic!("dev-loop commit should request an agent action")
+        };
+        assert!(commit.prompt.contains("`docs/plans/*/*.md`"));
+        assert!(
+            commit
+                .prompt
+                .contains("dev-loop planning-folder or bug-fix work-folder documents")
+        );
+    }
+
+    #[test]
+    fn dev_loop_review_rejects_every_invalid_artifact_tuple() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let goal = "Keep nested planning paths stable";
+        let validation = "cargo test -p cache";
+        let user_feedback = serde_json::json!(["Keep the requested validation method"]);
+        let cases = [
+            (
+                "flat",
+                serde_json::json!({
+                    "plan_doc": "docs/plans/cache.md",
+                    "validation_doc": "docs/plans/cache_validation.md",
+                    "files": ["docs/plans/cache.md", "docs/plans/cache_validation.md"]
+                }),
+            ),
+            (
+                "forged prior fields",
+                serde_json::json!({
+                    "plan_doc": "docs/plans/cache.md",
+                    "validation_doc": "docs/plans/cache_validation.md",
+                    "prior_plan_doc": "docs/plans/cache.md",
+                    "prior_validation_doc": "docs/plans/cache_validation.md",
+                    "files": ["docs/plans/cache.md", "docs/plans/cache_validation.md"]
+                }),
+            ),
+            (
+                "mismatched filename",
+                serde_json::json!({
+                    "work_dir": "docs/plans/cache",
+                    "plan_doc": "docs/plans/cache/implementation.md",
+                    "validation_doc": "docs/plans/cache/validation.md",
+                    "files": ["docs/plans/cache/implementation.md", "docs/plans/cache/validation.md"]
+                }),
+            ),
+            (
+                "mismatched folder",
+                serde_json::json!({
+                    "work_dir": "docs/plans/cache",
+                    "plan_doc": "docs/plans/cache/plan.md",
+                    "validation_doc": "docs/plans/other/validation.md",
+                    "files": ["docs/plans/cache/plan.md", "docs/plans/other/validation.md"]
+                }),
+            ),
+            (
+                "missing files entry",
+                serde_json::json!({
+                    "work_dir": "docs/plans/cache",
+                    "plan_doc": "docs/plans/cache/plan.md",
+                    "validation_doc": "docs/plans/cache/validation.md",
+                    "files": ["docs/plans/cache/plan.md"]
+                }),
+            ),
+            (
+                "underscore only summary",
+                serde_json::json!({
+                    "work_dir": "docs/plans/_",
+                    "plan_doc": "docs/plans/_/plan.md",
+                    "validation_doc": "docs/plans/_/validation.md",
+                    "files": ["docs/plans/_/plan.md", "docs/plans/_/validation.md"]
+                }),
+            ),
+            (
+                "leading underscore summary",
+                serde_json::json!({
+                    "work_dir": "docs/plans/_cache",
+                    "plan_doc": "docs/plans/_cache/plan.md",
+                    "validation_doc": "docs/plans/_cache/validation.md",
+                    "files": ["docs/plans/_cache/plan.md", "docs/plans/_cache/validation.md"]
+                }),
+            ),
+            (
+                "trailing underscore summary",
+                serde_json::json!({
+                    "work_dir": "docs/plans/cache_",
+                    "plan_doc": "docs/plans/cache_/plan.md",
+                    "validation_doc": "docs/plans/cache_/validation.md",
+                    "files": ["docs/plans/cache_/plan.md", "docs/plans/cache_/validation.md"]
+                }),
+            ),
+            (
+                "consecutive underscores summary",
+                serde_json::json!({
+                    "work_dir": "docs/plans/cache__fix",
+                    "plan_doc": "docs/plans/cache__fix/plan.md",
+                    "validation_doc": "docs/plans/cache__fix/validation.md",
+                    "files": ["docs/plans/cache__fix/plan.md", "docs/plans/cache__fix/validation.md"]
+                }),
+            ),
+        ];
+
+        for (name, artifact_fields) in cases {
+            let mut fields = artifact_fields;
+            fields["user_feedback"] = user_feedback.clone();
+            fields["goal"] = serde_json::json!(goal);
+            fields["validation"] = serde_json::json!(validation);
+            fields["rca_doc"] = serde_json::json!("docs/plans/untrusted/rca.md");
+            fields["repro_test"] = serde_json::json!("tests/untrusted.rs::repro");
+            let result = run_step(
+                &compiled.source_bundle,
+                "review_plan",
+                serde_json::json!({
+                    "request": goal,
+                    "prev": {
+                        "step": "plan",
+                        "action": "agent",
+                        "status": "ready",
+                        "fields": fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Status(rejection) = result.action else {
+                panic!("{name} tuple should be rejected before agent review")
+            };
+
+            assert_eq!(rejection.status, "changes_requested", "{name}");
+            assert_eq!(rejection.fields["user_feedback"], user_feedback, "{name}");
+            assert_eq!(rejection.fields["goal"], goal, "{name}");
+            assert_eq!(rejection.fields["validation"], validation, "{name}");
+            for untrusted in [
+                "work_dir",
+                "plan_doc",
+                "validation_doc",
+                "prior_work_dir",
+                "prior_plan_doc",
+                "prior_validation_doc",
+                "rca_doc",
+                "repro_test",
+                "files",
+            ] {
+                assert!(
+                    rejection.fields.get(untrusted).is_none(),
+                    "{name} retained untrusted {untrusted}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1701,7 +2012,9 @@ mod tests {
                         "summary": "focused tests passed",
                         "goal": goal,
                         "validation": validation,
-                        "plan_doc": "docs/plans/deterministic_cache_invalidation.md"
+                        "work_dir": "docs/plans/deterministic_cache_invalidation",
+                        "plan_doc": "docs/plans/deterministic_cache_invalidation/plan.md",
+                        "validation_doc": "docs/plans/deterministic_cache_invalidation/validation.md"
                     }
                 }
             }),
