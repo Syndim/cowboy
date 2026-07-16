@@ -17,8 +17,8 @@ use cowboy_command_parser::{slash_query, slash_suggestions};
 const MAX_SLASH_SUGGESTIONS: usize = 6;
 
 pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_width: u16) -> u16 {
-    let input_rows =
-        wrapped_input_row_count(state.input(), input_content_width(composer_width)).max(1);
+    let content_width = input_content_width(composer_width);
+    let input_rows = wrapped_input_row_count(state.input(), content_width).max(1);
     let suggestion_rows = if state.composer_accepts_submit() {
         slash_suggestion_line_count(state.input())
     } else {
@@ -26,7 +26,11 @@ pub(in crate::app) fn height(state: &AppState, terminal_height: u16, composer_wi
     };
     let wanted = (input_rows + suggestion_rows + 2).clamp(3, 12) as u16;
     let max_available = terminal_height.saturating_sub(3).max(3);
-    wanted.min(max_available)
+    let resolved_height = wanted.min(max_available);
+    let visible_rows = resolved_height.saturating_sub(2) as usize;
+    let input_budget = visible_rows.saturating_sub(suggestion_rows).max(1);
+    state.publish_composer_layout(content_width, input_budget);
+    resolved_height
 }
 
 fn slash_suggestion_line_count(input: &str) -> usize {
@@ -119,10 +123,57 @@ struct RenderedInput {
     cursor_column: usize,
 }
 
+#[cfg(test)]
 struct WrappedInput {
     lines: Vec<String>,
     cursor_line: usize,
     cursor_column: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CursorPoint {
+    source: usize,
+    column: usize,
+}
+
+struct VisualRow {
+    text: String,
+    source_start: usize,
+    source_end: usize,
+    display_width: usize,
+    last_grapheme_width: usize,
+    is_last_logical_segment: bool,
+    boundaries: Vec<CursorPoint>,
+    interior_cursor: Option<CursorPoint>,
+}
+
+impl VisualRow {
+    fn max_cursor_column(&self) -> usize {
+        if self.is_last_logical_segment {
+            self.display_width
+        } else {
+            self.display_width.saturating_sub(self.last_grapheme_width)
+        }
+    }
+
+    fn cursor_for_column(&self, column: usize) -> usize {
+        let mut cursor = self.source_start;
+        for point in &self.boundaries {
+            if point.column > column {
+                break;
+            }
+
+            cursor = point.source;
+        }
+
+        cursor.min(self.source_end)
+    }
+}
+
+struct VisualLayout {
+    rows: Vec<VisualRow>,
+    cursor_line: usize,
+    cursor_content_column: usize,
 }
 
 fn rendered_input(
@@ -138,45 +189,125 @@ fn rendered_input(
     let input_budget = max_visible_lines
         .saturating_sub(suggestion_line_count)
         .max(1);
-    let wrapped = wrapped_input_lines(state.input(), state.input_cursor(), content_width);
-    let mut lines = wrapped.lines;
-    let mut cursor_line = wrapped.cursor_line;
-    let cursor_column = wrapped.cursor_column;
-    let hidden = lines.len().saturating_sub(input_budget);
-    if hidden > 0 {
-        if input_budget == 1 {
-            let start = cursor_line.min(lines.len().saturating_sub(1));
-            lines = vec![lines[start].clone()];
-            cursor_line = 0;
-        } else {
-            let visible_after_marker = input_budget.saturating_sub(1);
-            let tail_start = lines.len().saturating_sub(visible_after_marker);
-            let start = if cursor_line >= tail_start {
-                tail_start
-            } else {
-                cursor_line.saturating_sub(visible_after_marker.saturating_sub(1))
-            };
-            if start == 0 {
-                lines.truncate(input_budget);
-            } else {
-                let end = (start + visible_after_marker).min(lines.len());
-                lines = lines[start..end].to_vec();
-                lines.insert(0, format!("> … {start} earlier line(s) hidden"));
-                cursor_line = 1 + cursor_line.saturating_sub(start);
-            }
-        }
-    }
+    state.publish_composer_layout(content_width, input_budget);
+
+    let VisualLayout {
+        rows,
+        cursor_line,
+        cursor_content_column,
+    } = visual_layout(state.input(), state.input_cursor(), content_width);
+    let viewport_start = state.composer_viewport_start(rows.len(), cursor_line);
+    let lines = rows
+        .into_iter()
+        .skip(viewport_start)
+        .take(input_budget)
+        .map(|row| row.text)
+        .collect();
 
     RenderedInput {
         lines,
-        cursor_line,
-        cursor_column,
+        cursor_line: cursor_line.saturating_sub(viewport_start),
+        cursor_column: PROMPT_WIDTH + cursor_content_column,
     }
 }
 
 fn input_content_width(composer_width: u16) -> usize {
     let inner_width = composer_width.saturating_sub(2) as usize;
     inner_width.saturating_sub(PROMPT_WIDTH).max(1)
+}
+
+#[derive(Clone, Copy)]
+enum VerticalNavigation {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+}
+
+pub(in crate::app) fn move_input_up(state: &mut AppState, allow_history: bool) {
+    navigate_input(state, VerticalNavigation::Up, allow_history);
+}
+
+pub(in crate::app) fn move_input_down(state: &mut AppState, allow_history: bool) {
+    navigate_input(state, VerticalNavigation::Down, allow_history);
+}
+
+pub(in crate::app) fn move_input_page_up(state: &mut AppState, allow_history: bool) {
+    navigate_input(state, VerticalNavigation::PageUp, allow_history);
+}
+
+pub(in crate::app) fn move_input_page_down(state: &mut AppState, allow_history: bool) {
+    navigate_input(state, VerticalNavigation::PageDown, allow_history);
+}
+
+fn navigate_input(state: &mut AppState, navigation: VerticalNavigation, allow_history: bool) {
+    let moving_up = matches!(
+        navigation,
+        VerticalNavigation::Up | VerticalNavigation::PageUp
+    );
+    if state.input().is_empty() {
+        if moving_up && allow_history {
+            state.history_previous();
+        }
+
+        return;
+    }
+
+    let (content_width, _) = state.composer_layout_metrics();
+    let layout = visual_layout(state.input(), state.input_cursor(), content_width);
+    let current_row = layout.cursor_line;
+    let last_row = layout.rows.len().saturating_sub(1);
+
+    if state.history_is_active()
+        && allow_history
+        && ((moving_up && current_row == 0) || (!moving_up && current_row == last_row))
+    {
+        if moving_up {
+            state.history_previous();
+        } else {
+            state.history_next();
+        }
+
+        return;
+    }
+
+    if matches!(navigation, VerticalNavigation::Up) && current_row == 0 {
+        state.set_input_cursor_boundary(layout.rows[0].source_start);
+        return;
+    }
+
+    if matches!(navigation, VerticalNavigation::Down) && current_row == last_row {
+        state.set_input_cursor_boundary(layout.rows[last_row].source_end);
+        return;
+    }
+
+    let step = if matches!(
+        navigation,
+        VerticalNavigation::PageUp | VerticalNavigation::PageDown
+    ) {
+        state.composer_page_step()
+    } else {
+        1
+    };
+
+    let target_row = if moving_up {
+        current_row.saturating_sub(step)
+    } else {
+        current_row.saturating_add(step).min(last_row)
+    };
+
+    if target_row == current_row {
+        return;
+    }
+
+    let source = &layout.rows[current_row];
+    let target = &layout.rows[target_row];
+    let target_column = state.composer_vertical_target_column(
+        layout.cursor_content_column,
+        source.max_cursor_column(),
+        target.max_cursor_column(),
+    );
+    state.set_input_cursor_vertical(target.cursor_for_column(target_column));
 }
 
 #[derive(Clone, Copy)]
@@ -210,7 +341,7 @@ impl<'a> Token<'a> {
             })
     }
 
-    fn drop_for_wrap(self, available_width: usize) -> Option<Self> {
+    fn drop_for_wrap(self, available_width: usize) -> (Option<Self>, Option<Self>) {
         let mut dropped_bytes = 0;
         let mut dropped_chars = 0;
         let mut dropped_width = 0;
@@ -248,12 +379,19 @@ impl<'a> Token<'a> {
             }
         }
 
-        let text = &self.text[dropped_bytes..];
-        (!text.is_empty()).then_some(Self {
-            text,
+        let dropped_text = &self.text[..dropped_bytes];
+        let dropped = (!dropped_text.is_empty()).then_some(Self {
+            text: dropped_text,
+            source_start: self.source_start,
+            width: dropped_width,
+        });
+        let remaining_text = &self.text[dropped_bytes..];
+        let remaining = (!remaining_text.is_empty()).then_some(Self {
+            text: remaining_text,
             source_start: self.source_start + dropped_chars,
             width: self.width.saturating_sub(dropped_width),
-        })
+        });
+        (remaining, dropped)
     }
 }
 
@@ -261,6 +399,7 @@ trait WrappedRowSink {
     fn begin_row(&mut self, logical_start: usize, segment_index: usize);
 
     fn push_source(&mut self, source: SourceGrapheme<'_>);
+    fn push_skipped_source(&mut self, source: SourceGrapheme<'_>);
 
     fn end_row(&mut self, logical_end: Option<usize>);
 
@@ -309,7 +448,17 @@ impl<'a, S: WrappedRowSink> RowEmitter<'a, S> {
         }
 
         if self.row_width > 0 {
-            whitespace = whitespace.and_then(|token| token.drop_for_wrap(self.remaining_width()));
+            if let Some(token) = whitespace {
+                let (remaining, dropped) = token.drop_for_wrap(self.remaining_width());
+                if let Some(dropped) = dropped {
+                    for source in dropped.source_graphemes() {
+                        self.sink.push_skipped_source(source);
+                    }
+                }
+
+                whitespace = remaining;
+            }
+
             self.finish_row(None);
         }
 
@@ -406,78 +555,121 @@ impl<'a, S: WrappedRowSink> RowEmitter<'a, S> {
     }
 }
 
-struct RenderedRowSink {
-    lines: Vec<String>,
-    current_line: String,
-    current_column: usize,
+struct VisualLayoutSink {
+    rows: Vec<VisualRow>,
+    current: Option<VisualRow>,
     cursor: usize,
-    direct_cursor: Option<(usize, usize)>,
-    previous_cursor: Option<(usize, usize)>,
-    next_cursor: Option<(usize, usize)>,
 }
 
-impl RenderedRowSink {
+impl VisualLayoutSink {
     fn new(cursor: usize) -> Self {
         Self {
-            lines: Vec::new(),
-            current_line: String::new(),
-            current_column: 0,
+            rows: Vec::new(),
+            current: None,
             cursor,
-            direct_cursor: None,
-            previous_cursor: None,
-            next_cursor: None,
         }
     }
 
-    fn observe_boundary(&mut self, source_index: usize) {
-        self.observe_boundary_at(source_index, (self.lines.len(), self.current_column));
-    }
+    fn finish(mut self) -> VisualLayout {
+        let cursor = self.cursor;
+        let mut exact = None;
+        let mut next = None;
+        let mut previous = None;
+        let mut containing_row = None;
 
-    fn observe_boundary_at(&mut self, source_index: usize, position: (usize, usize)) {
-        if source_index == self.cursor {
-            self.direct_cursor.get_or_insert(position);
-        } else if source_index < self.cursor {
-            self.previous_cursor = Some(position);
-        } else if self.next_cursor.is_none() {
-            self.next_cursor = Some(position);
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if cursor >= row.source_start && cursor <= row.source_end {
+                containing_row = Some(row_index);
+            }
+
+            for point in &row.boundaries {
+                if point.source == cursor {
+                    exact = Some((row_index, point.column));
+                } else if point.source < cursor {
+                    previous = Some((row_index, point.column));
+                } else if next.is_none() {
+                    next = Some((row_index, point.column));
+                }
+            }
+
+            if let Some(point) = row.interior_cursor {
+                exact = Some((row_index, point.column));
+            }
         }
-    }
 
-    fn finish(self) -> WrappedInput {
-        let (cursor_line, cursor_content_column) = self
-            .direct_cursor
-            .or(self.next_cursor)
-            .or(self.previous_cursor)
-            .unwrap_or((self.lines.len().saturating_sub(1), 0));
+        let fallback = containing_row.map(|row_index| {
+            let row = &self.rows[row_index];
+            let point = row
+                .boundaries
+                .iter()
+                .rev()
+                .find(|point| point.source <= cursor)
+                .copied()
+                .unwrap_or(CursorPoint {
+                    source: row.source_start,
+                    column: 0,
+                });
+            (row_index, point.column)
+        });
 
-        WrappedInput {
-            lines: self.lines,
+        let (cursor_line, cursor_content_column) =
+            exact.or(fallback).or(next).or(previous).unwrap_or((0, 0));
+
+        VisualLayout {
+            rows: std::mem::take(&mut self.rows),
             cursor_line,
-            cursor_column: PROMPT_WIDTH + cursor_content_column,
+            cursor_content_column,
         }
+    }
+
+    fn push_boundary(row: &mut VisualRow, point: CursorPoint) {
+        row.boundaries.push(point);
     }
 }
 
-impl WrappedRowSink for RenderedRowSink {
+impl WrappedRowSink for VisualLayoutSink {
     fn begin_row(&mut self, logical_start: usize, segment_index: usize) {
-        self.current_line.clear();
-        self.current_line.push_str(if segment_index == 0 {
-            PROMPT
-        } else {
-            CONTINUATION_PROMPT
-        });
-        self.current_column = 0;
-
+        let mut row = VisualRow {
+            text: if segment_index == 0 {
+                PROMPT.to_string()
+            } else {
+                CONTINUATION_PROMPT.to_string()
+            },
+            source_start: logical_start,
+            source_end: logical_start,
+            display_width: 0,
+            last_grapheme_width: 0,
+            is_last_logical_segment: false,
+            boundaries: Vec::new(),
+            interior_cursor: None,
+        };
         if segment_index == 0 {
-            self.observe_boundary(logical_start);
+            Self::push_boundary(
+                &mut row,
+                CursorPoint {
+                    source: logical_start,
+                    column: 0,
+                },
+            );
         }
+
+        self.current = Some(row);
     }
 
     fn push_source(&mut self, source: SourceGrapheme<'_>) {
-        let start_column = self.current_column;
-        self.current_line.push_str(source.text);
-        self.observe_boundary(source.source_start);
+        let row = self.current.as_mut().expect("row begins before source");
+        if row.boundaries.is_empty() {
+            row.source_start = source.source_start;
+            Self::push_boundary(
+                row,
+                CursorPoint {
+                    source: source.source_start,
+                    column: row.display_width,
+                },
+            );
+        }
 
+        row.text.push_str(source.text);
         if self.cursor > source.source_start && self.cursor < source.source_end {
             let scalar_offset = self.cursor - source.source_start;
             let prefix_end = source
@@ -486,25 +678,85 @@ impl WrappedRowSink for RenderedRowSink {
                 .nth(scalar_offset)
                 .map(|(byte_index, _)| byte_index)
                 .expect("cursor inside grapheme has a prefix boundary");
-            self.current_column = start_column + source.text[..prefix_end].width();
-            self.observe_boundary(self.cursor);
+            row.interior_cursor = Some(CursorPoint {
+                source: self.cursor,
+                column: row.display_width + source.text[..prefix_end].width(),
+            });
         }
 
-        self.current_column = start_column + source.width;
-        self.observe_boundary(source.source_end);
+        row.display_width += source.width;
+        row.last_grapheme_width = source.width;
+        row.source_end = source.source_end;
+        Self::push_boundary(
+            row,
+            CursorPoint {
+                source: source.source_end,
+                column: row.display_width,
+            },
+        );
+    }
+
+    fn push_skipped_source(&mut self, source: SourceGrapheme<'_>) {
+        let row = self
+            .current
+            .as_mut()
+            .expect("row begins before skipped source");
+        if self.cursor > source.source_start && self.cursor < source.source_end {
+            let scalar_offset = self.cursor - source.source_start;
+            let prefix_end = source
+                .text
+                .char_indices()
+                .nth(scalar_offset)
+                .map(|(byte_index, _)| byte_index)
+                .expect("cursor inside skipped grapheme has a prefix boundary");
+            row.interior_cursor = Some(CursorPoint {
+                source: self.cursor,
+                column: row.display_width + source.text[..prefix_end].width(),
+            });
+        }
+
+        row.display_width += source.width;
+        row.last_grapheme_width = source.width;
+        row.source_end = source.source_end;
+        Self::push_boundary(
+            row,
+            CursorPoint {
+                source: source.source_end,
+                column: row.display_width,
+            },
+        );
     }
 
     fn end_row(&mut self, logical_end: Option<usize>) {
+        let mut row = self.current.take().expect("row ends after begin");
         if let Some(logical_end) = logical_end {
-            self.observe_boundary(logical_end);
+            row.source_end = logical_end;
+            row.is_last_logical_segment = true;
+            let display_width = row.display_width;
+            Self::push_boundary(
+                &mut row,
+                CursorPoint {
+                    source: logical_end,
+                    column: display_width,
+                },
+            );
         }
 
-        self.lines.push(std::mem::take(&mut self.current_line));
+        self.rows.push(row);
     }
 
     fn attach_logical_end(&mut self, logical_end: usize) {
-        let position = (self.lines.len().saturating_sub(1), self.current_column);
-        self.observe_boundary_at(logical_end, position);
+        let row = self.rows.last_mut().expect("logical line has a row");
+        row.source_end = logical_end;
+        row.is_last_logical_segment = true;
+        let display_width = row.display_width;
+        Self::push_boundary(
+            row,
+            CursorPoint {
+                source: logical_end,
+                column: display_width,
+            },
+        );
     }
 }
 
@@ -518,17 +770,29 @@ impl WrappedRowSink for RowCountSink {
 
     fn push_source(&mut self, _source: SourceGrapheme<'_>) {}
 
-    fn attach_logical_end(&mut self, _logical_end: usize) {}
+    fn push_skipped_source(&mut self, _source: SourceGrapheme<'_>) {}
 
     fn end_row(&mut self, _logical_end: Option<usize>) {
         self.count += 1;
     }
+
+    fn attach_logical_end(&mut self, _logical_end: usize) {}
 }
 
-fn wrapped_input_lines(input: &str, cursor: usize, content_width: usize) -> WrappedInput {
-    let mut sink = RenderedRowSink::new(cursor);
+fn visual_layout(input: &str, cursor: usize, content_width: usize) -> VisualLayout {
+    let mut sink = VisualLayoutSink::new(cursor);
     wrap_input(input, content_width, &mut sink);
     sink.finish()
+}
+
+#[cfg(test)]
+fn wrapped_input_lines(input: &str, cursor: usize, content_width: usize) -> WrappedInput {
+    let layout = visual_layout(input, cursor, content_width);
+    WrappedInput {
+        lines: layout.rows.into_iter().map(|row| row.text).collect(),
+        cursor_line: layout.cursor_line,
+        cursor_column: PROMPT_WIDTH + layout.cursor_content_column,
+    }
 }
 
 fn wrapped_input_row_count(input: &str, content_width: usize) -> usize {
@@ -728,9 +992,119 @@ fn append_slash_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::input::{KeyHandling, handle_key_press};
     use crate::app::state::AppState;
     use crate::config::AppConfig;
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn nonempty_composer_navigation_matches_omp_up_and_page_up_behavior() {
+        let mut up_state = test_state();
+        up_state.push_input("from history");
+        assert_eq!(
+            up_state.take_submitted_input(),
+            Some("from history".to_string())
+        );
+        let draft = "alpha\nbravo\ncharl";
+        up_state.push_input(draft);
+
+        let up_handling = handle_key_press(
+            &mut up_state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        );
+        let up_observation = (
+            up_handling,
+            up_state.input().to_string(),
+            up_state.input_cursor(),
+        );
+
+        const COMPOSER_WIDTH: u16 = 20;
+        const TERMINAL_HEIGHT: u16 = 9;
+        const VISIBLE_CONTENT_ROWS: usize = 4;
+        let mut page_state = test_state();
+        page_state.push_card("Transcript", (0..20).map(|index| format!("line {index}")));
+        page_state.scroll_events_up();
+        let transcript_before = (page_state.scroll_offset(), page_state.is_following_events());
+        let page_draft = "l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9";
+        page_state.push_input(page_draft);
+        let composer_height = height(&page_state, TERMINAL_HEIGHT, COMPOSER_WIDTH);
+        let rows_before_page_up = lines(&page_state, VISIBLE_CONTENT_ROWS, COMPOSER_WIDTH)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let first_page_up_handling = handle_key_press(
+            &mut page_state,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        );
+        let cursor_after_first_page_up = page_state.input_cursor();
+        let rows_after_first_page_up = lines(&page_state, VISIBLE_CONTENT_ROWS, COMPOSER_WIDTH)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        let second_page_up_handling = handle_key_press(
+            &mut page_state,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        );
+        let cursor_after_second_page_up = page_state.input_cursor();
+        let rows_after_second_page_up = lines(&page_state, VISIBLE_CONTENT_ROWS, COMPOSER_WIDTH)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let transcript_after = (page_state.scroll_offset(), page_state.is_following_events());
+
+        assert_eq!(
+            (
+                up_observation,
+                composer_height,
+                rows_before_page_up,
+                first_page_up_handling,
+                cursor_after_first_page_up,
+                rows_after_first_page_up,
+                second_page_up_handling,
+                cursor_after_second_page_up,
+                rows_after_second_page_up,
+                page_state.input().to_string(),
+                transcript_before,
+                transcript_after,
+            ),
+            (
+                (
+                    KeyHandling::Continue,
+                    draft.to_string(),
+                    "alpha\nbravo".chars().count(),
+                ),
+                6,
+                vec![
+                    "> l6".to_string(),
+                    "> l7".to_string(),
+                    "> l8".to_string(),
+                    "> l9".to_string(),
+                ],
+                KeyHandling::Continue,
+                "l0\nl1\nl2\nl3\nl4\nl5\nl6".chars().count(),
+                vec![
+                    "> l6".to_string(),
+                    "> l7".to_string(),
+                    "> l8".to_string(),
+                    "> l9".to_string(),
+                ],
+                KeyHandling::Continue,
+                "l0\nl1\nl2\nl3".chars().count(),
+                vec![
+                    "> l3".to_string(),
+                    "> l4".to_string(),
+                    "> l5".to_string(),
+                    "> l6".to_string(),
+                ],
+                page_draft.to_string(),
+                (10, false),
+                (10, false),
+            )
+        );
+    }
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -932,8 +1306,13 @@ mod tests {
         let rendered = lines(&state, 3, 80);
 
         assert_eq!(rendered.len(), 3);
-        assert!(rendered[0].to_string().contains("earlier line"));
-        assert_eq!(rendered[2].to_string(), "> five");
+        assert_eq!(
+            rendered
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>(),
+            ["> three", "> four", "> five"]
+        );
     }
 
     #[test]
@@ -986,8 +1365,8 @@ mod tests {
         assert_eq!(before_mark.lines, ["> ab \u{0301}", "  c"]);
         assert_eq!(before_mark.cursor_line, 0);
         assert_eq!(before_mark.cursor_column, PROMPT_WIDTH + 3);
-        assert_eq!(after_mark.cursor_line, 0);
-        assert_eq!(after_mark.cursor_column, PROMPT_WIDTH + 3);
+        assert_eq!(after_mark.cursor_line, 1);
+        assert_eq!(after_mark.cursor_column, PROMPT_WIDTH);
     }
 
     #[test]
@@ -1225,8 +1604,8 @@ mod tests {
 
         let rendered = rendered_input(&state, 4, input_content_width(16));
 
-        assert_eq!(rendered.cursor_line, 0);
-        assert_eq!(rendered.cursor_column, PROMPT_WIDTH + 12);
+        assert_eq!(rendered.cursor_line, 1);
+        assert_eq!(rendered.cursor_column, PROMPT_WIDTH);
     }
 
     #[test]
@@ -1252,5 +1631,301 @@ mod tests {
         assert_eq!(rendered.lines.len(), 3);
         assert_eq!(rendered.lines[1], "> two");
         assert_eq!(rendered.cursor_line, 1);
+    }
+
+    #[test]
+    fn page_down_uses_visible_rows_minus_one_at_multiple_heights() {
+        for (visible_rows, expected_cursor) in [(4, 9), (3, 6)] {
+            let mut state = test_state();
+            state.push_input("l0\nl1\nl2\nl3\nl4\nl5");
+            state.set_input_cursor(0);
+            let _ = lines(&state, visible_rows, 20);
+
+            move_input_page_down(&mut state, true);
+
+            assert_eq!(state.input_cursor(), expected_cursor, "{visible_rows} rows");
+        }
+    }
+
+    #[test]
+    fn vertical_navigation_preserves_then_resets_preferred_display_column() {
+        let mut state = test_state();
+        state.push_input("1234567890\nx\n1234567890");
+        let _ = lines(&state, 3, 80);
+
+        move_input_up(&mut state, true);
+        assert_eq!(state.input_cursor(), "1234567890\nx".chars().count());
+
+        state.move_input_cursor_left();
+        move_input_up(&mut state, true);
+
+        assert_eq!(state.input_cursor(), 0);
+    }
+
+    #[test]
+    fn vertical_navigation_snaps_unicode_targets_to_grapheme_boundaries() {
+        for (input, cursor, expected) in [
+            ("ab\n😀😀", 1, 3),
+            ("中x\na", 1, 4),
+            ("a\u{0301}b\nz", 1, 5),
+        ] {
+            let mut state = test_state();
+            state.push_input(input);
+            state.set_input_cursor(cursor);
+            let _ = lines(&state, 4, 80);
+
+            move_input_down(&mut state, true);
+
+            assert_eq!(state.input_cursor(), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn skipped_wrap_whitespace_stays_on_preceding_row_for_cursor_and_navigation() {
+        let input = "hello   bananas";
+        for cursor in [6, 7] {
+            let wrapped = wrapped_input_lines(input, cursor, 12);
+            assert_eq!(wrapped.cursor_line, 0, "cursor {cursor}");
+            assert_eq!(
+                wrapped.cursor_column,
+                PROMPT_WIDTH + cursor,
+                "cursor {cursor}"
+            );
+        }
+
+        let boundary = wrapped_input_lines(input, 8, 12);
+        assert_eq!(boundary.cursor_line, 1);
+        assert_eq!(boundary.cursor_column, PROMPT_WIDTH);
+
+        let mut state = test_state();
+        state.push_input(input);
+        state.set_input_cursor(6);
+        let _ = rendered_input(&state, 2, 12);
+
+        move_input_down(&mut state, true);
+        assert_eq!(state.input_cursor(), 14);
+        move_input_up(&mut state, true);
+        assert_eq!(state.input_cursor(), 6);
+
+        state.set_input_cursor(8);
+        move_input_up(&mut state, true);
+        assert_eq!(state.input_cursor(), 0);
+        move_input_down(&mut state, true);
+        assert_eq!(state.input_cursor(), 8);
+
+        let mut four_column = test_state();
+        four_column.push_input("aaaa bbbb");
+        let _ = rendered_input(&four_column, 2, 4);
+        move_input_up(&mut four_column, true);
+        assert_eq!(four_column.input_cursor(), 4);
+        move_input_down(&mut four_column, true);
+        assert_eq!(four_column.input_cursor(), "aaaa bbbb".chars().count());
+    }
+
+    #[test]
+    fn viewport_follows_cursor_both_directions_and_clamps_after_shrink() {
+        let mut state = test_state();
+        state.push_input("l0\nl1\nl2\nl3\nl4\nl5");
+
+        let tail = lines(&state, 3, 20)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(tail, ["> l3", "> l4", "> l5"]);
+
+        move_input_page_up(&mut state, true);
+        move_input_page_up(&mut state, true);
+        let earlier = lines(&state, 3, 20)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(earlier, ["> l1", "> l2", "> l3"]);
+
+        move_input_page_down(&mut state, true);
+        let middle = lines(&state, 3, 20)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(middle, ["> l1", "> l2", "> l3"]);
+
+        move_input_page_down(&mut state, true);
+        let tail_again = lines(&state, 3, 20)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(tail_again, ["> l3", "> l4", "> l5"]);
+
+        state.replace_input_from_completion("a\nb".to_string());
+        let shrunk = lines(&state, 3, 20)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(shrunk, ["> a", "> b"]);
+    }
+
+    #[test]
+    fn immutable_render_seam_drives_page_step_and_width_reset_behavior() {
+        let mut page_state = test_state();
+        page_state.push_input("l0\nl1\nl2\nl3\nl4\nl5");
+        assert_eq!(height(&page_state, 9, 20), 6);
+
+        move_input_page_up(&mut page_state, true);
+        assert_eq!(page_state.input_cursor(), "l0\nl1\nl2".chars().count());
+
+        let mut width_state = test_state();
+        width_state.push_input("1234567890\nx\n1234567890");
+        let _ = rendered_input(&width_state, 2, input_content_width(80));
+        move_input_up(&mut width_state, true);
+        assert_eq!(width_state.input_cursor(), "1234567890\nx".chars().count());
+
+        let narrow_width = input_content_width(8);
+        let _ = rendered_input(&width_state, 2, narrow_width);
+        move_input_up(&mut width_state, true);
+        let rendered = rendered_input(&width_state, 2, narrow_width);
+
+        assert_eq!(width_state.input_cursor(), 9);
+        assert!(rendered.cursor_line < rendered.lines.len());
+    }
+
+    #[test]
+    fn nonvertical_actions_reset_the_next_vertical_destination() {
+        fn preferred_state() -> AppState {
+            let mut state = test_state();
+            state.push_input("1234567890\nx\n1234567890");
+            state.set_input_cursor(19);
+            let _ = lines(&state, 3, 80);
+            move_input_up(&mut state, true);
+            assert_eq!(state.input_cursor(), "1234567890\nx".chars().count());
+            state
+        }
+
+        type CursorAction = fn(&mut AppState);
+        let cases: [(CursorAction, usize); 8] = [
+            (
+                |state| {
+                    state.push_input("q");
+                    move_input_up(state, true);
+                },
+                2,
+            ),
+            (
+                |state| {
+                    state.pop_input_char();
+                    move_input_up(state, true);
+                },
+                0,
+            ),
+            (
+                |state| {
+                    state.delete_input_char();
+                    move_input_up(state, true);
+                },
+                1,
+            ),
+            (
+                |state| {
+                    state.move_input_cursor_left();
+                    move_input_up(state, true);
+                },
+                0,
+            ),
+            (
+                |state| {
+                    state.move_input_cursor_prev_word();
+                    move_input_up(state, true);
+                },
+                0,
+            ),
+            (
+                |state| {
+                    state.move_input_cursor_next_word();
+                    move_input_up(state, true);
+                    move_input_up(state, true);
+                },
+                0,
+            ),
+            (
+                |state| {
+                    state.set_input_cursor(17);
+                    move_input_up(state, true);
+                    move_input_up(state, true);
+                },
+                4,
+            ),
+            (
+                |state| {
+                    state.replace_input_from_completion("1234567890\nx\n1234567890".to_string());
+                    move_input_up(state, true);
+                    move_input_up(state, true);
+                },
+                10,
+            ),
+        ];
+
+        for (action, expected_cursor) in cases {
+            let mut state = preferred_state();
+            action(&mut state);
+            assert_eq!(state.input_cursor(), expected_cursor);
+        }
+    }
+
+    #[test]
+    fn right_and_line_boundary_reset_the_next_vertical_destination() {
+        fn preferred_at_last_line_end() -> AppState {
+            let mut state = test_state();
+            state.push_input("1234567890\nx");
+            state.set_input_cursor(6);
+            let _ = lines(&state, 2, 80);
+            move_input_down(&mut state, true);
+            assert_eq!(state.input_cursor(), state.input().chars().count());
+            state
+        }
+
+        let mut right = preferred_at_last_line_end();
+        right.move_input_cursor_right();
+        move_input_up(&mut right, true);
+        assert_eq!(right.input_cursor(), 1);
+
+        let mut boundary = preferred_at_last_line_end();
+        move_input_down(&mut boundary, true);
+        move_input_up(&mut boundary, true);
+        assert_eq!(boundary.input_cursor(), 1);
+    }
+
+    #[test]
+    fn history_replacement_resets_the_next_vertical_destination() {
+        let mut state = test_state();
+        let history_entry = "\u{200b}\n1234567890";
+        state.push_input(history_entry);
+        assert_eq!(
+            state.take_submitted_input(),
+            Some(history_entry.to_string())
+        );
+
+        state.push_input("1234567890\nx");
+        state.set_input_cursor(6);
+        let _ = lines(&state, 2, 80);
+        move_input_down(&mut state, true);
+        state.history_previous();
+        assert_eq!(state.input_cursor(), 0);
+
+        move_input_down(&mut state, true);
+        assert_eq!(state.input_cursor(), 2);
+    }
+
+    #[test]
+    fn submission_reset_keeps_recalled_vertical_navigation_at_the_new_column() {
+        let mut state = test_state();
+        let input = "1234567890\nx";
+        state.push_input(input);
+        state.set_input_cursor(6);
+        let _ = lines(&state, 2, 80);
+        move_input_down(&mut state, true);
+        assert_eq!(state.take_submitted_input(), Some(input.to_string()));
+
+        move_input_up(&mut state, true);
+        assert_eq!(state.input_cursor(), 0);
+        move_input_down(&mut state, true);
+        assert_eq!(state.input_cursor(), "1234567890\n".chars().count());
     }
 }

@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use anyhow::Result;
 use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
 use tui_input::{Input, InputRequest};
@@ -310,6 +312,27 @@ fn drain_available_events(
     result
 }
 
+const DEFAULT_COMPOSER_CONTENT_WIDTH: usize = 80;
+
+#[derive(Clone, Copy, Debug)]
+struct ComposerViewState {
+    content_width: usize,
+    visible_input_rows: usize,
+    viewport_start: usize,
+    preferred_column: Option<usize>,
+}
+
+impl Default for ComposerViewState {
+    fn default() -> Self {
+        Self {
+            content_width: DEFAULT_COMPOSER_CONTENT_WIDTH,
+            visible_input_rows: 1,
+            viewport_start: 0,
+            preferred_column: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct AppState {
     active_run_id: Option<String>,
@@ -327,6 +350,7 @@ pub(super) struct AppState {
     input: Input,
     history: Vec<String>,
     history_index: Option<usize>,
+    composer_view: Cell<ComposerViewState>,
     history_store: InputHistory,
     background: Vec<tokio::task::JoinHandle<Result<RunReport, String>>>,
     exit_requested: bool,
@@ -353,6 +377,7 @@ impl AppState {
             input: Input::default(),
             history,
             history_index: None,
+            composer_view: Cell::new(ComposerViewState::default()),
             history_store,
             background: Vec::new(),
             exit_requested: false,
@@ -422,6 +447,106 @@ impl AppState {
     #[cfg(test)]
     pub(in crate::app) fn set_input_cursor(&mut self, cursor: usize) {
         self.input.handle(InputRequest::SetCursor(cursor));
+        self.invalidate_composer_preferred_column();
+    }
+
+    pub(in crate::app) fn publish_composer_layout(
+        &self,
+        content_width: usize,
+        visible_input_rows: usize,
+    ) {
+        let mut view = self.composer_view.get();
+        let content_width = content_width.max(1);
+        if view.content_width != content_width {
+            view.content_width = content_width;
+            view.viewport_start = 0;
+            view.preferred_column = None;
+        }
+
+        view.visible_input_rows = visible_input_rows.max(1);
+        self.composer_view.set(view);
+    }
+
+    pub(in crate::app) fn composer_layout_metrics(&self) -> (usize, usize) {
+        let view = self.composer_view.get();
+        (view.content_width, view.visible_input_rows)
+    }
+
+    pub(in crate::app) fn composer_viewport_start(
+        &self,
+        row_count: usize,
+        cursor_row: usize,
+    ) -> usize {
+        let mut view = self.composer_view.get();
+        let visible_rows = view.visible_input_rows.max(1);
+        let max_start = row_count.saturating_sub(visible_rows);
+        let mut start = view.viewport_start.min(max_start);
+        if cursor_row < start {
+            start = cursor_row;
+        } else if cursor_row >= start.saturating_add(visible_rows) {
+            start = cursor_row.saturating_add(1).saturating_sub(visible_rows);
+        }
+
+        view.viewport_start = start.min(max_start);
+        self.composer_view.set(view);
+        view.viewport_start
+    }
+
+    pub(in crate::app) fn composer_page_step(&self) -> usize {
+        self.composer_view
+            .get()
+            .visible_input_rows
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    pub(in crate::app) fn composer_vertical_target_column(
+        &self,
+        current_column: usize,
+        source_max_column: usize,
+        target_max_column: usize,
+    ) -> usize {
+        let mut view = self.composer_view.get();
+        let cursor_in_middle = current_column < source_max_column;
+        let target_too_short = target_max_column < current_column;
+        let target_column = match view.preferred_column {
+            None if target_too_short => {
+                view.preferred_column = Some(current_column);
+                target_max_column
+            }
+            None => current_column,
+            Some(_) if cursor_in_middle && target_too_short => {
+                view.preferred_column = Some(current_column);
+                target_max_column
+            }
+            Some(_) if cursor_in_middle => {
+                view.preferred_column = None;
+                current_column
+            }
+            Some(preferred) if target_too_short || target_max_column < preferred => {
+                target_max_column
+            }
+            Some(preferred) => {
+                view.preferred_column = None;
+                preferred
+            }
+        };
+
+        self.composer_view.set(view);
+        target_column
+    }
+
+    pub(in crate::app) fn set_input_cursor_vertical(&mut self, cursor: usize) {
+        self.input.handle(InputRequest::SetCursor(cursor));
+    }
+
+    pub(in crate::app) fn set_input_cursor_boundary(&mut self, cursor: usize) {
+        self.input.handle(InputRequest::SetCursor(cursor));
+        self.invalidate_composer_preferred_column();
+    }
+
+    pub(in crate::app) fn history_is_active(&self) -> bool {
+        self.history_index.is_some()
     }
 
     pub(in crate::app) fn background_task_count(&self) -> usize {
@@ -443,50 +568,80 @@ impl AppState {
     }
 
     pub(in crate::app) fn push_input(&mut self, text: &str) {
+        self.history_index = None;
         for ch in text.chars() {
             self.input.handle(InputRequest::InsertChar(ch));
         }
+
+        self.invalidate_composer_preferred_column();
+    }
+
+    pub(in crate::app) fn push_typed_char(&mut self, ch: char) {
+        self.prepare_typed_history_edit();
+        self.input.handle(InputRequest::InsertChar(ch));
+        self.invalidate_composer_preferred_column();
+    }
+
+    fn prepare_typed_history_edit(&mut self) {
+        if self.history_index.is_none() {
+            return;
+        }
+
+        if self.input.cursor() == 0 {
+            let input_end = self.input.value().chars().count();
+            self.input.handle(InputRequest::SetCursor(input_end));
+        }
+
         self.history_index = None;
     }
 
     pub(in crate::app) fn pop_input_char(&mut self) {
         self.input.handle(InputRequest::DeletePrevChar);
         self.history_index = None;
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn delete_input_char(&mut self) {
         self.input.handle(InputRequest::DeleteNextChar);
         self.history_index = None;
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn move_input_cursor_left(&mut self) {
         self.input.handle(InputRequest::GoToPrevChar);
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn move_input_cursor_right(&mut self) {
         self.input.handle(InputRequest::GoToNextChar);
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn move_input_cursor_prev_word(&mut self) {
         self.input.handle(InputRequest::GoToPrevWord);
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn move_input_cursor_next_word(&mut self) {
         self.input.handle(InputRequest::GoToNextWord);
+        self.invalidate_composer_preferred_column();
     }
 
     pub(in crate::app) fn replace_input_from_completion(&mut self, input: String) {
         self.input = Input::new(input);
         self.history_index = None;
+        self.reset_composer_view();
     }
 
     pub(in crate::app) fn take_submitted_input(&mut self) -> Option<String> {
         let input = self.input.value_and_reset();
         let input = input.trim();
         self.history_index = None;
+        self.reset_composer_view();
         if input.is_empty() {
             return None;
         }
+
         self.persist_submitted_history(input);
         Some(input.to_string())
     }
@@ -576,18 +731,22 @@ impl AppState {
         if self.history.is_empty() {
             return;
         }
+
         let next = self
             .history_index
             .map(|index| index.saturating_sub(1))
             .unwrap_or_else(|| self.history.len() - 1);
         self.history_index = Some(next);
         self.input = Input::new(self.history[next].clone());
+        self.input.handle(InputRequest::SetCursor(0));
+        self.reset_composer_view();
     }
 
     pub(in crate::app) fn history_next(&mut self) {
         let Some(index) = self.history_index else {
             return;
         };
+
         if index + 1 >= self.history.len() {
             self.history_index = None;
             self.input.reset();
@@ -596,6 +755,21 @@ impl AppState {
             self.history_index = Some(next);
             self.input = Input::new(self.history[next].clone());
         }
+
+        self.reset_composer_view();
+    }
+
+    fn invalidate_composer_preferred_column(&self) {
+        let mut view = self.composer_view.get();
+        view.preferred_column = None;
+        self.composer_view.set(view);
+    }
+
+    fn reset_composer_view(&self) {
+        let mut view = self.composer_view.get();
+        view.viewport_start = 0;
+        view.preferred_column = None;
+        self.composer_view.set(view);
     }
 
     pub(in crate::app) fn spawn_card_report_task<F>(

@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::commands;
+use super::controls::composer;
 use super::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,16 +50,26 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
             KeyHandling::Continue
         }
         KeyCode::Tab => KeyHandling::Continue,
-        KeyCode::Up if state.composer_accepts_submit() => {
-            state.history_previous();
+        KeyCode::Up => {
+            let allow_history = state.composer_accepts_submit();
+            composer::move_input_up(state, allow_history);
             KeyHandling::Continue
         }
-        KeyCode::Up => KeyHandling::Continue,
-        KeyCode::Down if state.composer_accepts_submit() => {
-            state.history_next();
+        KeyCode::Down => {
+            let allow_history = state.composer_accepts_submit();
+            composer::move_input_down(state, allow_history);
             KeyHandling::Continue
         }
-        KeyCode::Down => KeyHandling::Continue,
+        KeyCode::PageUp => {
+            let allow_history = state.composer_accepts_submit();
+            composer::move_input_page_up(state, allow_history);
+            KeyHandling::Continue
+        }
+        KeyCode::PageDown => {
+            let allow_history = state.composer_accepts_submit();
+            composer::move_input_page_down(state, allow_history);
+            KeyHandling::Continue
+        }
         KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.move_input_cursor_prev_word();
             KeyHandling::Continue
@@ -88,7 +99,7 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            state.push_input(&ch.to_string());
+            state.push_typed_char(ch);
             KeyHandling::Continue
         }
         _ => KeyHandling::Continue,
@@ -125,14 +136,6 @@ mod tests {
         assert!(state.composer_accepts_edits());
         assert!(!state.composer_accepts_submit());
         assert!(state.pending_prompt().is_none());
-    }
-
-    fn seed_history(state: &mut AppState) {
-        state.push_input("from history");
-        assert_eq!(
-            state.take_submitted_input(),
-            Some("from history".to_string())
-        );
     }
 
     #[test]
@@ -483,10 +486,15 @@ mod tests {
         tab_state.cancel_background_tasks();
 
         let mut history_state = test_state();
-        seed_history(&mut history_state);
+        let recalled = "first\nsecond";
+        history_state.push_input(recalled);
+        assert_eq!(
+            history_state.take_submitted_input(),
+            Some(recalled.to_string())
+        );
         history_state.history_previous();
-        assert_eq!(history_state.input(), "from history");
-        let cursor = history_state.input_cursor();
+        assert_eq!(history_state.input(), recalled);
+        assert_eq!(history_state.input_cursor(), 0);
         lock_composer_with_pending_task(&mut history_state);
 
         let handling = handle_key_press(
@@ -495,8 +503,15 @@ mod tests {
         );
 
         assert_eq!(handling, KeyHandling::Continue);
-        assert_eq!(history_state.input(), "from history");
-        assert_eq!(history_state.input_cursor(), cursor);
+        assert_eq!(history_state.input(), recalled);
+        assert_eq!(history_state.input_cursor(), "first\n".chars().count());
+
+        handle_key_press(
+            &mut history_state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        assert_eq!(history_state.input(), recalled);
+        assert_eq!(history_state.input_cursor(), recalled.chars().count());
         assert!(!history_state.composer_accepts_submit());
         history_state.cancel_background_tasks();
     }
@@ -667,5 +682,66 @@ mod tests {
 
         assert_eq!(handling, KeyHandling::Continue);
         assert_eq!(second_state.input(), "");
+    }
+
+    #[test]
+    fn history_recall_insert_paths_match_omp_anchors() {
+        fn recalled_state() -> AppState {
+            let mut state = test_state();
+            state.push_input("line1\nline2");
+            assert_eq!(
+                state.take_submitted_input(),
+                Some("line1\nline2".to_string())
+            );
+            handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(state.input_cursor(), 0);
+            state
+        }
+
+        let mut typed = recalled_state();
+        handle_key_press(
+            &mut typed,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(typed.input(), "line1\nline2x");
+
+        let mut newline = recalled_state();
+        handle_key_press(
+            &mut newline,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
+        assert_eq!(newline.input(), "\nline1\nline2");
+
+        let mut pasted = recalled_state();
+        pasted.push_input("[paste]\n");
+        assert_eq!(pasted.input(), "[paste]\nline1\nline2");
+    }
+
+    #[test]
+    fn history_entries_change_only_at_visual_boundaries() {
+        let mut state = test_state();
+        for entry in ["older one\nolder two", "newer one\nnewer two"] {
+            state.push_input(entry);
+            assert_eq!(state.take_submitted_input(), Some(entry.to_string()));
+        }
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.input(), "newer one\nnewer two");
+        assert_eq!(state.input_cursor(), 0);
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.input(), "newer one\nnewer two");
+        assert_eq!(state.input_cursor(), "newer one\n".chars().count());
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.input(), "older one\nolder two");
+        assert_eq!(state.input_cursor(), 0);
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.input(), "older one\nolder two");
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(state.input(), "newer one\nnewer two");
+        assert_eq!(state.input_cursor(), "newer one\nnewer two".chars().count());
     }
 }

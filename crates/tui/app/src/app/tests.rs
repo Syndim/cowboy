@@ -283,9 +283,10 @@ fn draw_places_cursor_at_moved_wrapped_input_position() {
 
     terminal.draw(|frame| draw(frame, &state)).unwrap();
 
+    // OMP assigns a wrap boundary to the continuation row when later input remains.
     terminal
         .backend_mut()
-        .assert_cursor_position(Position::new(14, 7));
+        .assert_cursor_position(Position::new(3, 8));
 }
 
 #[test]
