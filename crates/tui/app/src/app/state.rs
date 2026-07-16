@@ -346,6 +346,7 @@ pub(super) struct AppState {
     event_log: Vec<TranscriptEntry>,
     active_event: Option<ActiveEvent>,
     scroll_offset: usize,
+    transcript_scroll_limit: usize,
     follow_events: bool,
     input: Input,
     history: Vec<String>,
@@ -373,6 +374,7 @@ impl AppState {
             event_log: Vec::new(),
             active_event: None,
             scroll_offset: 0,
+            transcript_scroll_limit: usize::MAX,
             follow_events: true,
             input: Input::default(),
             history,
@@ -434,6 +436,18 @@ impl AppState {
 
     pub(in crate::app) fn scroll_offset(&self) -> usize {
         self.scroll_offset
+    }
+
+    pub(in crate::app) fn next_scroll_offset(&self) -> usize {
+        self.scroll_offset.saturating_add(10)
+    }
+
+    pub(in crate::app) fn set_transcript_scroll_limit(&mut self, limit: usize) {
+        self.transcript_scroll_limit = limit;
+        self.scroll_offset = self.scroll_offset.min(limit);
+        if self.scroll_offset == 0 {
+            self.follow_events = true;
+        }
     }
 
     pub(in crate::app) fn input(&self) -> &str {
@@ -710,16 +724,25 @@ impl AppState {
         self.push_card("Cancelled", [self.status.clone()]);
     }
 
-    pub(in crate::app) fn scroll_events_up(&mut self) {
+    pub(in crate::app) fn scroll_events_up(&mut self) -> bool {
+        let next_offset = self.next_scroll_offset().min(self.transcript_scroll_limit);
+        if next_offset == self.scroll_offset {
+            return false;
+        }
+
+        self.scroll_offset = next_offset;
         self.follow_events = false;
-        self.scroll_offset = self.scroll_offset.saturating_add(10);
+        true
     }
 
-    pub(in crate::app) fn scroll_events_down(&mut self) {
+    pub(in crate::app) fn scroll_events_down(&mut self) -> bool {
+        let previous = (self.scroll_offset, self.follow_events);
         self.scroll_offset = self.scroll_offset.saturating_sub(10);
         if self.scroll_offset == 0 {
             self.follow_events = true;
         }
+
+        previous != (self.scroll_offset, self.follow_events)
     }
 
     pub(in crate::app) fn follow_latest(&mut self) {
@@ -727,24 +750,29 @@ impl AppState {
         self.follow_events = true;
     }
 
-    pub(in crate::app) fn history_previous(&mut self) {
+    pub(in crate::app) fn history_previous(&mut self) -> bool {
         if self.history.is_empty() {
-            return;
+            return false;
         }
 
         let next = self
             .history_index
             .map(|index| index.saturating_sub(1))
             .unwrap_or_else(|| self.history.len() - 1);
+        if self.history_index == Some(next) {
+            return false;
+        }
+
         self.history_index = Some(next);
         self.input = Input::new(self.history[next].clone());
         self.input.handle(InputRequest::SetCursor(0));
         self.reset_composer_view();
+        true
     }
 
-    pub(in crate::app) fn history_next(&mut self) {
+    pub(in crate::app) fn history_next(&mut self) -> bool {
         let Some(index) = self.history_index else {
-            return;
+            return false;
         };
 
         if index + 1 >= self.history.len() {
@@ -757,6 +785,7 @@ impl AppState {
         }
 
         self.reset_composer_view();
+        true
     }
 
     fn invalidate_composer_preferred_column(&self) {
