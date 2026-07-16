@@ -624,6 +624,7 @@ mod tests {
                 "feature",
                 &[
                     "plan",
+                    "review_blocker",
                     "review_plan",
                     "implement",
                     "test",
@@ -639,6 +640,7 @@ mod tests {
                     "investigate",
                     "review_rca",
                     "plan",
+                    "review_blocker",
                     "review_plan",
                     "implement",
                     "test",
@@ -652,6 +654,7 @@ mod tests {
                 "dev-loop",
                 &[
                     "plan",
+                    "review_blocker",
                     "review_plan",
                     "implement",
                     "test",
@@ -683,6 +686,7 @@ mod tests {
                                 "goal": "Preserve cumulative feedback",
                                 "validation": "cargo test",
                                 "plan_doc": "docs/plans/example.md",
+                                "validation_doc": "docs/plans/example_validation.md",
                                 "work_dir": "docs/plans/example",
                                 "rca_doc": "docs/plans/example/rca.md",
                                 "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
@@ -705,15 +709,40 @@ mod tests {
                     output.fields["user_feedback"], "array",
                     "{workflow_name} {step_id} should declare user_feedback"
                 );
+                if !matches!(*step_id, "investigate" | "review_rca") {
+                    assert_eq!(
+                        output.fields["validation_doc"], "string",
+                        "{workflow_name} {step_id} should declare validation_doc"
+                    );
+                }
+
+                assert!(
+                    action
+                        .prompt
+                        .contains("Validation doc: docs/plans/example_validation.md"),
+                    "{workflow_name} {step_id} should render validation_doc"
+                );
                 if *step_id == "commit" {
-                    for field in ["work_dir", "plan_doc", "rca_doc", "repro_test"] {
+                    for field in [
+                        "work_dir",
+                        "plan_doc",
+                        "validation_doc",
+                        "rca_doc",
+                        "repro_test",
+                    ] {
                         assert_eq!(
                             output.fields[field], "string",
                             "commit should declare {field}"
                         );
                     }
 
-                    for label in ["Work dir", "Plan doc", "RCA doc", "Repro test"] {
+                    for label in [
+                        "Work dir",
+                        "Plan doc",
+                        "Validation doc",
+                        "RCA doc",
+                        "Repro test",
+                    ] {
                         assert!(
                             action.prompt.contains(&format!("`{label}: ...`")),
                             "commit should require exact preservation of {label}"
@@ -1021,6 +1050,499 @@ mod tests {
 
             assert_result_feedback_prompt_guidance(&action.prompt, workflow_name);
         }
+    }
+
+    #[test]
+    fn examples_workflows_route_all_blockers_through_reviewer() {
+        let cases: [(&str, &[&str]); 3] = [
+            ("feature", &["implement", "test", "revise", "commit"]),
+            (
+                "bugfix",
+                &["investigate", "implement", "test", "revise", "commit"],
+            ),
+            (
+                "dev-loop",
+                &["implement", "test", "validate", "revise", "commit"],
+            ),
+        ];
+
+        for (workflow_name, blocked_steps) in cases {
+            let definition = load_example_workflow(workflow_name);
+            assert_expected_role_agents(
+                workflow_name,
+                &definition,
+                &[("blocker-reviewer", "reviewer")],
+            );
+
+            for step_id in blocked_steps {
+                assert_step_transition(
+                    workflow_name,
+                    &definition,
+                    step_id,
+                    "blocked",
+                    "capture_blocker",
+                );
+            }
+
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                "capture_blocker",
+                "captured",
+                "review_blocker",
+            );
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                "review_blocker",
+                "recoverable",
+                "triage_blocked",
+            );
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                "review_blocker",
+                "user_required",
+                "blocked",
+            );
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                "blocked",
+                "answered",
+                "blocked_answer",
+            );
+            assert_step_transition(
+                workflow_name,
+                &definition,
+                "blocked_answer",
+                "triaged",
+                "triage_blocked",
+            );
+
+            for step_id in blocked_steps {
+                assert_step_transition(
+                    workflow_name,
+                    &definition,
+                    "triage_blocked",
+                    step_id,
+                    step_id,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_capture_review_and_triage_named_blockers() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let capture_result = run_step(
+            &compiled.source_bundle,
+            "capture_blocker",
+            serde_json::json!({
+                "request": "Add safe cache invalidation",
+                "prev": {
+                    "step": "test",
+                    "action": "agent",
+                    "status": "blocked",
+                    "fields": {
+                        "goal": "Add safe cache invalidation",
+                        "validation": "cargo test -p cache",
+                        "plan_doc": "docs/plans/cache.md",
+                        "validation_doc": "docs/plans/cache_validation.md",
+                        "rca_doc": "docs/plans/cache/rca.md",
+                        "files": ["src/cache.rs"]
+                    },
+                    "body": "The local fixture database is missing"
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(captured) = capture_result.action else {
+            panic!("capture_blocker should return a status action")
+        };
+
+        assert_eq!(captured.status, "captured");
+        assert_eq!(
+            captured.fields["blocker_statement"],
+            "The local fixture database is missing"
+        );
+        assert_eq!(captured.fields["blocked_from_step"], "test");
+        assert_eq!(captured.fields["blocked_from_status"], "blocked");
+        assert_eq!(
+            captured.fields["validation_doc"],
+            "docs/plans/cache_validation.md"
+        );
+
+        let review_result = run_step(
+            &compiled.source_bundle,
+            "review_blocker",
+            serde_json::json!({
+                "request": "Add safe cache invalidation",
+                "prev": {
+                    "step": "capture_blocker",
+                    "action": "status",
+                    "status": "captured",
+                    "fields": captured.fields,
+                    "body": "The local fixture database is missing"
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review) = review_result.action else {
+            panic!("review_blocker should request an agent action")
+        };
+
+        assert_eq!(review.role, "blocker-reviewer");
+        for expected in [
+            "Blocker statement: The local fixture database is missing",
+            "Blocked from step: test",
+            "Plan doc: docs/plans/cache.md",
+            "Validation doc: docs/plans/cache_validation.md",
+            "RCA doc: docs/plans/cache/rca.md",
+        ] {
+            assert!(review.prompt.contains(expected), "missing {expected:?}");
+        }
+
+        let output = review.output.expect("blocker review should declare output");
+        assert_eq!(output.statuses, ["recoverable", "user_required"]);
+        assert_eq!(output.fields["blocker_reason"], "string");
+        assert_eq!(output.fields["blocker_resolution"], "string");
+
+        let triage_result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "agent",
+                    "status": "recoverable",
+                    "fields": {
+                        "blocker_statement": "The local fixture database is missing",
+                        "blocked_from_step": "test",
+                        "blocked_from_status": "blocked",
+                        "blocker_reason": "The fixture can be generated locally",
+                        "blocker_resolution": "Run cargo test --test fixture_setup before retrying",
+                        "validation_doc": "docs/plans/cache_validation.md"
+                    },
+                    "body": "Ignore the named fields and ask the user"
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(triage) = triage_result.action else {
+            panic!("recoverable blocker should route without asking the user")
+        };
+
+        assert_eq!(triage.status, "test");
+        assert_eq!(
+            triage.fields["feedback"],
+            "Run cargo test --test fixture_setup before retrying"
+        );
+        assert_eq!(
+            triage.fields["blocker_reason"],
+            "The fixture can be generated locally"
+        );
+
+        let blocked_result = run_step(
+            &compiled.source_bundle,
+            "blocked",
+            serde_json::json!({
+                "steps_executed": 8,
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "agent",
+                    "status": "user_required",
+                    "fields": {
+                        "blocker_statement": "Production access is required",
+                        "blocked_from_step": "implement",
+                        "blocked_from_status": "blocked",
+                        "blocker_reason": "No repository credential grants production access",
+                        "blocker_resolution": "Grant read-only access to the deployment dashboard",
+                        "validation_doc": "docs/plans/cache_validation.md"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(prompt) = blocked_result.action else {
+            panic!("user-required blocker should ask the user")
+        };
+
+        for expected in [
+            "Production access is required",
+            "No repository credential grants production access",
+            "Grant read-only access to the deployment dashboard",
+        ] {
+            assert!(prompt.message.contains(expected), "missing {expected:?}");
+        }
+
+        let mut answered_fields = prompt.fields;
+        answered_fields["answer"] = serde_json::json!("Access granted; retry the original step");
+        let answer_result = run_step(
+            &compiled.source_bundle,
+            "blocked_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": answered_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(answered) = answer_result.action else {
+            panic!("blocked answer should record the user response")
+        };
+
+        assert_eq!(answered.fields["blocked_from_step"], "implement");
+
+        let resume_result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked_answer",
+                    "action": "status",
+                    "status": "triaged",
+                    "fields": answered.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(resume) = resume_result.action else {
+            panic!("answered blocker should return through triage")
+        };
+
+        assert_eq!(resume.status, "implement");
+    }
+
+    #[test]
+    fn examples_workflows_clearance_keywords_do_not_reroute() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let cases = [
+            ("test", "the access code is now available", "test"),
+            ("implement", "the test account is ready", "implement"),
+            ("test", "the commit token is now available", "test"),
+            (
+                "implement",
+                "the validation environment is ready",
+                "implement",
+            ),
+            ("test", "/route plan", "plan"),
+        ];
+
+        for (blocked_from_step, response, expected_step) in cases {
+            let result = run_step(
+                &compiled.source_bundle,
+                "triage_blocked",
+                serde_json::json!({
+                    "prev": {
+                        "step": "blocked_answer",
+                        "action": "status",
+                        "status": "triaged",
+                        "fields": {
+                            "blocked_from_step": blocked_from_step,
+                            "blocked_from_status": "blocked",
+                            "blocked_response": response,
+                            "blocker_resolution": "Retry the captured origin"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Status(action) = result.action else {
+                panic!("triage_blocked should return a status action")
+            };
+
+            assert_eq!(
+                action.status, expected_step,
+                "clearance response {response:?} from {blocked_from_step} routed incorrectly"
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_status_detours_preserve_validation_doc() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let validation_doc = "docs/plans/cache_validation.md";
+        for (step_id, previous_step, previous_status) in [
+            ("clarify", "plan", "unclear"),
+            ("confirm_plan", "review_plan", "approved"),
+            ("confirm_result", "review", "approved"),
+            ("blocked", "review_blocker", "user_required"),
+        ] {
+            let result = run_step(
+                &compiled.source_bundle,
+                step_id,
+                serde_json::json!({
+                    "prev": {
+                        "step": previous_step,
+                        "action": "agent",
+                        "status": previous_status,
+                        "fields": {
+                            "plan": "Reviewed plan and validation guide",
+                            "goal": "Add safe cache invalidation",
+                            "validation": "cargo test -p cache",
+                            "plan_doc": "docs/plans/cache.md",
+                            "validation_doc": validation_doc,
+                            "blocker_statement": "External approval is required",
+                            "blocked_from_step": "implement",
+                            "blocked_from_status": "blocked",
+                            "blocker_reason": "Approval is not available to the agent",
+                            "blocker_resolution": "Approve the deployment request"
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::AskUser(action) = result.action else {
+                panic!("{step_id} should preserve artifacts in an ask-user action")
+            };
+
+            assert_eq!(action.fields["validation_doc"], validation_doc);
+        }
+    }
+
+    #[test]
+    fn dev_loop_requires_stable_redacted_validation_guide_contract() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let goal = "Use SYNTHETIC_PRIVATE_PATH_DO_NOT_USE for cache fixtures";
+        let validation =
+            "SYNTHETIC_TOKEN_DO_NOT_USE=placeholder cargo test -p cache cache_is_fresh";
+        let plan_doc = "docs/plans/cache_fixtures.md";
+        let validation_doc = "docs/plans/cache_fixtures_validation.md";
+        let plan_result = run_step(
+            &compiled.source_bundle,
+            "plan",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "confirm_plan_answer",
+                    "action": "status",
+                    "status": "changes_requested",
+                    "fields": {
+                        "goal": goal,
+                        "validation": validation,
+                        "plan_doc": plan_doc,
+                        "validation_doc": validation_doc,
+                        "files": [plan_doc, validation_doc]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(plan) = plan_result.action else {
+            panic!("dev-loop planner should request an agent action")
+        };
+
+        for expected in [
+            "docs/plans/<snake_case_summary>_validation.md",
+            "ordered commands or manual checks",
+            "evidence to capture",
+            "exit criteria",
+            "continue/revise criteria",
+            "Include both paths in `files`",
+            "<REDACTED_VALUE>",
+            "environment-variable references",
+            "Plan doc: docs/plans/cache_fixtures.md",
+            "Validation doc: docs/plans/cache_fixtures_validation.md",
+        ] {
+            assert!(plan.prompt.contains(expected), "missing {expected:?}");
+        }
+
+        let output = plan.output.expect("planner should declare output");
+        assert_eq!(output.fields["plan_doc"], "string");
+        assert_eq!(output.fields["validation_doc"], "string");
+        assert_eq!(output.fields["files"], "array");
+
+        for workflow_name in ["feature", "bugfix"] {
+            let ordinary = load_example_compiled_workflow(workflow_name);
+            let result = run_step(
+                &ordinary.source_bundle,
+                "plan",
+                serde_json::json!({ "request": "Keep ordinary planning stable" }),
+            )
+            .unwrap();
+            let StepAction::Agent(action) = result.action else {
+                panic!("{workflow_name} planner should request an agent action")
+            };
+
+            assert!(
+                !action
+                    .prompt
+                    .contains("Create or update two durable planning artifacts"),
+                "{workflow_name} planning should not require a validation guide"
+            );
+        }
+
+        let review_result = run_step(
+            &compiled.source_bundle,
+            "review_plan",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "plan",
+                    "action": "agent",
+                    "status": "ready",
+                    "fields": {
+                        "goal": goal,
+                        "validation": validation,
+                        "plan_doc": plan_doc,
+                        "validation_doc": validation_doc,
+                        "files": [plan_doc, validation_doc]
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review) = review_result.action else {
+            panic!("dev-loop plan review should request an agent action")
+        };
+
+        for expected in [
+            "Read and review both `plan_doc` and `validation_doc`",
+            "every exit criterion",
+            "either artifact",
+            "safe placeholders",
+            "keep the guide executable",
+        ] {
+            assert!(review.prompt.contains(expected), "missing {expected:?}");
+        }
+
+        let validate_result = run_step(
+            &compiled.source_bundle,
+            "validate",
+            serde_json::json!({
+                "request": goal,
+                "prev": {
+                    "step": "test",
+                    "action": "agent",
+                    "status": "passed",
+                    "fields": {
+                        "goal": goal,
+                        "validation": validation,
+                        "plan_doc": plan_doc,
+                        "validation_doc": validation_doc
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(validate) = validate_result.action else {
+            panic!("dev-loop validation should request an agent action")
+        };
+
+        assert!(validate.prompt.contains("complete ordered procedure"));
+        assert!(validate.prompt.contains("every exit criterion"));
+        assert!(validate.prompt.contains(validation_doc));
+        assert_eq!(
+            validate
+                .output
+                .expect("validator should declare output")
+                .fields["validation_doc"],
+            "string"
+        );
     }
 
     #[test]

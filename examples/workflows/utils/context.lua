@@ -60,8 +60,14 @@ function M.previous_step_context(ctx, heading)
   if fields.validation then table.insert(lines, "Validation: " .. tostring(fields.validation)) end
   if fields.work_dir then table.insert(lines, "Work dir: " .. tostring(fields.work_dir)) end
   if fields.plan_doc then table.insert(lines, "Plan doc: " .. tostring(fields.plan_doc)) end
+  if fields.validation_doc then table.insert(lines, "Validation doc: " .. tostring(fields.validation_doc)) end
   if fields.rca_doc then table.insert(lines, "RCA doc: " .. tostring(fields.rca_doc)) end
   if fields.repro_test then table.insert(lines, "Repro test: " .. tostring(fields.repro_test)) end
+  if fields.blocker_statement then table.insert(lines, "Blocker statement: " .. tostring(fields.blocker_statement)) end
+  if fields.blocked_from_step then table.insert(lines, "Blocked from step: " .. tostring(fields.blocked_from_step)) end
+  if fields.blocked_from_status then table.insert(lines, "Blocked from status: " .. tostring(fields.blocked_from_status)) end
+  if fields.blocker_reason then table.insert(lines, "Blocker reason: " .. tostring(fields.blocker_reason)) end
+  if fields.blocker_resolution then table.insert(lines, "Blocker resolution: " .. tostring(fields.blocker_resolution)) end
   if fields.files and #fields.files > 0 then
     table.insert(lines, "Files:")
     for _, file in ipairs(fields.files) do table.insert(lines, "- " .. tostring(file)) end

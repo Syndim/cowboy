@@ -240,9 +240,14 @@ cp -R examples/workflows/* ~/.config/cowboy/workflows/
 
 The starter set includes `feature`, `bugfix`, and `dev-loop`. The `dev-loop`
 workflow treats the run request as the Goal, asks the user for the exact
-validation method, requires the plan to preserve that method, and gates agent
-and human review on a validator successfully using it. After copying the
-examples, start it with `cowboy run --workflow workflows/dev-loop <goal>`.
+validation method, and creates both an implementation plan and a sibling
+validation guide with ordered checks, evidence requirements, and explicit exit
+criteria. Its validator must complete that guide before the loop can finish.
+Across all three starter workflows, blocked agent steps first go to a dedicated
+blocker reviewer; recoverable blockers return to the originating step with
+agent-side recovery instructions, and only blockers requiring external input
+prompt the user. After copying the examples, start dev-loop with
+`cowboy run --workflow workflows/dev-loop <goal>`.
 
 Read [Workflow authoring](docs/workflow-authoring.md) for the Lua API, runtime context, step actions, transitions, imports, examples, and debugging tools.
 

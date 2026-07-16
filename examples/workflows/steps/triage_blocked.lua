@@ -2,42 +2,65 @@ local context = require("utils/context.lua")
 
 return function(id)
   local opts = type(id) == "table" and id or { id = id }
+  local allowed_steps = {}
+  for _, step_id in ipairs(opts.retry_steps or { "plan", "implement", "revise" }) do
+    allowed_steps[step_id] = true
+  end
+
+  local function user_requested_step(response)
+    local trimmed = string.match(response, "^%s*(.-)%s*$") or ""
+    local requested_step = string.match(trimmed, "^/route%s+([%w_-]+)$")
+    if not requested_step then
+      requested_step = string.match(trimmed, "^route:%s*([%w_-]+)$")
+    end
+
+    if requested_step then
+      requested_step = string.lower(requested_step)
+    end
+
+    if requested_step and allowed_steps[requested_step] then
+      return requested_step
+    end
+
+    return nil
+  end
+
   local triage = step(opts.id or "triage_blocked")
   triage.run = function(ctx)
     local fields = (ctx.prev and ctx.prev.fields) or {}
-    local response = tostring(fields.blocked_response or "")
-    local normalized = string.lower(response)
     local blocked_from_step = tostring(fields.blocked_from_step or "")
-    local next_step = "implement"
+    local user_response = tostring(fields.blocked_response or "")
+    local recovery = user_response ~= "" and user_response or tostring(fields.blocker_resolution or "")
+    local next_step = allowed_steps[blocked_from_step] and blocked_from_step or "implement"
 
-    if blocked_from_step == "investigate" or string.match(normalized, "investigat") or string.match(normalized, "rca") or string.match(normalized, "root cause") or string.match(normalized, "repro") then
-      next_step = "investigate"
-    elseif string.match(normalized, "plan") or string.match(normalized, "scope") or string.match(normalized, "requirement") or string.match(normalized, "start over") then
-      next_step = "plan"
-    elseif blocked_from_step == "revise" or string.match(normalized, "revise") or string.match(normalized, "review feedback") then
-      next_step = "revise"
-    elseif opts.validation_step and (blocked_from_step == opts.validation_step or string.match(normalized, "validat")) then
-      next_step = opts.validation_step
+    if user_response ~= "" then
+      next_step = user_requested_step(user_response) or next_step
     end
 
     return action.status {
       status = next_step,
       fields = {
         summary = "Blocked workflow triaged to " .. next_step,
-        feedback = response,
+        feedback = recovery,
         user_feedback = context.copy_user_feedback(fields),
+        blocker_statement = fields.blocker_statement,
+        blocked_from_step = fields.blocked_from_step,
+        blocked_from_status = fields.blocked_from_status,
+        blocker_reason = fields.blocker_reason,
+        blocker_resolution = fields.blocker_resolution,
+        blocked_response = fields.blocked_response,
         goal = fields.goal,
         validation = fields.validation,
         work_dir = fields.work_dir,
         plan_doc = fields.plan_doc,
+        validation_doc = fields.validation_doc,
         rca_doc = fields.rca_doc,
         repro_test = fields.repro_test,
         files = fields.files or {},
-        blocked_from_step = fields.blocked_from_step,
-        blocked_from_status = fields.blocked_from_status,
       },
-      body = "Blocked workflow user response:\n" .. response,
+      body = "Blocker recovery instructions:\n" .. recovery,
     }
   end
+
   return triage
 end

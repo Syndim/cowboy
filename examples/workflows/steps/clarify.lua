@@ -16,6 +16,7 @@ return function(id)
             validation = fields.validation,
             work_dir = fields.work_dir,
             plan_doc = fields.plan_doc,
+            validation_doc = fields.validation_doc,
             rca_doc = fields.rca_doc,
             repro_test = fields.repro_test,
           },
@@ -30,7 +31,7 @@ return function(id)
       id = prompt_id,
       message = "Please provide enough context to plan this work: desired behavior, entrypoint, expected output/state changes, constraints, and verification criteria.",
       choices = {},
-      fields = { user_feedback = context.copy_user_feedback(previous_fields), goal = previous_fields.goal, validation = previous_fields.validation, work_dir = previous_fields.work_dir, plan_doc = previous_fields.plan_doc, rca_doc = previous_fields.rca_doc, repro_test = previous_fields.repro_test },
+      fields = { user_feedback = context.copy_user_feedback(previous_fields), goal = previous_fields.goal, validation = previous_fields.validation, work_dir = previous_fields.work_dir, plan_doc = previous_fields.plan_doc, validation_doc = previous_fields.validation_doc, rca_doc = previous_fields.rca_doc, repro_test = previous_fields.repro_test },
     }
   end
   return clarify

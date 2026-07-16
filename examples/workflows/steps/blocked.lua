@@ -9,9 +9,8 @@ return function(body, id)
         for key, value in pairs(previous_fields) do
           fields[key] = value
         end
+
         fields.blocked_response = tostring(answer)
-        fields.blocked_from_step = previous_fields.blocked_from_step
-        fields.blocked_from_status = previous_fields.blocked_from_status
         return action.status {
           status = "triaged",
           fields = fields,
@@ -25,15 +24,30 @@ return function(body, id)
     for key, value in pairs(previous_fields) do
       fields[key] = value
     end
-    fields.blocked_from_step = ctx.prev and ctx.prev.step
-    fields.blocked_from_status = ctx.prev and ctx.prev.status
+
+    local message = table.concat({
+      "The blocker reviewer determined that user action is required.",
+      tostring(body or "workflow blocked"),
+      "",
+      "Blocker:",
+      tostring(fields.blocker_statement or ""),
+      "",
+      "Reviewer analysis:",
+      tostring(fields.blocker_reason or ""),
+      "",
+      "Required user action:",
+      tostring(fields.blocker_resolution or ""),
+      "",
+      "To redirect instead of retrying the blocked step, reply with `/route <step>`.",
+    }, "\n")
     return action.ask_user {
       id = prompt_id,
-      message = "The workflow is blocked. What should Cowboy do next?\n" .. tostring(body or "workflow blocked"),
+      message = message,
       choices = {},
       fields = fields,
     }
   end
+
   return blocked
 end
 

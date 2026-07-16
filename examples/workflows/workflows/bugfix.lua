@@ -4,6 +4,7 @@ local roles = {
   implementer = require("roles/implementer.lua"),
   tester = require("roles/tester.lua"),
   reviewer = require("roles/reviewer.lua"),
+  blocker_reviewer = require("roles/blocker_reviewer.lua"),
   committer = require("roles/committer.lua"),
 }
 
@@ -26,13 +27,18 @@ local review_result_feedback = require("steps/review_result_feedback.lua")(roles
 local revise = require("steps/revise.lua")(roles)
 local commit = require("steps/commit.lua")(roles)
 local done = require("steps/done.lua")("bug fix implemented, tested, reviewed, and committed")
+local capture_blocker = require("steps/capture_blocker.lua")("capture_blocker")
+local review_blocker = require("steps/review_blocker.lua")(roles)
 local blocked = require("steps/blocked.lua")("bug fix workflow blocked")
 local blocked_answer = require("steps/blocked.lua")("bug fix workflow blocked", "blocked_answer")
-local triage_blocked = require("steps/triage_blocked.lua")("triage_blocked")
+local triage_blocked = require("steps/triage_blocked.lua")({
+  id = "triage_blocked",
+  retry_steps = { "investigate", "plan", "implement", "test", "revise", "commit" },
+})
 
 investigate:on("documented", review_rca)
 investigate:on("unclear", clarify)
-investigate:on("blocked", blocked)
+investigate:on("blocked", capture_blocker)
 review_rca:on("approved", confirm_rca)
 review_rca:on("changes_requested", investigate)
 confirm_rca:on("answered", confirm_rca_answer)
@@ -48,10 +54,10 @@ confirm_plan:on("answered", confirm_plan_answer)
 confirm_plan_answer:on("confirmed", implement)
 confirm_plan_answer:on("changes_requested", plan)
 implement:on("implemented", test)
-implement:on("blocked", blocked)
+implement:on("blocked", capture_blocker)
 test:on("passed", review)
 test:on("failed", revise)
-test:on("blocked", blocked)
+test:on("blocked", capture_blocker)
 review:on("approved", confirm_result)
 review:on("changes_requested", revise)
 review:on("replan_requested", plan)
@@ -61,15 +67,20 @@ confirm_result_answer:on("changes_requested", review_result_feedback)
 review_result_feedback:on("changes_requested", revise)
 review_result_feedback:on("replan_requested", plan)
 revise:on("implemented", test)
-revise:on("blocked", blocked)
+revise:on("blocked", capture_blocker)
 commit:on("committed", done)
-commit:on("blocked", blocked)
+commit:on("blocked", capture_blocker)
+capture_blocker:on("captured", review_blocker)
+review_blocker:on("recoverable", triage_blocked)
+review_blocker:on("user_required", blocked)
 blocked:on("answered", blocked_answer)
 blocked_answer:on("triaged", triage_blocked)
 triage_blocked:on("investigate", investigate)
 triage_blocked:on("plan", plan)
 triage_blocked:on("implement", implement)
+triage_blocked:on("test", test)
 triage_blocked:on("revise", revise)
+triage_blocked:on("commit", commit)
 
 return workflow("bugfix", investigate, {
   description = "Investigate, review RCA, confirm RCA, plan, review, confirm, implement, test, review, confirm, and commit bug fixes",
