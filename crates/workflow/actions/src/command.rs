@@ -15,6 +15,24 @@ use tokio::time;
 
 const CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
 
+const COMMAND_ENV_ALLOW_LIST: [&str; 7] = [
+    "PATH",
+    "SystemRoot",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+];
+
+fn apply_command_environment(command: &mut Command) {
+    for name in COMMAND_ENV_ALLOW_LIST {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CommandActionRunner {
     cwd: PathBuf,
@@ -53,10 +71,7 @@ impl CommandActionRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-
-        if let Some(path) = std::env::var_os("PATH") {
-            command.env("PATH", path);
-        }
+        apply_command_environment(&mut command);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -299,6 +314,17 @@ mod tests {
 
     static COMMAND_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
+    const EXPECTED_COMMAND_ENV_ALLOW_LIST: [&str; 7] = [
+        "PATH",
+        "SystemRoot",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+    ];
+    const UNAPPROVED_COMMAND_ENV: &str = "COWBOY_COMMAND_UNAPPROVED";
+
     async fn command_test_lock() -> MutexGuard<'static, ()> {
         COMMAND_TEST_LOCK.lock().await
     }
@@ -409,6 +435,112 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("CARGO=missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn command_runner_forwards_only_allowlisted_environment_variables() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command::tests::command_runner_environment_allow_list_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env_clear()
+            .envs(EXPECTED_COMMAND_ENV_ALLOW_LIST.map(|name| (name, "test-marker")))
+            .env("HOME", "test-marker")
+            .env("CARGO", "test-marker")
+            .env(UNAPPROVED_COMMAND_ENV, "test-marker")
+            .output()
+            .await
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "environment allow-list probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn command_runner_environment_allow_list_probe() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "environment_allow_list");
+        let runner = CommandActionRunner::new(dir.path());
+
+        let output = command_output(
+            runner
+                .run(action(program, helper_args()), context())
+                .await
+                .unwrap(),
+        );
+        let stdout = output.fields["stdout"].as_str().unwrap();
+
+        assert_eq!(output.status, "ok");
+        for name in EXPECTED_COMMAND_ENV_ALLOW_LIST {
+            assert!(
+                stdout.contains(&format!("{name}=set")),
+                "{name} was not forwarded: {stdout}"
+            );
+        }
+
+        for name in ["HOME", "CARGO", UNAPPROVED_COMMAND_ENV] {
+            assert!(
+                stdout.contains(&format!("{name}=missing")),
+                "{name} was unexpectedly forwarded: {stdout}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn command_runner_preserves_system_root_for_child_runtime_initialization() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "command::tests::command_runner_system_root_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("SystemRoot", r"C:\Windows")
+            .output()
+            .await
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "SystemRoot probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn command_runner_system_root_probe() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "system_root");
+        let runner = CommandActionRunner::new(dir.path());
+
+        let output = command_output(
+            runner
+                .run(action(program, helper_args()), context())
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(output.status, "ok");
+        assert!(
+            output.fields["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("SystemRoot=set"),
+            "fields: {}",
+            output.fields
         );
     }
 
@@ -619,6 +751,33 @@ mod tests {
                 };
                 println!("HOME={home}");
                 println!("CARGO={cargo}");
+            }
+            "environment_allow_list" => {
+                for name in EXPECTED_COMMAND_ENV_ALLOW_LIST {
+                    let state = if std::env::var_os(name).is_some() {
+                        "set"
+                    } else {
+                        "missing"
+                    };
+                    println!("{name}={state}");
+                }
+
+                for name in ["HOME", "CARGO", UNAPPROVED_COMMAND_ENV] {
+                    let state = if std::env::var_os(name).is_some() {
+                        "set"
+                    } else {
+                        "missing"
+                    };
+                    println!("{name}={state}");
+                }
+            }
+            "system_root" => {
+                let system_root = if std::env::var_os("SystemRoot").is_some() {
+                    "set"
+                } else {
+                    "missing"
+                };
+                println!("SystemRoot={system_root}");
             }
             "cwd" => {
                 println!("{}", std::env::current_dir().unwrap().display());
