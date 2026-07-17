@@ -10,7 +10,7 @@ return function(roles, opts)
 
 ]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "User result feedback:") .. context.preserve_user_feedback_guidance() .. context.review_user_feedback_guidance() .. [[
 
-Inspect the user's feedback, the implementation, and the plan document at the `Plan doc: ...` path. For bug fixes, also preserve the bug-fix work folder at `Work dir: ...`, the RCA document at `RCA doc: ...`, and the investigator-added regression test identified by `Repro test: ...`.
+Inspect the user's feedback, the implementation, and the concrete plan document supplied in the previous-step context. For bug fixes, also preserve the concrete bug-fix work-folder, RCA-document, and investigator-added regression-test references supplied in that context.
 
 Decide where the user's feedback should go next. Return "changes_requested" with actionable feedback when the user is asking for implementation changes that can be made within the approved plan. Return "replan_requested" with actionable feedback for the planner when the user's feedback means the approved plan, scope, requirements, verification strategy, or safety constraints must change before implementation continues. Do not route by keyword alone; decide from the full feedback and plan context. Preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly in output fields when present.]],
       output = {

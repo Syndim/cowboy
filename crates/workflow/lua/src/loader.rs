@@ -1054,6 +1054,60 @@ mod tests {
     }
 
     #[test]
+    fn examples_workflows_review_result_feedback_prompt_uses_concrete_document_paths() {
+        let compiled = load_example_compiled_workflow("bugfix");
+        let review_step = result_feedback_review_step("bugfix", &compiled.definition).to_string();
+        let result = run_step(
+            &compiled.source_bundle,
+            &review_step,
+            serde_json::json!({
+                "request": "Check document path handoff",
+                "prev": {
+                    "step": "confirm_result_answer",
+                    "status": "changes_requested",
+                    "fields": {
+                        "feedback": "Inspect the approved artifacts",
+                        "work_dir": "docs/plans/document_path_handoff",
+                        "plan_doc": "docs/plans/document_path_handoff/plan.md",
+                        "rca_doc": "docs/plans/document_path_handoff/rca.md",
+                        "repro_test": "crates/workflow/lua/src/loader.rs::document_path_handoff_repro"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+
+        let StepAction::Agent(action) = result.action else {
+            panic!("bugfix result-feedback review step should request an agent action")
+        };
+
+        for expected in [
+            "Work dir: docs/plans/document_path_handoff",
+            "Plan doc: docs/plans/document_path_handoff/plan.md",
+            "RCA doc: docs/plans/document_path_handoff/rca.md",
+            "Repro test: crates/workflow/lua/src/loader.rs::document_path_handoff_repro",
+        ] {
+            assert!(
+                action.prompt.contains(expected),
+                "result-feedback prompt should contain concrete artifact reference {expected:?}"
+            );
+        }
+
+        for placeholder in [
+            "`Work dir: ...`",
+            "`Plan doc: ...`",
+            "`RCA doc: ...`",
+            "`Repro test: ...`",
+        ] {
+            assert!(
+                !action.prompt.contains(placeholder),
+                "result-feedback prompt should not send placeholder artifact reference {placeholder:?} when concrete paths are available\nPrompt:\n{}",
+                action.prompt
+            );
+        }
+    }
+
+    #[test]
     fn examples_workflows_route_all_blockers_through_reviewer() {
         let cases: [(&str, &[&str]); 3] = [
             ("feature", &["implement", "test", "revise", "commit"]),
