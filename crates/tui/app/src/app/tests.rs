@@ -8,8 +8,6 @@ use crate::app::styles::{
     style_border_accent, style_muted, style_transcript_thought, style_warning,
 };
 use crate::config::AppConfig;
-use std::cell::Cell;
-use std::io::{self, Write};
 
 fn test_state() -> AppState {
     let dir = tempfile::tempdir().unwrap();
@@ -167,234 +165,6 @@ fn windows_terminal_mode_does_not_execute_unsupported_keyboard_enhancement_on_wi
          gate these commands away from Windows before entering or restoring terminal mode: {}",
         unguarded_commands.join("; ")
     );
-}
-
-struct FailAfterMouseCapture {
-    bytes: Vec<u8>,
-    failures_remaining: usize,
-}
-
-impl Write for FailAfterMouseCapture {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self.failures_remaining > 0
-            && self
-                .bytes
-                .windows(b"?1000h".len())
-                .any(|part| part == b"?1000h")
-        {
-            self.failures_remaining -= 1;
-            return Err(io::Error::other("injected terminal setup failure"));
-        }
-
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[test]
-fn terminal_screen_commands_pair_mouse_capture_and_bracketed_paste() {
-    let mut bytes = Vec::new();
-
-    enter_terminal_screen(&mut bytes).unwrap();
-    restore_terminal_screen(&mut bytes).unwrap();
-
-    let commands = String::from_utf8(bytes).unwrap();
-    assert!(commands.contains("?1000h"), "{commands:?}");
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004h"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
-}
-
-#[test]
-fn terminal_screen_setup_failure_rolls_back_mouse_capture() {
-    let mut writer = FailAfterMouseCapture {
-        bytes: Vec::new(),
-        failures_remaining: 1,
-    };
-
-    let error = enter_terminal_screen(&mut writer).unwrap_err();
-
-    let commands = String::from_utf8(writer.bytes).unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::Other);
-    assert_eq!(writer.failures_remaining, 0);
-    assert!(commands.contains("?1000h"), "{commands:?}");
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
-}
-
-#[test]
-fn terminal_guard_retries_screen_cleanup_after_setup_rollback_fails() {
-    let mut writer = FailAfterMouseCapture {
-        bytes: Vec::new(),
-        failures_remaining: 2,
-    };
-    let mut guard = TerminalModeGuard {
-        raw_mode_active: false,
-        screen_active: false,
-        keyboard_enhancement_active: false,
-    };
-
-    let setup_result =
-        guard.activate_screen(|| enter_terminal_screen(&mut writer).map_err(anyhow::Error::from));
-
-    assert!(setup_result.is_err());
-    assert!(guard.screen_active);
-    assert_eq!(writer.failures_remaining, 0);
-
-    guard
-        .restore_with(
-            || Ok(()),
-            || Ok(()),
-            || restore_terminal_screen(&mut writer).map_err(anyhow::Error::from),
-        )
-        .unwrap();
-
-    let commands = String::from_utf8(writer.bytes).unwrap();
-    assert!(guard.is_restored());
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
-}
-
-#[test]
-fn terminal_guard_retries_only_failed_restoration_components() {
-    let raw_calls = Cell::new(0);
-    let keyboard_calls = Cell::new(0);
-    let screen_calls = Cell::new(0);
-    let mut guard = TerminalModeGuard {
-        raw_mode_active: true,
-        screen_active: true,
-        keyboard_enhancement_active: true,
-    };
-
-    let first_result = guard.restore_with(
-        || {
-            raw_calls.set(raw_calls.get() + 1);
-            Ok(())
-        },
-        || {
-            keyboard_calls.set(keyboard_calls.get() + 1);
-            Ok(())
-        },
-        || {
-            screen_calls.set(screen_calls.get() + 1);
-            Err(anyhow::anyhow!("injected screen restoration failure"))
-        },
-    );
-
-    assert!(first_result.is_err());
-    assert!(!guard.is_restored());
-    assert!(!guard.raw_mode_active);
-    assert!(!guard.keyboard_enhancement_active);
-    assert!(guard.screen_active);
-
-    guard
-        .restore_with(
-            || {
-                raw_calls.set(raw_calls.get() + 1);
-                Ok(())
-            },
-            || {
-                keyboard_calls.set(keyboard_calls.get() + 1);
-                Ok(())
-            },
-            || {
-                screen_calls.set(screen_calls.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-    assert!(guard.is_restored());
-    assert_eq!(raw_calls.get(), 1);
-    assert_eq!(keyboard_calls.get(), 1);
-    assert_eq!(screen_calls.get(), 2);
-}
-
-#[test]
-fn shared_layout_tracks_composer_height_and_preserves_region_boundaries() {
-    let mut state = test_state();
-    let area = Rect::new(0, 0, 60, 20);
-    let compact = AppLayout::new(area, &state);
-    state.push_input("one\ntwo\nthree\nfour");
-    let expanded = AppLayout::new(area, &state);
-
-    assert_eq!(compact.header, Rect::new(0, 0, 60, 1));
-    assert!(expanded.composer.height > compact.composer.height);
-    assert!(expanded.transcript.height < compact.transcript.height);
-    assert_eq!(expanded.header.bottom(), expanded.transcript.y);
-    assert_eq!(expanded.transcript.bottom(), expanded.status.y);
-    assert_eq!(expanded.status.bottom(), expanded.composer.y);
-    assert_eq!(expanded.composer.bottom(), area.bottom());
-}
-
-fn scroll_to_oldest(state: &mut AppState, layout: AppLayout) {
-    loop {
-        let limit = transcript::next_scroll_limit(state, layout.transcript);
-        state.set_transcript_scroll_limit(limit);
-        if !state.scroll_events_up() {
-            break;
-        }
-    }
-
-    assert!(state.scroll_offset() > 0);
-    assert!(!state.is_following_events());
-}
-
-fn assert_new_tail_visible(state: &AppState, layout: AppLayout, marker: &str) {
-    let rows = transcript::lines(
-        state,
-        layout.transcript.height as usize,
-        layout.transcript.width as usize,
-    );
-    assert!(rows.iter().any(|line| line.to_string().contains(marker)));
-}
-
-#[test]
-fn terminal_growth_reconciles_scroll_state_and_follows_new_tail() {
-    let mut state = test_state();
-    state.push_card("Transcript", (0..10).map(|index| format!("line {index}")));
-    let short_layout = AppLayout::new(Rect::new(0, 0, 80, 9), &state);
-    scroll_to_oldest(&mut state, short_layout);
-
-    let tall_layout = AppLayout::new(Rect::new(0, 0, 80, 40), &state);
-    assert_eq!(
-        transcript::current_scroll_limit(&state, tall_layout.transcript),
-        0
-    );
-    reconcile_layout_transition(&mut state, short_layout, tall_layout);
-
-    assert_eq!(state.scroll_offset(), 0);
-    assert!(state.is_following_events());
-    state.push_card("Notice", ["TERMINAL_GROWTH_TAIL".to_string()]);
-    assert_new_tail_visible(&state, tall_layout, "TERMINAL_GROWTH_TAIL");
-}
-
-#[test]
-fn composer_shrink_reconciles_scroll_state_and_follows_new_tail() {
-    let mut state = test_state();
-    state.push_card("Transcript", (0..10).map(|index| format!("line {index}")));
-    state.push_input(&"composer line\n".repeat(20));
-    let area = Rect::new(0, 0, 80, 25);
-    let expanded_composer_layout = AppLayout::new(area, &state);
-    scroll_to_oldest(&mut state, expanded_composer_layout);
-
-    assert!(state.take_submitted_input().is_some());
-    let shrunk_composer_layout = AppLayout::new(area, &state);
-    assert!(shrunk_composer_layout.transcript.height > expanded_composer_layout.transcript.height);
-    assert_eq!(
-        transcript::current_scroll_limit(&state, shrunk_composer_layout.transcript),
-        0
-    );
-    reconcile_layout_transition(&mut state, expanded_composer_layout, shrunk_composer_layout);
-
-    assert_eq!(state.scroll_offset(), 0);
-    assert!(state.is_following_events());
-    state.push_card("Notice", ["COMPOSER_SHRINK_TAIL".to_string()]);
-    assert_new_tail_visible(&state, shrunk_composer_layout, "COMPOSER_SHRINK_TAIL");
 }
 
 #[test]
@@ -719,7 +489,7 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
 }
 
 #[test]
-fn production_draw_with_typed_input_does_not_scale_with_full_transcript_history() {
+fn draw_with_typed_input_does_not_scale_with_full_transcript_history() {
     fn state_with_transcript_entries(entries: usize) -> AppState {
         let mut state = test_state();
         for index in 0..entries {
@@ -728,25 +498,24 @@ fn production_draw_with_typed_input_does_not_scale_with_full_transcript_history(
             } else {
                 format!("transcript entry {index:05} filler text for redraw scaling")
             };
-            state.push_card("Notice", [content]);
+            state.apply_workflow_event(WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentResponse {
+                    step_id: "review".to_string(),
+                    content,
+                },
+            ));
         }
-
-        assert_eq!(state.event_entries().len(), entries);
 
         state.push_input("typed input stays responsive");
         state
     }
 
-    fn timed_draw(state: &mut AppState) -> (std::time::Duration, String) {
+    fn timed_draw(state: &AppState) -> (std::time::Duration, String) {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        let mut layout = AppLayout::new(Rect::default(), state);
         let started = std::time::Instant::now();
-        terminal
-            .draw(|frame| {
-                layout = draw_production_frame(frame, state, layout);
-            })
-            .unwrap();
+        terminal.draw(|frame| draw(frame, state)).unwrap();
         let elapsed = started.elapsed();
         let rendered =
             terminal
@@ -762,11 +531,11 @@ fn production_draw_with_typed_input_does_not_scale_with_full_transcript_history(
         (elapsed, rendered)
     }
 
-    let mut short_state = state_with_transcript_entries(64);
-    let mut long_state = state_with_transcript_entries(20_000);
+    let short_state = state_with_transcript_entries(64);
+    let long_state = state_with_transcript_entries(20_000);
 
-    let (short_draw, short_rendered) = timed_draw(&mut short_state);
-    let (long_draw, long_rendered) = timed_draw(&mut long_state);
+    let (short_draw, short_rendered) = timed_draw(&short_state);
+    let (long_draw, long_rendered) = timed_draw(&long_state);
     let budget = short_draw
         .checked_mul(8)
         .unwrap_or(std::time::Duration::MAX)
@@ -820,39 +589,6 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
     assert!(
         rows.iter()
             .any(|row| row.contains("┌ Enter answers active prompt")),
-        "{rendered}"
-    );
-    assert!(
-        rows.last().is_some_and(|row| row.starts_with('└')),
-        "{rendered}"
-    );
-}
-
-#[test]
-fn draw_shows_transcript_scrollbar_without_overwriting_status_or_composer() {
-    let mut state = test_state();
-    for index in 0..30 {
-        state.push_card("Notice", [format!("overflowing transcript entry {index}")]);
-    }
-
-    let area = Rect::new(0, 0, 40, 14);
-    let layout = AppLayout::new(area, &state);
-    let rows = rendered_rows(&state, area.width, area.height);
-    let rendered = rows.join("\n");
-    let scrollbar_column = usize::from(layout.transcript.right() - 1);
-
-    assert!(
-        rows[usize::from(layout.transcript.y)..usize::from(layout.transcript.bottom())]
-            .iter()
-            .any(|row| row.chars().nth(scrollbar_column) == Some('█')),
-        "{rendered}"
-    );
-    assert!(
-        rows[usize::from(layout.status.y)].starts_with('○'),
-        "{rendered}"
-    );
-    assert!(
-        rows[usize::from(layout.composer.y)].starts_with('┌'),
         "{rendered}"
     );
     assert!(

@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
@@ -9,154 +9,29 @@ use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 use super::super::state::{AppState, TranscriptEntry, render_pending_prompt_lines};
 use super::super::styles::{style_accent, style_muted, style_transcript_normal};
 
-#[derive(Debug)]
-struct TranscriptViewport {
-    rows: Vec<Line<'static>>,
-    effective_offset: usize,
-    older_overflow: bool,
-    newer_overflow: bool,
-    content_length: usize,
-}
-
-impl TranscriptViewport {
-    fn has_overflow(&self) -> bool {
-        self.older_overflow || self.newer_overflow
-    }
-}
-
-#[derive(Debug)]
-struct BoundedVisualRows {
-    rows: Vec<Line<'static>>,
-    older_unmeasured: bool,
-}
-
-#[derive(Debug)]
-struct EntryVisualRows {
-    rows: Vec<Line<'static>>,
-    older_unmeasured: bool,
-}
-
 pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
     let visible_height = area.height as usize;
-    let (content_area, viewport) = content_viewport(state, area, state.scroll_offset());
-    let show_scrollbar = content_area != area;
-    let scrollbar_position = scrollbar_position(&viewport, visible_height);
-
-    frame.render_widget(Paragraph::new(viewport.rows), content_area);
-
-    if show_scrollbar {
-        let scrollbar_area = Rect {
-            x: area.right() - 1,
-            width: 1,
-            ..area
-        };
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .thumb_symbol("█")
-            .thumb_style(style_accent())
-            .track_symbol(Some("│"))
-            .track_style(style_muted());
-        let mut scrollbar_state = ScrollbarState::new(viewport.content_length)
-            .position(scrollbar_position)
-            .viewport_content_length(visible_height);
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
+    let inner_width = usize::from(area.width).max(1);
+    let transcript = Paragraph::new(lines(state, visible_height, inner_width));
+    frame.render_widget(transcript, area);
 }
 
-pub(in crate::app) fn next_scroll_limit(state: &AppState, area: Rect) -> usize {
-    content_viewport(state, area, state.next_scroll_offset())
-        .1
-        .effective_offset
-}
-
-pub(in crate::app) fn current_scroll_limit(state: &AppState, area: Rect) -> usize {
-    content_viewport(state, area, state.scroll_offset())
-        .1
-        .effective_offset
-}
-
-fn content_viewport(
-    state: &AppState,
-    area: Rect,
-    requested_offset: usize,
-) -> (Rect, TranscriptViewport) {
-    let visible_height = area.height as usize;
-    let full_viewport =
-        viewport_at_offset(state, visible_height, area.width as usize, requested_offset);
-    if area.width < 2 || !full_viewport.has_overflow() {
-        return (area, full_viewport);
-    }
-
-    let content_area = Rect {
-        width: area.width - 1,
-        ..area
-    };
-    let viewport = viewport_at_offset(
-        state,
-        visible_height,
-        content_area.width as usize,
-        requested_offset,
-    );
-    (content_area, viewport)
-}
-
-fn scrollbar_position(viewport: &TranscriptViewport, visible_height: usize) -> usize {
-    let maximum_offset = viewport.content_length.saturating_sub(visible_height);
-    if maximum_offset == 0 {
-        return 0;
-    }
-
-    maximum_offset
-        .saturating_sub(viewport.effective_offset)
-        .saturating_mul(viewport.content_length.saturating_sub(1))
-        / maximum_offset
-}
-
-#[cfg(test)]
 pub(in crate::app) fn lines(
     state: &AppState,
     max_visible_lines: usize,
     wrap_width: usize,
 ) -> Vec<Line<'static>> {
-    viewport(state, max_visible_lines, wrap_width).rows
-}
-
-#[cfg(test)]
-fn viewport(state: &AppState, max_visible_lines: usize, wrap_width: usize) -> TranscriptViewport {
-    viewport_at_offset(state, max_visible_lines, wrap_width, state.scroll_offset())
-}
-
-fn viewport_at_offset(
-    state: &AppState,
-    max_visible_lines: usize,
-    wrap_width: usize,
-    requested_offset: usize,
-) -> TranscriptViewport {
     if max_visible_lines == 0 || wrap_width == 0 {
-        return TranscriptViewport {
-            rows: Vec::new(),
-            effective_offset: 0,
-            older_overflow: false,
-            newer_overflow: false,
-            content_length: 0,
-        };
+        return Vec::new();
     }
 
-    let bounded = if state.event_log_is_empty() {
-        BoundedVisualRows {
-            rows: visual_rows(empty_lines(), wrap_width),
-            older_unmeasured: false,
-        }
+    let rows = if state.event_log_is_empty() {
+        visual_rows(empty_lines(), wrap_width)
     } else {
-        bounded_tail_visual_rows(state, max_visible_lines, wrap_width, requested_offset)
+        bounded_tail_visual_rows(state, max_visible_lines, wrap_width)
     };
 
-    select_viewport(bounded, max_visible_lines, requested_offset)
+    visible_rows(rows, max_visible_lines, state.scroll_offset())
 }
 
 fn visual_rows(logical_lines: Vec<Line<'static>>, wrap_width: usize) -> Vec<Line<'static>> {
@@ -166,47 +41,29 @@ fn visual_rows(logical_lines: Vec<Line<'static>>, wrap_width: usize) -> Vec<Line
         .collect()
 }
 
-fn select_viewport(
-    bounded: BoundedVisualRows,
+fn visible_rows(
+    rows: Vec<Line<'static>>,
     max_visible_lines: usize,
-    requested_offset: usize,
-) -> TranscriptViewport {
-    let BoundedVisualRows {
-        rows,
-        older_unmeasured,
-    } = bounded;
-    let max_offset = if older_unmeasured {
-        requested_offset
-    } else {
-        rows.len().saturating_sub(max_visible_lines)
-    };
-    let effective_offset = requested_offset.min(max_offset);
-    let end = rows.len().saturating_sub(effective_offset);
-    let start = end.saturating_sub(max_visible_lines);
-    let older_overflow = older_unmeasured || start > 0;
-    let newer_overflow = end < rows.len();
-    let unmeasured_sentinel = usize::from(older_unmeasured);
-    let content_length = rows.len().saturating_add(unmeasured_sentinel);
-
-    TranscriptViewport {
-        rows: rows[start..end].to_vec(),
-        effective_offset,
-        older_overflow,
-        newer_overflow,
-        content_length,
+    scroll_offset: usize,
+) -> Vec<Line<'static>> {
+    if rows.len() <= max_visible_lines {
+        return rows;
     }
+
+    let offset = scroll_offset.min(rows.len().saturating_sub(1));
+    let end = rows.len().saturating_sub(offset).max(1);
+    let start = end.saturating_sub(max_visible_lines);
+    rows[start..end].to_vec()
 }
 
 fn bounded_tail_visual_rows(
     state: &AppState,
     max_visible_lines: usize,
     wrap_width: usize,
-    requested_offset: usize,
-) -> BoundedVisualRows {
-    let target_rows = max_visible_lines.saturating_add(requested_offset);
+) -> Vec<Line<'static>> {
+    let target_rows = max_visible_lines.saturating_add(state.scroll_offset());
     let mut chunks = Vec::new();
     let mut row_count = 0usize;
-    let mut older_unmeasured = false;
 
     let mut prompt_id_to_skip = None;
     if let Some(prompt) = state.pending_prompt()
@@ -223,27 +80,18 @@ fn bounded_tail_visual_rows(
             continue;
         }
         if row_count >= target_rows {
-            older_unmeasured = true;
             break;
         }
 
-        let mut entry_rows =
+        let mut rows =
             entry_tail_visual_rows(entry, target_rows.saturating_sub(row_count), wrap_width);
-        older_unmeasured |= entry_rows.older_unmeasured;
-        entry_rows.rows.push(Line::from(""));
-        row_count = row_count.saturating_add(entry_rows.rows.len());
-        chunks.push(entry_rows.rows);
-
-        if older_unmeasured {
-            break;
-        }
+        rows.push(Line::from(""));
+        row_count = row_count.saturating_add(rows.len());
+        chunks.push(rows);
     }
 
     chunks.reverse();
-    BoundedVisualRows {
-        rows: chunks.into_iter().flatten().collect(),
-        older_unmeasured,
-    }
+    chunks.into_iter().flatten().collect()
 }
 
 fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
@@ -273,20 +121,13 @@ fn entry_tail_visual_rows(
     entry: &TranscriptEntry,
     rows_needed: usize,
     wrap_width: usize,
-) -> EntryVisualRows {
+) -> Vec<Line<'static>> {
     match entry {
         TranscriptEntry::Workflow(event) => {
-            stream_event_tail_visual_rows(event, rows_needed, wrap_width).unwrap_or_else(|| {
-                EntryVisualRows {
-                    rows: entry.render_lines_for_width(wrap_width),
-                    older_unmeasured: false,
-                }
-            })
+            stream_event_tail_visual_rows(event, rows_needed, wrap_width)
+                .unwrap_or_else(|| entry.render_lines_for_width(wrap_width))
         }
-        TranscriptEntry::Card { .. } => EntryVisualRows {
-            rows: entry.render_lines_for_width(wrap_width),
-            older_unmeasured: false,
-        },
+        TranscriptEntry::Card { .. } => entry.render_lines_for_width(wrap_width),
     }
 }
 
@@ -294,7 +135,7 @@ fn stream_event_tail_visual_rows(
     event: &WorkflowEvent,
     rows_needed: usize,
     wrap_width: usize,
-) -> Option<EntryVisualRows> {
+) -> Option<Vec<Line<'static>>> {
     let retained_body_rows = rows_needed.saturating_add(2).max(1);
     let retained_body = match &event.kind {
         WorkflowEventKind::AgentResponse { content, .. }
@@ -315,10 +156,7 @@ fn stream_event_tail_visual_rows(
         _ => return None,
     }
 
-    Some(EntryVisualRows {
-        rows: TranscriptEntry::Workflow(event).render_lines_for_width(wrap_width),
-        older_unmeasured: true,
-    })
+    Some(TranscriptEntry::Workflow(event).render_lines_for_width(wrap_width))
 }
 
 fn stream_content(event: &WorkflowEvent) -> Option<&str> {
@@ -464,31 +302,6 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    fn rendered_rows(state: &AppState, height: u16, width: u16) -> Vec<String> {
-        let backend = ratatui::backend::TestBackend::new(width, height);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                let area = frame.area();
-                render(frame, area, state);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let width = buffer.area.width as usize;
-        buffer
-            .content
-            .chunks(width)
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect()
-    }
-
-    fn scrollbar_column(state: &AppState, height: u16, width: u16) -> Vec<String> {
-        rendered_rows(state, height, width)
-            .into_iter()
-            .map(|row| row.chars().last().unwrap_or(' ').to_string())
-            .collect()
     }
 
     #[test]
@@ -790,129 +603,5 @@ mod tests {
                 && refollowing.iter().any(|line| line.contains("IL")),
             "{refollowing:?}"
         );
-    }
-
-    #[test]
-    fn overflowing_content_reserves_rightmost_scrollbar_column() {
-        let mut state = test_state();
-        state.apply_workflow_event(WorkflowEvent::new(
-            "run-2",
-            WorkflowEventKind::AgentResponse {
-                step_id: "review".to_string(),
-                content: format!("{} END_MARKER", "wrapped transcript text ".repeat(30)),
-            },
-        ));
-
-        let rows = rendered_rows(&state, 8, 24);
-        let scrollbar = scrollbar_column(&state, 8, 24);
-
-        assert!(scrollbar.iter().any(|symbol| symbol == "█"), "{rows:?}");
-        assert!(
-            scrollbar
-                .iter()
-                .all(|symbol| matches!(symbol.as_str(), "█" | "│" | " ")),
-            "{rows:?}"
-        );
-        assert!(
-            rows.iter().all(|row| !row.ends_with("END_MARKER")),
-            "{rows:?}"
-        );
-    }
-
-    #[test]
-    fn scrollbar_thumb_moves_up_and_returns_to_bottom() {
-        let mut state = test_state();
-        for index in 0..20 {
-            state.push_card("Notice", [format!("transcript row {index}")]);
-        }
-
-        let following = scrollbar_column(&state, 10, 40);
-        assert_eq!(following.last().map(String::as_str), Some("█"));
-        let following_bottom = following.iter().rposition(|symbol| symbol == "█").unwrap();
-
-        assert!(state.scroll_events_up());
-        let scrolled = scrollbar_column(&state, 10, 40);
-        let scrolled_bottom = scrolled.iter().rposition(|symbol| symbol == "█").unwrap();
-
-        assert!(
-            scrolled_bottom < following_bottom,
-            "{following:?}\n{scrolled:?}"
-        );
-        assert!(state.scroll_events_down());
-        assert_eq!(scrollbar_column(&state, 10, 40), following);
-    }
-
-    #[test]
-    fn one_long_stream_reports_unmeasured_older_overflow() {
-        let mut state = test_state();
-        state.apply_workflow_event(WorkflowEvent::new(
-            "run-2",
-            WorkflowEventKind::AgentThought {
-                step_id: "review".to_string(),
-                content: "0123456789".repeat(2_000),
-            },
-        ));
-
-        let following = viewport(&state, 6, 20);
-        assert!(following.older_overflow);
-        assert!(!following.newer_overflow);
-        assert_eq!(following.effective_offset, 0);
-        assert!(following.content_length > following.rows.len());
-        assert!(
-            scrollbar_column(&state, 6, 20)
-                .iter()
-                .any(|symbol| symbol == "█")
-        );
-
-        assert!(state.scroll_events_up());
-        let scrolled = viewport(&state, 6, 20);
-        assert_eq!(scrolled.effective_offset, 10);
-        assert!(scrolled.older_overflow);
-        assert!(scrolled.newer_overflow);
-    }
-
-    #[test]
-    fn earlier_entries_report_bounded_older_overflow() {
-        let mut state = test_state();
-        for index in 0..100 {
-            state.push_card("Notice", [format!("entry {index}")]);
-        }
-
-        let viewport = viewport(&state, 6, 40);
-
-        assert!(viewport.older_overflow);
-        assert!(!viewport.newer_overflow);
-        assert!(viewport.content_length > viewport.rows.len());
-    }
-
-    #[test]
-    fn short_content_has_no_scrollbar() {
-        let mut state = test_state();
-        state.push_card("Notice", ["short".to_string()]);
-
-        let viewport = viewport(&state, 20, 40);
-        let column = scrollbar_column(&state, 20, 40);
-
-        assert!(!viewport.has_overflow());
-        assert!(column.iter().all(|symbol| symbol != "█"), "{column:?}");
-    }
-
-    #[test]
-    fn zero_height_and_one_column_transcript_areas_are_safe() {
-        assert!(viewport(&test_state(), 0, 20).rows.is_empty());
-        assert!(viewport(&test_state(), 10, 0).rows.is_empty());
-
-        let mut state = test_state();
-        state.apply_workflow_event(WorkflowEvent::new(
-            "run-2",
-            WorkflowEventKind::AgentResponse {
-                step_id: "review".to_string(),
-                content: "long content ".repeat(100),
-            },
-        ));
-
-        let rows = rendered_rows(&state, 5, 1);
-        assert_eq!(rows.len(), 5);
-        assert!(rows.iter().all(|row| row.chars().count() == 1));
     }
 }

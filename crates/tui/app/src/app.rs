@@ -5,8 +5,7 @@ use anyhow::Result;
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
 };
 
 #[cfg(not(windows))]
@@ -19,7 +18,7 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 
 use crate::config::AppConfig;
 
@@ -65,122 +64,58 @@ fn tui_input_cursor_style() -> SetCursorStyle {
 }
 
 struct TerminalModeGuard {
-    raw_mode_active: bool,
-    screen_active: bool,
+    restored: bool,
     keyboard_enhancement_active: bool,
 }
 
 impl TerminalModeGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        let mut guard = Self {
-            raw_mode_active: true,
-            screen_active: false,
-            keyboard_enhancement_active: false,
-        };
 
         let mut stdout = io::stdout();
-        guard
-            .activate_screen(|| enter_terminal_screen(&mut stdout).map_err(anyhow::Error::from))?;
-        guard.activate_keyboard(|| push_keyboard_enhancement_flags(&mut stdout))?;
-        Ok(guard)
-    }
+        if let Err(err) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            tui_input_cursor_style()
+        ) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
 
-    fn activate_screen(&mut self, activate: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.screen_active = true;
-        activate()
-    }
+        let keyboard_enhancement_active = match push_keyboard_enhancement_flags(&mut stdout) {
+            Ok(active) => active,
+            Err(err) => {
+                let _ = disable_raw_mode();
+                return Err(err);
+            }
+        };
 
-    fn activate_keyboard(&mut self, activate: impl FnOnce() -> Result<bool>) -> Result<()> {
-        self.keyboard_enhancement_active = true;
-        self.keyboard_enhancement_active = activate()?;
-        Ok(())
+        Ok(Self {
+            restored: false,
+            keyboard_enhancement_active,
+        })
     }
 
     fn restore(&mut self) -> Result<()> {
-        self.restore_with(
-            || disable_raw_mode().map_err(anyhow::Error::from),
-            || {
-                let mut stdout = io::stdout();
-                pop_keyboard_enhancement_flags(&mut stdout, true)
-            },
-            || {
-                let mut stdout = io::stdout();
-                restore_terminal_screen(&mut stdout).map_err(anyhow::Error::from)
-            },
-        )
-    }
-
-    fn restore_with(
-        &mut self,
-        disable_raw: impl FnOnce() -> Result<()>,
-        pop_keyboard_enhancement: impl FnOnce() -> Result<()>,
-        restore_screen: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        let mut first_error = None;
-
-        if self.raw_mode_active {
-            match disable_raw() {
-                Ok(()) => self.raw_mode_active = false,
-                Err(err) => first_error = Some(err),
-            }
+        if self.restored {
+            return Ok(());
         }
 
-        if self.keyboard_enhancement_active {
-            match pop_keyboard_enhancement() {
-                Ok(()) => self.keyboard_enhancement_active = false,
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-
-        if self.screen_active {
-            match restore_screen() {
-                Ok(()) => self.screen_active = false,
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-
-        first_error.map_or(Ok(()), Err)
-    }
-
-    fn is_restored(&self) -> bool {
-        !self.raw_mode_active && !self.screen_active && !self.keyboard_enhancement_active
-    }
-}
-
-fn enter_terminal_screen(stdout: &mut impl io::Write) -> io::Result<()> {
-    let result = (|| {
-        execute!(stdout, EnterAlternateScreen)?;
-        execute!(stdout, EnableBracketedPaste)?;
-        execute!(stdout, EnableMouseCapture)?;
-        execute!(stdout, tui_input_cursor_style())?;
+        disable_raw_mode()?;
+        let mut stdout = io::stdout();
+        pop_keyboard_enhancement_flags(&mut stdout, self.keyboard_enhancement_active)?;
+        self.keyboard_enhancement_active = false;
+        execute!(
+            stdout,
+            DisableBracketedPaste,
+            LeaveAlternateScreen,
+            SetCursorStyle::DefaultUserShape,
+            Show
+        )?;
+        self.restored = true;
         Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = restore_terminal_screen(stdout);
     }
-
-    result
-}
-
-fn restore_terminal_screen(stdout: &mut impl io::Write) -> io::Result<()> {
-    execute!(
-        stdout,
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen,
-        SetCursorStyle::DefaultUserShape,
-        Show
-    )
 }
 
 #[cfg(not(windows))]
@@ -217,42 +152,12 @@ fn pop_keyboard_enhancement_flags(_stdout: &mut io::Stdout, _active: bool) -> Re
 
 impl Drop for TerminalModeGuard {
     fn drop(&mut self) {
-        if self.is_restored() {
+        if self.restored {
             return;
         }
 
         if let Err(err) = self.restore() {
             tracing::error!(error = ?err, "failed to restore terminal after TUI exit");
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct AppLayout {
-    header: Rect,
-    transcript: Rect,
-    status: Rect,
-    composer: Rect,
-}
-
-impl AppLayout {
-    fn new(area: Rect, state: &AppState) -> Self {
-        let composer_height = composer::height(state, area.height, area.width);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(composer_height),
-            ])
-            .split(area);
-
-        Self {
-            header: chunks[0],
-            transcript: chunks[1],
-            status: chunks[2],
-            composer: chunks[3],
         }
     }
 }
@@ -297,7 +202,6 @@ where
     B::Error: Send + Sync + 'static,
 {
     let mut draw_scheduler = DrawScheduler::new();
-    let mut current_layout = AppLayout::new(Rect::default(), &state);
     loop {
         draw_scheduler.mark_dirty_if(state.drain_workflow_events(workflow_events));
         draw_scheduler.mark_dirty_if(state.drain_background_tasks().await);
@@ -305,13 +209,10 @@ where
             return Ok(());
         }
         if draw_scheduler.should_draw() {
-            if let Err(err) = terminal.draw(|frame| {
-                current_layout = draw_production_frame(frame, &mut state, current_layout);
-            }) {
+            if let Err(err) = terminal.draw(|frame| draw(frame, &state)) {
                 tracing::error!(error = ?err, "TUI draw failed");
                 return Err(err.into());
             }
-
             draw_scheduler.mark_clean();
         }
 
@@ -346,7 +247,7 @@ where
                     input_chars = state.input().chars().count(),
                     "TUI key received"
                 );
-                match input::handle_key_press_with_layout(&mut state, key, current_layout) {
+                match input::handle_key_press(&mut state, key) {
                     KeyHandling::Continue => draw_scheduler.mark_dirty(),
                     KeyHandling::Submit => {
                         commands::submit_input(&mut state, runtime).await;
@@ -354,13 +255,6 @@ where
                     }
                     KeyHandling::Exit => return Ok(()),
                 }
-            }
-            Event::Mouse(mouse) => {
-                draw_scheduler.mark_dirty_if(input::handle_mouse_event(
-                    &mut state,
-                    mouse,
-                    current_layout,
-                ));
             }
             Event::Resize(_, _) => draw_scheduler.mark_dirty(),
             event => {
@@ -401,45 +295,23 @@ fn key_code_name(code: &KeyCode) -> &'static str {
         KeyCode::Modifier(_) => "modifier",
     }
 }
-
-fn draw_production_frame(
-    frame: &mut ratatui::Frame<'_>,
-    state: &mut AppState,
-    previous_layout: AppLayout,
-) -> AppLayout {
-    let layout = AppLayout::new(frame.area(), state);
-    reconcile_layout_transition(state, previous_layout, layout);
-    draw_with_layout(frame, state, layout);
-    layout
-}
-
-fn reconcile_layout_transition(
-    state: &mut AppState,
-    previous_layout: AppLayout,
-    layout: AppLayout,
-) {
-    if previous_layout.transcript == layout.transcript
-        || layout.transcript.width == 0
-        || layout.transcript.height == 0
-    {
-        return;
-    }
-
-    let limit = transcript::current_scroll_limit(state, layout.transcript);
-    state.set_transcript_scroll_limit(limit);
-}
-
-#[cfg(test)]
 fn draw(frame: &mut ratatui::Frame<'_>, state: &AppState) {
-    let layout = AppLayout::new(frame.area(), state);
-    draw_with_layout(frame, state, layout);
-}
+    let area = frame.area();
+    let composer_height = composer::height(state, area.height, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(composer_height),
+        ])
+        .split(area);
 
-fn draw_with_layout(frame: &mut ratatui::Frame<'_>, state: &AppState, layout: AppLayout) {
-    header::render(frame, layout.header, state);
-    transcript::render(frame, layout.transcript, state);
-    status::render(frame, layout.status, state);
-    composer::render(frame, layout.composer, state);
+    header::render(frame, chunks[0], state);
+    transcript::render(frame, chunks[1], state);
+    status::render(frame, chunks[2], state);
+    composer::render(frame, chunks[3], state);
 }
 
 #[cfg(test)]
