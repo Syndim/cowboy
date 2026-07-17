@@ -5,15 +5,17 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent};
+use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent, StopReason};
 use cowboy_workflow_core::{
-    AgentAction, ExecutionContext, RoleDefinition, RoleId, RoleSession, RunId, RunStore,
-    StepDetail, StepInput, StepRecord, TurnRecord, WorkflowError,
+    AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow,
+    CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
+    RoleDefinition, RoleId, RoleSession, RunId, RunStore, StepDetail, StepInput, StepRecord,
+    TurnRecord, WorkflowError, ordered_user_inputs_from_parts,
 };
 use tokio::sync::Mutex;
 
 use crate::frontmatter::parse_frontmatter_output;
-use crate::prompt::build_agent_prompt;
+use crate::prompt::{build_agent_prompt, build_correction_prompt};
 use crate::{Error, Result};
 
 pub type ProgressSink = Arc<dyn Fn(AgentProgress) + Send + Sync>;
@@ -57,6 +59,36 @@ pub enum AgentProgressKind {
     Plan {
         entries: Vec<serde_json::Value>,
     },
+    PromptWindowOpened {
+        role: String,
+        window_id: String,
+    },
+    PromptWindowClosed {
+        role: String,
+        window_id: String,
+    },
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptWindowHandoffPoint {
+    BeforeCompareAndSeal {
+        run_id: RunId,
+        window_id: String,
+        applied_sequence: u64,
+    },
+    AfterCompareAndSeal {
+        run_id: RunId,
+        window_id: String,
+        applied_sequence: u64,
+        pending: bool,
+    },
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+pub trait PromptWindowHandoffObserver: Send + Sync {
+    async fn observe(&self, point: PromptWindowHandoffPoint);
 }
 
 /// Configuration shared by agent client sessions created for workflow roles.
@@ -68,16 +100,24 @@ pub struct AgentExecutionConfig {
     pub mcp_servers: Vec<serde_json::Value>,
     /// Optional progress sink for streaming UI-visible agent/tool updates.
     pub progress: Option<ProgressSink>,
+    #[cfg(feature = "test-support")]
+    /// Optional observer used by deterministic handoff-boundary tests.
+    pub handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
 
 impl fmt::Debug for AgentExecutionConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentExecutionConfig")
+        let mut debug = formatter.debug_struct("AgentExecutionConfig");
+        debug
             .field("cwd", &self.cwd)
             .field("mcp_servers", &self.mcp_servers)
-            .field("progress", &self.progress.as_ref().map(|_| "<sink>"))
-            .finish()
+            .field("progress", &self.progress.as_ref().map(|_| "<sink>"));
+        #[cfg(feature = "test-support")]
+        debug.field(
+            "handoff_observer",
+            &self.handoff_observer.as_ref().map(|_| "<observer>"),
+        );
+        debug.finish()
     }
 }
 
@@ -87,6 +127,8 @@ impl Default for AgentExecutionConfig {
             cwd: ".".to_string(),
             mcp_servers: Vec::new(),
             progress: None,
+            #[cfg(feature = "test-support")]
+            handoff_observer: None,
         }
     }
 }
@@ -132,6 +174,59 @@ pub struct AgentExecutor<F, S> {
     store: Arc<S>,
     config: AgentExecutionConfig,
     clients: Arc<Mutex<HashMap<RoleSessionKey, ActiveClient>>>,
+}
+
+struct PromptWindowGuard<S: RunStore> {
+    store: Arc<S>,
+    context: ExecutionContext,
+    role: String,
+    window_id: String,
+    progress: Option<ProgressSink>,
+    closed: bool,
+}
+
+impl<S: RunStore> PromptWindowGuard<S> {
+    fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        emit_progress_kind(
+            self.progress.as_ref(),
+            &self.context,
+            AgentProgressKind::PromptWindowClosed {
+                role: self.role.clone(),
+                window_id: self.window_id.clone(),
+            },
+        );
+    }
+}
+
+impl<S: RunStore> Drop for PromptWindowGuard<S> {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        match self.store.abort_agent_prompt_window(
+            &self.context.run_id,
+            &self.window_id,
+            Utc::now(),
+        ) {
+            Ok(
+                AbortAgentPromptWindowOutcome::Aborted(_)
+                | AbortAgentPromptWindowOutcome::NoWindow
+                | AbortAgentPromptWindowOutcome::StaleWindow
+                | AbortAgentPromptWindowOutcome::MissingRun,
+            ) => {}
+            Err(err) => tracing::warn!(
+                run_id = %self.context.run_id,
+                window_id = %self.window_id,
+                error = %err,
+                "failed to abort agent prompt window"
+            ),
+        }
+        self.close();
+    }
 }
 
 impl<F, S> AgentExecutor<F, S> {
@@ -190,7 +285,12 @@ where
 
         let started_at = Utc::now();
         let start = Instant::now();
-        let base_prompt = build_agent_prompt(role, &action);
+        let user_inputs = ordered_user_inputs_from_parts(
+            &context.original_request,
+            context.run_created_at,
+            &context.user_prompts,
+        );
+        let base_prompt = build_agent_prompt(role, &action, &user_inputs);
         let prompt = if context.attempt > 1 {
             format!(
                 "{base_prompt}\n\n{}",
@@ -199,21 +299,11 @@ where
         } else {
             base_prompt
         };
-        let mut visible = String::new();
-        let mut turns = Vec::new();
-        let mut tool_titles = HashMap::new();
         let mut clients = self.clients.lock().await;
         let active = clients
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
         let session_id = self.ensure_session(active, &key).await?;
-        tracing::debug!(
-            run_id = %context.run_id,
-            step = %context.step_id,
-            role = %action.role,
-            session_id = %session_id,
-            "agent step: session ready"
-        );
         emit_progress_kind(
             self.config.progress.as_ref(),
             &context,
@@ -222,6 +312,61 @@ where
                 session_id: session_id.clone(),
             },
         );
+
+        let window_id = format!("prompt-window-{}", uuid::Uuid::new_v4());
+        let expected_baseline = context
+            .user_prompts
+            .last()
+            .map(|prompt| prompt.sequence)
+            .unwrap_or(0);
+        let opened = self
+            .store
+            .open_agent_prompt_window(AgentPromptWindow {
+                window_id: window_id.clone(),
+                run_id: context.run_id.clone(),
+                step_record_id: context.step_record_id.clone(),
+                step_id: context.step_id.clone(),
+                role_id: action.role.clone(),
+                baseline_sequence: expected_baseline,
+                applied_sequence: expected_baseline,
+                opened_at: Utc::now(),
+                sealed_at: None,
+            })
+            .map_err(Error::from)?;
+        let OpenAgentPromptWindowOutcome::Opened(window) = opened else {
+            return Err(WorkflowError::InvalidAction(format!(
+                "cannot open agent prompt window for run {:?}: {opened:?}",
+                context.run_id
+            ))
+            .into());
+        };
+        if window.baseline_sequence != expected_baseline {
+            let _ = self
+                .store
+                .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now());
+            return Err(WorkflowError::InvalidAction(format!(
+                "agent prompt baseline changed from {expected_baseline} to {} before opening",
+                window.baseline_sequence
+            ))
+            .into());
+        }
+        emit_progress_kind(
+            self.config.progress.as_ref(),
+            &context,
+            AgentProgressKind::PromptWindowOpened {
+                role: action.role.clone(),
+                window_id: window_id.clone(),
+            },
+        );
+        let mut window_guard = PromptWindowGuard {
+            store: self.store.clone(),
+            context: context.clone(),
+            role: action.role.clone(),
+            window_id: window_id.clone(),
+            progress: self.config.progress.clone(),
+            closed: false,
+        };
+
         emit_progress_kind(
             self.config.progress.as_ref(),
             &context,
@@ -231,25 +376,112 @@ where
                 prompt: prompt.clone(),
             },
         );
-        let progress = self.config.progress.clone();
-        let stop_reason = active
-            .client
-            .prompt(
-                &session_id,
-                vec![PromptContent::text(prompt.clone())],
-                &mut |event| {
-                    collect_event(
+        let mut turn_cursor = TurnCursor::default();
+        let (mut visible, mut turns, stop_reason) = run_prompt_turn(
+            active.client.as_mut(),
+            &session_id,
+            vec![PromptContent::text(prompt.clone())],
+            &context,
+            self.config.progress.clone(),
+            &mut turn_cursor,
+        )
+        .await?;
+        tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
+
+        let mut applied_sequence = expected_baseline;
+        let mut correction_turns = Vec::new();
+        loop {
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.config.handoff_observer {
+                observer
+                    .observe(PromptWindowHandoffPoint::BeforeCompareAndSeal {
+                        run_id: context.run_id.clone(),
+                        window_id: window_id.clone(),
+                        applied_sequence,
+                    })
+                    .await;
+            }
+            let outcome = self
+                .store
+                .compare_and_seal_agent_prompt_window(
+                    &context.run_id,
+                    &window_id,
+                    applied_sequence,
+                    Utc::now(),
+                )
+                .map_err(Error::from)?;
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.config.handoff_observer {
+                observer
+                    .observe(PromptWindowHandoffPoint::AfterCompareAndSeal {
+                        run_id: context.run_id.clone(),
+                        window_id: window_id.clone(),
+                        applied_sequence,
+                        pending: matches!(
+                            &outcome,
+                            CompareAndSealPromptWindowOutcome::Pending { .. }
+                        ),
+                    })
+                    .await;
+            }
+            match outcome {
+                CompareAndSealPromptWindowOutcome::Pending { prompts, .. } => {
+                    let sequences = prompts
+                        .iter()
+                        .map(|prompt| prompt.sequence)
+                        .collect::<Vec<_>>();
+                    let blocks = build_correction_prompt(&action, &prompts);
+                    correction_turns.push(serde_json::json!({
+                        "window_id": window_id,
+                        "role": action.role,
+                        "applied_sequences": sequences,
+                        "content": blocks,
+                    }));
+                    applied_sequence = prompts
+                        .last()
+                        .expect("pending prompt batch is nonempty")
+                        .sequence;
+                    let rendered = blocks
+                        .iter()
+                        .map(|block| block.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    emit_progress_kind(
+                        self.config.progress.as_ref(),
                         &context,
-                        event,
-                        &progress,
-                        &mut tool_titles,
-                        &mut visible,
-                        &mut turns,
+                        AgentProgressKind::Prompt {
+                            role: action.role.clone(),
+                            session_id: session_id.clone(),
+                            prompt: rendered,
+                        },
+                    );
+                    let (replacement, correction_records, stop_reason) = run_prompt_turn(
+                        active.client.as_mut(),
+                        &session_id,
+                        blocks,
+                        &context,
+                        self.config.progress.clone(),
+                        &mut turn_cursor,
                     )
-                },
-            )
-            .await?;
-        tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, turns = turns.len(), reply_chars = visible.chars().count(), reply = %visible, "agent step: agent reply");
+                    .await?;
+                    visible = replacement;
+                    turns.extend(correction_records);
+                    tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
+                }
+                CompareAndSealPromptWindowOutcome::Sealed(_) => {
+                    window_guard.close();
+                    break;
+                }
+                outcome => {
+                    return Err(WorkflowError::InvalidAction(format!(
+                        "agent prompt window handoff failed for run {:?}: {outcome:?}",
+                        context.run_id
+                    ))
+                    .into());
+                }
+            }
+        }
+
         let parsed = parse_frontmatter_output(&visible).inspect_err(|_err| {
             tracing::error!(
                 run_id = %context.run_id,
@@ -258,13 +490,6 @@ where
                 "agent step: failed to parse frontmatter output"
             );
         })?;
-        tracing::debug!(
-            run_id = %context.run_id,
-            step = %context.step_id,
-            status = %parsed.output.status,
-            field_count = parsed.output.fields.as_object().map(|fields| fields.len()).unwrap_or(0),
-            "agent step: parsed output"
-        );
         let completed_at = Utc::now();
         let record = StepRecord {
             id: context.step_record_id,
@@ -273,7 +498,12 @@ where
             action: "agent".to_string(),
             input: StepInput {
                 prompt: Some(prompt),
-                context: serde_json::json!({ "role": action.role }),
+                context: serde_json::json!({
+                    "role": action.role,
+                    "user_inputs": user_inputs,
+                    "correction_turns": correction_turns,
+                    "final_applied_sequence": applied_sequence,
+                }),
             },
             output: Some(parsed.output),
             detail: StepDetail {
@@ -376,6 +606,58 @@ where
     }
 }
 
+#[derive(Default)]
+struct TurnCursor {
+    next_index: usize,
+    prev: Option<String>,
+}
+
+fn push_turn(
+    context: &ExecutionContext,
+    cursor: &mut TurnCursor,
+    turns: &mut Vec<TurnRecord>,
+    role: &str,
+    content: String,
+) {
+    cursor.next_index += 1;
+    let id = format!("{}-turn-{}", context.step_record_id, cursor.next_index);
+    turns.push(TurnRecord {
+        id: id.clone(),
+        step_id: context.step_record_id.clone(),
+        role: role.to_string(),
+        content,
+        timestamp: Utc::now(),
+        prev: cursor.prev.replace(id),
+    });
+}
+
+async fn run_prompt_turn(
+    client: &mut dyn Client,
+    session_id: &str,
+    content: Vec<PromptContent>,
+    context: &ExecutionContext,
+    progress: Option<ProgressSink>,
+    turn_cursor: &mut TurnCursor,
+) -> Result<(String, Vec<TurnRecord>, StopReason)> {
+    let mut visible = String::new();
+    let mut turns = Vec::new();
+    let mut tool_titles = HashMap::new();
+    let stop_reason = client
+        .prompt(session_id, content, &mut |event| {
+            collect_event(
+                context,
+                event,
+                &progress,
+                &mut tool_titles,
+                &mut visible,
+                &mut turns,
+                turn_cursor,
+            )
+        })
+        .await?;
+    Ok((visible, turns, stop_reason))
+}
+
 fn emit_progress_kind(
     progress: Option<&ProgressSink>,
     context: &ExecutionContext,
@@ -397,6 +679,7 @@ fn collect_event(
     tool_titles: &mut HashMap<String, String>,
     visible: &mut String,
     turns: &mut Vec<TurnRecord>,
+    turn_cursor: &mut TurnCursor,
 ) {
     tracing::trace!(
         run_id = %context.run_id,
@@ -422,15 +705,7 @@ fn collect_event(
                         content: text.clone(),
                     },
                 );
-                let prev = turns.last().map(|turn| turn.id.clone());
-                turns.push(TurnRecord {
-                    id: format!("{}-turn-{}", context.step_record_id, turns.len() + 1),
-                    step_id: context.step_record_id.clone(),
-                    role: "assistant".to_string(),
-                    content: text,
-                    timestamp: Utc::now(),
-                    prev,
-                });
+                push_turn(context, turn_cursor, turns, "assistant", text);
             }
         }
         Event::ThoughtChunk { content } => {
@@ -448,15 +723,7 @@ fn collect_event(
                         content: text.clone(),
                     },
                 );
-                let prev = turns.last().map(|turn| turn.id.clone());
-                turns.push(TurnRecord {
-                    id: format!("{}-turn-{}", context.step_record_id, turns.len() + 1),
-                    step_id: context.step_record_id.clone(),
-                    role: "thought".to_string(),
-                    content: text,
-                    timestamp: Utc::now(),
-                    prev,
-                });
+                push_turn(context, turn_cursor, turns, "thought", text);
             }
         }
         Event::ToolCall {
@@ -486,15 +753,7 @@ fn collect_event(
                     status,
                 },
             );
-            let prev = turns.last().map(|turn| turn.id.clone());
-            turns.push(TurnRecord {
-                id: format!("{}-turn-{}", context.step_record_id, turns.len() + 1),
-                step_id: context.step_record_id.clone(),
-                role: "tool".to_string(),
-                content: title,
-                timestamp: Utc::now(),
-                prev,
-            });
+            push_turn(context, turn_cursor, turns, "tool", title);
         }
         Event::ToolCallUpdate {
             tool_call_id,
@@ -568,7 +827,8 @@ mod tests {
     use anyhow::anyhow;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        ObjectHash, ObjectKind, Result as CoreResult, RunHead, WorkflowRun,
+        AppendUserPromptOutcome, ObjectHash, ObjectKind, Result as CoreResult, RunHead,
+        RunUserPrompt, WorkflowRun,
     };
     use parking_lot::Mutex as SyncMutex;
     use serde::{Serialize, de::DeserializeOwned};
@@ -583,6 +843,7 @@ mod tests {
         new_sessions: usize,
         loaded_sessions: Vec<String>,
         new_session_models: Arc<SyncMutex<Vec<ModelInfo>>>,
+        prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
     }
 
     impl FakeClient {
@@ -594,6 +855,7 @@ mod tests {
                 new_sessions: 0,
                 loaded_sessions: Vec::new(),
                 new_session_models: Arc::new(SyncMutex::new(Vec::new())),
+                prompt_calls: Arc::new(SyncMutex::new(Vec::new())),
             }
         }
 
@@ -653,9 +915,10 @@ mod tests {
         async fn prompt(
             &mut self,
             _session_id: &str,
-            _prompt_content: Vec<PromptContent>,
+            prompt_content: Vec<PromptContent>,
             event_handler: &mut (dyn FnMut(Event) + Send),
         ) -> anyhow::Result<StopReason> {
+            self.prompt_calls.lock().push(prompt_content);
             while let Some(event) = self.events.lock().pop_front() {
                 let completes_reply = matches!(event, Event::MessageChunk { .. });
                 event_handler(event);
@@ -712,6 +975,9 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         sessions: SyncMutex<HashMap<(String, String), RoleSession>>,
+        accepted_prompts: SyncMutex<Vec<RunUserPrompt>>,
+        window: SyncMutex<Option<AgentPromptWindow>>,
+        pending_prompt_batches: SyncMutex<VecDeque<Vec<RunUserPrompt>>>,
     }
 
     impl cowboy_workflow_core::RunStore for FakeStore {
@@ -780,6 +1046,102 @@ mod tests {
         ) -> CoreResult<ObjectHash> {
             Ok("turn".to_string())
         }
+
+        fn load_user_prompts(&self, _run_id: &str) -> CoreResult<Vec<RunUserPrompt>> {
+            Ok(self.accepted_prompts.lock().clone())
+        }
+
+        fn append_user_prompt(
+            &self,
+            _run_id: &str,
+            window_id: &str,
+            content: String,
+        ) -> CoreResult<AppendUserPromptOutcome> {
+            let window = self.window.lock();
+            let Some(window) = window.as_ref() else {
+                return Ok(AppendUserPromptOutcome::NoWindow);
+            };
+            if window.window_id != window_id {
+                return Ok(AppendUserPromptOutcome::StaleWindow);
+            }
+            if !window.is_open() {
+                return Ok(AppendUserPromptOutcome::SealedWindow);
+            }
+            let mut prompts = self.accepted_prompts.lock();
+            let prompt = RunUserPrompt {
+                sequence: prompts.last().map_or(1, |prompt| prompt.sequence + 1),
+                content,
+                submitted_at: Utc::now(),
+            };
+            prompts.push(prompt.clone());
+            Ok(AppendUserPromptOutcome::Accepted(prompt))
+        }
+
+        fn open_agent_prompt_window(
+            &self,
+            window: AgentPromptWindow,
+        ) -> CoreResult<OpenAgentPromptWindowOutcome> {
+            *self.window.lock() = Some(window.clone());
+            Ok(OpenAgentPromptWindowOutcome::Opened(window))
+        }
+
+        fn compare_and_seal_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            window_id: &str,
+            applied_sequence: u64,
+            sealed_at: chrono::DateTime<Utc>,
+        ) -> CoreResult<CompareAndSealPromptWindowOutcome> {
+            let mut window = self.window.lock();
+            let Some(active) = window.as_mut() else {
+                return Ok(CompareAndSealPromptWindowOutcome::NoWindow);
+            };
+            if active.window_id != window_id {
+                return Ok(CompareAndSealPromptWindowOutcome::StaleWindow);
+            }
+            let pending = self
+                .pending_prompt_batches
+                .lock()
+                .pop_front()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|prompt| prompt.sequence > applied_sequence)
+                .collect::<Vec<_>>();
+            if !pending.is_empty() {
+                active.applied_sequence = applied_sequence;
+                return Ok(CompareAndSealPromptWindowOutcome::Pending {
+                    window: active.clone(),
+                    prompts: pending,
+                });
+            }
+            active.applied_sequence = applied_sequence;
+            active.sealed_at = Some(sealed_at);
+            Ok(CompareAndSealPromptWindowOutcome::Sealed(active.clone()))
+        }
+
+        fn abort_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            window_id: &str,
+            aborted_at: chrono::DateTime<Utc>,
+        ) -> CoreResult<AbortAgentPromptWindowOutcome> {
+            let mut window = self.window.lock();
+            let Some(active) = window.as_mut() else {
+                return Ok(AbortAgentPromptWindowOutcome::NoWindow);
+            };
+            if active.window_id != window_id {
+                return Ok(AbortAgentPromptWindowOutcome::StaleWindow);
+            }
+            active.sealed_at = Some(aborted_at);
+            Ok(AbortAgentPromptWindowOutcome::Aborted(active.clone()))
+        }
+
+        fn clear_agent_prompt_window(
+            &self,
+            _run_id: &str,
+        ) -> CoreResult<Option<AgentPromptWindow>> {
+            Ok(self.window.lock().take())
+        }
     }
 
     fn event() -> Event {
@@ -814,6 +1176,9 @@ mod tests {
             role: Some(role("developer")),
             attempt: 1,
             retry_reason: None,
+            original_request: "Original request".to_string(),
+            run_created_at: Utc::now(),
+            user_prompts: Vec::new(),
         }
     }
 
@@ -826,6 +1191,9 @@ mod tests {
             role: Some(role(role_id)),
             attempt: 1,
             retry_reason: None,
+            original_request: "Original request".to_string(),
+            run_created_at: Utc::now(),
+            user_prompts: Vec::new(),
         }
     }
 
@@ -984,7 +1352,7 @@ mod tests {
             .unwrap();
 
         let progress_events = progress_events.lock();
-        assert_eq!(progress_events.len(), 6);
+        assert_eq!(progress_events.len(), 8);
         assert!(matches!(
             &progress_events[0],
             AgentProgressKind::SessionReady { role, session_id }
@@ -992,17 +1360,21 @@ mod tests {
         ));
         assert!(matches!(
             &progress_events[1],
+            AgentProgressKind::PromptWindowOpened { role, .. } if role == "developer"
+        ));
+        assert!(matches!(
+            &progress_events[2],
             AgentProgressKind::Prompt { role, session_id, prompt }
                 if role == "developer" && session_id == "session-1" && prompt.contains("Do work")
         ));
         assert_eq!(
-            progress_events[2],
+            progress_events[3],
             AgentProgressKind::Thought {
                 content: "checking approach".to_string(),
             }
         );
         assert_eq!(
-            progress_events[3],
+            progress_events[4],
             AgentProgressKind::ToolCall {
                 tool_call_id: "call_abc".to_string(),
                 title: "Reading app state".to_string(),
@@ -1011,7 +1383,7 @@ mod tests {
             }
         );
         assert_eq!(
-            progress_events[4],
+            progress_events[5],
             AgentProgressKind::ToolCallUpdate {
                 tool_call_id: "call_abc".to_string(),
                 title: "Reading app state".to_string(),
@@ -1020,8 +1392,12 @@ mod tests {
             }
         );
         assert!(matches!(
-            &progress_events[5],
+            &progress_events[6],
             AgentProgressKind::Response { content } if content.contains("status: success")
+        ));
+        assert!(matches!(
+            &progress_events[7],
+            AgentProgressKind::PromptWindowClosed { role, .. } if role == "developer"
         ));
     }
 
@@ -1112,18 +1488,26 @@ mod tests {
             .unwrap();
 
         let progress_events = progress_events.lock();
-        assert_eq!(progress_events.len(), 3);
+        assert_eq!(progress_events.len(), 5);
         assert!(matches!(
             &progress_events[0],
             AgentProgressKind::SessionReady { .. }
         ));
         assert!(matches!(
             &progress_events[1],
-            AgentProgressKind::Prompt { .. }
+            AgentProgressKind::PromptWindowOpened { .. }
         ));
         assert!(matches!(
             &progress_events[2],
+            AgentProgressKind::Prompt { .. }
+        ));
+        assert!(matches!(
+            &progress_events[3],
             AgentProgressKind::Response { .. }
+        ));
+        assert!(matches!(
+            &progress_events[4],
+            AgentProgressKind::PromptWindowClosed { .. }
         ));
     }
     #[tokio::test]
@@ -1275,5 +1659,120 @@ mod tests {
             execution.record.detail.session_id.as_deref(),
             Some("persisted-session")
         );
+    }
+
+    #[tokio::test]
+    async fn correction_turns_use_verbatim_blocks_and_replace_the_initial_response() {
+        let client = FakeClient::new(vec![
+            Event::MessageChunk {
+                content: serde_json::json!({"text": "---\nstatus: success\n---\ninitial"}),
+            },
+            Event::MessageChunk {
+                content: serde_json::json!({"text": "---\nstatus: success\n---\ncorrected"}),
+            },
+            Event::MessageChunk {
+                content: serde_json::json!({"text": "---\nstatus: success\n---\ncorrected twice"}),
+            },
+        ]);
+        let prompt_calls = client.prompt_calls.clone();
+        let factory = FakeFactory::new(vec![client]);
+        let store = FakeStore::default();
+        store
+            .pending_prompt_batches
+            .lock()
+            .push_back(vec![RunUserPrompt {
+                sequence: 2,
+                content: "  preserve\nthis correction  ".to_string(),
+                submitted_at: Utc::now(),
+            }]);
+        store
+            .pending_prompt_batches
+            .lock()
+            .push_back(vec![RunUserPrompt {
+                sequence: 3,
+                content: "second correction".to_string(),
+                submitted_at: Utc::now(),
+            }]);
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+        let mut context = context("run", "record");
+        context.user_prompts.push(RunUserPrompt {
+            sequence: 1,
+            content: "prior direction".to_string(),
+            submitted_at: Utc::now(),
+        });
+        let mut action = action("developer");
+        action.output = Some(cowboy_workflow_core::OutputSpec {
+            statuses: vec!["success".to_string()],
+            fields: serde_json::json!({"summary": "string"}),
+        });
+
+        let execution = executor.execute_agent(action, context).await.unwrap();
+
+        assert_eq!(
+            execution.record.output.as_ref().unwrap().body,
+            "corrected twice"
+        );
+        assert_eq!(execution.turns.len(), 3);
+        assert_eq!(
+            execution
+                .turns
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            ["record-turn-1", "record-turn-2", "record-turn-3"]
+        );
+        assert_eq!(execution.turns[0].prev, None);
+        assert_eq!(execution.turns[1].prev.as_deref(), Some("record-turn-1"));
+        assert_eq!(execution.turns[2].prev.as_deref(), Some("record-turn-2"));
+        let calls = prompt_calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].len(), 1);
+        assert!(calls[0][0].text.contains("\"sequence\": 0"));
+        assert!(calls[0][0].text.contains("Original request"));
+        assert!(calls[0][0].text.contains("prior direction"));
+        assert_eq!(calls[1].len(), 4);
+        assert!(calls[1][0].text.contains("Revise work already performed"));
+        assert!(calls[1][0].text.contains("complete replacement response"));
+        assert!(calls[1][1].text.contains("sequence 2"));
+        assert_eq!(calls[1][2].text, "  preserve\nthis correction  ");
+        assert!(calls[1][3].text.contains("valid YAML frontmatter"));
+        assert_eq!(calls[2][2].text, "second correction");
+
+        let input = &execution.record.input;
+        assert!(input.prompt.as_ref().unwrap().contains("prior direction"));
+        assert_eq!(input.context["final_applied_sequence"], 3);
+        assert_eq!(
+            input.context["correction_turns"][0]["applied_sequences"],
+            serde_json::json!([2])
+        );
+        assert_eq!(
+            input.context["correction_turns"][1]["applied_sequences"],
+            serde_json::json!([3])
+        );
+        assert_eq!(
+            input.context["correction_turns"][0]["content"][2]["text"],
+            "  preserve\nthis correction  "
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_final_response_leaves_prompt_window_closed() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({"text": "not frontmatter"}),
+        }])]);
+        let executor = AgentExecutor::new(
+            factory,
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::MissingFrontmatter));
+        let window = executor.store.window.lock();
+        assert!(window.as_ref().is_some_and(|window| !window.is_open()));
     }
 }

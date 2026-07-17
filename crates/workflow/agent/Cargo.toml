@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Agent action execution helpers for Cowboy workflows"
 
+[features]
+test-support = []
+
 [dependencies]
 cowboy-agent-client.workspace = true
 cowboy-agent-acp.workspace = true
@@ -20,7 +23,9 @@ serde_yaml = "0"
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

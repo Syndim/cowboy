@@ -128,6 +128,16 @@ pub enum WorkflowEventKind {
         role: String,
         session_id: String,
     },
+    AgentPromptWindowOpened {
+        step_id: String,
+        role: String,
+        window_id: String,
+    },
+    AgentPromptWindowClosed {
+        step_id: String,
+        role: String,
+        window_id: String,
+    },
     AgentPrompt {
         step_id: String,
         role: String,

@@ -26,7 +26,8 @@ pub use input::ResumeRouter;
 pub use runner::{LuaStepActionProvider, WorkflowRunner};
 pub use runtime::{
     AgentRuntimeConfig, ResolutionOptions, ResolutionStatus, RunReport, RunStatusDetail,
-    RunStatusState, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig, WorkflowRuntime,
+    RunStatusState, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig, UserPromptRejection,
+    UserPromptSubmission, WorkflowRuntime,
 };
 pub use workflow::{
     AgentRequestTopicGenerator, AgentWorkflowSelector, AgentWorkflowSummarizer,

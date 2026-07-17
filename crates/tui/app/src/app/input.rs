@@ -198,7 +198,6 @@ mod tests {
                 .await
         });
         assert!(state.composer_accepts_edits());
-        assert!(!state.composer_accepts_submit());
         assert!(state.pending_prompt().is_none());
     }
 
@@ -560,7 +559,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_run_blocks_tab_completion_and_history_navigation() {
+    async fn active_run_allows_slash_completion_but_blocks_plain_history_navigation() {
         let mut tab_state = test_state();
         tab_state.push_input("/ru");
         lock_composer_with_pending_task(&mut tab_state);
@@ -571,9 +570,8 @@ mod tests {
         );
 
         assert_eq!(handling, KeyHandling::Continue);
-        assert_eq!(tab_state.input(), "/ru");
-        assert_eq!(tab_state.input_cursor(), "/ru".chars().count());
-        assert!(!tab_state.composer_accepts_submit());
+        assert_eq!(tab_state.input(), "/run ");
+        assert!(tab_state.composer_accepts_submit());
         tab_state.cancel_background_tasks();
 
         let mut history_state = test_state();

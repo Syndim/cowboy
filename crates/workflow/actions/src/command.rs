@@ -338,6 +338,9 @@ mod tests {
             role: None,
             attempt: 1,
             retry_reason: None,
+            original_request: "request".to_string(),
+            run_created_at: Utc::now(),
+            user_prompts: Vec::new(),
         }
     }
 

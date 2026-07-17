@@ -2,9 +2,10 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    ActionDispatcher, Result, RunStatus, RunStore, StepAction, StepActionProvider, StepDefinition,
-    StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowSourceSnapshot,
-    apply_run_status, execute_step, retry_current_step,
+    ActionDispatcher, Result, RunStatus, RunStore, RunUserPrompt, StepAction, StepActionProvider,
+    StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
+    WorkflowSourceSnapshot, apply_run_status, execute_step, ordered_user_inputs,
+    retry_current_step,
 };
 use serde_json::{Value, json};
 
@@ -334,9 +335,12 @@ impl StepActionProvider for LuaStepActionProvider {
         run: &WorkflowRun,
         step: &StepDefinition,
         prev: Option<&StepRecord>,
+        user_prompts: &[RunUserPrompt],
     ) -> Result<StepAction> {
+        let user_inputs = ordered_user_inputs(run, user_prompts);
         let ctx = json!({
             "request": run.original_request,
+            "user_inputs": user_inputs,
             "run_id": run.id,
             "workflow": {
                 "name": definition.name,
@@ -448,6 +452,65 @@ mod tests {
 
         fn append_turn(&self, _run_id: &str, _turn: TurnRecord) -> Result<ObjectHash> {
             Ok("turn".to_string())
+        }
+
+        fn load_user_prompts(
+            &self,
+            _run_id: &str,
+        ) -> Result<Vec<cowboy_workflow_core::RunUserPrompt>> {
+            Ok(Vec::new())
+        }
+
+        fn open_agent_prompt_window(
+            &self,
+            _window: cowboy_workflow_core::AgentPromptWindow,
+        ) -> Result<cowboy_workflow_core::OpenAgentPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "runner test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn append_user_prompt(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _content: String,
+        ) -> Result<cowboy_workflow_core::AppendUserPromptOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "runner test store does not accept agent prompts".to_string(),
+            ))
+        }
+
+        fn compare_and_seal_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _applied_sequence: u64,
+            _sealed_at: chrono::DateTime<Utc>,
+        ) -> Result<cowboy_workflow_core::CompareAndSealPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "runner test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn abort_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _aborted_at: chrono::DateTime<Utc>,
+        ) -> Result<cowboy_workflow_core::AbortAgentPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "runner test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn clear_agent_prompt_window(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<cowboy_workflow_core::AgentPromptWindow>> {
+            Err(WorkflowError::InvalidAction(
+                "runner test store does not execute agent prompt windows".to_string(),
+            ))
         }
     }
 
@@ -605,6 +668,7 @@ mod tests {
             run: &WorkflowRun,
             _step: &StepDefinition,
             _prev: Option<&StepRecord>,
+            _user_prompts: &[cowboy_workflow_core::RunUserPrompt],
         ) -> Result<StepAction> {
             let index = run.steps_executed.saturating_sub(1) as usize;
             self.0
@@ -891,6 +955,7 @@ mod tests {
                 &run,
                 definition.steps.get("implement").unwrap(),
                 None,
+                &[],
             )
             .unwrap();
 
@@ -899,6 +964,78 @@ mod tests {
         };
         assert_eq!(action.status, "success");
         assert_eq!(action.body, "do it");
+    }
+
+    #[test]
+    fn lua_provider_exposes_ordered_user_inputs_without_changing_request() {
+        let provider = LuaStepActionProvider::new(WorkflowSourceSnapshot {
+            root: None,
+            entry: "main.lua".to_string(),
+            files: BTreeMap::from([(
+                "main.lua".to_string(),
+                r#"
+                local implement = step("implement")
+                implement.run = function(ctx)
+                  return action.status {
+                    status = "success",
+                    fields = {
+                      request = ctx.request,
+                      initial_sequence = ctx.user_inputs[1].sequence,
+                      initial_kind = ctx.user_inputs[1].kind,
+                      initial_content = ctx.user_inputs[1].content,
+                      initial_at = ctx.user_inputs[1].submitted_at,
+                      follow_sequence = ctx.user_inputs[2].sequence,
+                      follow_kind = ctx.user_inputs[2].kind,
+                      follow_content = ctx.user_inputs[2].content,
+                      follow_at = ctx.user_inputs[2].submitted_at,
+                    }
+                  }
+                end
+                return workflow("wf", implement)
+                "#
+                .to_string(),
+            )]),
+        });
+        let mut run = run();
+        run.current_step = "implement".to_string();
+        run.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let prompt = cowboy_workflow_core::RunUserPrompt {
+            sequence: 1,
+            content: "  follow\nup  ".to_string(),
+            submitted_at: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let definition = cowboy_workflow_lua::compile_snapshot(provider.source_bundle()).unwrap();
+        let action = provider
+            .step_action(
+                &definition,
+                &run,
+                definition.steps.get("implement").unwrap(),
+                None,
+                &[prompt],
+            )
+            .unwrap();
+
+        let StepAction::Status(action) = action else {
+            panic!("expected status action")
+        };
+        assert_eq!(
+            action.fields,
+            serde_json::json!({
+                "request": "do it",
+                "initial_sequence": 0,
+                "initial_kind": "initial",
+                "initial_content": "do it",
+                "initial_at": "2026-01-02T03:04:05.000Z",
+                "follow_sequence": 1,
+                "follow_kind": "follow_up",
+                "follow_content": "  follow\nup  ",
+                "follow_at": "2026-01-02T03:05:06.000Z",
+            })
+        );
     }
 
     #[tokio::test]

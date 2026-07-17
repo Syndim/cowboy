@@ -112,7 +112,9 @@ where
         .as_ref()
         .map(|head| store.get_object::<StepRecord>(head))
         .transpose()?;
-    let action = provider.step_action(definition, run, step, prev_record.as_ref())?;
+    let user_prompts = store.load_user_prompts(&run.id)?;
+    let action =
+        provider.step_action(definition, run, step, prev_record.as_ref(), &user_prompts)?;
     let role = match &action {
         StepAction::Agent(action) => Some(
             definition
@@ -134,6 +136,9 @@ where
         role,
         attempt,
         retry_reason,
+        original_request: run.original_request.clone(),
+        run_created_at: run.created_at,
+        user_prompts,
     };
 
     match dispatcher.dispatch(action, context).await? {
@@ -238,12 +243,14 @@ mod tests {
 
     struct StaticProvider {
         actions: Mutex<Vec<StepAction>>,
+        seen_prompts: Mutex<Vec<Vec<crate::RunUserPrompt>>>,
     }
 
     impl StaticProvider {
         fn new(actions: Vec<StepAction>) -> Self {
             Self {
                 actions: Mutex::new(actions),
+                seen_prompts: Mutex::new(Vec::new()),
             }
         }
     }
@@ -255,7 +262,9 @@ mod tests {
             _run: &WorkflowRun,
             _step: &StepDefinition,
             _prev: Option<&StepRecord>,
+            user_prompts: &[crate::RunUserPrompt],
         ) -> Result<StepAction> {
+            self.seen_prompts.lock().push(user_prompts.to_vec());
             Ok(self.actions.lock().remove(0))
         }
     }
@@ -263,6 +272,7 @@ mod tests {
     #[derive(Default)]
     struct NoopDispatcher {
         dispatched: Mutex<Vec<String>>,
+        contexts: Mutex<Vec<crate::ExecutionContext>>,
     }
 
     #[async_trait]
@@ -276,6 +286,7 @@ mod tests {
                 .lock()
                 .push(action.action_name().to_string());
             let now = Utc::now();
+            self.contexts.lock().push(context.clone());
             match action {
                 StepAction::Agent(action) => Ok(ActionResult::completed(StepRecord {
                     id: context.step_record_id,
@@ -384,6 +395,7 @@ mod tests {
         heads: Mutex<HashMap<String, RunHead>>,
         sessions: Mutex<HashMap<(String, String), crate::RoleSession>>,
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        prompts: Mutex<HashMap<String, Vec<crate::RunUserPrompt>>>,
     }
 
     impl RunStore for MemoryStore {
@@ -471,6 +483,61 @@ mod tests {
         ) -> Result<crate::ObjectHash> {
             Ok("turn".to_string())
         }
+        fn load_user_prompts(&self, run_id: &str) -> Result<Vec<crate::RunUserPrompt>> {
+            Ok(self.prompts.lock().get(run_id).cloned().unwrap_or_default())
+        }
+
+        fn open_agent_prompt_window(
+            &self,
+            _window: crate::AgentPromptWindow,
+        ) -> Result<crate::OpenAgentPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "core test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn append_user_prompt(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _content: String,
+        ) -> Result<crate::AppendUserPromptOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "core test store does not accept agent prompts".to_string(),
+            ))
+        }
+
+        fn compare_and_seal_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _applied_sequence: u64,
+            _sealed_at: chrono::DateTime<Utc>,
+        ) -> Result<crate::CompareAndSealPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "core test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn abort_agent_prompt_window(
+            &self,
+            _run_id: &str,
+            _window_id: &str,
+            _aborted_at: chrono::DateTime<Utc>,
+        ) -> Result<crate::AbortAgentPromptWindowOutcome> {
+            Err(WorkflowError::InvalidAction(
+                "core test store does not execute agent prompt windows".to_string(),
+            ))
+        }
+
+        fn clear_agent_prompt_window(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<crate::AgentPromptWindow>> {
+            Err(WorkflowError::InvalidAction(
+                "core test store does not execute agent prompt windows".to_string(),
+            ))
+        }
     }
 
     fn step(id: &str) -> StepDefinition {
@@ -531,6 +598,70 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[tokio::test]
+    async fn initial_and_retry_dispatch_share_the_loaded_prompt_baseline() {
+        let store = MemoryStore::default();
+        let prompt = crate::RunUserPrompt {
+            sequence: 1,
+            content: "correction".to_string(),
+            submitted_at: Utc::now(),
+        };
+        store
+            .prompts
+            .lock()
+            .insert("run".to_string(), vec![prompt.clone()]);
+        let executor = NoopDispatcher::default();
+        let provider = StaticProvider::new(vec![
+            StepAction::Status(StatusAction {
+                status: "success".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+            }),
+            StepAction::Status(StatusAction {
+                status: "success".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+            }),
+        ]);
+        let mut initial_run = run();
+        execute_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut initial_run,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap();
+        let mut retry_run = run();
+        retry_current_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut retry_run,
+            2,
+            Some("retry".to_string()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            provider.seen_prompts.lock().as_slice(),
+            [vec![prompt.clone()], vec![prompt.clone()]]
+        );
+        let contexts = executor.contexts.lock();
+        assert_eq!(contexts.len(), 2);
+        assert!(
+            contexts
+                .iter()
+                .all(|context| context.user_prompts == vec![prompt.clone()])
+        );
+        assert_eq!(contexts[0].original_request, "do it");
+        assert_eq!(contexts[1].attempt, 2);
     }
 
     #[tokio::test]

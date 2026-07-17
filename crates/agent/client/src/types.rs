@@ -33,7 +33,7 @@ pub struct AgentInfo {
 }
 
 /// Prompt content passed from Cowboy to an agent backend.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptContent {
     #[serde(rename = "type")]
     pub content_type: &'static str,

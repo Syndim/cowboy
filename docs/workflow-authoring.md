@@ -102,6 +102,7 @@ Runtime context passed to `run(ctx)`:
 | Field | Meaning |
 | --- | --- |
 | `ctx.request` | Original user request for the run. |
+| `ctx.user_inputs` | Ordered initial request plus every durably accepted on-the-fly prompt; see schema below. |
 | `ctx.run_id` | Stable run id. |
 | `ctx.workflow.name` | Current workflow name. |
 | `ctx.workflow.head` | Workflow head step id. |
@@ -119,6 +120,38 @@ Runtime context passed to `run(ctx)`:
 | `ctx.system.username` | Current user name, or `nil` if unavailable. |
 | `ctx.system.home_dir` | Home directory (`HOME`/`USERPROFILE`), or `nil` if unavailable. |
 | `ctx.system.cwd` | Process working directory, or `nil` if unavailable. |
+
+`ctx.user_inputs` has this exact shape and is ordered by `sequence`:
+
+```lua
+{
+  {
+    sequence = 0,
+    kind = "initial",
+    content = "the original request",
+    submitted_at = "2026-01-02T03:04:05.000Z",
+  },
+  {
+    sequence = 1,
+    kind = "follow_up",
+    content = "the first accepted on-the-fly prompt",
+    submitted_at = "2026-01-02T03:05:06.000Z",
+  },
+}
+```
+
+Sequence `0` is synthesized from `WorkflowRun.original_request` and the run's
+creation timestamp. Durable follow-ups start at `1`. Timestamps are UTC RFC
+3339 with millisecond precision and a `Z` suffix. Cowboy uses
+`content.trim().is_empty()` only to reject empty input, then stores and forwards
+every accepted string byte-for-byte, including leading/trailing whitespace and newlines.
+`ctx.request` remains the unchanged original request.
+
+Every agent action automatically receives the complete `ctx.user_inputs`
+history in its base prompt, regardless of the workflow-authored `prompt`.
+Answers to `action.ask_user` are deliberately excluded: they remain available
+only through `ctx.prev.fields.answer` because they are workflow control-point
+answers rather than on-the-fly direction.
 
 `ctx.system` is a curated, read-only, best-effort snapshot of the execution
 environment (modelled on the identity data `chezmoi` exposes to templates). Any

@@ -1,7 +1,9 @@
 use std::cell::Cell;
 
 use anyhow::Result;
-use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
+use cowboy_workflow_engine::{
+    RunReport, RunStatusDetail, RunStatusState, WorkflowEvent, WorkflowEventKind,
+};
 use tui_input::{Input, InputRequest};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone};
@@ -333,6 +335,43 @@ impl Default for ComposerViewState {
     }
 }
 
+fn run_status_state_from_str(status: &str) -> Option<RunStatusState> {
+    match status {
+        "running" | "retrying" => Some(RunStatusState::Running),
+        "waiting" | "waiting_for_input" => Some(RunStatusState::WaitingForInput),
+        "completed" => Some(RunStatusState::Completed),
+        "failed" => Some(RunStatusState::Failed),
+        "cancelled" => Some(RunStatusState::Cancelled),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum ComposerSubmissionMode {
+    Idle,
+    PendingAnswer,
+    AgentPrompt,
+    ExecutionBlocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundTaskKind {
+    WorkflowExecution,
+}
+
+#[derive(Debug)]
+struct BackgroundTask {
+    kind: BackgroundTaskKind,
+    handle: tokio::task::JoinHandle<Result<RunReport, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::app) struct AgentPromptWindowState {
+    pub run_id: String,
+    pub step_id: String,
+    pub window_id: String,
+}
+
 #[derive(Debug)]
 pub(super) struct AppState {
     active_run_id: Option<String>,
@@ -341,6 +380,8 @@ pub(super) struct AppState {
     current_topic_run_id: Option<String>,
     current_run_topic: Option<String>,
     pending_prompt: Option<PendingPrompt>,
+    durable_run_status: Option<RunStatusState>,
+    agent_prompt_window: Option<AgentPromptWindowState>,
     run_state: String,
     status: String,
     event_log: Vec<TranscriptEntry>,
@@ -353,7 +394,7 @@ pub(super) struct AppState {
     history_index: Option<usize>,
     composer_view: Cell<ComposerViewState>,
     history_store: InputHistory,
-    background: Vec<tokio::task::JoinHandle<Result<RunReport, String>>>,
+    background: Vec<BackgroundTask>,
     exit_requested: bool,
 }
 
@@ -369,6 +410,8 @@ impl AppState {
             current_topic_run_id: None,
             current_run_topic: None,
             pending_prompt: None,
+            durable_run_status: None,
+            agent_prompt_window: None,
             run_state: "idle".to_string(),
             status: "workflow runtime shell is ready".to_string(),
             event_log: Vec::new(),
@@ -406,12 +449,42 @@ impl AppState {
         self.pending_prompt.as_ref()
     }
 
+    pub(in crate::app) fn workflow_execution_running(&self) -> bool {
+        self.background
+            .iter()
+            .any(|task| task.kind == BackgroundTaskKind::WorkflowExecution)
+    }
+
+    pub(in crate::app) fn agent_prompt_window(&self) -> Option<&AgentPromptWindowState> {
+        self.agent_prompt_window.as_ref()
+    }
+
+    pub(in crate::app) fn composer_submission_mode(&self) -> ComposerSubmissionMode {
+        if self.pending_prompt.is_some() {
+            return ComposerSubmissionMode::PendingAnswer;
+        }
+        if !self.workflow_execution_running() {
+            return ComposerSubmissionMode::Idle;
+        }
+        if self.durable_run_status == Some(RunStatusState::Running)
+            && self
+                .agent_prompt_window
+                .as_ref()
+                .is_some_and(|window| self.active_run_id.as_deref() == Some(window.run_id.as_str()))
+        {
+            ComposerSubmissionMode::AgentPrompt
+        } else {
+            ComposerSubmissionMode::ExecutionBlocked
+        }
+    }
+
     pub(in crate::app) fn composer_accepts_edits(&self) -> bool {
         true
     }
 
     pub(in crate::app) fn composer_accepts_submit(&self) -> bool {
-        self.pending_prompt.is_some() || self.background.is_empty()
+        self.composer_submission_mode() != ComposerSubmissionMode::ExecutionBlocked
+            || self.input().trim().starts_with('/')
     }
 
     pub(in crate::app) fn display_state(&self) -> String {
@@ -647,17 +720,24 @@ impl AppState {
         self.reset_composer_view();
     }
 
-    pub(in crate::app) fn take_submitted_input(&mut self) -> Option<String> {
-        let input = self.input.value_and_reset();
-        let input = input.trim();
+    pub(in crate::app) fn submitted_input(&self) -> Option<String> {
+        let input = self.input.value();
+        (!input.trim().is_empty()).then(|| input.to_string())
+    }
+
+    pub(in crate::app) fn commit_submitted_input(&mut self, input: &str) {
+        self.input.reset();
         self.history_index = None;
         self.reset_composer_view();
-        if input.is_empty() {
-            return None;
-        }
-
         self.persist_submitted_history(input);
-        Some(input.to_string())
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn take_submitted_input(&mut self) -> Option<String> {
+        let input = self.submitted_input()?;
+        let trimmed = input.trim().to_string();
+        self.commit_submitted_input(&trimmed);
+        Some(trimmed)
     }
 
     fn persist_submitted_history(&mut self, input: &str) {
@@ -716,9 +796,11 @@ impl AppState {
 
         let cancelled = self.background.len();
         for task in &self.background {
-            task.abort();
+            task.handle.abort();
         }
         self.background.clear();
+        self.agent_prompt_window = None;
+        self.durable_run_status = Some(RunStatusState::Cancelled);
         self.status = format!("cancelled {cancelled} background task(s)");
         self.run_state = "cancelled".to_string();
         self.push_card("Cancelled", [self.status.clone()]);
@@ -839,7 +921,10 @@ impl AppState {
         self.status = status;
         self.run_state = "running".to_string();
         self.push_event(entry);
-        self.background.push(tokio::spawn(future));
+        self.background.push(BackgroundTask {
+            kind: BackgroundTaskKind::WorkflowExecution,
+            handle: tokio::spawn(future),
+        });
     }
 
     pub(super) fn drain_workflow_events(
@@ -922,11 +1007,38 @@ impl AppState {
                 self.workflow_name = Some(workflow_name.clone());
                 self.current_step = Some(current_step.clone());
                 self.run_state = "running".to_string();
+                self.durable_run_status = Some(RunStatusState::Running);
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::StepStarted {
                 step_id: current_step,
+            } => {
+                self.current_step = Some(current_step.clone());
+                self.run_state = "running".to_string();
+                self.agent_prompt_window = None;
             }
-            | WorkflowEventKind::StepProgress {
+            WorkflowEventKind::AgentPromptWindowOpened {
+                step_id, window_id, ..
+            } => {
+                self.current_step = Some(step_id.clone());
+                self.run_state = "running".to_string();
+                self.durable_run_status = Some(RunStatusState::Running);
+                self.agent_prompt_window = Some(AgentPromptWindowState {
+                    run_id: event.run_id.clone(),
+                    step_id: step_id.clone(),
+                    window_id: window_id.clone(),
+                });
+            }
+            WorkflowEventKind::AgentPromptWindowClosed { window_id, .. } => {
+                if self
+                    .agent_prompt_window
+                    .as_ref()
+                    .is_some_and(|window| window.window_id == *window_id)
+                {
+                    self.agent_prompt_window = None;
+                }
+            }
+            WorkflowEventKind::StepProgress {
                 step_id: current_step,
                 ..
             }
@@ -969,6 +1081,8 @@ impl AppState {
             } => {
                 self.current_step = Some(step.clone());
                 self.run_state = "waiting".to_string();
+                self.durable_run_status = Some(RunStatusState::WaitingForInput);
+                self.agent_prompt_window = None;
                 self.pending_prompt = Some(PendingPrompt {
                     run_id: event.run_id.clone(),
                     step: step.clone(),
@@ -979,29 +1093,45 @@ impl AppState {
             }
             WorkflowEventKind::StepCompleted { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::StepRetrying { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
                 self.run_state = "retrying".to_string();
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::ManuallyResolved { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
                 self.run_state = "running".to_string();
                 self.pending_prompt = None;
+                self.durable_run_status = Some(RunStatusState::Running);
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::RunCompleted => {
                 self.run_state = "completed".to_string();
                 self.pending_prompt = None;
+                self.durable_run_status = Some(RunStatusState::Completed);
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::RunFailed { .. } => {
                 self.run_state = "failed".to_string();
                 self.pending_prompt = None;
+                self.durable_run_status = Some(RunStatusState::Failed);
+                self.agent_prompt_window = None;
             }
             WorkflowEventKind::RunCancelled => {
                 self.run_state = "cancelled".to_string();
                 self.pending_prompt = None;
+                self.durable_run_status = Some(RunStatusState::Cancelled);
+                self.agent_prompt_window = None;
             }
-            WorkflowEventKind::RunStatusChanged { status } => self.run_state = status.clone(),
+            WorkflowEventKind::RunStatusChanged { status } => {
+                self.run_state = status.clone();
+                self.durable_run_status = run_status_state_from_str(status);
+                if self.durable_run_status != Some(RunStatusState::Running) {
+                    self.agent_prompt_window = None;
+                }
+            }
         }
     }
 
@@ -1010,9 +1140,9 @@ impl AppState {
         let mut pending = Vec::new();
         let tasks = std::mem::take(&mut self.background);
         for task in tasks {
-            if task.is_finished() {
+            if task.handle.is_finished() {
                 changed = true;
-                match task.await {
+                match task.handle.await {
                     Ok(Ok(report)) => self.apply_report(report),
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
@@ -1028,6 +1158,7 @@ impl AppState {
                         self.push_card("Error", [self.status.clone()]);
                     }
                 }
+                self.agent_prompt_window = None;
             } else {
                 pending.push(task);
             }
@@ -1075,6 +1206,8 @@ impl AppState {
         self.workflow_name = Some(report.run.workflow_name.clone());
         self.current_step = Some(report.run.current_step.clone());
         self.run_state = format!("{:?}", report.run.status).to_ascii_lowercase();
+        self.durable_run_status = Some(RunStatusDetail::from_status(&report.run.status).state);
+        self.agent_prompt_window = None;
         self.status = format!(
             "run={} status={:?} step={}",
             report.run.id, report.run.status, report.run.current_step
@@ -1600,7 +1733,7 @@ mod tests {
         state.spawn_test_card_report_task("pending".to_string(), async {
             std::future::pending::<Result<RunReport, String>>().await
         });
-        state.background[0].abort();
+        state.background[0].handle.abort();
         tokio::task::yield_now().await;
 
         assert!(state.drain_background_tasks().await);

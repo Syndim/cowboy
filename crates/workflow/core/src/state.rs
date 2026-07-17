@@ -81,6 +81,184 @@ pub struct WorkflowRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Durable on-the-fly prompt accepted for a workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUserPrompt {
+    /// Monotonic sequence within the run. Follow-up prompts start at `1`.
+    pub sequence: u64,
+    /// Exact user-provided text, preserved byte-for-byte.
+    pub content: String,
+    /// Timestamp captured transactionally when the prompt was accepted.
+    #[serde(with = "rfc3339_millis")]
+    pub submitted_at: DateTime<Utc>,
+}
+
+/// User input exposed to Lua and included in every agent prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunUserInput {
+    pub sequence: u64,
+    pub kind: RunUserInputKind,
+    pub content: String,
+    #[serde(with = "rfc3339_millis")]
+    pub submitted_at: DateTime<Utc>,
+}
+
+/// Origin of an entry in the ordered run input history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunUserInputKind {
+    Initial,
+    FollowUp,
+}
+
+/// Build the complete ordered user-input history for one prompt snapshot.
+pub fn ordered_user_inputs(run: &WorkflowRun, prompts: &[RunUserPrompt]) -> Vec<RunUserInput> {
+    ordered_user_inputs_from_parts(&run.original_request, run.created_at, prompts)
+}
+
+/// Build ordered inputs when execution context already carries the run's initial fields.
+pub fn ordered_user_inputs_from_parts(
+    original_request: &str,
+    created_at: DateTime<Utc>,
+    prompts: &[RunUserPrompt],
+) -> Vec<RunUserInput> {
+    let mut inputs = Vec::with_capacity(prompts.len() + 1);
+    inputs.push(RunUserInput {
+        sequence: 0,
+        kind: RunUserInputKind::Initial,
+        content: original_request.to_string(),
+        submitted_at: created_at,
+    });
+    inputs.extend(prompts.iter().map(|prompt| RunUserInput {
+        sequence: prompt.sequence,
+        kind: RunUserInputKind::FollowUp,
+        content: prompt.content.clone(),
+        submitted_at: prompt.submitted_at,
+    }));
+    inputs
+}
+
+/// Durable lifecycle record for the agent prompt window of a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPromptWindow {
+    pub window_id: String,
+    pub run_id: RunId,
+    pub step_record_id: RecordId,
+    pub step_id: StepId,
+    pub role_id: RoleId,
+    pub baseline_sequence: u64,
+    pub applied_sequence: u64,
+    #[serde(with = "rfc3339_millis")]
+    pub opened_at: DateTime<Utc>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_rfc3339_millis"
+    )]
+    pub sealed_at: Option<DateTime<Utc>>,
+}
+
+impl AgentPromptWindow {
+    pub fn is_open(&self) -> bool {
+        self.sealed_at.is_none()
+    }
+}
+
+/// Outcome of transactionally opening an agent prompt window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenAgentPromptWindowOutcome {
+    Opened(AgentPromptWindow),
+    MissingRun,
+    TerminalRun,
+}
+
+/// Outcome of transactionally appending an on-the-fly prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendUserPromptOutcome {
+    Accepted(RunUserPrompt),
+    MissingRun,
+    TerminalRun,
+    NoWindow,
+    StaleWindow,
+    SealedWindow,
+}
+
+/// Outcome of the executor's atomic prompt-drain/seal handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareAndSealPromptWindowOutcome {
+    Pending {
+        window: AgentPromptWindow,
+        prompts: Vec<RunUserPrompt>,
+    },
+    Sealed(AgentPromptWindow),
+    MissingRun,
+    TerminalRun,
+    NoWindow,
+    StaleWindow,
+}
+
+/// Outcome of aborting one exact prompt-window token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AbortAgentPromptWindowOutcome {
+    Aborted(AgentPromptWindow),
+    MissingRun,
+    NoWindow,
+    StaleWindow,
+}
+
+mod rfc3339_millis {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+mod optional_rfc3339_millis {
+    use chrono::{DateTime, SecondsFormat, Utc};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<DateTime<Utc>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => {
+                serializer.serialize_some(&value.to_rfc3339_opts(SecondsFormat::Millis, true))
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<String>::deserialize(deserializer)?;
+        value
+            .map(|value| {
+                DateTime::parse_from_rfc3339(&value)
+                    .map(|value| value.with_timezone(&Utc))
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
 /// Durable descriptor for process-local resume handling.
 ///
 /// Workflow state stores this small serializable descriptor at external input
@@ -417,5 +595,73 @@ mod tests {
         assert_eq!(round_trip.config_set.limits.max_retries_per_run, 7);
         assert_eq!(round_trip.retries_used, 3);
         assert_eq!(round_trip.step_retries_used["start"], 2);
+    }
+
+    #[test]
+    fn run_user_prompt_serializes_exact_content_and_millisecond_timestamp() {
+        let prompt = RunUserPrompt {
+            sequence: 1,
+            content: "  keep\nspacing  ".to_string(),
+            submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&prompt).unwrap(),
+            serde_json::json!({
+                "sequence": 1,
+                "content": "  keep\nspacing  ",
+                "submitted_at": "2026-01-02T03:05:06.000Z",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RunUserPrompt>(serde_json::to_value(&prompt).unwrap())
+                .unwrap(),
+            prompt
+        );
+    }
+
+    #[test]
+    fn ordered_user_inputs_synthesizes_initial_entry_and_follow_ups() {
+        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+            "id": "run",
+            "workflow_name": "wf",
+            "workflow_api_version": 1,
+            "workflow_hash": "hash",
+            "workflow_sources": {},
+            "original_request": "original",
+            "status": { "status": "running" },
+            "current_step": "start",
+            "head": null,
+            "created_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-01-02T03:04:05Z"
+        }))
+        .unwrap();
+        let prompts = vec![RunUserPrompt {
+            sequence: 1,
+            content: "follow up".to_string(),
+            submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }];
+
+        assert_eq!(
+            serde_json::to_value(ordered_user_inputs(&run, &prompts)).unwrap(),
+            serde_json::json!([
+                {
+                    "sequence": 0,
+                    "kind": "initial",
+                    "content": "original",
+                    "submitted_at": "2026-01-02T03:04:05.000Z",
+                },
+                {
+                    "sequence": 1,
+                    "kind": "follow_up",
+                    "content": "follow up",
+                    "submitted_at": "2026-01-02T03:05:06.000Z",
+                }
+            ])
+        );
     }
 }

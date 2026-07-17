@@ -88,6 +88,7 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - `start_run(request)`
 - `resume_run(run_id)` / `step_run(run_id)`
 - `answer_run(run_id, prompt_id, answer)`
+- `submit_user_prompt(run_id, window_id, content)`
 - `improve_run(run_id)`
 - `list_runs()` / `load_events(run_id)`
 
@@ -136,15 +137,46 @@ ceilings are exhausted.
 
 `cowboy-workflow-agent` handles `StepAction::Agent`:
 
-- builds the role prompt
-- sends it through `cowboy-agent-client::Client`
-- parses YAML frontmatter + Markdown body into `StepOutput`
+- builds the role prompt, including the complete ordered initial request and durable follow-ups
+- opens a durable prompt window identified by an opaque token and bound to the run, step record, step, and role
+- sends the initial prompt through `cowboy-agent-client::Client`
+- after each turn, atomically compares the applied prompt sequence with the latest accepted sequence
+- sends each pending correction as a separate serial turn on the same backend session until the store seals the window
+- parses only the latest complete replacement response into `StepOutput`
 - stores per-role backend sessions keyed by `(run_id, role_id)`
-- captures visible output and turn records
+- captures visible output and turn records from every initial/correction turn
 
-`WorkflowRuntime` wires this to ACP via `cowboy-agent-acp` using the configured command, args, and model.
+ACP v1 permits one `session/prompt` turn at a time and has no concurrent
+steering primitive. Cowboy therefore applies on-the-fly prompts only at safe
+turn boundaries. The redb append and compare-and-seal operations are totally
+ordered: a prompt committed before seal is returned for another correction
+turn; a prompt serialized after seal is rejected. Cancellation, failure,
+retry, dropped futures, and guarded process recovery abort or replace stale
+window tokens.
+
+`StepInput.prompt` remains the exact initial composed prompt. Replay metadata
+under `StepInput.context.correction_turns` stores each correction's exact
+`PromptContent` blocks, sequences, role, and window token, plus the final
+applied sequence.
+
+`WorkflowRuntime` wires agent clients to ACP via `cowboy-agent-acp` using the
+configured command, args, and model.
 
 ### User input
+
+On-the-fly prompts are accepted only through a matching open agent window while
+the durable run is `Running`. The store validates the run and opaque token,
+assigns sequence `1..N`, captures an RFC 3339 millisecond UTC timestamp, and
+appends the untouched content in one write transaction. Whitespace-only input
+is rejected before storage. Prompt acceptance does not acquire the run
+execution lock, advance a step, create a record, change active-duration
+accounting, or consume step, visit, or retry budgets.
+
+Every Lua dispatch reloads the full history and exposes it as
+`ctx.user_inputs`: sequence `0` is the original request at `run.created_at`,
+followed by durable `follow_up` entries. `ctx.request` remains the original
+request. Every agent base prompt includes the same ordered history. Explicit
+`ask_user` answers are excluded and remain in `ctx.prev.fields.answer`.
 
 `cowboy-workflow-engine::ResumeRouter` handles `action.ask_user` answers:
 
@@ -197,6 +229,28 @@ keeping the current step available to `cowboy resolve`.
 ## TUI
 
 The TUI accepts plain requests and slash commands in its composer. Slash command parsing and completion metadata come from `cowboy-command-parser`; the app crate owns dispatch, pending-prompt fallback, and rendering. Runtime behavior is delegated to `cowboy-workflow-engine`, and the TUI renders the workflow event stream from the runtime event bus.
+
+Composer behavior derives from three independent facts: whether a typed
+workflow-execution background task is running, whether that execution has an
+open agent prompt window, and the latest durable run status.
+
+| Execution task | Agent window | Durable status | Plain text |
+| --- | --- | --- | --- |
+| running | open | `Running` | Submit the exact draft to the current agent; clear/history it only after durable acceptance. |
+| running | absent/closed | any | Block Enter and retain the exact draft because no agent can accept it. |
+| idle | absent | `Running` | Normal idle behavior; `/step` and `/resume` remain available. |
+| idle | absent | `WaitingForInput` | Route plain text through the pending-answer fallback; explicit `/answer` remains available. |
+| idle | absent | `Failed` | Normal idle behavior; read-only and mutating `/resolve` remain available. |
+| idle | absent | `Completed`/`Cancelled` | Normal new-request and command behavior. |
+
+While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`,
+and read-only `/resolve <run-id>` remain available. `/run`, `/step`, `/resume`,
+`/answer`, `/improve`, and mutating `/resolve` are rejected before dispatch and
+retain the draft. This conflict list is never applied merely because an active
+run id exists: stepwise `Running`, waiting, failed, and terminal runs are idle
+after their background task returns. A pending `ask_user` answer has priority
+over agent-prompt submission, and leading-slash input is always parsed as a
+command rather than forwarded to an agent.
 
 Current vertical layout:
 

@@ -40,6 +40,9 @@ pub enum Error {
     /// Mutable run snapshot/head was not present for the requested run id.
     #[error("run {0:?} not found")]
     RunNotFound(String),
+    /// Prompt-window metadata violated a sequencing invariant.
+    #[error("invalid prompt-window state: {0}")]
+    InvalidPromptState(String),
 }
 
 impl From<Error> for cowboy_workflow_core::WorkflowError {

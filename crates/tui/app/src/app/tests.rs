@@ -862,7 +862,7 @@ fn draw_shows_transcript_scrollbar_without_overwriting_status_or_composer() {
 }
 
 #[tokio::test]
-async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
+async fn draw_active_run_composer_keeps_allowed_slash_suggestions() {
     let mut state = test_state();
     state.push_input("/");
     state.spawn_test_card_report_task("pending".to_string(), async {
@@ -875,30 +875,13 @@ async fn draw_active_run_composer_shows_draft_copy_without_slash_suggestions() {
 
     let title_row = rows
         .iter()
-        .find(|row| row.contains("Run active") && row.contains("Enter waits"))
+        .find(|row| row.contains("No agent accepting prompts") && row.contains("draft retained"))
         .unwrap_or_else(|| panic!("{rendered}"));
-    assert!(title_row.contains("type draft"), "{rendered}");
-    assert!(!title_row.contains("input disabled"), "{rendered}");
+    assert!(title_row.contains("Esc cancels"), "{rendered}");
     assert!(rendered.contains("● · ◷ 1"), "{rendered}");
-    assert!(!rendered.contains("draft allowed"), "{rendered}");
-    assert!(
-        !rendered.contains("Enter waits for active run"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("input disabled while run active"),
-        "{rendered}"
-    );
-    assert!(
-        !rendered.contains("Input disabled while run active. Press Esc to cancel."),
-        "{rendered}"
-    );
     assert!(rendered.contains("> /"), "{rendered}");
-    assert!(
-        !rendered.contains("slash command suggestions"),
-        "{rendered}"
-    );
-    assert!(!rendered.contains("/resume <run-id>"), "{rendered}");
+    assert!(rendered.contains("slash command suggestions"), "{rendered}");
+    assert!(rendered.contains("/resume <run-id>"), "{rendered}");
     state.cancel_background_tasks();
 }
 
@@ -916,7 +899,7 @@ async fn draw_composer_border_color_tracks_visual_state() {
             .await
     });
     assert_eq!(
-        composer_border_fg_for_title(&state, 100, 14, "Run active"),
+        composer_border_fg_for_title(&state, 100, 14, "No agent accepting prompts"),
         style_muted().fg.unwrap()
     );
 

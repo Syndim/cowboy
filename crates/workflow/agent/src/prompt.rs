@@ -1,20 +1,54 @@
-use cowboy_workflow_core::{AgentAction, OutputSpec, RoleDefinition};
+use cowboy_agent_client::PromptContent;
+use cowboy_workflow_core::{AgentAction, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt};
 use serde_json::Value;
 
 const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
 `blocked` is a last resort. Before choosing it, exhaust reasonable, safe, in-scope actions available through the repository, supplied context, and tools: inspect relevant context, diagnose failures, try reasonable safe fixes, and try viable in-scope alternatives. A crash, failing command or test, unfamiliar code, or an unsuccessful first approach does not by itself justify `blocked`.\n\n\
 Choose `blocked` only when a precise prerequisite cannot be obtained or resolved with the available tools and context and requires a human action, decision, credential, permission, or external resource. A blocked response MUST document what was tried, the evidence that rules out self-service recovery, and the exact human help needed to continue.";
 
-pub fn build_agent_prompt(role: &RoleDefinition, action: &AgentAction) -> String {
+pub fn build_agent_prompt(
+    role: &RoleDefinition,
+    action: &AgentAction,
+    user_inputs: &[RunUserInput],
+) -> String {
     let mut parts = Vec::new();
     if !role.instructions.trim().is_empty() {
         parts.push(format!("## Role\n\n{}", role.instructions.trim()));
     }
     parts.push(format!("## Task\n\n{}", action.prompt.trim()));
+    parts.push(format!(
+        "## User Inputs\n\nAll entries below are cumulative user direction. Apply them in sequence.\n\n```json\n{}\n```",
+        serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
+    ));
     if let Some(output) = &action.output {
         parts.push(build_output_instruction(output));
     }
     parts.join("\n\n")
+}
+
+pub(crate) fn build_correction_prompt(
+    action: &AgentAction,
+    prompts: &[RunUserPrompt],
+) -> Vec<PromptContent> {
+    let mut blocks = Vec::with_capacity(prompts.len() * 2 + 2);
+    blocks.push(PromptContent::text(
+        "These entries are new cumulative user direction for the current step. Revise work already performed and replace the prior result. Return a complete replacement response, not a patch or commentary, and satisfy the original allowed statuses, fields, body expectations, and YAML-frontmatter rules.",
+    ));
+    for prompt in prompts {
+        blocks.push(PromptContent::text(format!(
+            "Follow-up user input sequence {} submitted at {}:",
+            prompt.sequence,
+            prompt
+                .submitted_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        )));
+        blocks.push(PromptContent::text(prompt.content.clone()));
+    }
+    blocks.push(PromptContent::text(match &action.output {
+        Some(output) => build_output_instruction(output),
+        None => "Return a complete replacement response beginning with YAML frontmatter containing a `status` field.".to_string(),
+    }));
+    blocks
 }
 
 /// Build a corrective instruction appended to a retry prompt after a
@@ -103,7 +137,7 @@ mod tests {
                 fields: serde_json::json!({"summary": "string"}),
             }),
         };
-        let prompt = build_agent_prompt(&role, &action);
+        let prompt = build_agent_prompt(&role, &action, &[]);
         assert!(prompt.contains("Implement changes"));
         assert!(prompt.contains("Do work"));
         assert!(prompt.contains("valid YAML frontmatter"));
@@ -129,7 +163,7 @@ mod tests {
             }),
         };
 
-        let prompt = build_agent_prompt(&role, &action);
+        let prompt = build_agent_prompt(&role, &action, &[]);
 
         assert!(prompt.contains("`blocked` is a last resort"));
         assert!(prompt.contains("exhaust reasonable, safe, in-scope actions"));

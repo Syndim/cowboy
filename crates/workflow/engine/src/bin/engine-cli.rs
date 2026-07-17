@@ -344,6 +344,22 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
             "{} step {step_id} agent session ready role={role} session={session_id}",
             event.run_id
         ),
+        WorkflowEventKind::AgentPromptWindowOpened {
+            step_id,
+            role,
+            window_id,
+        } => format!(
+            "{} step {step_id} agent prompt window opened role={role} window={window_id}",
+            event.run_id
+        ),
+        WorkflowEventKind::AgentPromptWindowClosed {
+            step_id,
+            role,
+            window_id,
+        } => format!(
+            "{} step {step_id} agent prompt window closed role={role} window={window_id}",
+            event.run_id
+        ),
         WorkflowEventKind::AgentPrompt {
             step_id,
             role,

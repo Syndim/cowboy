@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 description = "Workflow runtime orchestration adapters for Cowboy"
 
+[features]
+test-support = ["cowboy-workflow-agent/test-support"]
+
 [dependencies]
 cowboy-agent-client.workspace = true
 cowboy-agent-acp.workspace = true

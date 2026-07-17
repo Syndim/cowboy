@@ -6,6 +6,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_client::ModelInfo;
+#[cfg(feature = "test-support")]
+use cowboy_workflow_agent::PromptWindowHandoffObserver;
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind,
 };
@@ -13,11 +15,11 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ActionResult, DEFAULT_CONFIG_SET_NAME, ExecutionContext, ObjectKind, ResolvedConfigSet, Result,
-    RunHead, RunStatus, RunnerLimits, StatusAction, StepAction, StepActionProvider, StepRecord,
-    WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowSelector,
-    WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status,
-    apply_step_record,
+    ActionResult, AppendUserPromptOutcome, DEFAULT_CONFIG_SET_NAME, ExecutionContext, ObjectKind,
+    ResolvedConfigSet, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction,
+    StepAction, StepActionProvider, StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError,
+    WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
+    apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::RedbRunStore;
 use serde::{Deserialize, Serialize};
@@ -229,6 +231,39 @@ impl RunStatusDetail {
     }
 }
 
+/// Durable result of attempting to send an on-the-fly prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserPromptSubmission {
+    Accepted(RunUserPrompt),
+    Rejected(UserPromptRejection),
+}
+
+/// Stable rejection reason used by the TUI to retain and explain a draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserPromptRejection {
+    Empty,
+    MissingRun,
+    TerminalRun,
+    NoAgentWindow,
+    StaleWindow,
+    SealedWindow,
+}
+
+impl UserPromptRejection {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "prompt is empty",
+            Self::MissingRun => "workflow run no longer exists",
+            Self::TerminalRun => "workflow run is no longer running",
+            Self::NoAgentWindow => "no agent is currently accepting prompts",
+            Self::StaleWindow => {
+                "the agent prompt window was replaced; wait for the current window"
+            }
+            Self::SealedWindow => "the agent already finalized this step",
+        }
+    }
+}
+
 /// Guided choices for manually resolving a run stopped on a failed step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionOptions {
@@ -264,6 +299,8 @@ pub struct WorkflowRuntime {
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
     dependencies: Arc<dyn RuntimeDependencies>,
+    #[cfg(feature = "test-support")]
+    handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
 
 /// How far [`WorkflowRuntime`] drives a run in a single call.
@@ -308,6 +345,10 @@ impl Drop for ActiveRunCancellationGuard {
             return;
         }
 
+        if let Err(err) = self.store.clear_agent_prompt_window(&self.run_id) {
+            tracing::warn!(run_id = %self.run_id, error = %err, "failed to clear agent prompt window during cancellation");
+        }
+
         match self.store.load_run(&self.run_id) {
             Ok(mut run) => {
                 if let Err(err) = self.active_clock.close(&self.store, &mut run) {
@@ -345,6 +386,8 @@ impl WorkflowRuntime {
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
+            #[cfg(feature = "test-support")]
+            handoff_observer: None,
         }
     }
 
@@ -352,6 +395,12 @@ impl WorkflowRuntime {
     /// one. Intended for tests that have no live agent backend.
     pub fn with_deterministic_selector(mut self) -> Self {
         self.selector = SelectorMode::Deterministic;
+        self
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    fn with_handoff_observer(mut self, observer: Arc<dyn PromptWindowHandoffObserver>) -> Self {
+        self.handoff_observer = Some(observer);
         self
     }
 
@@ -412,6 +461,38 @@ impl WorkflowRuntime {
 
     pub fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
         Ok(self.store()?.load_run(&run_id.to_string())?)
+    }
+
+    pub fn submit_user_prompt(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        content: String,
+    ) -> Result<UserPromptSubmission> {
+        if content.trim().is_empty() {
+            return Ok(UserPromptSubmission::Rejected(UserPromptRejection::Empty));
+        }
+        let outcome = self
+            .store()?
+            .append_user_prompt(run_id, window_id, content)?;
+        Ok(match outcome {
+            AppendUserPromptOutcome::Accepted(prompt) => UserPromptSubmission::Accepted(prompt),
+            AppendUserPromptOutcome::MissingRun => {
+                UserPromptSubmission::Rejected(UserPromptRejection::MissingRun)
+            }
+            AppendUserPromptOutcome::TerminalRun => {
+                UserPromptSubmission::Rejected(UserPromptRejection::TerminalRun)
+            }
+            AppendUserPromptOutcome::NoWindow => {
+                UserPromptSubmission::Rejected(UserPromptRejection::NoAgentWindow)
+            }
+            AppendUserPromptOutcome::StaleWindow => {
+                UserPromptSubmission::Rejected(UserPromptRejection::StaleWindow)
+            }
+            AppendUserPromptOutcome::SealedWindow => {
+                UserPromptSubmission::Rejected(UserPromptRejection::SealedWindow)
+            }
+        })
     }
 
     pub async fn start_run(&self, request: impl Into<String>) -> Result<RunReport> {
@@ -749,9 +830,10 @@ impl WorkflowRuntime {
             .as_ref()
             .map(|head| store.get_object::<StepRecord>(head))
             .transpose()?;
+        let user_prompts = store.load_user_prompts(&run.id)?;
         let provider = LuaStepActionProvider::new(snapshot);
         let action = provider
-            .step_action(&definition, run, &step, prev_record.as_ref())
+            .step_action(&definition, run, &step, prev_record.as_ref(), &user_prompts)
             .ok();
         let (required_fields, optional_fields, body_expected) =
             action_output_shape(action.as_ref());
@@ -848,6 +930,9 @@ impl WorkflowRuntime {
             role: None,
             attempt: 1,
             retry_reason: None,
+            original_request: run.original_request.clone(),
+            run_created_at: run.created_at,
+            user_prompts: store.load_user_prompts(&run.id)?,
         };
         let ActionResult::Completed(record) = crate::StatusActionRunner.run(
             StatusAction {
@@ -1028,6 +1113,7 @@ impl WorkflowRuntime {
         let progress_clock = active_clock.clone();
         let mut rx = self.events.subscribe();
         let store = self.store()?;
+        store.clear_agent_prompt_window(&run_id)?;
         let mut cancellation_guard =
             ActiveRunCancellationGuard::new(store.clone(), run_id.clone(), active_clock.clone());
         let agent_store = store.clone();
@@ -1041,6 +1127,8 @@ impl WorkflowRuntime {
                     &progress_clock,
                 ));
             })),
+            #[cfg(feature = "test-support")]
+            handoff_observer: self.handoff_observer.clone(),
         };
         let factory = self.dependencies.agent_factory(&self.config)?;
         let executor = AgentExecutor::new(factory, agent_store, agent_config);
@@ -1108,6 +1196,20 @@ impl WorkflowRuntime {
                     step_id,
                     role,
                     session_id,
+                }
+            }
+            AgentProgressKind::PromptWindowOpened { role, window_id } => {
+                WorkflowEventKind::AgentPromptWindowOpened {
+                    step_id,
+                    role,
+                    window_id,
+                }
+            }
+            AgentProgressKind::PromptWindowClosed { role, window_id } => {
+                WorkflowEventKind::AgentPromptWindowClosed {
+                    step_id,
+                    role,
+                    window_id,
                 }
             }
             AgentProgressKind::Prompt {
@@ -1314,8 +1416,12 @@ mod tests {
     use crate::runtime_dependencies::{MockRuntimeDependencies, SharedClientFactory};
     use async_trait::async_trait;
     use cowboy_agent_client::{AgentInfo, Client, Event, PromptContent, StopReason};
+    #[cfg(feature = "test-support")]
+    use cowboy_workflow_agent::PromptWindowHandoffPoint;
     use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
-    use cowboy_workflow_core::{ResumeCallback, RoleDefinition, RunStatus, StepAction};
+    use cowboy_workflow_core::{
+        AgentPromptWindow, ResumeCallback, RoleDefinition, RunStatus, StepAction,
+    };
     use parking_lot::Mutex as SyncMutex;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
@@ -1466,6 +1572,72 @@ mod tests {
                 },
                 backend: "scripted-agent".to_string(),
             })
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HandoffPause {
+        BeforeCompareAndSeal,
+        AfterSealed,
+    }
+
+    #[cfg(feature = "test-support")]
+    #[derive(Debug)]
+    struct BoundaryObserver {
+        pause: HandoffPause,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        point: SyncMutex<Option<PromptWindowHandoffPoint>>,
+        paused: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(feature = "test-support")]
+    impl BoundaryObserver {
+        fn new(pause: HandoffPause) -> Self {
+            Self {
+                pause,
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                point: SyncMutex::new(None),
+                paused: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        async fn wait_until_reached(&self) -> PromptWindowHandoffPoint {
+            self.reached.notified().await;
+            self.point
+                .lock()
+                .clone()
+                .expect("handoff point recorded before notification")
+        }
+
+        fn resume(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[async_trait]
+    impl PromptWindowHandoffObserver for BoundaryObserver {
+        async fn observe(&self, point: PromptWindowHandoffPoint) {
+            let should_pause = matches!(
+                (&self.pause, &point),
+                (
+                    HandoffPause::BeforeCompareAndSeal,
+                    PromptWindowHandoffPoint::BeforeCompareAndSeal { .. },
+                ) | (
+                    HandoffPause::AfterSealed,
+                    PromptWindowHandoffPoint::AfterCompareAndSeal { pending: false, .. },
+                )
+            );
+            if !should_pause || self.paused.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+
+            *self.point.lock() = Some(point);
+            self.reached.notify_one();
+            self.release.notified().await;
         }
     }
 
@@ -1677,6 +1849,214 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn append_at_pre_seal_boundary_forces_same_session_correction() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            local inspect = step("inspect")
+            inspect.run = function(ctx)
+              return action.status {
+                status = "success",
+                fields = {
+                  count = #ctx.user_inputs,
+                  initial = ctx.user_inputs[1].content,
+                  follow_up = ctx.user_inputs[2].content,
+                }
+              }
+            end
+            local verify = step("verify", { role = developer })
+            verify.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Verify all cumulative direction",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            start:on("success", inspect)
+            inspect:on("success", verify)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        };
+        let submit_runtime = WorkflowRuntime::new(config.clone());
+        let factory = ScriptedAgentFactory::new(vec![
+            "---\nstatus: success\nsummary: initial\n---\ninitial".to_string(),
+            "---\nstatus: success\nsummary: corrected\n---\ncorrected".to_string(),
+            "---\nstatus: success\nsummary: verified\n---\nverified".to_string(),
+        ]);
+        let observer = Arc::new(BoundaryObserver::new(HandoffPause::BeforeCompareAndSeal));
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(None, Some(factory.clone())),
+        )
+        .with_deterministic_selector()
+        .with_handoff_observer(observer.clone());
+        let executing_runtime = runtime.clone();
+        let run_task = tokio::spawn(async move { executing_runtime.start_run("original").await });
+        let PromptWindowHandoffPoint::BeforeCompareAndSeal {
+            run_id, window_id, ..
+        } = observer.wait_until_reached().await
+        else {
+            panic!("expected pre-seal boundary")
+        };
+
+        let accepted = submit_runtime
+            .submit_user_prompt(&run_id, &window_id, "  correct\nnow  ".to_string())
+            .unwrap();
+        assert!(matches!(accepted, UserPromptSubmission::Accepted(_)));
+        observer.resume();
+        let report = run_task.await.unwrap().unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let store = runtime.store().unwrap();
+        let final_record = store
+            .get_object::<StepRecord>(report.run.head.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(final_record.step, "verify");
+        assert_eq!(final_record.output.as_ref().unwrap().body, "verified");
+        let inspect_record = store
+            .get_object::<StepRecord>(final_record.prev.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(inspect_record.step, "inspect");
+        assert_eq!(inspect_record.output.as_ref().unwrap().fields["count"], 2);
+        assert_eq!(
+            inspect_record.output.as_ref().unwrap().fields["initial"],
+            "original"
+        );
+        assert_eq!(
+            inspect_record.output.as_ref().unwrap().fields["follow_up"],
+            "  correct\nnow  "
+        );
+        let first_record = store
+            .get_object::<StepRecord>(inspect_record.prev.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(first_record.output.as_ref().unwrap().body, "corrected");
+        assert_eq!(factory.created_roles(), ["developer"]);
+        let prompts = factory.prompts();
+        assert_eq!(prompts.len(), 3);
+        assert!(prompts[1].contains("  correct\nnow  "));
+        assert_eq!(prompts[2].matches("\"sequence\": 0").count(), 1);
+        assert_eq!(prompts[2].matches("\"sequence\": 1").count(), 1);
+        assert_eq!(prompts[2].matches(r#"  correct\nnow  "#).count(), 1);
+        assert_eq!(
+            final_record.input.context["user_inputs"],
+            serde_json::json!([
+                {
+                    "sequence": 0,
+                    "kind": "initial",
+                    "content": "original",
+                    "submitted_at": report.run.created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                },
+                {
+                    "sequence": 1,
+                    "kind": "follow_up",
+                    "content": "  correct\nnow  ",
+                    "submitted_at": submit_runtime.store().unwrap().load_user_prompts(&run_id).unwrap()[0]
+                        .submitted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                }
+            ])
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn append_at_post_seal_boundary_is_rejected_before_step_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows-seal");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state-seal"),
+            workflow_store: dir.path().join("state-seal/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        };
+        let submit_runtime = WorkflowRuntime::new(config.clone());
+        let factory = ScriptedAgentFactory::new(vec![
+            "---\nstatus: success\nsummary: done\n---\ndone".to_string(),
+        ]);
+        let observer = Arc::new(BoundaryObserver::new(HandoffPause::AfterSealed));
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(None, Some(factory)),
+        )
+        .with_deterministic_selector()
+        .with_handoff_observer(observer.clone());
+        let executing_runtime = runtime.clone();
+        let run_task = tokio::spawn(async move { executing_runtime.start_run("original").await });
+        let PromptWindowHandoffPoint::AfterCompareAndSeal {
+            run_id,
+            window_id,
+            pending,
+            ..
+        } = observer.wait_until_reached().await
+        else {
+            panic!("expected post-seal boundary")
+        };
+        assert!(!pending);
+
+        let rejected = submit_runtime
+            .submit_user_prompt(&run_id, &window_id, "too late".to_string())
+            .unwrap();
+        assert_eq!(
+            rejected,
+            UserPromptSubmission::Rejected(UserPromptRejection::SealedWindow)
+        );
+        assert!(matches!(
+            submit_runtime.load_run(&run_id).unwrap().status,
+            RunStatus::Running
+        ));
+        observer.resume();
+        let report = run_task.await.unwrap().unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert!(
+            submit_runtime
+                .store()
+                .unwrap()
+                .load_user_prompts(&run_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
     fn runtime_for_workflow_dir_with_config_sets(
         dir: &tempfile::TempDir,
         workflow_dir: PathBuf,
@@ -1739,6 +2119,77 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn submit_user_prompt_validates_empty_and_preserves_run_counters_and_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let run = summary_test_run("run-prompt", RunStatus::Running, None);
+        store.save_run(&run).unwrap();
+        store
+            .open_agent_prompt_window(AgentPromptWindow {
+                window_id: "window-1".to_string(),
+                run_id: run.id.clone(),
+                step_record_id: "record-1".to_string(),
+                step_id: run.current_step.clone(),
+                role_id: "developer".to_string(),
+                baseline_sequence: 0,
+                applied_sequence: 0,
+                opened_at: Utc::now(),
+                sealed_at: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .submit_user_prompt(&run.id, "window-1", " \n\t ".to_string())
+                .unwrap(),
+            UserPromptSubmission::Rejected(UserPromptRejection::Empty)
+        );
+        let exact = "  adjust\nthis  ".to_string();
+        let accepted = runtime
+            .clone()
+            .submit_user_prompt(&run.id, "window-1", exact.clone())
+            .unwrap();
+        let UserPromptSubmission::Accepted(prompt) = accepted else {
+            panic!("expected durable acceptance")
+        };
+        assert_eq!(prompt.sequence, 1);
+        assert_eq!(prompt.content, exact);
+        assert_eq!(store.load_user_prompts(&run.id).unwrap(), vec![prompt]);
+        assert_eq!(store.load_run(&run.id).unwrap(), run);
+    }
+
+    #[test]
+    fn cancellation_guard_clears_active_prompt_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let run = summary_test_run("run-cancel", RunStatus::Running, None);
+        store.save_run(&run).unwrap();
+        store
+            .open_agent_prompt_window(AgentPromptWindow {
+                window_id: "window-cancel".to_string(),
+                run_id: run.id.clone(),
+                step_record_id: "record-cancel".to_string(),
+                step_id: run.current_step.clone(),
+                role_id: "developer".to_string(),
+                baseline_sequence: 0,
+                applied_sequence: 0,
+                opened_at: Utc::now(),
+                sealed_at: None,
+            })
+            .unwrap();
+
+        drop(ActiveRunCancellationGuard::new(
+            store.clone(),
+            run.id.clone(),
+            ActiveRunClock::open(&run),
+        ));
+
+        assert!(store.clear_agent_prompt_window(&run.id).unwrap().is_none());
     }
 
     fn runtime_for_topic_workflow(dir: &tempfile::TempDir, topic: &str) -> WorkflowRuntime {

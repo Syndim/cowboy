@@ -3,8 +3,10 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::{
-    ObjectHash, ObjectKind, Result, ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId,
-    RunStatus, StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
+    AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome,
+    CompareAndSealPromptWindowOutcome, ObjectHash, ObjectKind, OpenAgentPromptWindowOutcome,
+    Result, ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
+    StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
     WorkflowDefinition, WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
 };
 
@@ -45,6 +47,12 @@ pub struct ExecutionContext {
     pub attempt: u64,
     /// Reason the previous attempt failed, when this is a corrective retry.
     pub retry_reason: Option<String>,
+    /// Original request that created the run.
+    pub original_request: String,
+    /// Timestamp of the initial request.
+    pub run_created_at: DateTime<Utc>,
+    /// Ordered durable follow-up prompt snapshot used for this dispatch.
+    pub user_prompts: Vec<RunUserPrompt>,
 }
 
 /// User answer and prompt metadata supplied to a registered resume callback.
@@ -96,6 +104,7 @@ pub trait StepActionProvider: Send + Sync {
         run: &WorkflowRun,
         step: &StepDefinition,
         prev: Option<&StepRecord>,
+        user_prompts: &[RunUserPrompt],
     ) -> Result<StepAction>;
 }
 
@@ -145,6 +154,38 @@ pub trait RunStore: Send + Sync {
     fn delete_role_sessions(&self, run_id: &str) -> Result<()>;
 
     fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash>;
+
+    fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>>;
+
+    fn open_agent_prompt_window(
+        &self,
+        window: AgentPromptWindow,
+    ) -> Result<OpenAgentPromptWindowOutcome>;
+
+    fn append_user_prompt(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        content: String,
+    ) -> Result<AppendUserPromptOutcome>;
+
+    fn compare_and_seal_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        applied_sequence: u64,
+        sealed_at: DateTime<Utc>,
+    ) -> Result<CompareAndSealPromptWindowOutcome>;
+
+    fn abort_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        aborted_at: DateTime<Utc>,
+    ) -> Result<AbortAgentPromptWindowOutcome>;
+
+    /// Clear any process-stale prompt window while holding the run execution guard.
+    fn clear_agent_prompt_window(&self, run_id: &str) -> Result<Option<AgentPromptWindow>>;
 }
 
 #[cfg(test)]

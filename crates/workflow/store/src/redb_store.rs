@@ -2,14 +2,19 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use cowboy_workflow_core::{
-    ObjectHash, ObjectKind, RoleSession, RunHead, RunId, RunStore, TurnRecord, WorkflowRun,
+    AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome,
+    CompareAndSealPromptWindowOutcome, ObjectHash, ObjectKind, OpenAgentPromptWindowOutcome,
+    RoleSession, RunHead, RunId, RunStatus, RunStore, RunUserPrompt, TurnRecord, WorkflowRun,
 };
 use redb::{Database, ReadableDatabase, ReadableTable};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::hash::{canonical_object_bytes, object_hash};
-use crate::tables::{OBJECTS, ROLE_SESSIONS, RUN_HEADS, RUN_TURNS, RUNS};
+use crate::tables::{
+    AGENT_PROMPT_WINDOWS, OBJECTS, ROLE_SESSIONS, RUN_HEADS, RUN_TURNS, RUN_USER_PROMPTS, RUNS,
+};
 use crate::{Error, Result};
 
 const OPEN_RETRY_ATTEMPTS: usize = 20;
@@ -60,7 +65,13 @@ impl RedbRunStore {
     /// Load a workflow run snapshot by run id.
     pub fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun> {
         self.with_read(|read| {
-            let table = read.open_table(RUNS)?;
+            let table = match read.open_table(RUNS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(Error::RunNotFound(run_id.clone()));
+                }
+                Err(err) => return Err(err.into()),
+            };
             let Some(bytes) = table.get(run_id.as_str())? else {
                 return Err(Error::RunNotFound(run_id.clone()));
             };
@@ -184,6 +195,240 @@ impl RedbRunStore {
         })
     }
 
+    /// Load durable follow-up prompts in sequence order.
+    pub fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>> {
+        self.with_read(|read| {
+            let table = match read.open_table(RUN_USER_PROMPTS) {
+                Ok(table) => table,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(err) => return Err(err.into()),
+            };
+            table
+                .get(run_id)?
+                .map(|value| decode_json(value.value()))
+                .transpose()
+                .map(Option::unwrap_or_default)
+        })
+    }
+
+    /// Open a new prompt window and bind it to the current durable prompt baseline.
+    pub fn open_agent_prompt_window(
+        &self,
+        mut window: AgentPromptWindow,
+    ) -> Result<OpenAgentPromptWindowOutcome> {
+        self.with_write(|write| {
+            let run = {
+                let runs = write.open_table(RUNS)?;
+                let Some(value) = runs.get(window.run_id.as_str())? else {
+                    return Ok(OpenAgentPromptWindowOutcome::MissingRun);
+                };
+                decode_json::<WorkflowRun>(value.value())?
+            };
+            if !matches!(run.status, RunStatus::Running) {
+                return Ok(OpenAgentPromptWindowOutcome::TerminalRun);
+            }
+
+            let baseline = {
+                let prompts = write.open_table(RUN_USER_PROMPTS)?;
+                prompts
+                    .get(window.run_id.as_str())?
+                    .map(|value| decode_json::<Vec<RunUserPrompt>>(value.value()))
+                    .transpose()?
+                    .and_then(|prompts| prompts.last().map(|prompt| prompt.sequence))
+                    .unwrap_or(0)
+            };
+            window.baseline_sequence = baseline;
+            window.applied_sequence = baseline;
+            window.sealed_at = None;
+            let bytes = serde_json::to_vec(&window)?;
+            write
+                .open_table(AGENT_PROMPT_WINDOWS)?
+                .insert(window.run_id.as_str(), bytes.as_slice())?;
+            Ok(OpenAgentPromptWindowOutcome::Opened(window))
+        })
+    }
+
+    /// Append a prompt only through the matching open token, assigning its sequence atomically.
+    pub fn append_user_prompt(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        content: String,
+    ) -> Result<AppendUserPromptOutcome> {
+        self.with_write(|write| {
+            let run = {
+                let runs = write.open_table(RUNS)?;
+                let Some(value) = runs.get(run_id)? else {
+                    return Ok(AppendUserPromptOutcome::MissingRun);
+                };
+                decode_json::<WorkflowRun>(value.value())?
+            };
+            if !matches!(run.status, RunStatus::Running) {
+                return Ok(AppendUserPromptOutcome::TerminalRun);
+            }
+
+            let window = {
+                let windows = write.open_table(AGENT_PROMPT_WINDOWS)?;
+                let Some(value) = windows.get(run_id)? else {
+                    return Ok(AppendUserPromptOutcome::NoWindow);
+                };
+                decode_json::<AgentPromptWindow>(value.value())?
+            };
+            if window.window_id != window_id {
+                return Ok(AppendUserPromptOutcome::StaleWindow);
+            }
+            if !window.is_open() {
+                return Ok(AppendUserPromptOutcome::SealedWindow);
+            }
+
+            let mut table = write.open_table(RUN_USER_PROMPTS)?;
+            let mut prompts = table
+                .get(run_id)?
+                .map(|value| decode_json::<Vec<RunUserPrompt>>(value.value()))
+                .transpose()?
+                .unwrap_or_default();
+            let sequence = prompts
+                .last()
+                .map(|prompt| prompt.sequence + 1)
+                .unwrap_or(1);
+            let submitted_at = Utc::now();
+            let prompt = RunUserPrompt {
+                sequence,
+                content,
+                submitted_at: DateTime::from_timestamp_millis(submitted_at.timestamp_millis())
+                    .expect("valid UTC timestamp milliseconds"),
+            };
+            prompts.push(prompt.clone());
+            let bytes = serde_json::to_vec(&prompts)?;
+            table.insert(run_id, bytes.as_slice())?;
+            Ok(AppendUserPromptOutcome::Accepted(prompt))
+        })
+    }
+
+    /// Return prompts newer than `applied_sequence`, or seal when none remain.
+    pub fn compare_and_seal_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        applied_sequence: u64,
+        sealed_at: DateTime<Utc>,
+    ) -> Result<CompareAndSealPromptWindowOutcome> {
+        self.with_write(|write| {
+            let run = {
+                let runs = write.open_table(RUNS)?;
+                let Some(value) = runs.get(run_id)? else {
+                    return Ok(CompareAndSealPromptWindowOutcome::MissingRun);
+                };
+                decode_json::<WorkflowRun>(value.value())?
+            };
+            if !matches!(run.status, RunStatus::Running) {
+                return Ok(CompareAndSealPromptWindowOutcome::TerminalRun);
+            }
+
+            let mut window = {
+                let windows = write.open_table(AGENT_PROMPT_WINDOWS)?;
+                let Some(value) = windows.get(run_id)? else {
+                    return Ok(CompareAndSealPromptWindowOutcome::NoWindow);
+                };
+                decode_json::<AgentPromptWindow>(value.value())?
+            };
+            if window.window_id != window_id {
+                return Ok(CompareAndSealPromptWindowOutcome::StaleWindow);
+            }
+            if !window.is_open() {
+                return Ok(CompareAndSealPromptWindowOutcome::Sealed(window));
+            }
+            if applied_sequence < window.applied_sequence {
+                return Err(Error::InvalidPromptState(format!(
+                    "applied sequence moved backwards from {} to {applied_sequence}",
+                    window.applied_sequence
+                )));
+            }
+
+            let prompts = {
+                let table = write.open_table(RUN_USER_PROMPTS)?;
+                table
+                    .get(run_id)?
+                    .map(|value| decode_json::<Vec<RunUserPrompt>>(value.value()))
+                    .transpose()?
+                    .unwrap_or_default()
+            };
+            let latest = prompts.last().map(|prompt| prompt.sequence).unwrap_or(0);
+            if applied_sequence > latest {
+                return Err(Error::InvalidPromptState(format!(
+                    "applied sequence {applied_sequence} exceeds latest sequence {latest}"
+                )));
+            }
+
+            window.applied_sequence = applied_sequence;
+            let pending = prompts
+                .into_iter()
+                .filter(|prompt| prompt.sequence > applied_sequence)
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                window.sealed_at = Some(sealed_at);
+            }
+            let bytes = serde_json::to_vec(&window)?;
+            write
+                .open_table(AGENT_PROMPT_WINDOWS)?
+                .insert(run_id, bytes.as_slice())?;
+            if pending.is_empty() {
+                Ok(CompareAndSealPromptWindowOutcome::Sealed(window))
+            } else {
+                Ok(CompareAndSealPromptWindowOutcome::Pending {
+                    window,
+                    prompts: pending,
+                })
+            }
+        })
+    }
+
+    /// Seal the matching window without accepting further prompts.
+    pub fn abort_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        aborted_at: DateTime<Utc>,
+    ) -> Result<AbortAgentPromptWindowOutcome> {
+        self.with_write(|write| {
+            {
+                let runs = write.open_table(RUNS)?;
+                if runs.get(run_id)?.is_none() {
+                    return Ok(AbortAgentPromptWindowOutcome::MissingRun);
+                }
+            }
+            let mut window = {
+                let windows = write.open_table(AGENT_PROMPT_WINDOWS)?;
+                let Some(value) = windows.get(run_id)? else {
+                    return Ok(AbortAgentPromptWindowOutcome::NoWindow);
+                };
+                decode_json::<AgentPromptWindow>(value.value())?
+            };
+            if window.window_id != window_id {
+                return Ok(AbortAgentPromptWindowOutcome::StaleWindow);
+            }
+            window.sealed_at.get_or_insert(aborted_at);
+            let bytes = serde_json::to_vec(&window)?;
+            write
+                .open_table(AGENT_PROMPT_WINDOWS)?
+                .insert(run_id, bytes.as_slice())?;
+            Ok(AbortAgentPromptWindowOutcome::Aborted(window))
+        })
+    }
+
+    /// Remove process-stale prompt-window metadata under the caller's execution guard.
+    pub fn clear_agent_prompt_window(&self, run_id: &str) -> Result<Option<AgentPromptWindow>> {
+        self.with_write(|write| {
+            let mut windows = write.open_table(AGENT_PROMPT_WINDOWS)?;
+            let window = windows
+                .get(run_id)?
+                .map(|value| decode_json::<AgentPromptWindow>(value.value()))
+                .transpose()?;
+            windows.remove(run_id)?;
+            Ok(window)
+        })
+    }
+
     /// Delete a run snapshot, run head, and indexed turn lists for the run.
     ///
     /// Immutable objects are intentionally left in `OBJECTS`; later garbage
@@ -192,6 +437,8 @@ impl RedbRunStore {
         self.with_write(|write| {
             write.open_table(RUNS)?.remove(run_id)?;
             write.open_table(RUN_HEADS)?.remove(run_id)?;
+            write.open_table(RUN_USER_PROMPTS)?.remove(run_id)?;
+            write.open_table(AGENT_PROMPT_WINDOWS)?.remove(run_id)?;
 
             let mut role_sessions = write.open_table(ROLE_SESSIONS)?;
             let session_prefix = format!("{run_id}:");
@@ -367,6 +614,60 @@ impl RunStore for RedbRunStore {
     ) -> cowboy_workflow_core::Result<ObjectHash> {
         RedbRunStore::append_turn(self, run_id, turn).map_err(Into::into)
     }
+
+    fn load_user_prompts(&self, run_id: &str) -> cowboy_workflow_core::Result<Vec<RunUserPrompt>> {
+        RedbRunStore::load_user_prompts(self, run_id).map_err(Into::into)
+    }
+
+    fn open_agent_prompt_window(
+        &self,
+        window: AgentPromptWindow,
+    ) -> cowboy_workflow_core::Result<OpenAgentPromptWindowOutcome> {
+        RedbRunStore::open_agent_prompt_window(self, window).map_err(Into::into)
+    }
+
+    fn append_user_prompt(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        content: String,
+    ) -> cowboy_workflow_core::Result<AppendUserPromptOutcome> {
+        RedbRunStore::append_user_prompt(self, run_id, window_id, content).map_err(Into::into)
+    }
+
+    fn compare_and_seal_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        applied_sequence: u64,
+        sealed_at: DateTime<Utc>,
+    ) -> cowboy_workflow_core::Result<CompareAndSealPromptWindowOutcome> {
+        RedbRunStore::compare_and_seal_agent_prompt_window(
+            self,
+            run_id,
+            window_id,
+            applied_sequence,
+            sealed_at,
+        )
+        .map_err(Into::into)
+    }
+
+    fn abort_agent_prompt_window(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        aborted_at: DateTime<Utc>,
+    ) -> cowboy_workflow_core::Result<AbortAgentPromptWindowOutcome> {
+        RedbRunStore::abort_agent_prompt_window(self, run_id, window_id, aborted_at)
+            .map_err(Into::into)
+    }
+
+    fn clear_agent_prompt_window(
+        &self,
+        run_id: &str,
+    ) -> cowboy_workflow_core::Result<Option<AgentPromptWindow>> {
+        RedbRunStore::clear_agent_prompt_window(self, run_id).map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -408,6 +709,20 @@ mod tests {
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn prompt_window(run_id: &str, window_id: &str) -> AgentPromptWindow {
+        AgentPromptWindow {
+            window_id: window_id.to_string(),
+            run_id: run_id.to_string(),
+            step_record_id: "record-1".to_string(),
+            step_id: "step-1".to_string(),
+            role_id: "developer".to_string(),
+            baseline_sequence: 0,
+            applied_sequence: 0,
+            opened_at: Utc::now(),
+            sealed_at: None,
         }
     }
 
@@ -667,5 +982,136 @@ mod tests {
             store.get_object::<StepRecord>(&hash),
             Err(Error::ObjectNotFound(_))
         ));
+    }
+
+    #[test]
+    fn prompt_append_and_compare_and_seal_are_totally_ordered() {
+        let (file, store) = store();
+        let run = run();
+        store.save_run(&run).unwrap();
+        assert_eq!(store.load_user_prompts(&run.id).unwrap(), Vec::new());
+
+        let opened = store
+            .open_agent_prompt_window(prompt_window(&run.id, "window-1"))
+            .unwrap();
+        assert!(matches!(opened, OpenAgentPromptWindowOutcome::Opened(_)));
+        let content = "  correction\nwith spacing  ".to_string();
+        let accepted_not_before = Utc::now().timestamp_millis();
+        let accepted = store
+            .append_user_prompt(&run.id, "window-1", content.clone())
+            .unwrap();
+        let AppendUserPromptOutcome::Accepted(prompt) = accepted else {
+            panic!("expected accepted prompt")
+        };
+        assert_eq!(prompt.sequence, 1);
+        assert_eq!(prompt.content, content);
+        assert!(prompt.submitted_at.timestamp_millis() >= accepted_not_before);
+        assert!(prompt.submitted_at.timestamp_millis() <= Utc::now().timestamp_millis());
+
+        let pending = store
+            .compare_and_seal_agent_prompt_window(&run.id, "window-1", 0, Utc::now())
+            .unwrap();
+        assert!(matches!(
+            pending,
+            CompareAndSealPromptWindowOutcome::Pending { prompts, .. }
+                if prompts == vec![prompt.clone()]
+        ));
+        let sealed = store
+            .compare_and_seal_agent_prompt_window(&run.id, "window-1", 1, Utc::now())
+            .unwrap();
+        assert!(matches!(
+            sealed,
+            CompareAndSealPromptWindowOutcome::Sealed(_)
+        ));
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "window-1", "too late".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::SealedWindow
+        );
+
+        let reopened = RedbRunStore::open(file.path()).unwrap();
+        assert_eq!(reopened.load_user_prompts(&run.id).unwrap(), vec![prompt]);
+    }
+
+    #[test]
+    fn prompt_submission_rejects_missing_terminal_stale_and_absent_windows_without_writing() {
+        let (_file, store) = store();
+        assert_eq!(
+            store
+                .append_user_prompt("missing", "window", "text".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::MissingRun
+        );
+        let mut run = run();
+        store.save_run(&run).unwrap();
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "window", "text".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::NoWindow
+        );
+        store
+            .open_agent_prompt_window(prompt_window(&run.id, "current"))
+            .unwrap();
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "stale", "text".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::StaleWindow
+        );
+        run.status = RunStatus::Completed;
+        store.save_run(&run).unwrap();
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "current", "text".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::TerminalRun
+        );
+        assert!(store.load_user_prompts(&run.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replacing_and_clearing_windows_invalidates_old_tokens_and_delete_removes_prompt_indexes() {
+        let (_file, store) = store();
+        let run = run();
+        store.save_run(&run).unwrap();
+        store
+            .open_agent_prompt_window(prompt_window(&run.id, "old"))
+            .unwrap();
+        store
+            .open_agent_prompt_window(prompt_window(&run.id, "new"))
+            .unwrap();
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "old", "stale".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::StaleWindow
+        );
+        assert_eq!(
+            store
+                .clear_agent_prompt_window(&run.id)
+                .unwrap()
+                .unwrap()
+                .window_id,
+            "new"
+        );
+        assert_eq!(
+            store
+                .append_user_prompt(&run.id, "new", "closed".to_string())
+                .unwrap(),
+            AppendUserPromptOutcome::NoWindow
+        );
+
+        store
+            .open_agent_prompt_window(prompt_window(&run.id, "final"))
+            .unwrap();
+        let accepted = store
+            .append_user_prompt(&run.id, "final", "saved".to_string())
+            .unwrap();
+        assert!(matches!(accepted, AppendUserPromptOutcome::Accepted(_)));
+        store.delete_run(&run.id).unwrap();
+        assert!(store.load_user_prompts(&run.id).unwrap().is_empty());
+        assert!(store.clear_agent_prompt_window(&run.id).unwrap().is_none());
     }
 }

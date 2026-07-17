@@ -10,7 +10,7 @@ const PROMPT: &str = "> ";
 const CONTINUATION_PROMPT: &str = "  ";
 const PROMPT_WIDTH: usize = 2;
 
-use super::super::state::AppState;
+use super::super::state::{AppState, ComposerSubmissionMode};
 use super::super::styles::{style_accent, style_border_accent, style_muted, style_warning};
 use cowboy_command_parser::{slash_query, slash_suggestions};
 
@@ -49,25 +49,25 @@ fn slash_suggestion_line_count(input: &str) -> usize {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComposerVisualState {
-    Initial,
-    SubmitDisabled,
+    Idle,
+    AgentPrompt,
+    ExecutionBlocked,
     WaitingForInput,
 }
 
 fn composer_visual_state(state: &AppState) -> ComposerVisualState {
-    if state.pending_prompt().is_some() {
-        ComposerVisualState::WaitingForInput
-    } else if !state.composer_accepts_submit() {
-        ComposerVisualState::SubmitDisabled
-    } else {
-        ComposerVisualState::Initial
+    match state.composer_submission_mode() {
+        ComposerSubmissionMode::Idle => ComposerVisualState::Idle,
+        ComposerSubmissionMode::PendingAnswer => ComposerVisualState::WaitingForInput,
+        ComposerSubmissionMode::AgentPrompt => ComposerVisualState::AgentPrompt,
+        ComposerSubmissionMode::ExecutionBlocked => ComposerVisualState::ExecutionBlocked,
     }
 }
 
 fn composer_style_for_state(visual_state: ComposerVisualState) -> Style {
     match visual_state {
-        ComposerVisualState::Initial => style_border_accent(),
-        ComposerVisualState::SubmitDisabled => style_muted(),
+        ComposerVisualState::Idle | ComposerVisualState::AgentPrompt => style_border_accent(),
+        ComposerVisualState::ExecutionBlocked => style_muted(),
         ComposerVisualState::WaitingForInput => style_warning(),
     }
 }
@@ -94,12 +94,19 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 }
 
 pub(in crate::app) fn title(state: &AppState) -> String {
-    if state.pending_prompt().is_some() {
-        " Enter answers active prompt · Shift/Ctrl-Enter newline ".to_string()
-    } else if !state.composer_accepts_submit() {
-        " Run active · type draft, Enter waits · Esc cancels ".to_string()
-    } else {
-        " Enter submits · Shift/Ctrl-Enter newline · type / for commands ".to_string()
+    match state.composer_submission_mode() {
+        ComposerSubmissionMode::PendingAnswer => {
+            " Enter answers active prompt · Shift/Ctrl-Enter newline ".to_string()
+        }
+        ComposerSubmissionMode::AgentPrompt => {
+            " Enter sends prompt · Shift/Ctrl-Enter newline · Esc cancels ".to_string()
+        }
+        ComposerSubmissionMode::ExecutionBlocked => {
+            " No agent accepting prompts · draft retained · Esc cancels ".to_string()
+        }
+        ComposerSubmissionMode::Idle => {
+            " Enter submits · Shift/Ctrl-Enter newline · type / for commands ".to_string()
+        }
     }
 }
 
@@ -1129,7 +1136,6 @@ mod tests {
                 .await
         });
         assert!(state.composer_accepts_edits());
-        assert!(!state.composer_accepts_submit());
     }
 
     fn apply_waiting_prompt(state: &mut AppState) {
@@ -1161,6 +1167,50 @@ mod tests {
         assert!(state.pending_prompt().is_none());
         assert_eq!(composer_style(&state).fg, style_muted().fg);
 
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn active_agent_window_advertises_prompt_submission_until_closed() {
+        let mut state = test_state();
+        lock_composer_with_pending_task(&mut state);
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "wf".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentPromptWindowOpened {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                window_id: "window-1".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            title(&state),
+            " Enter sends prompt · Shift/Ctrl-Enter newline · Esc cancels "
+        );
+        assert!(state.composer_accepts_submit());
+        assert_eq!(composer_style(&state).fg, style_border_accent().fg);
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentPromptWindowClosed {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                window_id: "window-1".to_string(),
+            },
+        ));
+        assert_eq!(
+            title(&state),
+            " No agent accepting prompts · draft retained · Esc cancels "
+        );
+        assert!(!state.composer_accepts_submit());
         state.cancel_background_tasks();
     }
 
@@ -1267,7 +1317,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_run_composer_uses_draft_title_and_hides_submit_affordances() {
+    async fn active_run_without_agent_allows_slash_commands_but_blocks_plain_text() {
         let mut state = test_state();
         state.push_input("/");
         let enabled = lines(&state, 12, 80)
@@ -1284,17 +1334,17 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-
         assert_eq!(
             title(&state),
-            " Run active · type draft, Enter waits · Esc cancels "
+            " No agent accepting prompts · draft retained · Esc cancels "
         );
-        assert_eq!(height(&state, 10, 80), 3);
+        assert!(state.composer_accepts_submit());
         assert!(rendered.contains("> /"));
-        assert!(!rendered.contains("Input disabled"));
-        assert!(!rendered.contains("input disabled"));
-        assert!(!rendered.contains("slash command suggestions"));
-        assert!(!rendered.contains("/resume <run-id>"));
+        assert!(rendered.contains("slash command suggestions"));
+        assert!(rendered.contains("/resume <run-id>"));
+
+        state.replace_input_from_completion("plain correction".to_string());
+        assert!(!state.composer_accepts_submit());
         state.cancel_background_tasks();
     }
 

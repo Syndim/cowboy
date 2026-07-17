@@ -96,6 +96,26 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             CardMetadata::step(step_id),
             CardMetadata::run(&event.run_id),
         ]),
+        WorkflowEventKind::AgentPromptWindowOpened { step_id, .. } => workflow_card(
+            event,
+            status_icon("running"),
+            "Agent accepting prompts",
+            CardTone::Accent,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ]),
+        WorkflowEventKind::AgentPromptWindowClosed { step_id, .. } => workflow_card(
+            event,
+            status_icon("completed"),
+            "Agent prompt window closed",
+            CardTone::Neutral,
+        )
+        .metadata([
+            CardMetadata::step(step_id),
+            CardMetadata::run(&event.run_id),
+        ]),
         WorkflowEventKind::AgentPrompt {
             step_id, prompt, ..
         } => workflow_card(
