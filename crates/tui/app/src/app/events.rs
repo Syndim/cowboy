@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
 use super::controls::chrome::status_icon;
-use super::markup::{ContentFormat, render_content};
+use super::markup::render_content;
 use super::styles::{
     style_error, style_for_run_state, style_for_tool_status, style_transcript_metadata,
     style_transcript_normal, style_transcript_plan, style_transcript_prompt,
@@ -84,7 +84,6 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         .section(CardSection::body(render_content(
             message,
             style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::AgentSessionReady { step_id, .. } => workflow_card(
             event,
@@ -130,11 +129,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         ])
         .section(CardSection::named(
             "Prompt",
-            render_content(
-                prompt,
-                style_transcript_prompt(),
-                ContentFormat::LiteralWithCodeHighlighting,
-            ),
+            render_content(prompt, style_transcript_prompt()),
         )),
         WorkflowEventKind::AgentResponse { step_id, content } => workflow_card(
             event,
@@ -149,7 +144,6 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         .section(CardSection::body(render_content(
             content,
             style_transcript_normal(),
-            ContentFormat::Markdown,
         ))),
         WorkflowEventKind::AgentThought { step_id, content } => workflow_card(
             event,
@@ -164,7 +158,6 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         .section(CardSection::body(render_content(
             content,
             style_transcript_thought(),
-            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::AgentToolCall {
             step_id,
@@ -207,11 +200,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 let content = display_tool_update_content(content);
                 card = card.section(CardSection::named(
                     "Output",
-                    render_content(
-                        &content,
-                        style_transcript_normal(),
-                        ContentFormat::LiteralWithCodeHighlighting,
-                    ),
+                    render_content(&content, style_transcript_normal()),
                 ));
             }
             card
@@ -220,11 +209,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             let lines = entries
                 .iter()
                 .flat_map(|entry| {
-                    render_content(
-                        &display_json_value(entry),
-                        style_transcript_plan(),
-                        ContentFormat::LiteralWithCodeHighlighting,
-                    )
+                    render_content(&display_json_value(entry), style_transcript_plan())
                 })
                 .collect::<Vec<_>>();
             workflow_card(event, status_icon("running"), "Agent plan", CardTone::Plan)
@@ -259,11 +244,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             ])]))
             .section(CardSection::named(
                 "Body",
-                render_content(
-                    body,
-                    style_transcript_normal(),
-                    ContentFormat::LiteralWithCodeHighlighting,
-                ),
+                render_content(body, style_transcript_normal()),
             ))
         }
         WorkflowEventKind::WaitingForInput {
@@ -282,7 +263,6 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             .section(CardSection::body(render_content(
                 message,
                 style_transcript_normal(),
-                ContentFormat::LiteralWithCodeHighlighting,
             )));
             if !choices.is_empty() {
                 card = card.section(CardSection::named(
@@ -324,7 +304,6 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         .section(CardSection::body(render_content(
             reason,
             style_transcript_metadata(),
-            ContentFormat::LiteralWithCodeHighlighting,
         ))),
         WorkflowEventKind::ManuallyResolved { step_id, status } => workflow_card(
             event,
@@ -343,11 +322,7 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
         WorkflowEventKind::RunFailed { reason } => {
             workflow_card(event, status_icon("failed"), "Run failed", CardTone::Error)
                 .metadata([CardMetadata::run(&event.run_id)])
-                .section(CardSection::body(render_content(
-                    reason,
-                    style_error(),
-                    ContentFormat::LiteralWithCodeHighlighting,
-                )))
+                .section(CardSection::body(render_content(reason, style_error())))
                 .section(CardSection::named(
                     "Next action",
                     vec![Line::from(vec![
@@ -562,8 +537,9 @@ mod tests {
 
     use super::*;
     use crate::app::styles::{
-        style_error, style_success, style_transcript_thought, style_transcript_tool_pending,
-        style_warning,
+        style_error, style_success, style_transcript_metadata, style_transcript_normal,
+        style_transcript_plan, style_transcript_prompt, style_transcript_thought,
+        style_transcript_tool_pending, style_warning,
     };
 
     fn event(kind: WorkflowEventKind) -> WorkflowEvent {
@@ -843,7 +819,7 @@ mod tests {
         let completed_text = completed.text();
 
         assert!(waiting_text.contains("◔ Waiting for input · ↳ confirm_plan · ▶ 170dc431"));
-        assert!(waiting_text.contains("Review `plan`"));
+        assert!(waiting_text.contains("Review plan"));
         assert!(waiting_text.contains("├─── Choices "));
         assert!(waiting_text.contains("approve · reject"));
         assert!(!waiting_text.contains("prompt="), "{waiting_text}");
@@ -895,6 +871,31 @@ mod tests {
         assert!(text.contains("blocked body line 1"), "{text}");
         assert!(text.contains("blocked body line 20"), "{text}");
         assert!(!text.contains("more rows"), "{text}");
+    }
+
+    #[test]
+    fn agent_step_completed_body_renders_markdown_instead_of_raw_syntax() {
+        let rendered = render_workflow_event(&event(WorkflowEventKind::StepCompleted {
+            step_id: "implement".to_string(),
+            action: "agent".to_string(),
+            status: Some("success".to_string()),
+            body: "Completed **successfully**.".to_string(),
+        }));
+        let body_line = rendered
+            .lines()
+            .iter()
+            .find(|line| line.to_string().contains("Completed"))
+            .expect("agent step output body should be rendered");
+
+        let body_text = body_line.to_string();
+        assert!(body_text.contains("Completed successfully."), "{body_text}");
+        assert!(!body_text.contains("**"), "{body_text}");
+        assert!(
+            body_line.spans.iter().any(|span| {
+                span.content == "successfully" && span.style.add_modifier.contains(Modifier::BOLD)
+            }),
+            "markdown strong text should render in bold: {body_line:?}"
+        );
     }
 
     #[test]
@@ -963,21 +964,112 @@ mod tests {
     }
 
     #[test]
-    fn step_progress_uses_literal_with_code_highlighting() {
-        let rendered = render_workflow_event(&event(WorkflowEventKind::StepProgress {
-            step_id: "implement".to_string(),
-            message: "Still **working**.".to_string(),
-        }));
-        let body_line = rendered
-            .lines()
-            .iter()
-            .find(|line| line.to_string().contains("working"))
-            .expect("step progress body should be rendered");
+    fn all_free_form_workflow_card_content_renders_markdown() {
+        let cases = [
+            (
+                "step progress",
+                WorkflowEventKind::StepProgress {
+                    step_id: "implement".to_string(),
+                    message: "**rendered**".to_string(),
+                },
+                style_transcript_normal(),
+            ),
+            (
+                "agent prompt",
+                WorkflowEventKind::AgentPrompt {
+                    step_id: "implement".to_string(),
+                    role: "developer".to_string(),
+                    session_id: "session-1".to_string(),
+                    prompt: "**rendered**".to_string(),
+                },
+                style_transcript_prompt(),
+            ),
+            (
+                "agent thought",
+                WorkflowEventKind::AgentThought {
+                    step_id: "implement".to_string(),
+                    content: "**rendered**".to_string(),
+                },
+                style_transcript_thought(),
+            ),
+            (
+                "tool update output",
+                WorkflowEventKind::AgentToolCallUpdate {
+                    step_id: "implement".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    title: "Reading output".to_string(),
+                    status: "completed".to_string(),
+                    content: Some(serde_json::json!({"text": "**rendered**"})),
+                },
+                style_transcript_normal(),
+            ),
+            (
+                "agent plan entry",
+                WorkflowEventKind::AgentPlan {
+                    step_id: "implement".to_string(),
+                    entries: vec![serde_json::json!("**rendered**")],
+                },
+                style_transcript_plan(),
+            ),
+            (
+                "non-agent completed body",
+                WorkflowEventKind::StepCompleted {
+                    step_id: "implement".to_string(),
+                    action: "command".to_string(),
+                    status: Some("success".to_string()),
+                    body: "**rendered**".to_string(),
+                },
+                style_transcript_normal(),
+            ),
+            (
+                "waiting message",
+                WorkflowEventKind::WaitingForInput {
+                    step: "confirm".to_string(),
+                    prompt_id: "approval".to_string(),
+                    message: "**rendered**".to_string(),
+                    choices: Vec::new(),
+                },
+                style_transcript_normal(),
+            ),
+            (
+                "retry reason",
+                WorkflowEventKind::StepRetrying {
+                    step_id: "implement".to_string(),
+                    attempt: 2,
+                    max_attempts: 3,
+                    reason: "**rendered**".to_string(),
+                },
+                style_transcript_metadata(),
+            ),
+            (
+                "failure reason",
+                WorkflowEventKind::RunFailed {
+                    reason: "**rendered**".to_string(),
+                },
+                style_error(),
+            ),
+        ];
 
-        assert!(body_line.to_string().contains("**working**"));
-        assert!(!body_line.spans.iter().any(|span| {
-            span.content == "working" && span.style.add_modifier.contains(Modifier::BOLD)
-        }));
+        for (name, kind, base_style) in cases {
+            let rendered = render_workflow_event(&event(kind));
+            assert!(
+                !rendered.text().contains("**"),
+                "{name}: {}",
+                rendered.text()
+            );
+            let span = rendered
+                .lines()
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content == "rendered")
+                .unwrap_or_else(|| panic!("{name}: rendered Markdown span missing"));
+
+            assert_eq!(
+                span.style,
+                base_style.add_modifier(Modifier::BOLD),
+                "{name}: Markdown style should compose with the card payload style"
+            );
+        }
     }
 
     #[test]

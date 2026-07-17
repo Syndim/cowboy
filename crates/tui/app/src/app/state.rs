@@ -10,7 +10,7 @@ use super::card::{Card, CardMetadata, CardSection, CardTone};
 use super::controls::chrome::status_icon;
 use super::events::{render_workflow_event, render_workflow_event_width};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
-use super::markup::{ContentFormat, render_content};
+use super::markup::render_content;
 use super::styles::{style_transcript_normal, style_warning};
 use crate::config::AppConfig;
 
@@ -112,7 +112,6 @@ pub(in crate::app) fn render_pending_prompt_lines(
     .section(CardSection::body(render_content(
         prompt.message(),
         style_transcript_normal(),
-        ContentFormat::LiteralWithCodeHighlighting,
     )));
 
     if !prompt.choices().is_empty() {
@@ -165,13 +164,7 @@ fn app_card(
     let (status, tone) = app_card_status_and_tone(title, title_suffix);
     let body = details
         .iter()
-        .flat_map(|detail| {
-            render_content(
-                detail,
-                style_transcript_normal(),
-                ContentFormat::LiteralWithCodeHighlighting,
-            )
-        })
+        .flat_map(|detail| render_content(detail, style_transcript_normal()))
         .collect::<Vec<_>>();
     let card = title_prefix
         .iter()
@@ -1230,9 +1223,11 @@ mod tests {
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind, WorkflowRuntime};
 
     use fs2::FileExt;
+    use ratatui::style::Modifier;
 
     use super::*;
     use crate::app::card::DEFAULT_CARD_WIDTH;
+    use crate::app::styles::style_transcript_code_fallback;
     use crate::config::AppConfig;
 
     fn test_state() -> AppState {
@@ -1309,7 +1304,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_prompt_message_preserves_markdown_punctuation() {
+    fn pending_prompt_message_renders_markdown() {
         let prompt = PendingPrompt {
             run_id: "run-1".to_string(),
             step: "confirm".to_string(),
@@ -1317,37 +1312,46 @@ mod tests {
             message: "Approve **literal** `plan`?".to_string(),
             choices: Vec::new(),
         };
-        let rendered = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH)
+        let lines = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH);
+        let rendered = lines
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            rendered.contains("Approve **literal** `plan`?"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Approve literal plan?"), "{rendered}");
+        assert!(!rendered.contains("**"), "{rendered}");
+        assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+            span.content == "literal" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+            span.content == "plan" && span.style == style_transcript_code_fallback()
+        }));
     }
 
     #[test]
-    fn application_card_details_preserve_markdown_punctuation() {
+    fn application_card_details_render_markdown() {
         let entry = TranscriptEntry::Card {
             title: "Notice".to_string(),
             title_prefix: Vec::new(),
             title_suffix: Vec::new(),
             details: vec!["Result: **literal** `detail`".to_string()],
         };
-        let rendered = entry
-            .render_lines_for_width(DEFAULT_CARD_WIDTH)
+        let lines = entry.render_lines_for_width(DEFAULT_CARD_WIDTH);
+        let rendered = lines
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(
-            rendered.contains("Result: **literal** `detail`"),
-            "{rendered}"
-        );
+        assert!(rendered.contains("Result: literal detail"), "{rendered}");
+        assert!(!rendered.contains("**"), "{rendered}");
+        assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+            span.content == "literal" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+            span.content == "detail" && span.style == style_transcript_code_fallback()
+        }));
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
@@ -8,66 +7,13 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
-use super::styles::{style_border, style_transcript_code_fallback};
+use super::styles::style_transcript_code_fallback;
 
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEME_SET: LazyLock<syntect::highlighting::ThemeSet> =
     LazyLock::new(syntect::highlighting::ThemeSet::load_defaults);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ContentFormat {
-    LiteralWithCodeHighlighting,
-    Markdown,
-}
-
-pub(super) fn render_content(
-    text: &str,
-    base_style: Style,
-    format: ContentFormat,
-) -> Vec<Line<'static>> {
-    match format {
-        ContentFormat::LiteralWithCodeHighlighting => {
-            render_literal_with_code_highlighting(text, base_style)
-        }
-        ContentFormat::Markdown => render_markdown_content(text, base_style),
-    }
-}
-
-fn render_literal_with_code_highlighting(text: &str, base_style: Style) -> Vec<Line<'static>> {
-    if text.is_empty() {
-        return vec![Line::from("")];
-    }
-
-    let mut rendered = Vec::new();
-    let mut code_block: Option<CodeBlock> = None;
-
-    for raw_line in text.lines() {
-        if let Some(language) = fence_language(raw_line) {
-            if code_block.is_some() {
-                code_block = None;
-            } else {
-                code_block = Some(CodeBlock::new(language));
-            }
-            rendered.push(Line::from(Span::styled(
-                raw_line.to_string(),
-                style_border(),
-            )));
-            continue;
-        }
-
-        if let Some(block) = code_block.as_mut() {
-            rendered.push(block.highlight(raw_line));
-        } else if is_command_line(raw_line) {
-            rendered.push(highlight_syntax_line(raw_line, Some("sh")));
-        } else {
-            rendered.push(render_inline_code(raw_line, base_style));
-        }
-    }
-
-    rendered
-}
-
-fn render_markdown_content(text: &str, base_style: Style) -> Vec<Line<'static>> {
+pub(super) fn render_content(text: &str, base_style: Style) -> Vec<Line<'static>> {
     if text.is_empty() {
         return vec![Line::from("")];
     }
@@ -410,39 +356,6 @@ impl MarkdownCodeBlock {
     }
 }
 
-fn render_inline_code(line: &str, base_style: Style) -> Line<'static> {
-    if !line.contains('`') {
-        return Line::from(Span::styled(line.to_string(), base_style));
-    }
-
-    let mut spans = Vec::new();
-    let mut remaining = line;
-    let mut in_code = false;
-    while let Some(index) = remaining.find('`') {
-        let (before, after_tick) = remaining.split_at(index);
-        if !before.is_empty() {
-            let style = if in_code {
-                style_transcript_code_fallback()
-            } else {
-                base_style
-            };
-            spans.push(Span::styled(before.to_string(), style));
-        }
-        spans.push(Span::styled("`", style_transcript_code_fallback()));
-        remaining = &after_tick[1..];
-        in_code = !in_code;
-    }
-    if !remaining.is_empty() {
-        let style = if in_code {
-            style_transcript_code_fallback()
-        } else {
-            base_style
-        };
-        spans.push(Span::styled(remaining.to_string(), style));
-    }
-    Line::from(spans)
-}
-
 struct CodeBlock {
     syntax_token: Option<String>,
     highlighter: Option<HighlightLines<'static>>,
@@ -533,16 +446,6 @@ fn fallback_code_line(line: &str) -> Line<'static> {
     ))
 }
 
-fn fence_language(line: &str) -> Option<Option<&str>> {
-    let trimmed = line.trim_start();
-    let rest = trimmed.strip_prefix("```")?;
-    let language = rest
-        .split_whitespace()
-        .next()
-        .filter(|language| !language.is_empty());
-    Some(language)
-}
-
 fn resolve_syntax(token: &str) -> Option<&'static SyntaxReference> {
     let token = shell_syntax_token(token).unwrap_or(token).trim();
     if token.is_empty() {
@@ -572,57 +475,10 @@ fn syntax_theme() -> &'static Theme {
         .expect("syntect bundled themes are available")
 }
 
-fn is_command_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.contains('`') {
-        return false;
-    }
-    if trimmed.starts_with("$ ") {
-        return trimmed.len() > 2;
-    }
-    if matches!(
-        trimmed,
-        "/run"
-            | "/step"
-            | "/resume"
-            | "/answer"
-            | "/runs"
-            | "/workflows"
-            | "/improve"
-            | "/resolve"
-            | "/cancel"
-            | "/help"
-            | "/exit"
-    ) || trimmed.starts_with("/run ")
-        || trimmed.starts_with("/step ")
-        || trimmed.starts_with("/resume ")
-        || trimmed.starts_with("/answer ")
-        || trimmed.starts_with("/improve ")
-        || trimmed.starts_with("/resolve ")
-    {
-        return true;
-    }
-    let first = trimmed.split_whitespace().next().unwrap_or_default();
-    command_names().contains(first)
-}
-
-fn command_names() -> &'static HashSet<&'static str> {
-    static COMMANDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-        [
-            "bun", "cargo", "cat", "cmake", "cp", "curl", "deno", "docker", "git", "just",
-            "kubectl", "less", "make", "mkdir", "mv", "node", "npm", "pip", "pnpm", "python",
-            "python3", "rm", "rustc", "rustup", "scp", "ssh", "tail", "touch", "uv", "wget",
-            "yarn",
-        ]
-        .into_iter()
-        .collect()
-    });
-    &COMMANDS
-}
-
 #[cfg(test)]
 mod tests {
     use ratatui::style::Color;
+    use std::collections::HashSet;
 
     use super::*;
     use crate::app::styles::{style_transcript_normal, style_transcript_prompt};
@@ -634,11 +490,7 @@ mod tests {
     #[test]
     fn markdown_composes_nested_inline_styles_with_base_color() {
         let base_style = Style::default().fg(Color::Cyan);
-        let lines = render_content(
-            "***nested*** and ~~removed~~",
-            base_style,
-            ContentFormat::Markdown,
-        );
+        let lines = render_content("***nested*** and ~~removed~~", base_style);
         let line = &lines[0];
         let nested = line
             .spans
@@ -663,7 +515,6 @@ mod tests {
         let lines = render_content(
             "# Heading\n\n3. third\n4. fourth\n\n- plain\n- [x] done\n- [ ] todo\n\n> quoted\n> continued\n\nfirst\nsoft  \nhard\n\n---",
             style_transcript_normal(),
-            ContentFormat::Markdown,
         );
         let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
 
@@ -696,7 +547,6 @@ mod tests {
         let lines = render_content(
             "[Cowboy](https://example.test) [https://same.test](https://same.test) ![diagram](image.png) ![](empty.png)\n\nbefore <kbd>raw</kbd> after",
             base_style,
-            ContentFormat::Markdown,
         );
 
         assert_eq!(
@@ -719,11 +569,7 @@ mod tests {
 
     #[test]
     fn markdown_reuses_code_highlighting_without_delimiters() {
-        let inline = render_content(
-            "Use `cargo test` now",
-            style_transcript_prompt(),
-            ContentFormat::Markdown,
-        );
+        let inline = render_content("Use `cargo test` now", style_transcript_prompt());
         assert_eq!(inline[0].to_string(), "Use cargo test now");
         assert!(inline[0].spans.iter().any(|span| {
             span.content == "cargo test" && span.style == style_transcript_code_fallback()
@@ -732,7 +578,6 @@ mod tests {
         let rust = render_content(
             "```rust\nfn main() { println!(\"hi\"); }\n```",
             style_transcript_normal(),
-            ContentFormat::Markdown,
         );
         assert_eq!(rust.len(), 1);
         assert_eq!(rust[0].to_string(), "fn main() { println!(\"hi\"); }");
@@ -747,7 +592,6 @@ mod tests {
         let shell = render_content(
             "```terminal\ncargo test -p cowboy\n```",
             style_transcript_normal(),
-            ContentFormat::Markdown,
         );
         assert_eq!(shell[0].to_string(), "cargo test -p cowboy");
         assert_ne!(
@@ -755,19 +599,11 @@ mod tests {
             style_transcript_code_fallback().fg
         );
 
-        let unknown = render_content(
-            "```madeup\nplain text\n```",
-            style_transcript_normal(),
-            ContentFormat::Markdown,
-        );
+        let unknown = render_content("```madeup\nplain text\n```", style_transcript_normal());
         assert_eq!(unknown[0].to_string(), "plain text");
         assert_eq!(unknown[0].spans[0].style, style_transcript_code_fallback());
 
-        let indented = render_content(
-            "    indented code",
-            style_transcript_normal(),
-            ContentFormat::Markdown,
-        );
+        let indented = render_content("    indented code", style_transcript_normal());
         assert_eq!(indented[0].to_string(), "indented code");
         assert_eq!(indented[0].spans[0].style, style_transcript_code_fallback());
     }
@@ -777,7 +613,6 @@ mod tests {
         let lines = render_content(
             "```rust\nlet first = 1;\n\nlet second = 2;\n```",
             style_transcript_normal(),
-            ContentFormat::Markdown,
         );
         let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
 
@@ -785,73 +620,13 @@ mod tests {
     }
 
     #[test]
-    fn highlights_fenced_rust_code_with_syntect_styles() {
-        let lines = render_content(
-            "```rust\nfn main() { println!(\"hi\"); }\n```",
-            style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        );
-        let code_line = &lines[1];
-        let styles = foregrounds(code_line).into_iter().collect::<HashSet<_>>();
+    fn markdown_highlights_unterminated_fenced_code_without_delimiters() {
+        let lines = render_content("```rust\nlet value = 1;", style_transcript_normal());
 
-        assert!(styles.len() >= 2, "{code_line:?}");
-        assert!(code_line.to_string().contains("fn main"));
-    }
-
-    #[test]
-    fn routes_shell_fences_through_shell_syntax() {
-        let lines = render_content(
-            "```terminal\ncargo test -p cowboy\n```",
-            style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        );
-        assert_eq!(lines[1].to_string(), "cargo test -p cowboy");
-        assert_ne!(
-            lines[1].spans.first().and_then(|span| span.style.fg),
-            style_transcript_code_fallback().fg
-        );
-    }
-
-    #[test]
-    fn inline_code_uses_code_fallback_style() {
-        let line = render_content(
-            "Use `cargo test` now",
-            style_transcript_prompt(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        )
-        .into_iter()
-        .next()
-        .unwrap();
-
-        assert_eq!(line.to_string(), "Use `cargo test` now");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].to_string(), "let value = 1;");
         assert!(
-            line.spans.iter().any(|span| span.content == "cargo test"
-                && span.style == style_transcript_code_fallback())
-        );
-    }
-
-    #[test]
-    fn unknown_language_fence_uses_code_fallback_style() {
-        let lines = render_content(
-            "```madeup\nplain text\n```",
-            style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        );
-        assert_eq!(lines[1].to_string(), "plain text");
-        assert_eq!(lines[1].spans[0].style, style_transcript_code_fallback());
-    }
-
-    #[test]
-    fn unterminated_code_fence_highlights_until_end() {
-        let lines = render_content(
-            "```rust\nlet value = 1;",
-            style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[1].to_string(), "let value = 1;");
-        assert!(
-            foregrounds(&lines[1])
+            foregrounds(&lines[0])
                 .into_iter()
                 .collect::<HashSet<_>>()
                 .len()
@@ -860,47 +635,12 @@ mod tests {
     }
 
     #[test]
-    fn literal_mode_preserves_markdown_delimiters_and_highlights_commands() {
-        let lines = render_content(
-            "# **literal** and `inline`\ncargo test -p cowboy",
-            style_transcript_normal(),
-            ContentFormat::LiteralWithCodeHighlighting,
-        );
-
-        assert_eq!(lines[0].to_string(), "# **literal** and `inline`");
-        assert!(lines[0].spans.iter().any(|span| {
-            span.content == "inline" && span.style == style_transcript_code_fallback()
-        }));
-        assert_eq!(lines[1].to_string(), "cargo test -p cowboy");
-        assert_ne!(
-            lines[1].spans.first().and_then(|span| span.style.fg),
-            style_transcript_code_fallback().fg
-        );
-    }
-
-    #[test]
-    fn markdown_mode_treats_standalone_commands_as_ordinary_text() {
+    fn plain_text_uses_base_style() {
         let base_style = Style::default().fg(Color::Cyan);
-        let lines = render_content("cargo test -p cowboy", base_style, ContentFormat::Markdown);
+        let lines = render_content("cargo test -p cowboy", base_style);
 
         assert_eq!(lines[0].to_string(), "cargo test -p cowboy");
         assert_eq!(lines[0].spans.len(), 1);
         assert_eq!(lines[0].spans[0].style, base_style);
-    }
-
-    #[test]
-    fn command_routing_accepts_standalone_commands_and_rejects_prose() {
-        assert!(is_command_line("$ cargo test"));
-        assert!(is_command_line("cargo run -- run add a route"));
-        assert!(is_command_line("/run add a route"));
-        assert!(is_command_line("/run --workflow review do work"));
-        assert!(is_command_line("/run --step do work"));
-        assert!(!is_command_line("/run-workflow"));
-        assert!(!is_command_line("/run-workflow review do work"));
-        assert!(is_command_line("/resume"));
-        assert!(!is_command_line("please run cargo test"));
-        assert!(!is_command_line("please resume run-1"));
-        assert!(!is_command_line("please run-workflow review do work"));
-        assert!(!is_command_line("run-workflow review do work"));
     }
 }
