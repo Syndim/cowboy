@@ -537,9 +537,9 @@ mod tests {
 
     use super::*;
     use crate::app::styles::{
-        style_error, style_success, style_transcript_metadata, style_transcript_normal,
-        style_transcript_plan, style_transcript_prompt, style_transcript_thought,
-        style_transcript_tool_pending, style_warning,
+        style_accent, style_error, style_success, style_transcript_metadata,
+        style_transcript_normal, style_transcript_plan, style_transcript_prompt,
+        style_transcript_thought, style_transcript_tool_pending, style_warning,
     };
 
     fn event(kind: WorkflowEventKind) -> WorkflowEvent {
@@ -669,6 +669,37 @@ mod tests {
         assert!(!rendered.contains("run="), "{rendered}");
         assert!(!rendered.contains("workflow="), "{rendered}");
         assert!(!rendered.contains("tasks="), "{rendered}");
+    }
+
+    #[test]
+    fn renders_agent_prompt_window_opened_and_closed_cards_with_metadata() {
+        let opened = render_workflow_event(&event(WorkflowEventKind::AgentPromptWindowOpened {
+            step_id: "implement".to_string(),
+            role: "developer".to_string(),
+            window_id: "window-open".to_string(),
+        }));
+        let closed = render_workflow_event(&event(WorkflowEventKind::AgentPromptWindowClosed {
+            step_id: "implement".to_string(),
+            role: "developer".to_string(),
+            window_id: "window-closed".to_string(),
+        }));
+        let text = [opened.text(), closed.text()].join("\n");
+
+        assert!(text.contains("● Agent accepting prompts · ↳ implement · ▶ 170dc431"));
+        assert!(text.contains("✓ Agent prompt window closed · ↳ implement · ▶ 170dc431"));
+        assert!(!text.contains("developer"), "{text}");
+        assert!(!text.contains("window-open"), "{text}");
+        assert!(!text.contains("window-closed"), "{text}");
+        assert!(line_has_style(
+            opened.lines(),
+            "Agent accepting prompts",
+            style_accent()
+        ));
+        assert!(line_has_style(
+            closed.lines(),
+            "Agent prompt window closed",
+            style_transcript_normal()
+        ));
     }
 
     #[test]
@@ -963,113 +994,172 @@ mod tests {
         ));
     }
 
+    const MARKDOWN_CARD_FIXTURE: &str = "first line\nsecond **rendered**";
+
+    fn assert_markdown_card_surface(
+        kind: WorkflowEventKind,
+        base_style: Style,
+        title: &str,
+        metadata: &str,
+    ) {
+        let rendered = render_workflow_event(&event(kind));
+        let rows = rendered
+            .lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let text = rows.join("\n");
+        let first_row = rows
+            .iter()
+            .position(|row| row.contains("first line"))
+            .expect("first Markdown source row should be rendered");
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains("second rendered"))
+            .expect("second Markdown source row should be rendered");
+        let rendered_span = rendered
+            .lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "rendered")
+            .expect("rendered Markdown span should be present");
+
+        assert_ne!(first_row, second_row, "source rows collapsed: {text}");
+        assert!(!text.contains("**"), "raw Markdown leaked: {text}");
+        assert!(text.contains(title), "card title missing: {text}");
+        assert!(text.contains(metadata), "card metadata missing: {text}");
+        assert_eq!(
+            rendered_span.style,
+            base_style.add_modifier(Modifier::BOLD),
+            "Markdown style should compose with the card payload style"
+        );
+    }
+
     #[test]
-    fn all_free_form_workflow_card_content_renders_markdown() {
-        let cases = [
-            (
-                "step progress",
-                WorkflowEventKind::StepProgress {
-                    step_id: "implement".to_string(),
-                    message: "**rendered**".to_string(),
-                },
-                style_transcript_normal(),
-            ),
-            (
-                "agent prompt",
-                WorkflowEventKind::AgentPrompt {
-                    step_id: "implement".to_string(),
-                    role: "developer".to_string(),
-                    session_id: "session-1".to_string(),
-                    prompt: "**rendered**".to_string(),
-                },
-                style_transcript_prompt(),
-            ),
-            (
-                "agent thought",
-                WorkflowEventKind::AgentThought {
-                    step_id: "implement".to_string(),
-                    content: "**rendered**".to_string(),
-                },
-                style_transcript_thought(),
-            ),
-            (
-                "tool update output",
-                WorkflowEventKind::AgentToolCallUpdate {
-                    step_id: "implement".to_string(),
-                    tool_call_id: "call-1".to_string(),
-                    title: "Reading output".to_string(),
-                    status: "completed".to_string(),
-                    content: Some(serde_json::json!({"text": "**rendered**"})),
-                },
-                style_transcript_normal(),
-            ),
-            (
-                "agent plan entry",
-                WorkflowEventKind::AgentPlan {
-                    step_id: "implement".to_string(),
-                    entries: vec![serde_json::json!("**rendered**")],
-                },
-                style_transcript_plan(),
-            ),
-            (
-                "non-agent completed body",
-                WorkflowEventKind::StepCompleted {
-                    step_id: "implement".to_string(),
-                    action: "command".to_string(),
-                    status: Some("success".to_string()),
-                    body: "**rendered**".to_string(),
-                },
-                style_transcript_normal(),
-            ),
-            (
-                "waiting message",
-                WorkflowEventKind::WaitingForInput {
-                    step: "confirm".to_string(),
-                    prompt_id: "approval".to_string(),
-                    message: "**rendered**".to_string(),
-                    choices: Vec::new(),
-                },
-                style_transcript_normal(),
-            ),
-            (
-                "retry reason",
-                WorkflowEventKind::StepRetrying {
-                    step_id: "implement".to_string(),
-                    attempt: 2,
-                    max_attempts: 3,
-                    reason: "**rendered**".to_string(),
-                },
-                style_transcript_metadata(),
-            ),
-            (
-                "failure reason",
-                WorkflowEventKind::RunFailed {
-                    reason: "**rendered**".to_string(),
-                },
-                style_error(),
-            ),
-        ];
+    fn step_progress_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::StepProgress {
+                step_id: "implement".to_string(),
+                message: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_transcript_normal(),
+            "Step progress",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
 
-        for (name, kind, base_style) in cases {
-            let rendered = render_workflow_event(&event(kind));
-            assert!(
-                !rendered.text().contains("**"),
-                "{name}: {}",
-                rendered.text()
-            );
-            let span = rendered
-                .lines()
-                .iter()
-                .flat_map(|line| line.spans.iter())
-                .find(|span| span.content == "rendered")
-                .unwrap_or_else(|| panic!("{name}: rendered Markdown span missing"));
+    #[test]
+    fn agent_prompt_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::AgentPrompt {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-1".to_string(),
+                prompt: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_transcript_prompt(),
+            "Prompt sent to agent",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
 
-            assert_eq!(
-                span.style,
-                base_style.add_modifier(Modifier::BOLD),
-                "{name}: Markdown style should compose with the card payload style"
-            );
-        }
+    #[test]
+    fn agent_thought_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::AgentThought {
+                step_id: "implement".to_string(),
+                content: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_transcript_thought(),
+            "Agent thinking",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn agent_tool_update_output_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "implement".to_string(),
+                tool_call_id: "call-1".to_string(),
+                title: "Reading output".to_string(),
+                status: "completed".to_string(),
+                content: Some(serde_json::json!({"text": MARKDOWN_CARD_FIXTURE})),
+            },
+            style_transcript_normal(),
+            "Reading output",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn agent_plan_entry_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::AgentPlan {
+                step_id: "implement".to_string(),
+                entries: vec![serde_json::json!(MARKDOWN_CARD_FIXTURE)],
+            },
+            style_transcript_plan(),
+            "Agent plan",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn step_completed_body_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::StepCompleted {
+                step_id: "implement".to_string(),
+                action: "command".to_string(),
+                status: Some("success".to_string()),
+                body: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_transcript_normal(),
+            "Step completed",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn waiting_for_input_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm".to_string(),
+                prompt_id: "approval".to_string(),
+                message: MARKDOWN_CARD_FIXTURE.to_string(),
+                choices: Vec::new(),
+            },
+            style_transcript_normal(),
+            "Waiting for input",
+            "↳ confirm · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn step_retrying_reason_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::StepRetrying {
+                step_id: "implement".to_string(),
+                attempt: 2,
+                max_attempts: 3,
+                reason: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_transcript_metadata(),
+            "Step retrying",
+            "↳ implement · ▶ 170dc431",
+        );
+    }
+
+    #[test]
+    fn run_failed_reason_card_renders_markdown_lines_and_styles() {
+        assert_markdown_card_surface(
+            WorkflowEventKind::RunFailed {
+                reason: MARKDOWN_CARD_FIXTURE.to_string(),
+            },
+            style_error(),
+            "Run failed",
+            "▶ 170dc431",
+        );
     }
 
     #[test]
@@ -1095,6 +1185,73 @@ mod tests {
                 span.content == "successfully" && span.style.add_modifier.contains(Modifier::BOLD)
             }),
             "markdown strong text should render in bold: {body_line:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_cards_preserve_line_breaks_and_render_tables() {
+        let line_break_rendered = render_workflow_event(&event(WorkflowEventKind::AgentResponse {
+            step_id: "implement".to_string(),
+            content: "first line\nsecond line".to_string(),
+        }));
+        let line_break_lines = line_break_rendered
+            .lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let line_break_text = line_break_lines.join("\n");
+        let first_row = line_break_lines
+            .iter()
+            .position(|line| line.contains("first line"))
+            .expect("first source line should be rendered");
+        let second_row = line_break_lines
+            .iter()
+            .position(|line| line.contains("second line"))
+            .expect("second source line should be rendered");
+
+        let rendered = render_workflow_event(&event(WorkflowEventKind::AgentResponse {
+            step_id: "implement".to_string(),
+            content:
+                "Summary\n\n| Item | State |\n| --- | --- |\n| first | **done** |\n\nNext line"
+                    .to_string(),
+        }));
+        let text_lines = rendered
+            .lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let rendered_text = text_lines.join("\n");
+        let header_row = text_lines
+            .iter()
+            .position(|line| line.contains("Item"))
+            .expect("table header should be rendered");
+        let value_row = text_lines
+            .iter()
+            .position(|line| line.contains("first"))
+            .expect("table value should be rendered");
+        let ordinary_lines_are_distinct = first_row != second_row;
+        let table_is_rendered = !rendered_text.contains("| --- | --- |") && header_row != value_row;
+
+        assert!(
+            ordinary_lines_are_distinct && table_is_rendered,
+            "ordinary Markdown lines should occupy distinct rows: {line_break_text}\n\nMarkdown table should render as distinct rows without raw delimiter syntax: {rendered_text}"
+        );
+        assert_ne!(
+            first_row, second_row,
+            "ordinary Markdown lines should occupy distinct rows: {line_break_text}"
+        );
+        assert!(
+            !rendered_text.contains("| --- | --- |") && header_row != value_row,
+            "Markdown table should render as distinct rows without raw delimiter syntax: {rendered_text}"
+        );
+        assert!(
+            rendered
+                .lines()
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| {
+                    span.content == "done" && span.style.add_modifier.contains(Modifier::BOLD)
+                })
         );
     }
 

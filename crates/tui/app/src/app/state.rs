@@ -1280,20 +1280,29 @@ mod tests {
             run_id: "run-1".to_string(),
             step: "confirm".to_string(),
             prompt_id: "approval".to_string(),
-            message: "Approve **literal** `plan`?".to_string(),
-            choices: Vec::new(),
+            message: "first line\nsecond **literal** `plan`?".to_string(),
+            choices: vec!["approve".to_string()],
         };
         let lines = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH);
-        let rendered = lines
+        let rows = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let rendered = rows.join("\n");
+        let first_row = rows
             .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .position(|row| row.contains("first line"))
+            .unwrap();
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains("second literal plan?"))
+            .unwrap();
 
-        assert!(rendered.contains("Approve literal plan?"), "{rendered}");
+        assert_ne!(first_row, second_row, "{rendered}");
+        assert!(rendered.contains("◔ Waiting for input · ↳ confirm · ▶ run-1"));
+        assert!(rendered.contains("├─── Choices "), "{rendered}");
+        assert!(rendered.contains("approve"), "{rendered}");
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
-            span.content == "literal" && span.style.add_modifier.contains(Modifier::BOLD)
+            span.content == "literal"
+                && span.style == style_transcript_normal().add_modifier(Modifier::BOLD)
         }));
         assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
             span.content == "plan" && span.style == style_transcript_code_fallback()
@@ -1306,19 +1315,31 @@ mod tests {
             title: "Notice".to_string(),
             title_prefix: Vec::new(),
             title_suffix: Vec::new(),
-            details: vec!["Result: **literal** `detail`".to_string()],
+            details: vec!["first line\nsecond **literal** `detail`".to_string()],
         };
         let lines = entry.render_lines_for_width(DEFAULT_CARD_WIDTH);
-        let rendered = lines
+        let rows = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let rendered = rows.join("\n");
+        let first_row = rows
             .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .position(|row| row.contains("first line"))
+            .unwrap();
+        let second_row = rows
+            .iter()
+            .position(|row| row.contains("second literal detail"))
+            .unwrap();
 
-        assert!(rendered.contains("Result: literal detail"), "{rendered}");
+        assert_ne!(first_row, second_row, "{rendered}");
+        assert!(rendered.contains("◔ Notice"), "{rendered}");
+        assert!(rows[1].starts_with('╭'), "{rendered}");
+        assert!(
+            rows.last().is_some_and(|row| row.starts_with('╰')),
+            "{rendered}"
+        );
         assert!(!rendered.contains("**"), "{rendered}");
         assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
-            span.content == "literal" && span.style.add_modifier.contains(Modifier::BOLD)
+            span.content == "literal"
+                && span.style == style_transcript_normal().add_modifier(Modifier::BOLD)
         }));
         assert!(lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
             span.content == "detail" && span.style == style_transcript_code_fallback()

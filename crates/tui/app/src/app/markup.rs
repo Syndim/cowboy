@@ -18,7 +18,8 @@ pub(super) fn render_content(text: &str, base_style: Style) -> Vec<Line<'static>
         return vec![Line::from("")];
     }
 
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     MarkdownRenderer::new(base_style).render(Parser::new_ext(text, options))
 }
 
@@ -32,6 +33,7 @@ struct MarkdownRenderer {
     links: Vec<MarkdownLink>,
     image: Option<MarkdownImage>,
     code_block: Option<MarkdownCodeBlock>,
+    table_cell_index: Option<usize>,
 }
 
 impl MarkdownRenderer {
@@ -46,6 +48,7 @@ impl MarkdownRenderer {
             links: Vec::new(),
             image: None,
             code_block: None,
+            table_cell_index: None,
         }
     }
 
@@ -79,8 +82,15 @@ impl MarkdownRenderer {
                 self.append_text(&html, style_transcript_code_fallback());
             }
             Event::SoftBreak => {
-                let style = self.current_style();
-                self.append_text(" ", style);
+                if let Some(image) = self.image.as_mut() {
+                    image.alt.push(' ');
+                } else {
+                    if let Some(link) = self.links.last_mut() {
+                        link.label.push(' ');
+                    }
+
+                    self.finish_line();
+                }
             }
             Event::HardBreak => {
                 if let Some(image) = self.image.as_mut() {
@@ -151,14 +161,21 @@ impl MarkdownRenderer {
                     alt: String::new(),
                 });
             }
+            Tag::Table(_) => self.finish_line(),
+            Tag::TableHead => {
+                self.finish_line();
+                self.table_cell_index = Some(0);
+                self.inline_modifiers.push(Modifier::BOLD);
+            }
+            Tag::TableRow => {
+                self.finish_line();
+                self.table_cell_index = Some(0);
+            }
+            Tag::TableCell => self.start_table_cell(),
             Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
             | Tag::Superscript
             | Tag::Subscript
             | Tag::MetadataBlock(_) => {}
@@ -188,18 +205,37 @@ impl MarkdownRenderer {
             TagEnd::Strikethrough => self.remove_modifier(Modifier::CROSSED_OUT),
             TagEnd::Link => self.finish_link(),
             TagEnd::Image => self.finish_image(),
+            TagEnd::Table => {
+                self.finish_line();
+                self.table_cell_index = None;
+            }
+            TagEnd::TableHead => {
+                self.remove_modifier(Modifier::BOLD);
+                self.finish_line();
+                self.table_cell_index = None;
+            }
+            TagEnd::TableRow => {
+                self.finish_line();
+                self.table_cell_index = None;
+            }
+            TagEnd::TableCell => {}
             TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::Superscript
             | TagEnd::Subscript
             | TagEnd::MetadataBlock(_) => {}
         }
+    }
+
+    fn start_table_cell(&mut self) {
+        let cell_index = self.table_cell_index.get_or_insert(0);
+        if *cell_index > 0 {
+            self.append_generated(" │ ", self.base_style);
+        }
+
+        *self.table_cell_index.get_or_insert(0) += 1;
     }
 
     fn current_style(&self) -> Style {
@@ -490,8 +526,18 @@ mod tests {
     #[test]
     fn markdown_composes_nested_inline_styles_with_base_color() {
         let base_style = Style::default().fg(Color::Cyan);
-        let lines = render_content("***nested*** and ~~removed~~", base_style);
+        let lines = render_content("*italic* **bold** ***nested*** and ~~removed~~", base_style);
         let line = &lines[0];
+        let italic = line
+            .spans
+            .iter()
+            .find(|span| span.content == "italic")
+            .unwrap();
+        let bold = line
+            .spans
+            .iter()
+            .find(|span| span.content == "bold")
+            .unwrap();
         let nested = line
             .spans
             .iter()
@@ -503,6 +549,10 @@ mod tests {
             .find(|span| span.content == "removed")
             .unwrap();
 
+        assert_eq!(italic.style.fg, Some(Color::Cyan));
+        assert!(italic.style.add_modifier.contains(Modifier::ITALIC));
+        assert_eq!(bold.style.fg, Some(Color::Cyan));
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
         assert_eq!(nested.style.fg, Some(Color::Cyan));
         assert!(nested.style.add_modifier.contains(Modifier::BOLD));
         assert!(nested.style.add_modifier.contains(Modifier::ITALIC));
@@ -527,8 +577,10 @@ mod tests {
                 "- plain",
                 "- [x] done",
                 "- [ ] todo",
-                "│ quoted continued",
-                "first soft",
+                "│ quoted",
+                "│ continued",
+                "first",
+                "soft",
                 "hard",
                 "────────────────────────",
             ]
@@ -553,6 +605,14 @@ mod tests {
             lines[0].to_string(),
             "Cowboy (https://example.test) https://same.test [image: diagram] (image.png) [image] (empty.png)"
         );
+
+        let multiline = render_content("[foo\nbar](foobar) [same](same)", base_style);
+        let multiline_text = multiline
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(multiline_text, vec!["foo", "bar (foobar) same"]);
+        assert!(!multiline_text.join("\n").contains("(same)"));
         assert_eq!(lines[1].to_string(), "before <kbd>raw</kbd> after");
         assert!(lines[1].spans.iter().any(|span| {
             span.content == "<kbd>" && span.style == style_transcript_code_fallback()
@@ -565,6 +625,106 @@ mod tests {
             .render([Event::FootnoteReference("unhandled payload".into())]);
         assert_eq!(fallback[0].to_string(), "unhandled payload");
         assert_eq!(fallback[0].spans[0].style, style_transcript_code_fallback());
+    }
+
+    #[test]
+    fn markdown_preserves_multiline_image_alt_spacing() {
+        let lines = render_content(
+            "![first line\nsecond line](image.png)",
+            style_transcript_normal(),
+        );
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].to_string(),
+            "[image: first line second line] (image.png)"
+        );
+    }
+
+    #[test]
+    fn markdown_renders_block_html_math_and_footnote_fallbacks() {
+        let fallback_style = style_transcript_code_fallback();
+        let html = render_content(
+            "<section>\nblock payload\n</section>",
+            style_transcript_normal(),
+        );
+        let payloads = MarkdownRenderer::new(style_transcript_normal()).render([
+            Event::InlineMath("x + y".into()),
+            Event::SoftBreak,
+            Event::DisplayMath("z = 1".into()),
+            Event::SoftBreak,
+            Event::FootnoteReference("note".into()),
+        ]);
+
+        assert_eq!(
+            html.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["<section>", "block payload", "</section>"]
+        );
+        assert!(
+            html.iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|span| span.style == fallback_style)
+        );
+        assert_eq!(
+            payloads.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["x + y", "z = 1", "note"]
+        );
+        assert!(
+            payloads
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|span| span.style == fallback_style)
+        );
+    }
+
+    #[test]
+    fn markdown_renders_gfm_tables_as_distinct_styled_rows() {
+        let base_style = Style::default().fg(Color::Cyan);
+        let lines = render_content(
+            "| Item | State | Command |\n| --- | --- | --- |\n| *first* | **done** | `cargo test` |\n| [Cowboy](https://example.test) | pending | next |\n\nAfter table",
+            base_style,
+        );
+        let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert_eq!(
+            text,
+            vec![
+                "Item │ State │ Command",
+                "first │ done │ cargo test",
+                "Cowboy (https://example.test) │ pending │ next",
+                "After table",
+            ]
+        );
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains("---") || line.contains('|'))
+        );
+        assert!(lines[0].spans.iter().any(|span| {
+            span.content == "Item"
+                && span.style.fg == Some(Color::Cyan)
+                && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content == "first" && span.style.add_modifier.contains(Modifier::ITALIC)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content == "done" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content == "cargo test" && span.style == style_transcript_code_fallback()
+        }));
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|span| span.content == "Cowboy" && span.style == base_style)
+        );
+        assert!(
+            lines[2].spans.iter().any(|span| {
+                span.content == " (https://example.test)" && span.style == base_style
+            })
+        );
     }
 
     #[test]
@@ -596,6 +756,16 @@ mod tests {
         assert_eq!(shell[0].to_string(), "cargo test -p cowboy");
         assert_ne!(
             shell[0].spans[0].style.fg,
+            style_transcript_code_fallback().fg
+        );
+
+        let shell_alias = render_content(
+            "```shell\nprintf '%s\\n' done\n```",
+            style_transcript_normal(),
+        );
+        assert_eq!(shell_alias[0].to_string(), "printf '%s\\n' done");
+        assert_ne!(
+            shell_alias[0].spans[0].style.fg,
             style_transcript_code_fallback().fg
         );
 
@@ -642,5 +812,12 @@ mod tests {
         assert_eq!(lines[0].to_string(), "cargo test -p cowboy");
         assert_eq!(lines[0].spans.len(), 1);
         assert_eq!(lines[0].spans[0].style, base_style);
+    }
+
+    #[test]
+    fn empty_markdown_returns_one_empty_line() {
+        let lines = render_content("", style_transcript_normal());
+
+        assert_eq!(lines, vec![Line::from("")]);
     }
 }
