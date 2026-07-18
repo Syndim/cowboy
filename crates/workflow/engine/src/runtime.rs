@@ -3749,6 +3749,103 @@ exit 0
     }
 
     #[tokio::test]
+    async fn resume_retries_current_step_when_run_failed_by_exhausted_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "finished" }
+            end
+            start:on("success", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        };
+
+        // The initial attempt plus both recoverable retries return
+        // frontmatter-less bodies, exhausting the per-step retry budget. The
+        // valid response is only reached if resume retries the failed step.
+        let factory = ScriptedAgentFactory::new(vec![
+            "no frontmatter here".to_string(),
+            "still no frontmatter".to_string(),
+            "again no frontmatter".to_string(),
+            "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+        ]);
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(None, Some(factory.clone())),
+        )
+        .with_deterministic_selector();
+
+        // Exhausted recoverable retries persist the run as Failed while keeping
+        // the failing step as the current step.
+        let start_err = runtime.start_run("do work").await.unwrap_err();
+        assert!(
+            start_err.to_string().contains("exhausted retry budget"),
+            "unexpected start error: {start_err}"
+        );
+
+        let runs = runtime.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let run_id = runs[0].run_id.clone();
+        let failed = runtime.load_run(&run_id).unwrap();
+        assert!(
+            matches!(failed.status, RunStatus::Failed { .. }),
+            "expected Failed run, got {:?}",
+            failed.status
+        );
+        assert_eq!(failed.current_step, "start");
+
+        // Resume must retry the current step and drive the run forward. Before
+        // the fix, resume short-circuits on the Failed status and returns the
+        // run unchanged with no events.
+        let report = runtime.resume_run(&run_id).await.unwrap();
+
+        assert_eq!(
+            report.run.status,
+            RunStatus::Completed,
+            "resume should retry the failed current step and complete the run"
+        );
+        assert!(
+            report.events.iter().any(|event| matches!(
+                &event.kind,
+                WorkflowEventKind::StepStarted { step_id } if step_id == "start"
+            )),
+            "resume should re-run the failed current step"
+        );
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
     async fn two_runtimes_start_independent_runs_against_one_store() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
