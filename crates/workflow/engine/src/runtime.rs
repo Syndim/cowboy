@@ -705,7 +705,7 @@ impl WorkflowRuntime {
     async fn resume_with(&self, run_id: &str, mode: RunMode) -> Result<RunReport> {
         tracing::debug!(run_id, mode = ?mode, "resuming workflow run");
         let _run_guard = self.run_locks.acquire(run_id)?;
-        let run = self.load_run(run_id)?;
+        let mut run = self.load_run(run_id)?;
         tracing::debug!(
             run_id = %run.id,
             status = ?run.status,
@@ -713,12 +713,36 @@ impl WorkflowRuntime {
             steps_executed = run.steps_executed,
             "loaded workflow run"
         );
-        if !matches!(run.status, RunStatus::Running) {
-            tracing::debug!(run_id = %run.id, status = ?run.status, "workflow run is not running; returning without execution");
-            return Ok(RunReport {
-                run,
-                events: Vec::new(),
-            });
+        match run.status {
+            RunStatus::Running => {}
+            RunStatus::Failed { .. } | RunStatus::WaitingForInput { .. } => {
+                // Every non-terminal run retains its current step and must be
+                // re-executed on resume; only Completed and Cancelled runs are
+                // non-resumable no-ops. A Failed run gave up after exhausting its
+                // recoverable retry budget, and a WaitingForInput run is blocked
+                // on its retained ask_user step. Flip the status back to Running
+                // and persist it so the retained current step is re-executed
+                // through the normal execution path; the runner persists the
+                // resulting terminal status. Re-executing an ask_user step mints
+                // a fresh record id and overwrites the prior WaitingForInput
+                // status, so the durable pending resume callback is safely
+                // replaced rather than duplicated or orphaned.
+                tracing::debug!(
+                    run_id = %run.id,
+                    status = ?run.status,
+                    current_step = %run.current_step,
+                    "resuming non-terminal run; re-executing the retained current step"
+                );
+                let store = self.store()?;
+                apply_run_status(&store, &mut run, RunStatus::Running)?;
+            }
+            RunStatus::Completed | RunStatus::Cancelled => {
+                tracing::debug!(run_id = %run.id, status = ?run.status, "workflow run is not resumable; returning without execution");
+                return Ok(RunReport {
+                    run,
+                    events: Vec::new(),
+                });
+            }
         }
         let active_clock = ActiveRunClock::open(&run);
         let snapshot = snapshot_from_run(&run);
@@ -3842,6 +3866,297 @@ exit 0
             )),
             "resume should re-run the failed current step"
         );
+        factory.assert_exhausted();
+    }
+
+    /// Build a runtime whose only workflow is a single agent step that exhausts
+    /// its per-step recoverable retry budget, then hands control to a `finish`
+    /// status step on `success`. The scripted `responses` drive the agent
+    /// backend deterministically.
+    fn agent_exhaustion_runtime(
+        dir: &tempfile::TempDir,
+        responses: Vec<String>,
+    ) -> (WorkflowRuntime, ScriptedAgentFactory) {
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "finished" }
+            end
+            start:on("success", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        };
+        let factory = ScriptedAgentFactory::new(responses);
+        let runtime = WorkflowRuntime::with_dependencies(
+            config,
+            mock_runtime_dependencies(None, Some(factory.clone())),
+        )
+        .with_deterministic_selector();
+        (runtime, factory)
+    }
+
+    /// Drive `agent_exhaustion_runtime` until the run gives up as Failed with the
+    /// failing `start` step retained as the current step, and return its id.
+    async fn failed_agent_run(runtime: &WorkflowRuntime) -> String {
+        let start_err = runtime.start_run("do work").await.unwrap_err();
+        assert!(
+            start_err.to_string().contains("exhausted retry budget"),
+            "unexpected start error: {start_err}"
+        );
+        let runs = runtime.list_runs().unwrap();
+        assert_eq!(runs.len(), 1);
+        let run_id = runs[0].run_id.clone();
+        let failed = runtime.load_run(&run_id).unwrap();
+        assert!(
+            matches!(failed.status, RunStatus::Failed { .. }),
+            "expected Failed run, got {:?}",
+            failed.status
+        );
+        assert_eq!(failed.current_step, "start");
+        assert_eq!(failed.retries_used, 2);
+        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+        run_id
+    }
+
+    #[tokio::test]
+    async fn resume_is_noop_for_completed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success", body = "done" }
+            end
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let started = runtime.start_run("do work").await.unwrap();
+        assert_eq!(started.run.status, RunStatus::Completed);
+        let before = runtime.load_run(&started.run.id).unwrap();
+
+        let report = runtime.resume_run(&started.run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert!(
+            report.events.is_empty(),
+            "resuming a completed run should emit no events"
+        );
+        assert_eq!(runtime.load_run(&started.run.id).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn resume_is_noop_for_cancelled_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let run = summary_test_run(
+            "run-00000000-0000-0000-0000-000000000000",
+            RunStatus::Cancelled,
+            None,
+        );
+        store.save_run(&run).unwrap();
+        store.update_run_head(&run.id, run_head(&run)).unwrap();
+
+        let report = runtime.resume_run(&run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Cancelled);
+        assert!(
+            report.events.is_empty(),
+            "resuming a cancelled run should emit no events"
+        );
+        assert_eq!(runtime.load_run(&run.id).unwrap(), run);
+    }
+
+    /// Extract the durable ask-user resume-callback `record_id` from a
+    /// `WaitingForInput` status. Each fresh execution of the ask-user step mints
+    /// a new record id, so this uniquely identifies the pending callback.
+    fn waiting_callback_record_id(status: &RunStatus) -> String {
+        match status {
+            RunStatus::WaitingForInput {
+                resume_callback, ..
+            } => resume_callback
+                .payload()
+                .get("record_id")
+                .and_then(|value| value.as_str())
+                .expect("ask_user resume callback payload carries a record_id")
+                .to_string(),
+            other => panic!("expected WaitingForInput status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local ask = step("ask")
+            ask.run = function(ctx)
+              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes" } }
+            end
+            local done = step("done")
+            done.run = function(ctx) return action.status { status = "success" } end
+            ask:on("answered", done)
+            return workflow("aaa", ask)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+
+        let started = runtime.start_run("do work").await.unwrap();
+        // The ask_user step blocks the run, retaining "ask" as the current step
+        // with a durable pending resume callback.
+        assert!(matches!(
+            started.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        assert_eq!(started.run.current_step, "ask");
+        let first_callback_record = waiting_callback_record_id(&started.run.status);
+
+        // Resume must re-execute (re-prompt) the retained ask_user step rather
+        // than treating a WaitingForInput run as a no-op. Only Completed and
+        // Cancelled runs are non-resumable.
+        let report = runtime.resume_run(&started.run.id).await.unwrap();
+
+        // The run is re-prompted: still WaitingForInput on the same step, and
+        // the ask_user step ran again (a fresh StepStarted event was emitted).
+        assert!(matches!(
+            &report.run.status,
+            RunStatus::WaitingForInput { step, prompt_id, .. }
+                if step == "ask" && prompt_id == "approval"
+        ));
+        assert!(
+            report.events.iter().any(|event| matches!(
+                &event.kind,
+                WorkflowEventKind::StepStarted { step_id } if step_id == "ask"
+            )),
+            "resume must re-execute the waiting ask_user step, emitting StepStarted for it"
+        );
+
+        // The durable pending callback is safely replaced by the fresh
+        // execution's callback, not left dangling or duplicated.
+        let reloaded = runtime.load_run(&started.run.id).unwrap();
+        let second_callback_record = waiting_callback_record_id(&reloaded.status);
+        assert_ne!(
+            first_callback_record, second_callback_record,
+            "re-executing the ask_user step must replace the durable pending resume callback"
+        );
+
+        // The freshly re-prompted run stays answerable to completion, and
+        // answering routes through the replaced callback.
+        let answered = runtime
+            .answer_run(&started.run.id, "approval", "yes")
+            .await
+            .unwrap();
+        assert_eq!(answered.run.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn step_run_takes_one_fresh_attempt_at_failed_current_step() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three frontmatter-less bodies exhaust the per-step retry budget; the
+        // valid fourth body is only reached by the fresh step attempt.
+        let (runtime, factory) = agent_exhaustion_runtime(
+            &dir,
+            vec![
+                "no frontmatter here".to_string(),
+                "still no frontmatter".to_string(),
+                "again no frontmatter".to_string(),
+                "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+            ],
+        );
+        let run_id = failed_agent_run(&runtime).await;
+
+        let report = runtime.step_run(&run_id).await.unwrap();
+
+        // The single fresh attempt succeeds and advances the run to `finish`,
+        // leaving it Running (step mode executes exactly one step).
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(report.run.current_step, "finish");
+        assert!(report.events.iter().any(|event| matches!(
+            &event.kind,
+            WorkflowEventKind::StepStarted { step_id } if step_id == "start"
+        )));
+
+        let loaded = runtime.load_run(&run_id).unwrap();
+        assert_eq!(loaded.status, RunStatus::Running);
+        assert_eq!(loaded.current_step, "finish");
+        // The fresh initial attempt does not consume retry budget.
+        assert_eq!(loaded.retries_used, 2);
+        assert_eq!(loaded.step_retries_used.get("start").copied(), Some(2));
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn resume_refails_when_fresh_attempt_fails_with_exhausted_step_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // Every body lacks frontmatter, so the fresh resume attempt fails while
+        // the per-step budget is already exhausted.
+        let (runtime, factory) = agent_exhaustion_runtime(
+            &dir,
+            vec![
+                "no frontmatter here".to_string(),
+                "still no frontmatter".to_string(),
+                "again no frontmatter".to_string(),
+                "yet again no frontmatter".to_string(),
+            ],
+        );
+        let run_id = failed_agent_run(&runtime).await;
+
+        let resume_err = runtime.resume_run(&run_id).await.unwrap_err();
+        assert!(
+            resume_err.to_string().contains("exhausted retry budget"),
+            "unexpected resume error: {resume_err}"
+        );
+
+        let loaded = runtime.load_run(&run_id).unwrap();
+        assert!(
+            matches!(loaded.status, RunStatus::Failed { .. }),
+            "expected Failed run, got {:?}",
+            loaded.status
+        );
+        assert_eq!(loaded.current_step, "start");
+        // No budget was available to consume, so counters are unchanged.
+        assert_eq!(loaded.retries_used, 2);
+        assert_eq!(loaded.step_retries_used.get("start").copied(), Some(2));
         factory.assert_exhausted();
     }
 

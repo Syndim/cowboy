@@ -224,7 +224,14 @@ remain strings while valid JSON literals preserve structured types, for example
 
 Recoverable step failures consume the snapshotted cumulative run-wide and
 per-step-id retry budgets described above. Exhaustion persists `Failed` while
-keeping the current step available to `cowboy resolve`.
+keeping the current step available. More generally, `cowboy resume`/`cowboy
+step` re-execute the retained current step for every non-terminal run status —
+`Running`, `Failed`, and `WaitingForInput`: for a `Failed` step this grants one
+fresh initial attempt that can succeed or deterministically re-fail on an
+exhausted budget, and for a `WaitingForInput` run it re-prompts the retained
+`ask_user` step and safely replaces the durable pending resume callback. Only
+`Completed` and `Cancelled` runs are non-resumable no-ops. `cowboy resolve`
+forces a manual status on a failed run.
 
 ## TUI
 
@@ -239,8 +246,8 @@ open agent prompt window, and the latest durable run status.
 | running | open | `Running` | Submit the exact draft to the current agent; clear/history it only after durable acceptance. |
 | running | absent/closed | any | Block Enter and retain the exact draft because no agent can accept it. |
 | idle | absent | `Running` | Normal idle behavior; `/step` and `/resume` remain available. |
-| idle | absent | `WaitingForInput` | Route plain text through the pending-answer fallback; explicit `/answer` remains available. |
-| idle | absent | `Failed` | Normal idle behavior; read-only and mutating `/resolve` remain available. |
+| idle | absent | `WaitingForInput` | Route plain text through the pending-answer fallback; explicit `/answer` remains available, and `/step`/`/resume` re-prompt the retained `ask_user` step. |
+| idle | absent | `Failed` | Normal idle behavior; `/step` and `/resume` retry the retained failed step, and read-only and mutating `/resolve` remain available. |
 | idle | absent | `Completed`/`Cancelled` | Normal new-request and command behavior. |
 
 While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`,

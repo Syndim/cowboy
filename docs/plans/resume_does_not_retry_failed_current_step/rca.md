@@ -117,10 +117,12 @@ recoverable retry budget and that resume performed no execution.
   runnable state before re-entering `run_existing` so lifecycle events
   (`StepStarted`, `StepCompleted`/`StepRetrying`, `RunCompleted`/`RunFailed`)
   are emitted and persisted through the existing path.
-- Preserve safe no-op semantics for terminal/blocked states where retrying is
-  not meaningful, or define and test exact behavior consistent with the
-  requirement: `Completed` and `Cancelled` should not be silently re-run;
-  `WaitingForInput` must continue to be answered via `answer`, not resumed.
+- Preserve safe no-op semantics only for terminal states where retrying is not
+  meaningful: `Completed` and `Cancelled` should not be silently re-run. Every
+  non-terminal status — `Running`, `Failed`, and `WaitingForInput` — is
+  re-executed by `resume`/`step`. A `WaitingForInput` run is re-prompted (its
+  retained `ask_user` step runs again and the durable pending resume callback is
+  safely replaced); `answer` remains available to supply a prompt answer.
 - Retry-budget interaction must remain coherent. Durable counters
   (`retries_used`, `step_retries_used`) and per-visit numbering already exist; a
   resumed retry of a step that previously exhausted its budget must have a
