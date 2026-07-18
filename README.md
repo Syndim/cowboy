@@ -88,9 +88,13 @@ cowboy improve <run-id>
 ```
 
 Resolve a failed run. A run gives up as `Failed` only after exhausting the
-recoverable-retry budget; its failed step stays current so it can be resolved
-manually. Without a `<status>`, this lists the statuses the failed step can be
-resolved to along with the fields each requires:
+recoverable-retry budget; its failed step stays current. `cowboy resume` and
+`cowboy step` retry that retained current step (`resume` continues until the run
+blocks, fails, or completes; `step` takes one fresh attempt), which grants one
+fresh initial attempt that can succeed or deterministically re-fail if the step
+budget is still exhausted. Use `cowboy resolve` instead to force a manual status
+rather than retrying the failed work. Without a `<status>`, this lists the
+statuses the failed step can be resolved to along with the fields each requires:
 
 ```bash
 cowboy resolve <run-id>
@@ -134,7 +138,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /exit                                             quit Cowboy
 ```
 
-`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes.
+`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes. Both also re-execute the retained current step of any non-terminal run — `Running`, `Failed` (for example one that gave up after exhausting its recoverable-retry budget), and `WaitingForInput`: `step` takes one fresh attempt and `resume` continues until the run blocks, fails, or completes. Re-executing a `WaitingForInput` run re-prompts its retained `ask_user` step and safely replaces the durable pending callback. Only `Completed` and `Cancelled` runs are non-resumable no-ops and left unchanged; `answer` remains the way to supply a prompt answer.
 
 `/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
