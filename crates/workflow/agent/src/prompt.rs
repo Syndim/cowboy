@@ -53,7 +53,11 @@ pub(crate) fn build_correction_prompt(
 
 /// Build a corrective instruction appended to a retry prompt after a
 /// frontmatter/parse failure. Reuses the required-frontmatter description so the
-/// agent re-emits its already-completed work with a valid frontmatter block.
+/// agent re-emits its already-completed work with a valid frontmatter block. The
+/// generic instruction covers the opening delimiter, the fields/`status`, and the
+/// closing delimiter so it is accurate whether the previous reply was missing the
+/// opening `---`, the closing `---`, or the `status` field; the precise `reason`
+/// (surfaced in parentheses) names the specific defect.
 pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
     let mut nudge =
         String::from("## Retry\n\nYour previous response could not be parsed as a workflow result");
@@ -61,8 +65,10 @@ pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
         nudge.push_str(&format!(" ({reason})"));
     }
     nudge.push_str(
-        ".\n\nDo not redo the work. Re-emit your result now, and make sure the response \
-BEGINS with a valid YAML frontmatter block containing a `status` field.",
+        ".\n\nDo not redo the work. Re-emit your result now as a complete replacement with a \
+valid YAML frontmatter block: begin the response with an opening `---` line, include the \
+frontmatter fields (with a `status` field), and end the frontmatter with a closing `---` line \
+on its own before the Markdown body.",
     );
     if let Some(output) = &action.output {
         nudge.push_str("\n\n");
@@ -187,8 +193,24 @@ mod tests {
         assert!(nudge.contains("Retry"));
         assert!(nudge.contains("missing YAML frontmatter"));
         assert!(nudge.contains("YAML frontmatter"));
+        assert!(nudge.contains("opening `---`"));
+        assert!(nudge.contains("closing `---`"));
         assert!(nudge.contains("status"));
         assert!(nudge.contains("Do not redo the work"));
         assert!(nudge.contains(BLOCKED_STATUS_POLICY));
+    }
+
+    #[test]
+    fn retry_nudge_surfaces_precise_closing_delimiter_reason() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        let reason =
+            "agent response has an opening `---` but is missing the closing `---` delimiter";
+        let nudge = build_retry_nudge(&action, Some(reason));
+        assert!(nudge.contains(reason));
+        assert!(nudge.contains("closing `---`"));
     }
 }
