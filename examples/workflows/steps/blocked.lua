@@ -1,16 +1,20 @@
+local context = require("utils/context.lua")
+
 return function(body, id)
   local blocked = step(id or "blocked")
   blocked.run = function(ctx)
     local previous_fields = (ctx.prev and ctx.prev.fields) or {}
     if ctx.prev and ctx.prev.action == "ask_user" then
-      local answer = previous_fields.answer
-      if answer and tostring(answer) ~= "" then
+      local answer = tostring(previous_fields.answer)
+      if answer ~= "" then
         local fields = {}
         for key, value in pairs(previous_fields) do
           fields[key] = value
         end
 
-        fields.blocked_response = tostring(answer)
+        fields.user_feedback = context.copy_user_feedback(previous_fields)
+        table.insert(fields.user_feedback, answer)
+        fields.blocked_response = answer
         return action.status {
           status = "triaged",
           fields = fields,

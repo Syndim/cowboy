@@ -1483,6 +1483,63 @@ mod tests {
     }
 
     #[test]
+    fn bugfix_blocker_answer_becomes_cumulative_user_feedback() {
+        let compiled = load_example_compiled_workflow("bugfix");
+        let user_answer = "skip TODO-13";
+        let answer_result = run_step(
+            &compiled.source_bundle,
+            "blocked_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": {
+                        "answer": user_answer,
+                        "user_feedback": ["keep the original raw request"],
+                        "blocker_statement": "TODO evidence needs a manual smoke test",
+                        "blocked_from_step": "revise",
+                        "blocked_from_status": "blocked",
+                        "blocker_reason": "The smoke test needs user direction",
+                        "blocker_resolution": "Ask the user whether to run or skip the smoke test"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(answered) = answer_result.action else {
+            panic!("blocked_answer should return a status action")
+        };
+
+        assert_eq!(answered.fields["blocked_response"], serde_json::json!(user_answer));
+
+        let triage_result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked_answer",
+                    "action": "status",
+                    "status": "triaged",
+                    "fields": answered.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(triaged) = triage_result.action else {
+            panic!("triage_blocked should return a status action")
+        };
+
+        assert_eq!(triaged.status, "revise");
+        assert_eq!(triaged.fields["feedback"], serde_json::json!(user_answer));
+        assert_eq!(
+            triaged.fields["user_feedback"],
+            serde_json::json!(["keep the original raw request", user_answer]),
+            "blocker answers must travel as raw cumulative user feedback so downstream reviewers can distinguish user waivers from agent or reviewer feedback"
+        );
+    }
+
+    #[test]
     fn dev_loop_preserves_reproducible_evidence_through_result_confirmation() {
         let compiled = load_example_compiled_workflow("dev-loop");
         let all_evidence = sample_evidence_fields();
