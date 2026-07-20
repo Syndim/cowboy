@@ -52,7 +52,8 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
                 [equals_field] = "string",
                 [hyphen_field] = "boolean",
                 [spaced_field] = "array"
-              }
+              },
+              required_fields = { spaced_field, hyphen_field, equals_field, required_field }
             }
           }
         end

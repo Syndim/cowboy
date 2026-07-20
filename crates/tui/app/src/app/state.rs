@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use anyhow::Result;
 use cowboy_workflow_engine::{
-    RunReport, RunStatusDetail, RunStatusState, WorkflowEvent, WorkflowEventKind,
+    RunReport, RunStatusDetail, RunStatusState, RunSummaryLine, WorkflowEvent, WorkflowEventKind,
 };
 use tui_input::{Input, InputRequest};
 
@@ -13,6 +13,7 @@ use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
 use super::markup::render_content;
 use super::styles::{style_transcript_normal, style_warning};
 use crate::config::AppConfig;
+use crate::run_summary::render_run_summary_lines;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingPrompt {
@@ -350,12 +351,19 @@ pub(in crate::app) enum ComposerSubmissionMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundTaskKind {
     WorkflowExecution,
+    RunsList,
+}
+
+#[derive(Debug)]
+enum BackgroundTaskResult {
+    WorkflowReport(Box<RunReport>),
+    RunsList(Vec<RunSummaryLine>),
 }
 
 #[derive(Debug)]
 struct BackgroundTask {
     kind: BackgroundTaskKind,
-    handle: tokio::task::JoinHandle<Result<RunReport, String>>,
+    handle: tokio::task::JoinHandle<Result<BackgroundTaskResult, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,14 +878,20 @@ impl AppState {
         }
 
         let cancelled = self.background.len();
+        let cancelled_workflow = self
+            .background
+            .iter()
+            .any(|task| task.kind == BackgroundTaskKind::WorkflowExecution);
         for task in &self.background {
             task.handle.abort();
         }
         self.background.clear();
-        self.agent_prompt_window = None;
-        self.durable_run_status = Some(RunStatusState::Cancelled);
+        if cancelled_workflow {
+            self.agent_prompt_window = None;
+            self.durable_run_status = Some(RunStatusState::Cancelled);
+            self.run_state = "cancelled".to_string();
+        }
         self.status = format!("cancelled {cancelled} background task(s)");
-        self.run_state = "cancelled".to_string();
         self.push_card("Cancelled", [self.status.clone()]);
     }
 
@@ -961,7 +975,6 @@ impl AppState {
         view.preferred_column = None;
         self.composer_view.set(view);
     }
-
     pub(in crate::app) fn spawn_card_report_task<F>(
         &mut self,
         title: &str,
@@ -985,6 +998,19 @@ impl AppState {
         );
     }
 
+    pub(in crate::app) fn spawn_runs_list_task<F>(&mut self, status: String, future: F)
+    where
+        F: Future<Output = Result<Vec<RunSummaryLine>, String>> + Send + 'static,
+    {
+        self.status = status;
+        self.background.push(BackgroundTask {
+            kind: BackgroundTaskKind::RunsList,
+            handle: tokio::spawn(async move {
+                future.await.map(BackgroundTaskResult::RunsList)
+            }),
+        });
+    }
+
     #[cfg(test)]
     pub(in crate::app) fn spawn_test_card_report_task<F>(&mut self, status: String, future: F)
     where
@@ -1002,7 +1028,11 @@ impl AppState {
         self.push_event(entry);
         self.background.push(BackgroundTask {
             kind: BackgroundTaskKind::WorkflowExecution,
-            handle: tokio::spawn(future),
+            handle: tokio::spawn(async move {
+                future
+                    .await
+                    .map(|report| BackgroundTaskResult::WorkflowReport(Box::new(report)))
+            }),
         });
     }
 
@@ -1225,23 +1255,35 @@ impl AppState {
         for task in tasks {
             if task.handle.is_finished() {
                 changed = true;
+                let kind = task.kind;
                 match task.handle.await {
-                    Ok(Ok(report)) => self.apply_report(report),
+                    Ok(Ok(BackgroundTaskResult::WorkflowReport(report))) => {
+                        self.apply_report(*report);
+                    }
+                    Ok(Ok(BackgroundTaskResult::RunsList(runs))) => self.apply_runs_list(runs),
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
                         self.push_card("Error", [self.status.clone()]);
+                        if kind == BackgroundTaskKind::WorkflowExecution {
+                            self.agent_prompt_window = None;
+                        }
                     }
                     Err(err) if err.is_cancelled() => {
                         self.status = "background task cancelled".to_string();
-                        self.run_state = "cancelled".to_string();
+                        if kind == BackgroundTaskKind::WorkflowExecution {
+                            self.run_state = "cancelled".to_string();
+                            self.agent_prompt_window = None;
+                        }
                         self.push_card("Cancelled", [self.status.clone()]);
                     }
                     Err(err) => {
                         self.status = format!("background task failed: {err}");
                         self.push_card("Error", [self.status.clone()]);
+                        if kind == BackgroundTaskKind::WorkflowExecution {
+                            self.agent_prompt_window = None;
+                        }
                     }
                 }
-                self.agent_prompt_window = None;
             } else {
                 pending.push(task);
             }
@@ -1282,6 +1324,17 @@ impl AppState {
 
         self.current_topic_run_id = None;
         self.current_run_topic = None;
+    }
+
+    fn apply_runs_list(&mut self, runs: Vec<RunSummaryLine>) {
+        self.status = format!("{} run(s)", runs.len());
+        if runs.is_empty() {
+            self.push_card("Runs", ["known runs: 0".to_string()]);
+        } else {
+            for run in runs {
+                self.push_card("Run", render_run_summary_lines(&run));
+            }
+        }
     }
 
     fn apply_report(&mut self, report: RunReport) {

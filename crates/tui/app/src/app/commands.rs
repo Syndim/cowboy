@@ -1,5 +1,4 @@
 use crate::resolution::resolution_command;
-use crate::run_summary::render_run_summary_lines;
 use anyhow::Result;
 use cowboy_command_parser::{
     SharedCommand, SlashCommand, SlashParseError, parse_slash_command, resolve_fields_object,
@@ -187,7 +186,7 @@ async fn dispatch_shared_command(
             } = args;
             spawn_answer_task(state, runtime, run_id, prompt_id, answer.join(" "));
         }
-        SharedCommand::Runs => show_runs(state, runtime)?,
+        SharedCommand::Runs => spawn_runs_list(state, runtime),
         SharedCommand::Improve(args) => improve_run(state, runtime, &args.run_id).await?,
         SharedCommand::Resolve(args) => {
             let cowboy_command_parser::ResolveArgs {
@@ -392,6 +391,18 @@ fn spawn_answer_task(
     );
 }
 
+fn spawn_runs_list(state: &mut AppState, runtime: &WorkflowRuntime) {
+    let runtime = runtime.clone();
+    state.spawn_runs_list_task("loading runs".to_string(), async move {
+        let runs = tokio::task::spawn_blocking(move || {
+            runtime.list_runs().map_err(|err| err.to_string())
+        })
+        .await
+        .map_err(|err| err.to_string())??;
+        Ok(runs)
+    });
+}
+
 async fn improve_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: &str) -> Result<()> {
     let applied = runtime.improve_run(run_id).await?;
     state.set_status(format!("improvement={applied:?}"));
@@ -489,19 +500,6 @@ pub(in crate::app) fn show_workflows(
     Ok(())
 }
 
-fn show_runs(state: &mut AppState, runtime: &WorkflowRuntime) -> Result<()> {
-    let runs = runtime.list_runs()?;
-    state.set_status(format!("{} run(s)", runs.len()));
-    if runs.is_empty() {
-        state.push_card("Runs", ["known runs: 0".to_string()]);
-    } else {
-        for run in runs {
-            state.push_card("Run", render_run_summary_lines(&run));
-        }
-    }
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -635,6 +633,18 @@ mod tests {
             "rendered /runs card was missing {expected:?}:\n{rendered}"
         );
     }
+    async fn drain_finished_background_task(state: &mut AppState) {
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if state.drain_background_tasks().await {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("background task did not finish");
+    }
+
 
     #[tokio::test]
     async fn plain_request_submission_renders_initial_input_as_card() {
@@ -726,6 +736,41 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn runs_submission_is_dispatched_as_background_task_to_keep_ui_responsive() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+        state.push_input("/runs");
+
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(
+            state.background_task_count(),
+            1,
+            "/runs must run in a background task so the TUI event loop can keep processing keys"
+        );
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn runs_submission_does_not_mark_workflow_execution_running() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+        state.push_input("/runs");
+
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.background_task_count(), 1);
+        assert!(!state.workflow_execution_running());
+        assert_eq!(state.composer_submission_mode(), ComposerSubmissionMode::Idle);
+
+        state.push_input("new workflow request");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.background_task_count(), 2);
+        assert!(state.workflow_execution_running());
+        state.cancel_background_tasks();
+    }
+
+
     #[test]
     fn help_uses_generated_slash_command_rows() {
         let mut state = test_state();
@@ -781,8 +826,8 @@ mod tests {
         assert!(rendered.contains("root:"));
     }
 
-    #[test]
-    fn runs_command_renders_structured_runtime_summaries() {
+    #[tokio::test]
+    async fn runs_submission_eventually_renders_structured_runtime_summaries_after_background_drain() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
@@ -845,7 +890,11 @@ mod tests {
             ),
         );
 
-        show_runs(&mut state, &runtime).unwrap();
+        state.push_input("/runs");
+        submit_input(&mut state, &runtime).await;
+        assert_eq!(state.background_task_count(), 1);
+
+        drain_finished_background_task(&mut state).await;
 
         assert_eq!(state.status(), "3 run(s)");
         let run_cards = state
@@ -944,11 +993,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn runs_command_renders_empty_state_card() {
+    #[tokio::test]
+    async fn runs_submission_eventually_renders_empty_state_card_after_background_drain() {
         let (_dir, runtime, mut state) = test_runtime_state();
 
-        show_runs(&mut state, &runtime).unwrap();
+        state.push_input("/runs");
+        submit_input(&mut state, &runtime).await;
+        assert_eq!(state.background_task_count(), 1);
+
+        drain_finished_background_task(&mut state).await;
 
         assert_eq!(state.status(), "0 run(s)");
         assert_eq!(state.event_entries().len(), 1);
@@ -1110,6 +1163,9 @@ mod tests {
                     ["foo=bar"] = "string",
                     ["-review"] = "string",
                     [" review "] = "string"
+                  },
+                  required_fields = {
+                    "summary", "retry", "files", "foo=bar", "-review", " review "
                   }
                 }
               }
@@ -1762,7 +1818,8 @@ mod tests {
 
         answer_state.push_input("  /runs  ");
         submit_input(&mut answer_state, &runtime).await;
-        assert_eq!(answer_state.background_task_count(), 0);
+        assert_eq!(answer_state.background_task_count(), 1);
+        drain_finished_background_task(&mut answer_state).await;
 
         let mut history_state = AppState::new(config);
         history_state.history_previous();
@@ -1919,6 +1976,8 @@ mod tests {
         submit_input(&mut state, &runtime).await;
 
         assert_eq!(state.input(), "");
+        assert_eq!(state.background_task_count(), 2);
+        drain_finished_background_task(&mut state).await;
         assert_eq!(state.background_task_count(), 1);
         assert!(rendered_entries(&state).contains("known runs: 0"));
         state.cancel_background_tasks();
