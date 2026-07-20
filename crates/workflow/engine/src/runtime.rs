@@ -797,7 +797,8 @@ impl WorkflowRuntime {
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
-        self.run_existing(run, definition, snapshot, mode, None, active_clock)
+        let request_topic = run.request_topic.clone();
+        self.run_existing(run, definition, snapshot, mode, request_topic, active_clock)
             .await
     }
 
@@ -846,13 +847,14 @@ impl WorkflowRuntime {
         tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
 
         if matches!(status, RunStatus::Running) {
+            let request_topic = run.request_topic.clone();
             self.run_existing_with_events(
                 run,
                 definition,
                 snapshot,
                 RunMode::UntilBlocked,
                 ActiveRunExecution {
-                    request_topic: None,
+                    request_topic,
                     events,
                     active_clock,
                 },
@@ -1036,13 +1038,14 @@ impl WorkflowRuntime {
         }
 
         if matches!(status_result, RunStatus::Running) {
+            let request_topic = run.request_topic.clone();
             self.run_existing_with_events(
                 run,
                 definition,
                 snapshot,
                 RunMode::UntilBlocked,
                 ActiveRunExecution {
-                    request_topic: None,
+                    request_topic,
                     events,
                     active_clock,
                 },
@@ -3372,22 +3375,39 @@ exit 0
     }
 
     #[tokio::test]
-    async fn existing_run_resume_does_not_attach_new_topic() {
+    async fn resume_run_restores_persisted_request_topic_in_run_started_event() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_topic_workflow(&dir, "Initial topic");
         let start = runtime.start_run_stepwise("do first step").await.unwrap();
 
+        assert_eq!(start.run.request_topic.as_deref(), Some("Initial topic"));
+        assert_eq!(
+            runtime
+                .load_run(&start.run.id)
+                .unwrap()
+                .request_topic
+                .as_deref(),
+            Some("Initial topic")
+        );
+
         let report = runtime.resume_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(first_run_started_topic(&report), None);
-        assert!(report.events.iter().any(|event| matches!(
-            &event.kind,
-            WorkflowEventKind::RunStarted {
-                request_topic: None,
-                ..
-            }
-        )));
+        assert_eq!(first_run_started_topic(&report), Some("Initial topic"));
+    }
+
+    #[tokio::test]
+    async fn step_run_restores_persisted_request_topic_in_run_started_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_topic_workflow(&dir, "Step topic");
+        let start = runtime.start_run_stepwise("do first step").await.unwrap();
+
+        assert_eq!(start.run.request_topic.as_deref(), Some("Step topic"));
+
+        let report = runtime.step_run(&start.run.id).await.unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(first_run_started_topic(&report), Some("Step topic"));
     }
 
     #[tokio::test]
@@ -3744,7 +3764,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn resolve_run_routes_and_exposes_fields_to_next_step() {
+    async fn resolve_run_restores_persisted_request_topic_and_exposes_fields_to_next_step() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -3820,17 +3840,7 @@ exit 0
         assert_eq!(output.fields["prev_status"], "planned");
         assert_eq!(output.fields["summary"], "did the thing");
         assert_eq!(output.body, "manual body");
-        assert!(
-            report.events.iter().any(|event| matches!(
-                &event.kind,
-                WorkflowEventKind::RunStarted {
-                    request_topic: None,
-                    ..
-                }
-            )),
-            "{:#?}",
-            report.events
-        );
+        assert_eq!(first_run_started_topic(&report), Some("Original topic"));
 
         // A ManuallyResolved event is persisted in the run's event log.
         let events = runtime.load_events(&run_id).unwrap();
@@ -4754,7 +4764,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn answer_run_persists_ask_user_completion_before_resumed_events() {
+    async fn answer_run_restores_persisted_request_topic_before_resumed_events() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -4843,16 +4853,9 @@ exit 0
             "{:#?}",
             report.events
         );
-        assert!(
-            report.events.iter().any(|event| matches!(
-                &event.kind,
-                WorkflowEventKind::RunStarted {
-                    request_topic: None,
-                    ..
-                }
-            )),
-            "{:#?}",
-            report.events
+        assert_eq!(
+            first_run_started_topic(&report),
+            Some("Initial prompt topic")
         );
 
         let persisted = runtime.load_events(&report.run.id).unwrap();
