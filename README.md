@@ -179,6 +179,7 @@ Example config:
 state_dir = "~/.local/state/cowboy"
 workflow_store = "~/.local/state/cowboy/workflow.redb"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
+mouse_scroll_lines = 3
 
 [config_sets.default]
 max_steps_per_run = 100
@@ -215,6 +216,10 @@ shown above. The built-in `default` set always exists, even when the file only
 declares custom sets. Set either retry limit to `0` to disable that retry
 scope; `max_steps_per_run` and `max_visits_per_step` must be greater than zero.
 Blank set names and unknown fields are rejected.
+
+`mouse_scroll_lines` controls how many transcript visual rows one mouse-wheel
+detent scrolls in the TUI. It defaults to `3` and must be greater than zero.
+
 
 Workflows select a set with
 `workflow(name, head, { config_set = "careful" })`; omission selects `default`.

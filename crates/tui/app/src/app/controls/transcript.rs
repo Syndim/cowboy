@@ -48,7 +48,15 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 }
 
 pub(in crate::app) fn next_scroll_limit(state: &AppState, area: Rect) -> usize {
-    content_viewport(state, area, state.next_scroll_offset())
+    next_scroll_limit_by(state, area, 10)
+}
+
+pub(in crate::app) fn next_scroll_limit_by(
+    state: &AppState,
+    area: Rect,
+    visual_rows: usize,
+) -> usize {
+    content_viewport(state, area, state.next_scroll_offset_by(visual_rows))
         .1
         .effective_offset
 }

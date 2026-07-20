@@ -425,6 +425,7 @@ pub(super) struct AppState {
     active_event: Option<ActiveEvent>,
     scroll_offset: usize,
     transcript_scroll_limit: usize,
+    mouse_scroll_lines: usize,
     transcript_selection: Option<TranscriptSelection>,
     pending_clipboard_text: Option<String>,
     follow_events: bool,
@@ -457,6 +458,7 @@ impl AppState {
             active_event: None,
             scroll_offset: 0,
             transcript_scroll_limit: usize::MAX,
+            mouse_scroll_lines: usize::from(config.mouse_scroll_lines),
             transcript_selection: None,
             pending_clipboard_text: None,
             follow_events: true,
@@ -551,9 +553,12 @@ impl AppState {
     pub(in crate::app) fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
+    pub(in crate::app) fn mouse_scroll_lines(&self) -> usize {
+        self.mouse_scroll_lines
+    }
 
-    pub(in crate::app) fn next_scroll_offset(&self) -> usize {
-        self.scroll_offset.saturating_add(10)
+    pub(in crate::app) fn next_scroll_offset_by(&self, visual_rows: usize) -> usize {
+        self.scroll_offset.saturating_add(visual_rows)
     }
 
     pub(in crate::app) fn set_transcript_scroll_limit(&mut self, limit: usize) {
@@ -912,7 +917,13 @@ impl AppState {
     }
 
     pub(in crate::app) fn scroll_events_up(&mut self) -> bool {
-        let next_offset = self.next_scroll_offset().min(self.transcript_scroll_limit);
+        self.scroll_events_up_by(10)
+    }
+
+    pub(in crate::app) fn scroll_events_up_by(&mut self, visual_rows: usize) -> bool {
+        let next_offset = self
+            .next_scroll_offset_by(visual_rows)
+            .min(self.transcript_scroll_limit);
         if next_offset == self.scroll_offset {
             return false;
         }
@@ -924,8 +935,12 @@ impl AppState {
     }
 
     pub(in crate::app) fn scroll_events_down(&mut self) -> bool {
+        self.scroll_events_down_by(10)
+    }
+
+    pub(in crate::app) fn scroll_events_down_by(&mut self, visual_rows: usize) -> bool {
         let previous = (self.scroll_offset, self.follow_events);
-        self.scroll_offset = self.scroll_offset.saturating_sub(10);
+        self.scroll_offset = self.scroll_offset.saturating_sub(visual_rows);
         if self.scroll_offset == 0 {
             self.follow_events = true;
         }
@@ -1444,6 +1459,27 @@ mod tests {
             )]),
             ..AppConfig::default()
         })
+    }
+
+    #[test]
+    fn app_state_uses_configured_mouse_scroll_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(AppConfig {
+            state_dir: dir.path().to_path_buf(),
+            workflow_store: dir.path().join("workflow.redb"),
+            mouse_scroll_lines: 7,
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
+            ..AppConfig::default()
+        });
+
+        assert_eq!(state.mouse_scroll_lines(), 7);
     }
 
     fn assert_last_entry_is_card(state: &AppState, expected_title: &str, expected_body: &str) {

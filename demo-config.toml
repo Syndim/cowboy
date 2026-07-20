@@ -4,6 +4,7 @@
 state_dir = ".cowboy/demo-state"
 workflow_store = ".cowboy/demo-state/workflow.redb"
 workflow_dirs = ["crates/workflow/engine/test_files"]
+mouse_scroll_lines = 3
 
 [config_sets.default]
 max_steps_per_run = 100

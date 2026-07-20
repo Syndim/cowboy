@@ -1292,6 +1292,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/workflow.redb"),
             workflow_dirs: vec![workflow_dir],
+            mouse_scroll_lines: crate::config::AppConfig::default().mouse_scroll_lines,
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {

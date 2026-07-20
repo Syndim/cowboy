@@ -35,6 +35,9 @@ pub struct AppConfig {
     /// Additional workflow roots scanned for `.lua` workflows.
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
+    /// Transcript mouse-wheel visual rows scrolled per wheel detent.
+    #[serde(default = "default_mouse_scroll_lines")]
+    pub mouse_scroll_lines: u16,
     /// ACP-compatible agent commands used by workflow agent actions.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
@@ -63,6 +66,10 @@ impl Default for ConfigSetConfig {
 
 fn default_config_sets() -> BTreeMap<String, ConfigSetConfig> {
     BTreeMap::from([("default".to_string(), ConfigSetConfig::default())])
+}
+
+fn default_mouse_scroll_lines() -> u16 {
+    3
 }
 
 fn deserialize_config_sets<'de, D>(
@@ -137,6 +144,7 @@ impl Default for AppConfig {
             state_dir,
             config_sets: default_config_sets(),
             workflow_dirs: vec![config_root().join("workflows")],
+            mouse_scroll_lines: default_mouse_scroll_lines(),
             agents: default_agents(),
         }
     }
@@ -183,8 +191,18 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("invalid agent config in {}", path.display()))?;
     validate_config_sets(&config.config_sets)
         .with_context(|| format!("invalid config set in {}", path.display()))?;
+    validate_mouse_scroll_lines(config.mouse_scroll_lines)
+        .with_context(|| format!("invalid mouse_scroll_lines in {}", path.display()))?;
     config.expand_paths();
     Ok(config)
+}
+
+fn validate_mouse_scroll_lines(mouse_scroll_lines: u16) -> Result<()> {
+    if mouse_scroll_lines == 0 {
+        anyhow::bail!("mouse_scroll_lines must be greater than zero");
+    }
+
+    Ok(())
 }
 
 fn validate_config_sets(config_sets: &BTreeMap<String, ConfigSetConfig>) -> Result<()> {
@@ -305,6 +323,46 @@ mod tests {
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "default");
         assert_eq!(config.agents[0].command, "copilot");
+        assert_eq!(config.mouse_scroll_lines, 3);
+    }
+
+    #[test]
+    fn explicit_mouse_scroll_lines_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "mouse_scroll_lines = 5\n").unwrap();
+
+        let config = load_config(&path).unwrap();
+
+        assert_eq!(config.mouse_scroll_lines, 5);
+    }
+
+    #[test]
+    fn mouse_scroll_lines_zero_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "mouse_scroll_lines = 0\n").unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("mouse_scroll_lines must be greater than zero"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn unknown_top_level_field_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "unknown_top_level = 1\n").unwrap();
+
+        let err = load_config(&path).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("unknown field `unknown_top_level`"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -393,6 +451,26 @@ max_retries_per_step = 4
     }
 
     #[test]
+    fn runtime_config_does_not_include_mouse_scroll_lines() {
+        let slow_mouse = AppConfig {
+            mouse_scroll_lines: 1,
+            ..AppConfig::default()
+        };
+        let fast_mouse = AppConfig {
+            mouse_scroll_lines: 9,
+            ..slow_mouse.clone()
+        };
+
+        let slow_runtime = slow_mouse.runtime_config(PathBuf::from("."));
+        let fast_runtime = fast_mouse.runtime_config(PathBuf::from("."));
+
+        assert_eq!(
+            serde_json::to_value(&slow_runtime).unwrap(),
+            serde_json::to_value(&fast_runtime).unwrap()
+        );
+    }
+
+    #[test]
     fn config_set_validation_rejects_names_fields_and_nonpositive_execution_limits() {
         let dir = tempfile::tempdir().unwrap();
         let cases = [
@@ -456,6 +534,7 @@ max_retries_per_step = 4
         assert_eq!(config.config_sets["careful"].max_visits_per_step, 20);
         assert_eq!(config.config_sets["careful"].max_retries_per_run, 20);
         assert_eq!(config.config_sets["careful"].max_retries_per_step, 4);
+        assert_eq!(config.mouse_scroll_lines, 3);
     }
 
     #[test]

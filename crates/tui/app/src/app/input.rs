@@ -176,14 +176,17 @@ pub(super) fn handle_mouse_event(
             true
         }
         MouseEventKind::ScrollUp if layout.transcript.contains(position) => {
-            let limit = transcript::next_scroll_limit(state, layout.transcript);
+            let mouse_scroll_lines = state.mouse_scroll_lines();
+            let limit =
+                transcript::next_scroll_limit_by(state, layout.transcript, mouse_scroll_lines);
             state.set_transcript_scroll_limit(limit);
-            state.scroll_events_up()
+            state.scroll_events_up_by(mouse_scroll_lines)
         }
         MouseEventKind::ScrollDown if layout.transcript.contains(position) => {
+            let mouse_scroll_lines = state.mouse_scroll_lines();
             let limit = transcript::current_scroll_limit(state, layout.transcript);
             state.set_transcript_scroll_limit(limit);
-            state.scroll_events_down()
+            state.scroll_events_down_by(mouse_scroll_lines)
         }
         _ => false,
     }
@@ -202,6 +205,24 @@ mod tests {
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
             workflow_store: dir.path().join("workflow.redb"),
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
+            ..AppConfig::default()
+        })
+    }
+
+    fn test_state_with_mouse_scroll_lines(mouse_scroll_lines: u16) -> AppState {
+        let dir = tempfile::tempdir().unwrap();
+        AppState::new(AppConfig {
+            state_dir: dir.path().to_path_buf(),
+            workflow_store: dir.path().join("workflow.redb"),
+            mouse_scroll_lines,
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {
@@ -495,11 +516,11 @@ mod tests {
     #[test]
     fn tab_completion_omits_space_for_commands_without_arguments() {
         let mut state = test_state();
-        state.push_input("/runs");
+        state.push_input("/help");
 
         handle_key_press(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
-        assert_eq!(state.input(), "/runs");
+        assert_eq!(state.input(), "/help");
     }
 
     #[test]
@@ -1062,9 +1083,9 @@ mod tests {
     }
 
     #[test]
-    fn transcript_wheel_changes_only_transcript_scroll_state() {
+    fn transcript_wheel_uses_default_mouse_scroll_lines() {
         let mut state = test_state();
-        populate_scrollable_transcript(&mut state);
+        state.push_card("Transcript", (0..60).map(|index| format!("line {index}")));
         state.push_input("draft");
         let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
         let point = (layout.transcript.x, layout.transcript.y);
@@ -1074,7 +1095,7 @@ mod tests {
             mouse(MouseEventKind::ScrollUp, point.0, point.1),
             layout,
         ));
-        assert!((1..=10).contains(&state.scroll_offset()));
+        assert_eq!(state.scroll_offset(), 3);
         assert!(!state.is_following_events());
         assert_eq!(state.input(), "draft");
 
@@ -1086,6 +1107,41 @@ mod tests {
         assert_eq!(state.scroll_offset(), 0);
         assert!(state.is_following_events());
         assert_eq!(state.input(), "draft");
+    }
+
+    #[test]
+    fn transcript_wheel_uses_configured_mouse_scroll_lines() {
+        let mut state = test_state_with_mouse_scroll_lines(2);
+        state.push_card("Transcript", (0..60).map(|index| format!("line {index}")));
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::ScrollUp,
+                layout.transcript.x,
+                layout.transcript.y,
+            ),
+            layout,
+        ));
+
+        assert_eq!(state.scroll_offset(), 2);
+    }
+
+    #[test]
+    fn keyboard_transcript_scroll_keeps_ten_line_step() {
+        let mut state = test_state_with_mouse_scroll_lines(2);
+        state.push_card("Transcript", (0..60).map(|index| format!("line {index}")));
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+
+        let handling = handle_key_press_with_layout(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            layout,
+        );
+
+        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(state.scroll_offset(), 10);
     }
 
     #[test]
@@ -1221,9 +1277,14 @@ mod tests {
 
             let after = visible_transcript_rows(&state, tall_layout);
             assert_ne!(after, before, "ScrollDown only drained hidden overscroll");
+            let expected_delta = if use_mouse {
+                state.mouse_scroll_lines()
+            } else {
+                10
+            };
             assert_eq!(
                 state.scroll_offset(),
-                resized_limit.saturating_sub(10),
+                resized_limit.saturating_sub(expected_delta),
                 "stored offset retained hidden overscroll"
             );
         }
