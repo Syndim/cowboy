@@ -1,13 +1,19 @@
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use unicode_width::UnicodeWidthChar;
 
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 
-use super::super::state::{AppState, TranscriptEntry, render_pending_prompt_lines};
-use super::super::styles::{style_accent, style_muted, style_transcript_normal};
+use super::super::state::{
+    AppState, TranscriptEntry, TranscriptSelection, TranscriptSelectionPoint,
+    render_pending_prompt_lines,
+};
+use super::super::styles::{
+    style_accent, style_muted, style_transcript_normal, style_transcript_selection,
+};
 
 #[derive(Debug)]
 struct TranscriptViewport {
@@ -46,7 +52,10 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
     let show_scrollbar = content_area != area;
     let scrollbar_position = scrollbar_position(&viewport, visible_height);
 
-    frame.render_widget(Paragraph::new(viewport.rows), content_area);
+    frame.render_widget(
+        Paragraph::new(selected_rows(viewport.rows, state.transcript_selection())),
+        content_area,
+    );
 
     if show_scrollbar {
         let scrollbar_area = Rect {
@@ -78,6 +87,36 @@ pub(in crate::app) fn current_scroll_limit(state: &AppState, area: Rect) -> usiz
     content_viewport(state, area, state.scroll_offset())
         .1
         .effective_offset
+}
+
+pub(in crate::app) fn selection_point_at(
+    state: &AppState,
+    area: Rect,
+    position: Position,
+) -> Option<TranscriptSelectionPoint> {
+    let (content_area, viewport) = content_viewport(state, area, state.scroll_offset());
+    if content_area.width == 0 || content_area.height == 0 || !content_area.contains(position) {
+        return None;
+    }
+
+    if viewport.rows.is_empty() {
+        return None;
+    }
+
+    let row = usize::from(position.y.saturating_sub(content_area.y))
+        .min(viewport.rows.len().saturating_sub(1));
+    let column = usize::from(position.x.saturating_sub(content_area.x))
+        .min(line_display_width(&viewport.rows[row]));
+    Some(TranscriptSelectionPoint::new(row, column))
+}
+
+pub(in crate::app) fn selected_text(state: &AppState, area: Rect) -> String {
+    let Some(selection) = state.transcript_selection() else {
+        return String::new();
+    };
+
+    let (_, viewport) = content_viewport(state, area, state.scroll_offset());
+    selected_text_from_rows(&viewport.rows, selection)
 }
 
 fn content_viewport(
@@ -115,6 +154,190 @@ fn scrollbar_position(viewport: &TranscriptViewport, visible_height: usize) -> u
         .saturating_sub(viewport.effective_offset)
         .saturating_mul(viewport.content_length.saturating_sub(1))
         / maximum_offset
+}
+
+fn selected_rows(
+    rows: Vec<Line<'static>>,
+    selection: Option<&TranscriptSelection>,
+) -> Vec<Line<'static>> {
+    let Some(selection) = selection else {
+        return rows;
+    };
+
+    rows.into_iter()
+        .enumerate()
+        .map(|(row_index, row)| line_with_selection(row, row_index, selection))
+        .collect()
+}
+
+fn line_with_selection(
+    line: Line<'static>,
+    row_index: usize,
+    selection: &TranscriptSelection,
+) -> Line<'static> {
+    let line_width = line_display_width(&line);
+    let Some(range) = row_selection_range(selection, row_index, line_width) else {
+        return line;
+    };
+
+    let Line {
+        spans,
+        style,
+        alignment,
+    } = line;
+    let mut selected_spans = Vec::new();
+    for span in spans {
+        push_split_span(&mut selected_spans, span, range.clone());
+    }
+
+    let mut row = Line::from(selected_spans);
+    row.style = style;
+    row.alignment = alignment;
+    row
+}
+
+fn push_split_span(
+    output: &mut Vec<Span<'static>>,
+    span: Span<'static>,
+    range: std::ops::Range<usize>,
+) {
+    let mut segment = String::new();
+    let mut segment_style = span.style;
+    let mut segment_selected = None;
+    let mut column = 0usize;
+
+    for ch in span.content.chars() {
+        let width = ch.width().unwrap_or(0);
+        let selected = char_intersects_range(column, width, &range);
+        if segment_selected.is_some_and(|previous| previous != selected) {
+            push_selection_segment(output, &mut segment, segment_style);
+        }
+
+        if segment_selected != Some(selected) {
+            segment_style = if selected {
+                style_transcript_selection(span.style)
+            } else {
+                span.style
+            };
+            segment_selected = Some(selected);
+        }
+
+        segment.push(ch);
+        column = column.saturating_add(width);
+    }
+
+    push_selection_segment(output, &mut segment, segment_style);
+}
+
+fn push_selection_segment(output: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
+    if segment.is_empty() {
+        return;
+    }
+
+    output.push(Span::styled(std::mem::take(segment), style));
+}
+
+fn selected_text_from_rows(rows: &[Line<'static>], selection: &TranscriptSelection) -> String {
+    let (start, end) = normalize_selection(selection);
+    if start == end || rows.is_empty() {
+        return String::new();
+    }
+
+    let mut selected_rows = Vec::new();
+    for row_index in start.row..=end.row {
+        let Some(row) = rows.get(row_index) else {
+            continue;
+        };
+
+        let row_width = line_display_width(row);
+        let Some(range) = row_selection_range_between(start, end, row_index, row_width) else {
+            selected_rows.push(String::new());
+            continue;
+        };
+
+        selected_rows.push(line_selected_text(row, range));
+    }
+
+    selected_rows.join("\n")
+}
+
+fn line_selected_text(line: &Line<'static>, range: std::ops::Range<usize>) -> String {
+    let mut text = String::new();
+    let mut column = 0usize;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            let width = ch.width().unwrap_or(0);
+            if char_intersects_range(column, width, &range) {
+                text.push(ch);
+            }
+
+            column = column.saturating_add(width);
+        }
+    }
+
+    text
+}
+
+fn row_selection_range(
+    selection: &TranscriptSelection,
+    row_index: usize,
+    row_width: usize,
+) -> Option<std::ops::Range<usize>> {
+    let (start, end) = normalize_selection(selection);
+    row_selection_range_between(start, end, row_index, row_width)
+}
+
+fn row_selection_range_between(
+    start: TranscriptSelectionPoint,
+    end: TranscriptSelectionPoint,
+    row_index: usize,
+    row_width: usize,
+) -> Option<std::ops::Range<usize>> {
+    if start == end || row_index < start.row || row_index > end.row {
+        return None;
+    }
+
+    let start_column = if row_index == start.row {
+        start.column
+    } else {
+        0
+    }
+    .min(row_width);
+    let end_column = if row_index == end.row {
+        end.column
+    } else {
+        row_width
+    }
+    .min(row_width);
+    (start_column < end_column).then_some(start_column..end_column)
+}
+
+fn normalize_selection(
+    selection: &TranscriptSelection,
+) -> (TranscriptSelectionPoint, TranscriptSelectionPoint) {
+    let anchor = selection.anchor;
+    let focus = selection.focus;
+    if (focus.row, focus.column) < (anchor.row, anchor.column) {
+        (focus, anchor)
+    } else {
+        (anchor, focus)
+    }
+}
+
+fn line_display_width(line: &Line<'static>) -> usize {
+    line.spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .map(|ch| ch.width().unwrap_or(0))
+        .sum()
+}
+
+fn char_intersects_range(column: usize, width: usize, range: &std::ops::Range<usize>) -> bool {
+    if width == 0 {
+        return range.contains(&column);
+    }
+
+    column < range.end && column.saturating_add(width) > range.start
 }
 
 #[cfg(test)]
@@ -434,10 +657,11 @@ fn empty_lines() -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
     use super::*;
-    use crate::app::state::AppState;
+    use crate::app::state::{AppState, TranscriptSelection, TranscriptSelectionPoint};
     use crate::app::styles::{style_transcript_metadata, style_transcript_thought};
     use crate::config::AppConfig;
 
@@ -456,6 +680,75 @@ mod tests {
             )]),
             ..AppConfig::default()
         })
+    }
+
+    fn selection(anchor: (usize, usize), focus: (usize, usize)) -> TranscriptSelection {
+        TranscriptSelection {
+            anchor: TranscriptSelectionPoint::new(anchor.0, anchor.1),
+            focus: TranscriptSelectionPoint::new(focus.0, focus.1),
+            active: false,
+            selected_text: String::new(),
+        }
+    }
+
+    #[test]
+    fn selection_point_hit_testing_excludes_scrollbar_column() {
+        let mut state = test_state();
+        state.push_card("Transcript", (0..20).map(|index| format!("row {index}")));
+        let area = Rect::new(0, 0, 24, 6);
+
+        assert!(selection_point_at(&state, area, Position::new(22, 1)).is_some());
+        assert_eq!(selection_point_at(&state, area, Position::new(23, 1)), None);
+    }
+
+    #[test]
+    fn selected_text_extracts_single_row_and_highlights_range() {
+        let rows = vec![Line::from("abcdef")];
+        let selection = selection((0, 1), (0, 4));
+
+        assert_eq!(selected_text_from_rows(&rows, &selection), "bcd");
+
+        let highlighted = selected_rows(rows, Some(&selection));
+        let spans = &highlighted[0].spans;
+        assert_eq!(spans[0].content, "a");
+        assert_eq!(spans[1].content, "bcd");
+        assert!(spans[1].style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(spans[2].content, "ef");
+    }
+
+    #[test]
+    fn selected_text_extracts_across_wrapped_visual_rows() {
+        let rows = visual_rows(vec![Line::from("abcdefghij")], 4);
+        let selection = selection((0, 2), (2, 1));
+
+        assert_eq!(
+            rows.iter().map(Line::to_string).collect::<Vec<_>>(),
+            vec!["abcd", "efgh", "ij"]
+        );
+        assert_eq!(selected_text_from_rows(&rows, &selection), "cd\nefgh\ni");
+    }
+
+    #[test]
+    fn selected_text_extracts_across_multiple_rows() {
+        let rows = vec![
+            Line::from("first"),
+            Line::from("second"),
+            Line::from("third"),
+        ];
+        let selection = selection((0, 2), (2, 3));
+
+        assert_eq!(
+            selected_text_from_rows(&rows, &selection),
+            "rst\nsecond\nthi"
+        );
+    }
+
+    #[test]
+    fn selected_text_uses_display_width_for_wide_unicode() {
+        let rows = vec![Line::from("a界b")];
+        let selection = selection((0, 1), (0, 2));
+
+        assert_eq!(selected_text_from_rows(&rows, &selection), "界");
     }
 
     fn rendered_text(state: &AppState, height: usize, width: usize) -> String {

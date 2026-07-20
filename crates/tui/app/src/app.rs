@@ -4,6 +4,7 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Result;
+use base64::Engine;
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
@@ -381,11 +382,12 @@ where
                 }
             }
             Event::Mouse(mouse) => {
-                draw_scheduler.mark_dirty_if(input::handle_mouse_event(
-                    &mut state,
-                    mouse,
-                    current_layout,
-                ));
+                let handled = input::handle_mouse_event(&mut state, mouse, current_layout);
+                if handled && let Err(err) = emit_pending_clipboard_copy(&mut state) {
+                    tracing::warn!(error = ?err, "failed to copy transcript selection");
+                }
+
+                draw_scheduler.mark_dirty_if(handled);
             }
             Event::Resize(_, _) => draw_scheduler.mark_dirty(),
             event => {
@@ -393,6 +395,27 @@ where
             }
         }
     }
+}
+
+fn emit_pending_clipboard_copy(state: &mut AppState) -> io::Result<bool> {
+    let Some(text) = state.take_pending_clipboard_text() else {
+        return Ok(false);
+    };
+
+    let mut stdout = io::stdout();
+    write_osc52_clipboard(&mut stdout, &text)?;
+    Ok(true)
+}
+
+fn write_osc52_clipboard(stdout: &mut impl io::Write, text: &str) -> io::Result<()> {
+    stdout.write_all(b"\x1b]52;c;")?;
+    stdout.write_all(
+        base64::engine::general_purpose::STANDARD
+            .encode(text.as_bytes())
+            .as_bytes(),
+    )?;
+    stdout.write_all(b"\x07")?;
+    stdout.flush()
 }
 
 fn key_code_name(code: &KeyCode) -> &'static str {

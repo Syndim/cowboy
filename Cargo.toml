@@ -10,6 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-trait = "0"
 chrono = "0"
 fs2 = "0"

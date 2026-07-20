@@ -1,4 +1,4 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Position;
 
 use super::AppLayout;
@@ -144,6 +144,37 @@ pub(super) fn handle_mouse_event(
     let position = Position::new(event.column, event.row);
 
     match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some(point) = transcript::selection_point_at(state, layout.transcript, position)
+            else {
+                state.clear_transcript_selection();
+                return false;
+            };
+
+            state.start_transcript_selection(point);
+            true
+        }
+        MouseEventKind::Drag(MouseButton::Left) if state.transcript_selection_is_active() => {
+            let Some(point) = transcript::selection_point_at(state, layout.transcript, position)
+            else {
+                return false;
+            };
+
+            state.update_transcript_selection(point);
+            let selected_text = transcript::selected_text(state, layout.transcript);
+            state.set_transcript_selection_text(selected_text);
+            true
+        }
+        MouseEventKind::Up(MouseButton::Left) if state.transcript_selection_is_active() => {
+            if let Some(point) = transcript::selection_point_at(state, layout.transcript, position)
+            {
+                state.update_transcript_selection(point);
+            }
+
+            let selected_text = transcript::selected_text(state, layout.transcript);
+            state.finalize_transcript_selection(selected_text);
+            true
+        }
         MouseEventKind::ScrollUp if layout.transcript.contains(position) => {
             let limit = transcript::next_scroll_limit(state, layout.transcript);
             state.set_transcript_scroll_limit(limit);
@@ -164,6 +195,7 @@ mod tests {
     use crate::config::AppConfig;
     use crossterm::event::MouseButton;
     use ratatui::layout::Rect;
+    use unicode_width::UnicodeWidthStr;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -898,6 +930,118 @@ mod tests {
     }
 
     #[test]
+    fn transcript_mouse_drag_is_handled_for_text_selection() {
+        let mut state = test_state();
+        state.push_card("Transcript", ["selectable transcript text".to_string()]);
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+        let row = layout.transcript.y.saturating_add(1);
+
+        for (kind, column) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                layout.transcript.x.saturating_add(1),
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                layout.transcript.x.saturating_add(10),
+            ),
+            (
+                MouseEventKind::Up(MouseButton::Left),
+                layout.transcript.x.saturating_add(10),
+            ),
+        ] {
+            assert!(
+                handle_mouse_event(&mut state, mouse(kind, column, row), layout),
+                "{kind:?} over transcript was ignored, so captured mouse input cannot select text"
+            );
+        }
+    }
+
+    #[test]
+    fn transcript_mouse_selection_updates_finalizes_and_queues_copy() {
+        let mut state = test_state();
+        state.push_card("Transcript", ["selectable transcript text".to_string()]);
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+        let rows = visible_transcript_rows(&state, layout);
+        let row_index = rows
+            .iter()
+            .position(|row| row.contains("selectable transcript text"))
+            .unwrap();
+        let line = &rows[row_index];
+        let start_column = UnicodeWidthStr::width(&line[..line.find("selectable").unwrap()]) as u16;
+        let end_column = start_column + "selectable".chars().count() as u16;
+        let row = layout.transcript.y + row_index as u16;
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                layout.transcript.x + start_column,
+                row,
+            ),
+            layout,
+        ));
+        assert!(state.transcript_selection_is_active());
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                layout.transcript.x + end_column,
+                row,
+            ),
+            layout,
+        ));
+        assert_eq!(
+            state.transcript_selection().unwrap().selected_text,
+            "selectable"
+        );
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                layout.transcript.x + end_column,
+                row,
+            ),
+            layout,
+        ));
+        let selection = state.transcript_selection().unwrap();
+        assert!(!selection.active);
+        assert_eq!(selection.selected_text, "selectable");
+        assert_eq!(
+            state.take_pending_clipboard_text(),
+            Some("selectable".to_string())
+        );
+    }
+
+    #[test]
+    fn non_transcript_left_button_events_do_not_edit_composer_state() {
+        let mut state = test_state();
+        seed_history(&mut state);
+        state.push_input("draft");
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+        let input = state.input().to_string();
+
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert!(!handle_mouse_event(
+                &mut state,
+                mouse(kind, layout.composer.x, layout.composer.y),
+                layout,
+            ));
+        }
+
+        assert_eq!(state.input(), input);
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+        assert!(state.transcript_selection().is_none());
+    }
+
+    #[test]
     fn transcript_wheel_changes_only_transcript_scroll_state() {
         let mut state = test_state();
         populate_scrollable_transcript(&mut state);
@@ -1088,7 +1232,6 @@ mod tests {
             MouseEventKind::Moved,
             MouseEventKind::ScrollLeft,
             MouseEventKind::ScrollRight,
-            MouseEventKind::Down(MouseButton::Left),
         ] {
             assert!(!handle_mouse_event(
                 &mut state,

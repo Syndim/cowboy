@@ -7,6 +7,7 @@ license.workspace = true
 description = "Workflow-first terminal UI for Cowboy"
 
 [dependencies]
+base64.workspace = true
 cowboy-command-parser.workspace = true
 cowboy-workflow-engine = { path = "../../workflow/engine" }
 anyhow.workspace = true

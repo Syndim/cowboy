@@ -1,4 +1,4 @@
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 pub(super) const COLOR_TRANSCRIPT_NORMAL: Color = Color::White;
 pub(super) const COLOR_TRANSCRIPT_METADATA: Color = Color::Rgb(107, 114, 128);
@@ -43,6 +43,10 @@ pub(super) fn style_border_accent() -> Style {
 
 pub(super) fn style_transcript_normal() -> Style {
     Style::default().fg(COLOR_TRANSCRIPT_NORMAL)
+}
+
+pub(super) fn style_transcript_selection(base: Style) -> Style {
+    base.add_modifier(Modifier::REVERSED)
 }
 
 pub(super) fn style_transcript_metadata() -> Style {

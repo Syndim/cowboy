@@ -365,6 +365,26 @@ pub(in crate::app) struct AgentPromptWindowState {
     pub window_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) struct TranscriptSelectionPoint {
+    pub row: usize,
+    pub column: usize,
+}
+
+impl TranscriptSelectionPoint {
+    pub(in crate::app) fn new(row: usize, column: usize) -> Self {
+        Self { row, column }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::app) struct TranscriptSelection {
+    pub anchor: TranscriptSelectionPoint,
+    pub focus: TranscriptSelectionPoint,
+    pub active: bool,
+    pub selected_text: String,
+}
+
 #[derive(Debug)]
 pub(super) struct AppState {
     active_run_id: Option<String>,
@@ -381,6 +401,8 @@ pub(super) struct AppState {
     active_event: Option<ActiveEvent>,
     scroll_offset: usize,
     transcript_scroll_limit: usize,
+    transcript_selection: Option<TranscriptSelection>,
+    pending_clipboard_text: Option<String>,
     follow_events: bool,
     input: Input,
     history: Vec<String>,
@@ -411,6 +433,8 @@ impl AppState {
             active_event: None,
             scroll_offset: 0,
             transcript_scroll_limit: usize::MAX,
+            transcript_selection: None,
+            pending_clipboard_text: None,
             follow_events: true,
             input: Input::default(),
             history,
@@ -509,11 +533,68 @@ impl AppState {
     }
 
     pub(in crate::app) fn set_transcript_scroll_limit(&mut self, limit: usize) {
+        let previous_offset = self.scroll_offset;
         self.transcript_scroll_limit = limit;
         self.scroll_offset = self.scroll_offset.min(limit);
+        if self.scroll_offset != previous_offset {
+            self.clear_transcript_selection();
+        }
+
         if self.scroll_offset == 0 {
             self.follow_events = true;
         }
+    }
+
+    pub(in crate::app) fn transcript_selection(&self) -> Option<&TranscriptSelection> {
+        self.transcript_selection.as_ref()
+    }
+
+    pub(in crate::app) fn transcript_selection_is_active(&self) -> bool {
+        self.transcript_selection
+            .as_ref()
+            .is_some_and(|selection| selection.active)
+    }
+
+    pub(in crate::app) fn start_transcript_selection(&mut self, point: TranscriptSelectionPoint) {
+        self.transcript_selection = Some(TranscriptSelection {
+            anchor: point,
+            focus: point,
+            active: true,
+            selected_text: String::new(),
+        });
+    }
+
+    pub(in crate::app) fn update_transcript_selection(&mut self, point: TranscriptSelectionPoint) {
+        if let Some(selection) = self.transcript_selection.as_mut()
+            && selection.active
+        {
+            selection.focus = point;
+        }
+    }
+
+    pub(in crate::app) fn set_transcript_selection_text(&mut self, selected_text: String) {
+        if let Some(selection) = self.transcript_selection.as_mut() {
+            selection.selected_text = selected_text;
+        }
+    }
+
+    pub(in crate::app) fn finalize_transcript_selection(&mut self, selected_text: String) {
+        if let Some(selection) = self.transcript_selection.as_mut() {
+            selection.active = false;
+            selection.selected_text = selected_text.clone();
+        }
+
+        if !selected_text.is_empty() {
+            self.pending_clipboard_text = Some(selected_text);
+        }
+    }
+
+    pub(in crate::app) fn clear_transcript_selection(&mut self) {
+        self.transcript_selection = None;
+    }
+
+    pub(in crate::app) fn take_pending_clipboard_text(&mut self) -> Option<String> {
+        self.pending_clipboard_text.take()
     }
 
     pub(in crate::app) fn input(&self) -> &str {
@@ -807,6 +888,7 @@ impl AppState {
 
         self.scroll_offset = next_offset;
         self.follow_events = false;
+        self.clear_transcript_selection();
         true
     }
 
@@ -817,12 +899,18 @@ impl AppState {
             self.follow_events = true;
         }
 
-        previous != (self.scroll_offset, self.follow_events)
+        if previous == (self.scroll_offset, self.follow_events) {
+            return false;
+        }
+
+        self.clear_transcript_selection();
+        true
     }
 
     pub(in crate::app) fn follow_latest(&mut self) {
         self.scroll_offset = 0;
         self.follow_events = true;
+        self.clear_transcript_selection();
     }
 
     pub(in crate::app) fn history_previous(&mut self) -> bool {
@@ -967,6 +1055,7 @@ impl AppState {
 
         self.status = status;
         self.event_log[index] = TranscriptEntry::Workflow(active_event);
+        self.clear_transcript_selection();
         self.apply_workflow_event_metadata(event);
         if self.follow_events {
             self.scroll_offset = 0;
@@ -1162,6 +1251,7 @@ impl AppState {
 
     fn push_event(&mut self, event: TranscriptEntry) {
         self.event_log.push(event);
+        self.clear_transcript_selection();
         if self.follow_events {
             self.scroll_offset = 0;
         }

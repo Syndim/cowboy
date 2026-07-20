@@ -225,6 +225,15 @@ fn terminal_screen_commands_pair_mouse_capture_and_bracketed_paste() {
 }
 
 #[test]
+fn osc52_clipboard_command_encodes_selected_text() {
+    let mut bytes = Vec::new();
+
+    write_osc52_clipboard(&mut bytes, "hello").unwrap();
+
+    assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b]52;c;aGVsbG8=\x07");
+}
+
+#[test]
 fn terminal_screen_setup_failure_rolls_back_mouse_capture() {
     let mut writer = FailAfterMouseCapture {
         bytes: Vec::new(),
