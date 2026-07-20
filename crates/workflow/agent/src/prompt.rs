@@ -77,7 +77,7 @@ fn build_output_instruction(output: &OutputSpec) -> String {
     } else {
         output.statuses.join(", ")
     };
-    let fields = describe_fields(&output.fields);
+    let fields = describe_fields(&output.fields, &output.required_fields);
     let mut instruction = format!(
         "## Deliverable Format\n\n\
 Your response MUST begin with valid YAML frontmatter followed by Markdown body. Quote frontmatter strings and list items that contain `: `, backticks, brackets, braces, or other YAML punctuation.\n\n\
@@ -94,13 +94,21 @@ Example:\n\n---\nstatus: success\nsummary: short summary\n---\n\nMarkdown detail
     instruction
 }
 
-fn describe_fields(fields: &Value) -> String {
+fn describe_fields(fields: &Value, required_fields: &[String]) -> String {
     let Some(object) = fields.as_object() else {
         return "- status: routing status string".to_string();
     };
     let mut lines = vec!["- status: routing status string".to_string()];
     for (key, value) in object {
-        lines.push(format!("- {key}: {}", field_description(value)));
+        let requirement = if required_fields.iter().any(|field| field == key) {
+            "required"
+        } else {
+            "optional"
+        };
+        lines.push(format!(
+            "- {key}: {} ({requirement})",
+            field_description(value)
+        ));
     }
     lines.join("\n")
 }
@@ -135,6 +143,7 @@ mod tests {
                     "unblocked".into(),
                 ],
                 fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec!["summary".into()],
             }),
         };
         let prompt = build_agent_prompt(&role, &action, &[]);
@@ -160,6 +169,7 @@ mod tests {
             output: Some(OutputSpec {
                 statuses: vec!["implemented".into(), "blocked".into()],
                 fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec![],
             }),
         };
 
@@ -181,6 +191,7 @@ mod tests {
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec![],
             }),
         };
         let nudge = build_retry_nudge(&action, Some("missing YAML frontmatter"));

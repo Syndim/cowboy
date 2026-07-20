@@ -1384,13 +1384,23 @@ fn ensure_resolvable(run: &WorkflowRun) -> Result<()> {
 fn action_output_shape(action: Option<&StepAction>) -> (Vec<String>, Vec<String>, bool) {
     match action {
         Some(StepAction::Agent(agent)) => {
-            let fields = agent
+            let required_fields = agent
+                .output
+                .as_ref()
+                .map(|output| output.required_fields.clone())
+                .unwrap_or_default();
+            let optional_fields = agent
                 .output
                 .as_ref()
                 .and_then(|output| output.fields.as_object())
-                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .map(|map| {
+                    map.keys()
+                        .filter(|field| !required_fields.iter().any(|required| required == *field))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
-            (fields, Vec::new(), true)
+            (required_fields, optional_fields, true)
         }
         _ => (Vec::new(), Vec::new(), true),
     }
@@ -1867,7 +1877,7 @@ mod tests {
                   return action.agent {{
                     role = developer,
                     prompt = "Do work",
-                    output = {{ status = {{ "success" }}, fields = {{ summary = "string" }} }}
+                    output = {{ status = {{ "success" }}, fields = {{ summary = "string", validation_doc = "string", rca_doc = "string", repro_test = "string" }}, required_fields = {{ "summary" }} }}
                   }}
                 end
                 return workflow("aaa", start)
@@ -2186,7 +2196,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
               return action.agent {
                 role = developer,
                 prompt = "Do work",
-                output = { status = { "success" }, fields = { summary = "string" } }
+                output = { status = { "success" }, fields = { summary = "string" }, required_fields = { "summary" } }
               }
             end
             return workflow("aaa", start)
@@ -3495,6 +3505,14 @@ exit 0
             .expect("success option");
         // Required fields are recovered from the agent action's OutputSpec.
         assert_eq!(success.required_fields, vec!["summary".to_string()]);
+        assert_eq!(
+            success.optional_fields,
+            vec![
+                "rca_doc".to_string(),
+                "repro_test".to_string(),
+                "validation_doc".to_string(),
+            ]
+        );
 
         // Resolving without the required field is a clear, actionable error.
         let err = runtime
@@ -3515,6 +3533,18 @@ exit 0
             .unwrap_err();
         assert!(err.to_string().contains("Valid statuses"), "{err}");
         assert!(err.to_string().contains("success"), "{err}");
+
+        // Optional fields may be omitted during manual resolution.
+        let resolved = runtime
+            .resolve_run(
+                &run_id,
+                "success",
+                Some(serde_json::json!({ "summary": "manually resolved" })),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolved.run.status, RunStatus::Completed);
     }
 
     #[tokio::test]
@@ -5028,7 +5058,7 @@ exit 0
         assert!(
             implement_action
                 .prompt
-                .contains("changing each completed `- [ ]` item to `- [x]`")
+                .contains("changing each completed `- [ ] TODO-NN` item to `- [x] TODO-NN`")
         );
         let fields = &implement_action.output.as_ref().unwrap().fields;
         assert_eq!(fields["plan_doc"], "string");
@@ -5090,9 +5120,13 @@ exit 0
         assert!(
             review_action
                 .prompt
-                .contains("Verify every checked TODO item is actually completed")
+                .contains("complete Pass 1 for every required `TODO-NN` in plan order")
         );
-        assert!(review_action.prompt.contains("unfinished work items"));
+        assert!(
+            review_action
+                .prompt
+                .contains("An unchecked required TODO must remain visible")
+        );
         let fields = &review_action.output.as_ref().unwrap().fields;
         assert_eq!(fields["plan_doc"], "string");
 
@@ -5276,6 +5310,10 @@ user_feedback: []
 goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 commands: [cargo test -p cowboy-workflow-engine]
 failures: []
 ---
@@ -5321,6 +5359,10 @@ user_feedback:
 goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 commands: [cargo test -p cowboy]
 failures: []
 ---
@@ -5397,6 +5439,10 @@ plan_doc: docs/plans/example.md
 work_dir: docs/plans/example
 rca_doc: docs/plans/example/rca.md
 repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 commands: [cargo test -p cowboy]
 failures: []
 ---

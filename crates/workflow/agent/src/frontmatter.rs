@@ -193,6 +193,37 @@ mod tests {
         assert_eq!(parsed.output.body, "Committed locally.");
     }
     #[test]
+    fn structured_yaml_equality_ignores_formatting_but_preserves_value_semantics() {
+        let original = parse_frontmatter_mapping(
+            "records:\n  - subject_id: TODO-01\n    procedure:\n      kind: command\n      steps: [cargo test -p sample]\n    exit_status: 0\n  - subject_id: TODO-02\n    exit_status: 7\n",
+        )
+        .unwrap();
+        let reformatted = parse_frontmatter_mapping(
+            "records:\n- exit_status: 0\n  procedure: { steps: [\"cargo test -p sample\"], kind: command }\n  subject_id: TODO-01\n- exit_status: 7\n  subject_id: TODO-02\n",
+        )
+        .unwrap();
+        assert_eq!(original, reformatted);
+
+        let reordered = parse_frontmatter_mapping(
+            "records:\n  - subject_id: TODO-02\n    exit_status: 7\n  - subject_id: TODO-01\n    procedure:\n      kind: command\n      steps: [cargo test -p sample]\n    exit_status: 0\n",
+        )
+        .unwrap();
+        assert_ne!(original, reordered);
+
+        let changed_value = parse_frontmatter_mapping(
+            "records:\n  - subject_id: TODO-01\n    procedure:\n      kind: command\n      steps: [cargo test -p sample]\n    exit_status: 1\n  - subject_id: TODO-02\n    exit_status: 7\n",
+        )
+        .unwrap();
+        assert_ne!(original, changed_value);
+
+        let changed_type = parse_frontmatter_mapping(
+            "records:\n  - subject_id: TODO-01\n    procedure:\n      kind: command\n      steps: [cargo test -p sample]\n    exit_status: \"0\"\n  - subject_id: TODO-02\n    exit_status: 7\n",
+        )
+        .unwrap();
+        assert_ne!(original, changed_type);
+    }
+
+    #[test]
     fn rejects_missing_frontmatter() {
         assert!(matches!(
             parse_frontmatter_output("plain text"),

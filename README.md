@@ -242,12 +242,30 @@ mkdir -p ~/.config/cowboy/workflows
 cp -R examples/workflows/* ~/.config/cowboy/workflows/
 ```
 
-The starter set includes `feature`, `bugfix`, and `dev-loop`. The `dev-loop`
-workflow treats the run request as the Goal, asks the user for the exact
-validation method, and creates a per-request `docs/plans/<snake_case_summary>/`
-folder containing the implementation plan at `plan.md` and the validation guide
-at `validation.md`, with ordered checks, evidence requirements, and explicit exit
-criteria. Its validator must complete that guide before the loop can finish.
+The starter set includes `feature`, `bugfix`, and `dev-loop`. Plans give every
+implementation task a stable `TODO-NN` identifier, exact subject text,
+reproducible procedure, and observable expected result. Each source emits exactly
+one typed evidence record per subject; a record contains the complete ordered
+procedure, while command records map individual command steps by procedure index.
+Implementers attach evidence to each completed TODO, and testers independently
+reproduce the same procedure.
+
+Review is globally gated and runs in two passes. First, reviewers durably assess
+every proof for relevance, sufficiency, safety, currentness, falsifiability, and
+non-circularity, and separately validate the submitted evidence. No reviewer
+command runs until every subject has a sound proof and valid submission. Only
+then does the reviewer independently reproduce every procedure and compare the
+observations before approval.
+
+The `dev-loop` workflow treats the run request as the Goal, asks the user for the
+exact validation method, and creates a per-request
+`docs/plans/<snake_case_summary>/` folder containing the implementation plan at
+`plan.md` and the validation guide at `validation.md`. Validation steps and exit
+criteria use stable `VAL-NN` identifiers; validators record one criterion-keyed
+evidence record, and reviewers assess and reproduce those criteria through the
+same two-pass gate. The validator must complete the guide before the loop can
+finish.
+
 Across all three starter workflows, blocked agent steps first go to a dedicated
 blocker reviewer; recoverable blockers return to the originating step with
 agent-side recovery instructions, and only blockers requiring external input

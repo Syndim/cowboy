@@ -614,6 +614,7 @@ where
                 "agent step: failed to parse frontmatter output"
             );
         })?;
+        validate_output_spec(action.output.as_ref(), &parsed.output)?;
         let completed_at = Utc::now();
         let record = StepRecord {
             id: context.step_record_id,
@@ -727,6 +728,111 @@ where
             "agent session saved"
         );
         Ok(session_id)
+    }
+}
+
+fn validate_output_spec(
+    spec: Option<&cowboy_workflow_core::OutputSpec>,
+    output: &cowboy_workflow_core::StepOutput,
+) -> Result<()> {
+    let Some(spec) = spec else {
+        return Ok(());
+    };
+
+    if !spec.statuses.is_empty() && !spec.statuses.iter().any(|status| status == &output.status) {
+        return Err(Error::DisallowedStatus {
+            status: output.status.clone(),
+            allowed: spec.statuses.join(", "),
+        });
+    }
+
+    let Some(fields) = spec.fields.as_object() else {
+        return Ok(());
+    };
+
+    for (field, descriptor) in fields {
+        validate_supported_descriptor(field, descriptor)?;
+    }
+
+    let output_fields = output.fields.as_object();
+    let missing = spec
+        .required_fields
+        .iter()
+        .filter(|field| {
+            !output_fields
+                .and_then(|values| values.get(*field))
+                .map(|value| !value.is_null())
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if !missing.is_empty() {
+        return Err(Error::MissingOutputFields(missing.join(", ")));
+    }
+
+    let Some(output_fields) = output_fields else {
+        return Ok(());
+    };
+
+    for (field, descriptor) in fields {
+        if let Some(value) = output_fields.get(field)
+            && !value.is_null()
+        {
+            validate_output_field_type(field, descriptor, value)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_supported_descriptor(field: &str, descriptor: &serde_json::Value) -> Result<()> {
+    match descriptor.as_str() {
+        Some("array" | "boolean" | "number" | "string") => Ok(()),
+        Some(value) => Err(Error::UnsupportedOutputFieldDescriptor {
+            field: field.to_string(),
+            descriptor: value.to_string(),
+        }),
+        None => Err(Error::UnsupportedOutputFieldDescriptor {
+            field: field.to_string(),
+            descriptor: descriptor.to_string(),
+        }),
+    }
+}
+
+fn validate_output_field_type(
+    field: &str,
+    descriptor: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<()> {
+    let expected = descriptor.as_str().expect("descriptor validated first");
+    let valid = match expected {
+        "array" => value.is_array(),
+        "boolean" => value.is_boolean(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        _ => unreachable!("descriptor validated first"),
+    };
+
+    if valid {
+        return Ok(());
+    }
+
+    Err(Error::InvalidOutputFieldType {
+        field: field.to_string(),
+        expected: expected.to_string(),
+        actual: json_type_name(value).to_string(),
+    })
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -1508,6 +1614,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_agent_output_missing_declared_required_fields() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({"text":"---\nstatus: passed\nsummary: ok\n---\nbody"}),
+        }])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+        let mut action = action("developer");
+        action.output = Some(cowboy_workflow_core::OutputSpec {
+            statuses: vec!["passed".to_string(), "failed".to_string()],
+            fields: serde_json::json!({
+                "summary": "string",
+                "implementation_commands": "array",
+                "implementation_evidence": "array",
+                "tester_commands": "array",
+                "tester_evidence": "array",
+            }),
+            required_fields: vec![
+                "implementation_commands".to_string(),
+                "implementation_evidence".to_string(),
+                "tester_commands".to_string(),
+                "tester_evidence".to_string(),
+            ],
+        });
+
+        let error = executor
+            .execute_agent(action, context("run", "record"))
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::MissingOutputFields(fields) => {
+                assert!(fields.contains("implementation_commands"));
+                assert!(fields.contains("implementation_evidence"));
+                assert!(fields.contains("tester_commands"));
+                assert!(fields.contains("tester_evidence"));
+                assert!(!fields.contains("summary"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allows_omitted_optional_declared_fields() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({"text":"---\nstatus: ready\nsummary: ok\n---\nbody"}),
+        }])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+        let mut action = action("developer");
+        action.output = Some(cowboy_workflow_core::OutputSpec {
+            statuses: vec!["ready".to_string()],
+            fields: serde_json::json!({
+                "summary": "string",
+                "validation_doc": "string",
+                "rca_doc": "string",
+                "repro_test": "string",
+            }),
+            required_fields: vec!["summary".to_string()],
+        });
+
+        let execution = executor
+            .execute_agent(action, context("run", "record"))
+            .await
+            .unwrap();
+
+        let fields = &execution.record.output.as_ref().unwrap().fields;
+        assert_eq!(fields["summary"], "ok");
+        assert!(fields.get("validation_doc").is_none());
+        assert!(fields.get("rca_doc").is_none());
+        assert!(fields.get("repro_test").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_agent_output_with_disallowed_status() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({"text":"---\nstatus: skipped\nsummary: ok\nimplementation_commands: []\nimplementation_evidence: []\ntester_commands: []\ntester_evidence: []\n---\nbody"}),
+        }])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+        let mut action = action("developer");
+        action.output = Some(cowboy_workflow_core::OutputSpec {
+            statuses: vec!["passed".to_string(), "failed".to_string()],
+            fields: serde_json::json!({
+                "summary": "string",
+                "implementation_commands": "array",
+                "implementation_evidence": "array",
+                "tester_commands": "array",
+                "tester_evidence": "array",
+            }),
+            required_fields: vec![
+                "implementation_commands".to_string(),
+                "implementation_evidence".to_string(),
+                "tester_commands".to_string(),
+                "tester_evidence".to_string(),
+            ],
+        });
+
+        let error = executor
+            .execute_agent(action, context("run", "record"))
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::DisallowedStatus { status, allowed } => {
+                assert_eq!(status, "skipped");
+                assert_eq!(allowed, "passed, failed");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_agent_output_with_wrong_declared_field_types() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({"text":"---\nstatus: passed\nsummary: ok\nplan_doc: [not, string]\nfiles: not-array\nimplementation_commands: not-array\nimplementation_evidence: {}\ntester_commands: not-array\ntester_evidence: passed\n---\nbody"}),
+        }])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+        let mut action = action("developer");
+        action.output = Some(cowboy_workflow_core::OutputSpec {
+            statuses: vec!["passed".to_string()],
+            fields: serde_json::json!({
+                "summary": "string",
+                "plan_doc": "string",
+                "files": "array",
+                "implementation_commands": "array",
+                "implementation_evidence": "array",
+                "tester_commands": "array",
+                "tester_evidence": "array",
+            }),
+            required_fields: vec![],
+        });
+
+        let error = executor
+            .execute_agent(action, context("run", "record"))
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::InvalidOutputFieldType {
+                field,
+                expected,
+                actual,
+            } => {
+                assert_eq!(field, "files");
+                assert_eq!(expected, "array");
+                assert_eq!(actual, "string");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn executes_agent_action_and_normalizes_output() {
         let factory = FakeFactory::new(vec![FakeClient::new(vec![event()])]);
         let store = FakeStore::default();
@@ -1952,13 +2211,13 @@ mod tests {
     async fn correction_turns_use_verbatim_blocks_and_replace_the_initial_response() {
         let client = FakeClient::new(vec![
             Event::MessageChunk {
-                content: serde_json::json!({"text": "---\nstatus: success\n---\ninitial"}),
+                content: serde_json::json!({"text": "---\nstatus: success\nsummary: initial\n---\ninitial"}),
             },
             Event::MessageChunk {
-                content: serde_json::json!({"text": "---\nstatus: success\n---\ncorrected"}),
+                content: serde_json::json!({"text": "---\nstatus: success\nsummary: corrected\n---\ncorrected"}),
             },
             Event::MessageChunk {
-                content: serde_json::json!({"text": "---\nstatus: success\n---\ncorrected twice"}),
+                content: serde_json::json!({"text": "---\nstatus: success\nsummary: corrected twice\n---\ncorrected twice"}),
             },
         ]);
         let prompt_calls = client.prompt_calls.clone();
@@ -1991,6 +2250,7 @@ mod tests {
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["success".to_string()],
             fields: serde_json::json!({"summary": "string"}),
+            required_fields: vec!["summary".to_string()],
         });
 
         let execution = executor.execute_agent(action, context).await.unwrap();

@@ -175,7 +175,22 @@ fn output_spec(value: Value) -> Result<Option<OutputSpec>> {
                 }
             };
             let fields = lua_to_json(table.get::<Value>("fields")?)?;
-            Ok(Some(OutputSpec { statuses, fields }))
+            let required_fields = match table.get::<Value>("required_fields")? {
+                Value::Nil => Vec::new(),
+                Value::Table(t) => table_to_string_vec(&t)?,
+                _ => {
+                    return Err(Error::InvalidActionField {
+                        action: "agent".to_string(),
+                        field: "output.required_fields".to_string(),
+                        reason: "must be an array of strings".to_string(),
+                    });
+                }
+            };
+            Ok(Some(OutputSpec {
+                statuses,
+                fields,
+                required_fields,
+            }))
         }
         _ => Err(Error::InvalidActionField {
             action: "agent".to_string(),

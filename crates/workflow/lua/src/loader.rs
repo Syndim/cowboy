@@ -353,6 +353,1379 @@ mod tests {
         }
     }
 
+    const EVIDENCE_FIELD_NAMES: [&str; 9] = [
+        "implementation_commands",
+        "implementation_evidence",
+        "tester_commands",
+        "tester_evidence",
+        "validator_commands",
+        "validator_evidence",
+        "reviewer_commands",
+        "reviewer_evidence",
+        "reviewer_assessments",
+    ];
+
+    fn sample_evidence_fields() -> serde_json::Value {
+        serde_json::json!({
+            "implementation_commands": [
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 1, "command": "cargo test -p sample focused_contract", "exit_status": 0 },
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 2, "command": "cargo clippy -p sample -- -D warnings", "exit_status": "0" },
+                { "subject_kind": "todo", "subject_id": "TODO-02", "procedure_index": 1, "command": "cargo test -p sample routing_contract", "exit_status": 0 }
+            ],
+            "implementation_evidence": [
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Implement the focused contract", "source": "implementer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample focused_contract", "cargo clippy -p sample -- -D warnings"] },
+                    "expected_result": "The focused contract passes", "observed_result": "The focused contract and lint passed",
+                    "applicability": "applicable", "match": "matched", "comparisons": []
+                },
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Confirm routing text: status=ready; user_feedback remains raw", "source": "implementer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample routing_contract"] },
+                    "expected_result": "The routing contract passes", "observed_result": "The routing contract passed",
+                    "applicability": "applicable", "match": "matched", "comparisons": []
+                }
+            ],
+            "tester_commands": [
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 1, "command": "cargo test -p sample focused_contract", "exit_status": 0 },
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 2, "command": "cargo clippy -p sample -- -D warnings", "exit_status": "0" },
+                { "subject_kind": "todo", "subject_id": "TODO-02", "procedure_index": 1, "command": "cargo test -p sample routing_contract", "exit_status": 0 }
+            ],
+            "tester_evidence": [
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Implement the focused contract", "source": "tester",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample focused_contract", "cargo clippy -p sample -- -D warnings"] },
+                    "expected_result": "The focused contract passes", "observed_result": "The focused contract and lint passed independently",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [{ "source": "implementer", "observed_result": "The focused contract and lint passed", "match": "matched" }]
+                },
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Confirm routing text: status=ready; user_feedback remains raw", "source": "tester",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample routing_contract"] },
+                    "expected_result": "The routing contract passes", "observed_result": "The routing contract passed independently",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [{ "source": "implementer", "observed_result": "The routing contract passed", "match": "matched" }]
+                }
+            ],
+            "validator_commands": [
+                { "subject_kind": "validation_criterion", "subject_id": "VAL-01", "procedure_index": 1, "command": "cargo test -p sample acceptance_contract", "exit_status": 0 },
+                { "subject_kind": "validation_criterion", "subject_id": "VAL-02", "procedure_index": 1, "command": "cargo test -p sample boundary_contract", "exit_status": 0 }
+            ],
+            "validator_evidence": [
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-01", "subject": "Run the user acceptance command", "source": "validator",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample acceptance_contract"] },
+                    "expected_result": "The acceptance contract passes", "observed_result": "The acceptance contract passed",
+                    "applicability": "applicable", "match": "matched", "comparisons": []
+                },
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-02", "subject": "Run the boundary acceptance command", "source": "validator",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample boundary_contract"] },
+                    "expected_result": "The boundary contract passes", "observed_result": "The boundary contract passed",
+                    "applicability": "applicable", "match": "matched", "comparisons": []
+                }
+            ],
+            "reviewer_commands": [
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 1, "command": "cargo test -p sample focused_contract", "exit_status": 0 },
+                { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 2, "command": "cargo clippy -p sample -- -D warnings", "exit_status": "0" },
+                { "subject_kind": "todo", "subject_id": "TODO-02", "procedure_index": 1, "command": "cargo test -p sample routing_contract", "exit_status": 0 },
+                { "subject_kind": "validation_criterion", "subject_id": "VAL-01", "procedure_index": 1, "command": "cargo test -p sample acceptance_contract", "exit_status": 0 },
+                { "subject_kind": "validation_criterion", "subject_id": "VAL-02", "procedure_index": 1, "command": "cargo test -p sample boundary_contract", "exit_status": 0 }
+            ],
+            "reviewer_evidence": [
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Implement the focused contract", "source": "reviewer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample focused_contract", "cargo clippy -p sample -- -D warnings"] },
+                    "expected_result": "The focused contract passes", "observed_result": "The focused contract and lint passed during review",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [
+                        { "source": "implementer", "observed_result": "The focused contract and lint passed", "match": "matched" },
+                        { "source": "tester", "observed_result": "The focused contract and lint passed independently", "match": "matched" }
+                    ]
+                },
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Confirm routing text: status=ready; user_feedback remains raw", "source": "reviewer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample routing_contract"] },
+                    "expected_result": "The routing contract passes", "observed_result": "The routing contract passed during review",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [
+                        { "source": "implementer", "observed_result": "The routing contract passed", "match": "matched" },
+                        { "source": "tester", "observed_result": "The routing contract passed independently", "match": "matched" }
+                    ]
+                },
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-01", "subject": "Run the user acceptance command", "source": "reviewer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample acceptance_contract"] },
+                    "expected_result": "The acceptance contract passes", "observed_result": "The acceptance contract passed during review",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [{ "source": "validator", "observed_result": "The acceptance contract passed", "match": "matched" }]
+                },
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-02", "subject": "Run the boundary acceptance command", "source": "reviewer",
+                    "procedure": { "kind": "command", "steps": ["cargo test -p sample boundary_contract"] },
+                    "expected_result": "The boundary contract passes", "observed_result": "The boundary contract passed during review",
+                    "applicability": "applicable", "match": "matched",
+                    "comparisons": [{ "source": "validator", "observed_result": "The boundary contract passed", "match": "matched" }]
+                }
+            ],
+            "reviewer_assessments": [
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Implement the focused contract", "source": "reviewer", "completion_state": "checked", "proof_verdict": "sound",
+                    "relevance": "The focused test exercises the exact implementation contract", "sufficiency": "The test and lint cover behavior and static acceptance",
+                    "safety_and_executability": "Both commands use safe repository-local fixtures", "currentness": "Commands and subject match current code",
+                    "falsifiability": "A broken contract or lint defect makes one command fail", "non_circularity": "Independent assertions inspect observable behavior",
+                    "submission_verdict": "valid", "submission_issues": []
+                },
+                {
+                    "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Confirm routing text: status=ready; user_feedback remains raw", "source": "reviewer", "completion_state": "checked", "proof_verdict": "sound",
+                    "relevance": "The check observes the exact ready-state requirement", "sufficiency": "The routing command covers the stated boundary",
+                    "safety_and_executability": "The local routing test is safe and available", "currentness": "The command and subject match current code",
+                    "falsifiability": "A broken ready route makes the command fail", "non_circularity": "Independent assertions inspect routing behavior",
+                    "submission_verdict": "valid", "submission_issues": []
+                },
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-01", "subject": "Run the user acceptance command", "source": "reviewer", "completion_state": "checked", "proof_verdict": "sound",
+                    "relevance": "The command is the exact user validation method", "sufficiency": "The suite covers the declared goal boundary",
+                    "safety_and_executability": "The local command is safe and available", "currentness": "The criterion matches the current guide",
+                    "falsifiability": "Broken acceptance behavior makes the suite fail", "non_circularity": "Independent assertions determine the outcome",
+                    "submission_verdict": "valid", "submission_issues": []
+                },
+                {
+                    "subject_kind": "validation_criterion", "subject_id": "VAL-02", "subject": "Run the boundary acceptance command", "source": "reviewer", "completion_state": "checked", "proof_verdict": "sound",
+                    "relevance": "The command exercises the ordered boundary criterion", "sufficiency": "The boundary suite covers the second acceptance boundary",
+                    "safety_and_executability": "The local boundary command is safe and available", "currentness": "The criterion matches the current guide order",
+                    "falsifiability": "Broken boundary behavior makes the suite fail", "non_circularity": "Independent boundary assertions determine the outcome",
+                    "submission_verdict": "valid", "submission_issues": []
+                }
+            ]
+        })
+    }
+
+    fn assert_evidence_fields_equal(actual: &serde_json::Value, expected: &serde_json::Value) {
+        for field in EVIDENCE_FIELD_NAMES {
+            assert_eq!(
+                actual[field], expected[field],
+                "evidence field {field} changed during handoff"
+            );
+        }
+    }
+
+    #[test]
+    fn examples_workflows_require_stable_reproducible_evidence_contracts() {
+        for workflow_name in ["feature", "bugfix", "dev-loop"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let tester_role = &compiled.definition.roles["tester"];
+            for expected in [
+                "implementation_commands",
+                "implementation_evidence",
+                "tester_commands",
+                "tester_evidence",
+                "Never substitute a generic `commands` list or prose report",
+                "never return `passed` when any mandatory array",
+            ] {
+                assert!(
+                    tester_role.instructions.contains(expected),
+                    "{workflow_name} tester role should contain {expected:?}"
+                );
+            }
+
+            let plan_result = run_step(
+                &compiled.source_bundle,
+                "plan",
+                serde_json::json!({ "request": "Add reproducible review evidence" }),
+            )
+            .unwrap();
+            let StepAction::Agent(plan) = plan_result.action else {
+                panic!("{workflow_name} plan should request an agent action")
+            };
+            for expected in [
+                "- [ ] TODO-NN",
+                "never renumber or reuse existing IDs",
+                "ordered manual procedure",
+                "observable expected result",
+            ] {
+                assert!(
+                    plan.prompt.contains(expected),
+                    "{workflow_name} plan prompt should contain {expected:?}"
+                );
+            }
+
+            if workflow_name == "dev-loop" {
+                for expected in [
+                    "stable `VAL-NN` identifier",
+                    "every ordered validation step",
+                    "every exit criterion",
+                    "next unused number",
+                ] {
+                    assert!(
+                        plan.prompt.contains(expected),
+                        "dev-loop plan prompt should contain {expected:?}"
+                    );
+                }
+            }
+
+            let planning_fields = if workflow_name == "dev-loop" {
+                serde_json::json!({
+                    "work_dir": "docs/plans/reproducible_evidence",
+                    "plan_doc": "docs/plans/reproducible_evidence/plan.md",
+                    "validation_doc": "docs/plans/reproducible_evidence/validation.md",
+                    "files": [
+                        "docs/plans/reproducible_evidence/plan.md",
+                        "docs/plans/reproducible_evidence/validation.md"
+                    ]
+                })
+            } else {
+                serde_json::json!({
+                    "plan_doc": "docs/plans/reproducible_evidence.md",
+                    "files": ["docs/plans/reproducible_evidence.md"]
+                })
+            };
+            let review_plan_result = run_step(
+                &compiled.source_bundle,
+                "review_plan",
+                serde_json::json!({
+                    "request": "Add reproducible review evidence",
+                    "prev": {
+                        "step": "plan",
+                        "action": "agent",
+                        "status": "ready",
+                        "fields": planning_fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(review_plan) = review_plan_result.action else {
+                panic!("{workflow_name} plan review should request an agent action")
+            };
+            for expected in [
+                "stable, unique `TODO-NN` identifier",
+                "exact task text",
+                "duplicate",
+                "non-reproducible",
+            ] {
+                assert!(review_plan.prompt.contains(expected));
+            }
+            if workflow_name == "dev-loop" {
+                assert!(
+                    review_plan
+                        .prompt
+                        .contains("stable, unique `VAL-NN` identifier")
+                );
+                assert!(review_plan.prompt.contains("renumbered"));
+            }
+
+            for step_id in ["implement", "revise"] {
+                let result = run_step(
+                    &compiled.source_bundle,
+                    step_id,
+                    serde_json::json!({
+                        "request": "Add reproducible review evidence",
+                        "prev": {
+                            "step": "handoff",
+                            "action": "agent",
+                            "status": "approved",
+                            "fields": sample_evidence_fields()
+                        }
+                    }),
+                )
+                .unwrap();
+                let StepAction::Agent(action) = result.action else {
+                    panic!("{workflow_name} {step_id} should request an agent action")
+                };
+                for expected in [
+                    "`subject_kind`: `todo` or `validation_criterion`",
+                    "`subject_id`: the stable `TODO-NN` or `VAL-NN` identifier",
+                    "`source`: `implementer`, `tester`, `validator`, or `reviewer`",
+                    "`procedure_index`",
+                    "implementation_commands",
+                    "implementation_evidence",
+                ] {
+                    assert!(
+                        action.prompt.contains(expected),
+                        "{workflow_name} {step_id} prompt should contain {expected:?}"
+                    );
+                }
+                let output = action
+                    .output
+                    .expect("implementer action should declare output");
+                assert_eq!(output.fields["implementation_commands"], "array");
+                assert_eq!(output.fields["implementation_evidence"], "array");
+            }
+
+            let test_result = run_step(
+                &compiled.source_bundle,
+                "test",
+                serde_json::json!({
+                    "request": "Add reproducible review evidence",
+                    "prev": {
+                        "step": "implement",
+                        "action": "agent",
+                        "status": "implemented",
+                        "fields": sample_evidence_fields()
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(test) = test_result.action else {
+                panic!("{workflow_name} test should request an agent action")
+            };
+            for expected in [
+                "Implementation evidence records:",
+                "Subject ID: string(\"TODO-01\")",
+                "Subject ID: string(\"TODO-02\")",
+                "exactly one matching implementation record",
+                "exactly one `tester_evidence` record",
+                "Reject duplicate `(source, subject_kind, subject_id)` records",
+                "semantic deep equality and unchanged array order",
+                "output MUST include all four source-specific arrays",
+                "A generic `commands` list or prose pass report does not satisfy this contract",
+                "Command arrays may be empty only when every corresponding evidence record declares `procedure.kind: manual`",
+                "mixed manual/command plans need command entries only for command procedures",
+                "an evidence array is empty for checked work, a command array is empty despite a command procedure",
+            ] {
+                assert!(
+                    test.prompt.contains(expected),
+                    "{workflow_name} tester prompt should contain {expected:?}"
+                );
+            }
+            let todo_01 = test.prompt.find("Subject ID: string(\"TODO-01\")").unwrap();
+            let todo_02 = test.prompt.find("Subject ID: string(\"TODO-02\")").unwrap();
+            assert!(todo_01 < todo_02, "tester should retain plan record order");
+            let test_output = test.output.expect("tester should declare output");
+            for field in [
+                "implementation_commands",
+                "implementation_evidence",
+                "tester_commands",
+                "tester_evidence",
+            ] {
+                assert_eq!(test_output.fields[field], "array");
+            }
+            assert_eq!(
+                test_output.required_fields,
+                vec![
+                    "implementation_commands".to_string(),
+                    "implementation_evidence".to_string(),
+                    "tester_commands".to_string(),
+                    "tester_evidence".to_string(),
+                ]
+            );
+
+            let review_result = run_step(
+                &compiled.source_bundle,
+                "review",
+                serde_json::json!({
+                    "request": "Add reproducible review evidence",
+                    "prev": {
+                        "step": if workflow_name == "dev-loop" { "validate" } else { "test" },
+                        "action": "agent",
+                        "status": if workflow_name == "dev-loop" { "achieved" } else { "passed" },
+                        "fields": sample_evidence_fields()
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(review) = review_result.action else {
+                panic!("{workflow_name} review should request an agent action")
+            };
+            for expected in [
+                "globally gated two-pass process",
+                "complete Pass 1 for every required `TODO-NN` in plan order—whether checked or unchecked",
+                "before running any reviewer command or manual procedure",
+                "exactly one `reviewer_assessments` record per required subject",
+                "`replan_requested`, even if another submission is invalid",
+                "globally empty `reviewer_commands: []` and `reviewer_evidence: []`",
+                "Only when every assessment is `sound` and `valid` may Pass 2 begin",
+                "reject duplicate records rather than selecting, merging, or reproducing them",
+                "Do not improvise substitute checks",
+            ] {
+                assert!(
+                    review.prompt.contains(expected),
+                    "{workflow_name} review prompt should contain {expected:?}"
+                );
+            }
+            if workflow_name == "dev-loop" {
+                assert!(review.prompt.contains("every required `VAL-NN`"));
+                assert!(review.prompt.contains("matching validator observation"));
+            }
+            let review_output = review.output.expect("reviewer should declare output");
+            for field in EVIDENCE_FIELD_NAMES {
+                assert_eq!(review_output.fields[field], "array");
+            }
+            for status in ["approved", "changes_requested", "replan_requested"] {
+                assert!(review_output.statuses.iter().any(|value| value == status));
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_render_source_labeled_evidence_in_stable_order() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let result = run_step(
+            &compiled.source_bundle,
+            "review",
+            serde_json::json!({
+                "request": "Render structured evidence",
+                "prev": {
+                    "step": "validate",
+                    "action": "agent",
+                    "status": "achieved",
+                    "fields": sample_evidence_fields()
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("review should request an agent action")
+        };
+
+        let labels = [
+            "Implementation command records:",
+            "Implementation evidence records:",
+            "Tester command records:",
+            "Tester evidence records:",
+            "Validator command records:",
+            "Validator evidence records:",
+            "Reviewer command records:",
+            "Reviewer evidence records:",
+            "Reviewer soundness assessments:",
+        ];
+        let mut previous = 0;
+        for label in labels {
+            let position = action
+                .prompt
+                .find(label)
+                .unwrap_or_else(|| panic!("missing evidence label {label:?}"));
+            assert!(
+                position >= previous,
+                "evidence labels should retain source order"
+            );
+            previous = position;
+        }
+
+        for expected in [
+            "Subject kind: string(\"validation_criterion\")",
+            "Subject ID: string(\"VAL-01\")",
+            "Procedure kind: string(\"command\")",
+            "Expected result: string(\"The acceptance contract passes\")",
+            "Observed result: string(\"The acceptance contract passed during review\")",
+            "Applicability: string(\"applicable\")",
+            "Match: string(\"matched\")",
+            "Comparisons: array(nonempty,length=1)",
+            "Source: string(\"validator\")",
+            "Exit status: number(0)",
+            "Exit status: string(\"0\")",
+            "Subject: string(\"Confirm routing text: status=ready; user_feedback remains raw\")",
+            "Submission issues: array(empty)",
+            "Proof verdict: string(\"sound\")",
+        ] {
+            assert!(
+                action.prompt.contains(expected),
+                "missing rendered field {expected:?}"
+            );
+        }
+        assert!(!action.prompt.contains("User feedback history:"));
+    }
+
+    #[test]
+    fn examples_workflows_allow_manual_only_evidence_without_commands() {
+        let compiled = load_example_compiled_workflow("feature");
+        let manual_record = serde_json::json!({
+            "subject_kind": "todo",
+            "subject_id": "TODO-01",
+            "subject": "Inspect the rendered status manually",
+            "source": "implementer",
+            "procedure": { "kind": "manual", "steps": ["Open the status page", "Confirm the ready indicator"] },
+            "expected_result": "The ready indicator is visible",
+            "observed_result": "The ready indicator was visible",
+            "applicability": "applicable",
+            "match": "matched",
+            "comparisons": []
+        });
+        let command_record = serde_json::json!({
+            "subject_kind": "todo",
+            "subject_id": "TODO-02",
+            "subject": "Run the routing contract",
+            "source": "implementer",
+            "procedure": { "kind": "command", "steps": ["cargo test -p sample routing_contract"] },
+            "expected_result": "The routing contract passes",
+            "observed_result": "The routing contract passed",
+            "applicability": "applicable",
+            "match": "matched",
+            "comparisons": []
+        });
+
+        let cases = [
+            (
+                "manual only",
+                serde_json::json!({
+                    "implementation_commands": [],
+                    "implementation_evidence": [manual_record.clone()]
+                }),
+                "Implementation command records: array(empty)",
+            ),
+            (
+                "mixed manual and command",
+                serde_json::json!({
+                    "implementation_commands": [
+                        { "subject_kind": "todo", "subject_id": "TODO-02", "procedure_index": 1, "command": "cargo test -p sample routing_contract", "exit_status": 0 }
+                    ],
+                    "implementation_evidence": [manual_record, command_record]
+                }),
+                "Implementation command records: array(nonempty,length=1)",
+            ),
+        ];
+
+        for (name, fields, command_state) in cases {
+            let result = run_step(
+                &compiled.source_bundle,
+                "test",
+                serde_json::json!({
+                    "request": "Validate manual and command evidence",
+                    "prev": { "step": "implement", "action": "agent", "status": "implemented", "fields": fields }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(action) = result.action else {
+                panic!("{name} should request a tester action")
+            };
+            assert!(action.prompt.contains(command_state), "{name}");
+            assert!(action
+                .prompt
+                .contains("Command arrays may be empty only when every corresponding evidence record declares `procedure.kind: manual`"));
+            assert!(action.prompt.contains(
+                "mixed manual/command plans need command entries only for command procedures"
+            ));
+            let output = action.output.expect("tester should declare output");
+            for field in [
+                "implementation_commands",
+                "implementation_evidence",
+                "tester_commands",
+                "tester_evidence",
+            ] {
+                assert_eq!(output.fields[field], "array", "{name} {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_reject_duplicate_evidence_records() {
+        let compiled = load_example_compiled_workflow("feature");
+        let mut fields = sample_evidence_fields();
+        let duplicate = fields["implementation_evidence"][0].clone();
+        fields["implementation_evidence"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+
+        for step_id in ["test", "review"] {
+            let result = run_step(
+                &compiled.source_bundle,
+                step_id,
+                serde_json::json!({
+                    "request": "Reject duplicate proof records",
+                    "prev": {
+                        "step": "implement",
+                        "action": "agent",
+                        "status": "implemented",
+                        "fields": fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(action) = result.action else {
+                panic!("{step_id} should request an agent action")
+            };
+            let implementation_section = action
+                .prompt
+                .split("Implementation evidence records:")
+                .nth(1)
+                .unwrap()
+                .split("Tester command records:")
+                .next()
+                .unwrap();
+            assert_eq!(
+                implementation_section
+                    .matches("Subject ID: string(\"TODO-01\")")
+                    .count(),
+                2,
+                "the duplicate input should be rendered rather than silently deduplicated"
+            );
+            for expected in if step_id == "test" {
+                [
+                    "Reject duplicate `(source, subject_kind, subject_id)` records",
+                    "never select or merge duplicate records",
+                ]
+            } else {
+                [
+                    "reject duplicate records rather than selecting, merging, or reproducing them",
+                    "`duplicate_record`",
+                ]
+            } {
+                assert!(action.prompt.contains(expected), "missing {expected:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_render_typed_evidence_and_invalid_comparisons() {
+        let compiled = load_example_compiled_workflow("feature");
+        let mut fields = sample_evidence_fields();
+        fields["implementation_commands"] = serde_json::json!([
+            { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 1, "command": false, "exit_status": 0 },
+            { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 2, "command": "false", "exit_status": "0" }
+        ]);
+        fields["implementation_evidence"] = serde_json::json!([
+            {
+                "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Typed: [proof] \"value\"; user_feedback: raw", "source": "implementer",
+                "procedure": { "kind": "command", "steps": [false, "false"] },
+                "expected_result": "Typed values remain distinct", "observed_result": false,
+                "applicability": "applicable", "match": "matched", "comparisons": []
+            },
+            {
+                "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Missing comparisons", "source": "implementer",
+                "procedure": { "kind": "manual", "steps": ["inspect"] },
+                "expected_result": "missing is visible", "observed_result": "false",
+                "applicability": "applicable", "match": "matched"
+            },
+            {
+                "subject_kind": "todo", "subject_id": "TODO-03", "subject": "Invalid comparisons", "source": "implementer",
+                "procedure": { "kind": "manual", "steps": ["inspect"] },
+                "expected_result": "invalid is visible", "observed_result": "done",
+                "applicability": "applicable", "match": "matched", "comparisons": "invalid"
+            },
+            {
+                "subject_kind": "todo", "subject_id": "TODO-04", "subject": "Malformed comparisons", "source": "implementer",
+                "procedure": { "kind": "manual", "steps": ["inspect"] },
+                "expected_result": "malformed is visible", "observed_result": "done",
+                "applicability": "applicable", "match": "matched", "comparisons": { "2": "gap" }
+            },
+            {
+                "subject_kind": "todo", "subject_id": "TODO-05", "subject": "Nonempty comparisons", "source": "tester",
+                "procedure": { "kind": "manual", "steps": ["inspect"] },
+                "expected_result": "nonempty is visible", "observed_result": "done",
+                "applicability": "applicable", "match": "matched",
+                "comparisons": [{ "source": "implementer", "observed_result": "done", "match": "matched" }]
+            }
+        ]);
+
+        let result = run_step(
+            &compiled.source_bundle,
+            "test",
+            serde_json::json!({
+                "request": "Render typed proof records",
+                "prev": { "step": "implement", "action": "agent", "status": "implemented", "fields": fields }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("test should request an agent action")
+        };
+        for expected in [
+            "Command: boolean(false)",
+            "Command: string(\"false\")",
+            "Exit status: number(0)",
+            "Exit status: string(\"0\")",
+            "Step 1: boolean(false)",
+            "Step 2: string(\"false\")",
+            "Observed result: boolean(false)",
+            "Observed result: string(\"false\")",
+            "Comparisons: array(empty)",
+            "Comparisons: <missing-array>",
+            "Comparisons: <invalid-array:type=string value=string(\"invalid\")>",
+            "Comparisons: <invalid-array:table-non-array-key>",
+            "Comparisons: array(nonempty,length=1)",
+            "Subject: string(\"Typed: [proof] \\\"value\\\"; user_feedback: raw\")",
+        ] {
+            assert!(
+                action.prompt.contains(expected),
+                "missing typed rendering {expected:?}"
+            );
+        }
+        assert!(!action.prompt.contains("User feedback history:"));
+
+        let top_level_fields = serde_json::json!({
+            "implementation_commands": false,
+            "implementation_evidence": { "unexpected": "record" },
+            "tester_commands": [],
+            "validator_commands": [
+                { "subject_kind": "validation_criterion", "subject_id": "VAL-01", "procedure_index": 1, "command": "cargo test", "exit_status": 0 }
+            ],
+            "validator_evidence": { "2": "gap" },
+            "reviewer_commands": "invalid",
+            "reviewer_evidence": [],
+            "reviewer_assessments": false
+        });
+        let top_level_result = run_step(
+            &compiled.source_bundle,
+            "test",
+            serde_json::json!({
+                "request": "Render every required top-level state",
+                "prev": { "step": "implement", "action": "agent", "status": "implemented", "fields": top_level_fields }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(top_level_action) = top_level_result.action else {
+            panic!("test should request an agent action")
+        };
+        for expected in [
+            "Implementation command records: <invalid-array:type=boolean value=boolean(false)>",
+            "Implementation evidence records: <invalid-array:table-non-array-key>",
+            "Tester command records: array(empty)",
+            "Tester evidence records: <missing-array>",
+            "Validator command records: array(nonempty,length=1)",
+            "Validator evidence records: <invalid-array:table-non-array-key>",
+            "Reviewer command records: <invalid-array:type=string value=string(\"invalid\")>",
+            "Reviewer evidence records: array(empty)",
+            "Reviewer soundness assessments: <invalid-array:type=boolean value=boolean(false)>",
+        ] {
+            assert!(
+                top_level_action.prompt.contains(expected),
+                "missing top-level rendering {expected:?}"
+            );
+        }
+
+        let malformed = serde_json::json!({
+            "implementation_commands": false,
+            "implementation_evidence": false,
+            "tester_commands": false,
+            "tester_evidence": false,
+            "validator_commands": false,
+            "validator_evidence": false,
+            "reviewer_commands": false,
+            "reviewer_evidence": false,
+            "reviewer_assessments": false
+        });
+        let confirmation = run_step(
+            &compiled.source_bundle,
+            "confirm_result",
+            serde_json::json!({
+                "steps_executed": 3,
+                "prev": { "step": "review", "action": "agent", "status": "approved", "fields": malformed }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(confirmation) = confirmation.action else {
+            panic!("confirm_result should ask the user")
+        };
+        for field in EVIDENCE_FIELD_NAMES {
+            assert_eq!(
+                confirmation.fields[field], false,
+                "false evidence field {field} should remain false"
+            );
+        }
+
+        let missing = serde_json::json!({
+            "implementation_evidence": []
+        });
+        let missing_confirmation = run_step(
+            &compiled.source_bundle,
+            "confirm_result",
+            serde_json::json!({
+                "steps_executed": 4,
+                "prev": { "step": "review", "action": "agent", "status": "approved", "fields": missing }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(missing_confirmation) = missing_confirmation.action else {
+            panic!("confirm_result should ask the user")
+        };
+        assert!(
+            missing_confirmation
+                .fields
+                .get("implementation_commands")
+                .is_none()
+        );
+        assert_eq!(
+            missing_confirmation.fields["implementation_evidence"],
+            serde_json::json!([])
+        );
+        assert!(missing_confirmation.fields.get("tester_commands").is_none());
+    }
+
+    #[test]
+    fn examples_workflows_reviewer_assesses_evidence_before_rerun() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let mut upstream = sample_evidence_fields();
+        for field in [
+            "reviewer_commands",
+            "reviewer_evidence",
+            "reviewer_assessments",
+        ] {
+            upstream.as_object_mut().unwrap().remove(field);
+        }
+
+        let result = run_step(
+            &compiled.source_bundle,
+            "review",
+            serde_json::json!({
+                "request": "Assess every proof before rerunning",
+                "prev": { "step": "validate", "action": "agent", "status": "achieved", "fields": upstream }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("review should request an agent action")
+        };
+        let output = action.output.expect("review should declare output");
+        assert_eq!(output.fields["reviewer_assessments"], "array");
+        assert_eq!(output.fields["reviewer_commands"], "array");
+        assert_eq!(output.fields["reviewer_evidence"], "array");
+        for expected in [
+            "globally gated two-pass process",
+            "every required `TODO-NN` in plan order—whether checked or unchecked—followed by every required `VAL-NN`",
+            "before running any reviewer command or manual procedure",
+            "An unchecked required TODO must remain visible",
+            "`completion_state`: `checked`, `unchecked`, or `not_applicable`",
+            "exactly one `reviewer_assessments` record per required subject",
+            "`relevance`, `sufficiency`, `safety_and_executability`, `currentness`, `falsifiability`, and `non_circularity`",
+            "`submission_verdict`: `valid` or `invalid`",
+            "`submission_issues`: an ordered array",
+            "`missing_record`, `duplicate_record`, `subject_mismatch`, `procedure_mismatch`, `expected_result_mismatch`, `observed_result_mismatch`, `invalid_comparison`, `stale_record`, `malformed_field`, or `unmapped_command`",
+            "Reject unknown codes, missing fields, invalid source/subject combinations, or empty messages",
+            "`submission_verdict: valid` requires `submission_issues: []`",
+            "`submission_verdict: invalid` requires at least one issue",
+            "If any `proof_verdict` is `unsound`, return `replan_requested`, even if another submission is invalid",
+            "If all proofs are sound but any `submission_verdict` is `invalid`, return `changes_requested`",
+            "globally empty `reviewer_commands: []` and `reviewer_evidence: []`",
+            "Only when every assessment is `sound` and `valid` may Pass 2 begin",
+            "Reviewer TODO evidence compares against exactly the matching implementer and tester observations",
+            "reviewer validation evidence compares against exactly the matching validator observation",
+        ] {
+            assert!(
+                action.prompt.contains(expected),
+                "missing assessment prompt contract {expected:?}"
+            );
+        }
+
+        let pass_one = action
+            .prompt
+            .find("Review is a globally gated two-pass process")
+            .unwrap();
+        let pass_two = action.prompt.find("Only when every assessment").unwrap();
+        let first_positive_reproduction = action.prompt.find("independently reproduce").unwrap();
+        assert!(pass_one < pass_two);
+        assert!(
+            pass_two < first_positive_reproduction,
+            "the earliest positive reproduction directive must be inside Pass 2"
+        );
+
+        let validator_section = action
+            .prompt
+            .split("Validator evidence records:")
+            .nth(1)
+            .unwrap()
+            .split("Reviewer command records:")
+            .next()
+            .unwrap();
+        let val_01 = validator_section
+            .find("Subject ID: string(\"VAL-01\")")
+            .unwrap();
+        let val_02 = validator_section
+            .find("Subject ID: string(\"VAL-02\")")
+            .unwrap();
+        assert!(
+            val_01 < val_02,
+            "validator criteria should retain guide order"
+        );
+
+        let expected_subjects = serde_json::json!([
+            ["todo", "TODO-01"],
+            ["todo", "TODO-02"],
+            ["validation_criterion", "VAL-01"],
+            ["validation_criterion", "VAL-02"]
+        ]);
+        let fixture = sample_evidence_fields();
+        for field in ["reviewer_assessments", "reviewer_evidence"] {
+            let subjects = serde_json::Value::Array(
+                fixture[field]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|record| serde_json::json!([record["subject_kind"], record["subject_id"]]))
+                    .collect(),
+            );
+            assert_eq!(subjects, expected_subjects, "{field} subject order changed");
+        }
+        for command in fixture["reviewer_commands"].as_array().unwrap() {
+            assert!(
+                fixture["reviewer_assessments"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|assessment| {
+                        assessment["subject_kind"] == command["subject_kind"]
+                            && assessment["subject_id"] == command["subject_id"]
+                            && assessment["proof_verdict"] == "sound"
+                            && assessment["submission_verdict"] == "valid"
+                    })
+            );
+        }
+
+        let mut issue_fields = sample_evidence_fields();
+        issue_fields["reviewer_assessments"][1]["submission_verdict"] =
+            serde_json::json!("invalid");
+        issue_fields["reviewer_assessments"][1]["submission_issues"] = serde_json::json!([{
+            "source": "tester", "code": "observed_result_mismatch", "field": "observed_result",
+            "message": "Tester result does not match the declared procedure"
+        }]);
+        issue_fields["user_feedback"] = serde_json::json!(["Initial request remains raw"]);
+        let feedback_result = run_step(
+            &compiled.source_bundle,
+            "review_result_feedback",
+            serde_json::json!({
+                "request": "Keep typed issues separate",
+                "prev": { "step": "confirm_result_answer", "action": "status", "status": "changes_requested", "fields": issue_fields }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(feedback) = feedback_result.action else {
+            panic!("feedback review should request an agent action")
+        };
+        for expected in [
+            "Code: string(\"observed_result_mismatch\")",
+            "Field: string(\"observed_result\")",
+            "Message: string(\"Tester result does not match the declared procedure\")",
+        ] {
+            assert!(feedback.prompt.contains(expected));
+        }
+        assert_eq!(
+            feedback
+                .prompt
+                .matches("Initial request remains raw")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn examples_workflows_preserve_evidence_through_blocker_detours() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let mut expected = sample_evidence_fields();
+        expected["reviewer_assessments"][1]["submission_verdict"] = serde_json::json!("invalid");
+        expected["reviewer_assessments"][1]["submission_issues"] = serde_json::json!([{
+            "source": "tester",
+            "code": "observed_result_mismatch",
+            "field": "observed_result",
+            "message": "Tester result does not match the declared manual procedure"
+        }]);
+        let capture_result = run_step(
+            &compiled.source_bundle,
+            "capture_blocker",
+            serde_json::json!({
+                "prev": {
+                    "step": "validate",
+                    "action": "agent",
+                    "status": "blocked",
+                    "fields": expected.clone(),
+                    "body": "A local fixture must be generated"
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(captured) = capture_result.action else {
+            panic!("capture_blocker should return a status action")
+        };
+        assert_evidence_fields_equal(&captured.fields, &expected);
+
+        let review_result = run_step(
+            &compiled.source_bundle,
+            "review_blocker",
+            serde_json::json!({
+                "prev": {
+                    "step": "capture_blocker",
+                    "action": "status",
+                    "status": "captured",
+                    "fields": captured.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review) = review_result.action else {
+            panic!("review_blocker should request an agent action")
+        };
+        assert!(review.prompt.contains("Implementation evidence records:"));
+        assert!(review.prompt.contains("Validator evidence records:"));
+        assert!(
+            review
+                .prompt
+                .contains("semantic deep equality and unchanged array order")
+        );
+        let output = review
+            .output
+            .expect("blocker reviewer should declare output");
+        for field in EVIDENCE_FIELD_NAMES {
+            assert_eq!(output.fields[field], "array");
+        }
+
+        let mut reviewed_fields = expected.clone();
+        reviewed_fields["blocker_statement"] =
+            serde_json::json!("A local fixture must be generated");
+        reviewed_fields["blocked_from_step"] = serde_json::json!("validate");
+        reviewed_fields["blocked_from_status"] = serde_json::json!("blocked");
+        reviewed_fields["blocker_reason"] = serde_json::json!("The fixture is local");
+        reviewed_fields["blocker_resolution"] =
+            serde_json::json!("Generate the fixture, then retry validation");
+        let blocked_result = run_step(
+            &compiled.source_bundle,
+            "blocked",
+            serde_json::json!({
+                "steps_executed": 7,
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "agent",
+                    "status": "user_required",
+                    "fields": reviewed_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(blocked) = blocked_result.action else {
+            panic!("blocked should ask the user")
+        };
+        assert_evidence_fields_equal(&blocked.fields, &expected);
+
+        let mut answered_fields = blocked.fields;
+        answered_fields["answer"] = serde_json::json!("Fixture generated; retry");
+        let answer_result = run_step(
+            &compiled.source_bundle,
+            "blocked_answer",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "action": "ask_user",
+                    "status": "answered",
+                    "fields": answered_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(answered) = answer_result.action else {
+            panic!("blocked answer should return a status action")
+        };
+        assert_evidence_fields_equal(&answered.fields, &expected);
+
+        let triage_result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked_answer",
+                    "action": "status",
+                    "status": "triaged",
+                    "fields": answered.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(triaged) = triage_result.action else {
+            panic!("triage_blocked should return a status action")
+        };
+        assert_eq!(triaged.status, "validate");
+        assert_evidence_fields_equal(&triaged.fields, &expected);
+
+        let missing_capture = run_step(
+            &compiled.source_bundle,
+            "capture_blocker",
+            serde_json::json!({
+                "prev": {
+                    "step": "validate",
+                    "action": "agent",
+                    "status": "blocked",
+                    "fields": { "implementation_evidence": [] },
+                    "body": "A local fixture is unavailable"
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(mut missing_captured) = missing_capture.action else {
+            panic!("capture_blocker should return a status action")
+        };
+        assert!(
+            missing_captured
+                .fields
+                .get("implementation_commands")
+                .is_none()
+        );
+        assert_eq!(
+            missing_captured.fields["implementation_evidence"],
+            serde_json::json!([])
+        );
+        missing_captured.fields["blocker_resolution"] =
+            serde_json::json!("Generate the fixture and retry validation");
+        let missing_triage = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "agent",
+                    "status": "recoverable",
+                    "fields": missing_captured.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(missing_triaged) = missing_triage.action else {
+            panic!("triage_blocked should return a status action")
+        };
+        assert_eq!(missing_triaged.status, "validate");
+        assert!(
+            missing_triaged
+                .fields
+                .get("implementation_commands")
+                .is_none()
+        );
+        assert_eq!(
+            missing_triaged.fields["implementation_evidence"],
+            serde_json::json!([])
+        );
+        assert!(missing_triaged.fields.get("tester_evidence").is_none());
+    }
+
+    #[test]
+    fn dev_loop_preserves_reproducible_evidence_through_result_confirmation() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let all_evidence = sample_evidence_fields();
+        let mut tester_fields = all_evidence.clone();
+        for field in [
+            "validator_commands",
+            "validator_evidence",
+            "reviewer_commands",
+            "reviewer_evidence",
+            "reviewer_assessments",
+        ] {
+            tester_fields.as_object_mut().unwrap().remove(field);
+        }
+        tester_fields["goal"] = serde_json::json!("Provide reproducible evidence");
+        tester_fields["validation"] = serde_json::json!("cargo test -p sample acceptance_contract");
+        tester_fields["work_dir"] = serde_json::json!("docs/plans/reproducible_evidence");
+        tester_fields["plan_doc"] = serde_json::json!("docs/plans/reproducible_evidence/plan.md");
+        tester_fields["validation_doc"] =
+            serde_json::json!("docs/plans/reproducible_evidence/validation.md");
+
+        let validate_result = run_step(
+            &compiled.source_bundle,
+            "validate",
+            serde_json::json!({
+                "request": "Provide reproducible evidence",
+                "prev": {
+                    "step": "test",
+                    "action": "agent",
+                    "status": "passed",
+                    "fields": tester_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(validate) = validate_result.action else {
+            panic!("validate should request an agent action")
+        };
+        for expected in [
+            "Implementation evidence records:",
+            "Tester evidence records:",
+            "stable `VAL-NN` identifier",
+            "exactly one `validator_evidence` record per criterion",
+            "explicitly rendered `comparisons: []`",
+            "Reject duplicate `(validator, validation_criterion, VAL-NN)` records",
+            "TODO evidence supplements but never replaces",
+            "Comparisons: array(nonempty,length=1)",
+        ] {
+            assert!(validate.prompt.contains(expected), "missing {expected:?}");
+        }
+        let validate_output = validate.output.expect("validator should declare output");
+        for field in [
+            "implementation_commands",
+            "implementation_evidence",
+            "tester_commands",
+            "tester_evidence",
+            "validator_commands",
+            "validator_evidence",
+        ] {
+            assert_eq!(validate_output.fields[field], "array");
+        }
+
+        let mut validator_fields = all_evidence.clone();
+        for field in [
+            "reviewer_commands",
+            "reviewer_evidence",
+            "reviewer_assessments",
+        ] {
+            validator_fields.as_object_mut().unwrap().remove(field);
+        }
+        validator_fields["goal"] = serde_json::json!("Provide reproducible evidence");
+        validator_fields["validation"] =
+            serde_json::json!("cargo test -p sample acceptance_contract");
+        validator_fields["plan_doc"] =
+            serde_json::json!("docs/plans/reproducible_evidence/plan.md");
+        validator_fields["validation_doc"] =
+            serde_json::json!("docs/plans/reproducible_evidence/validation.md");
+        let review_result = run_step(
+            &compiled.source_bundle,
+            "review",
+            serde_json::json!({
+                "request": "Provide reproducible evidence",
+                "prev": {
+                    "step": "validate",
+                    "action": "agent",
+                    "status": "achieved",
+                    "fields": validator_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(review) = review_result.action else {
+            panic!("review should request an agent action")
+        };
+        for expected in [
+            "Implementation evidence records:",
+            "Tester evidence records:",
+            "Validator evidence records:",
+            "Comparisons: array(empty)",
+            "every required `VAL-NN`",
+            "compares against exactly the matching validator observation",
+            "compares against exactly the matching implementer and tester observations",
+            "exactly one `reviewer_assessments` record per required subject",
+        ] {
+            assert!(review.prompt.contains(expected), "missing {expected:?}");
+        }
+
+        let reviewer_criterion = &all_evidence["reviewer_evidence"][2];
+        assert_eq!(reviewer_criterion["subject_kind"], "validation_criterion");
+        assert_eq!(reviewer_criterion["subject_id"], "VAL-01");
+        assert_eq!(reviewer_criterion["comparisons"][0]["source"], "validator");
+        assert_eq!(
+            reviewer_criterion["comparisons"][0]["observed_result"],
+            all_evidence["validator_evidence"][0]["observed_result"]
+        );
+        let criterion_command = &all_evidence["reviewer_commands"][3];
+        assert_eq!(criterion_command["subject_kind"], "validation_criterion");
+        assert_eq!(criterion_command["subject_id"], "VAL-01");
+        let reviewer_criterion_02 = &all_evidence["reviewer_evidence"][3];
+        assert_eq!(
+            reviewer_criterion_02["subject_kind"],
+            "validation_criterion"
+        );
+        assert_eq!(reviewer_criterion_02["subject_id"], "VAL-02");
+        assert_eq!(
+            reviewer_criterion_02["comparisons"][0]["source"],
+            "validator"
+        );
+        assert_eq!(
+            reviewer_criterion_02["comparisons"][0]["observed_result"],
+            all_evidence["validator_evidence"][1]["observed_result"]
+        );
+        let criterion_command_02 = &all_evidence["reviewer_commands"][4];
+        assert_eq!(criterion_command_02["subject_kind"], "validation_criterion");
+        assert_eq!(criterion_command_02["subject_id"], "VAL-02");
+
+        let mut reviewer_fields = all_evidence.clone();
+        reviewer_fields["goal"] = serde_json::json!("Provide reproducible evidence");
+        reviewer_fields["validation"] =
+            serde_json::json!("cargo test -p sample acceptance_contract");
+        reviewer_fields["work_dir"] = serde_json::json!("docs/plans/reproducible_evidence");
+        reviewer_fields["plan_doc"] = serde_json::json!("docs/plans/reproducible_evidence/plan.md");
+        reviewer_fields["validation_doc"] =
+            serde_json::json!("docs/plans/reproducible_evidence/validation.md");
+        reviewer_fields["user_feedback"] =
+            serde_json::json!(["Initial request: keep evidence reproducible"]);
+        let confirm_result = run_step(
+            &compiled.source_bundle,
+            "confirm_result",
+            serde_json::json!({
+                "steps_executed": 12,
+                "prev": {
+                    "step": "review",
+                    "action": "agent",
+                    "status": "approved",
+                    "fields": reviewer_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(pending) = confirm_result.action else {
+            panic!("confirm_result should ask the user")
+        };
+        assert_evidence_fields_equal(&pending.fields, &all_evidence);
+
+        for (answer, expected_status) in [
+            ("approved", "confirmed"),
+            ("Please include the manual screenshot", "changes_requested"),
+        ] {
+            let mut answered_fields = pending.fields.clone();
+            answered_fields["answer"] = serde_json::json!(answer);
+            let answer_result = run_step(
+                &compiled.source_bundle,
+                "confirm_result_answer",
+                serde_json::json!({
+                    "prev": {
+                        "step": "confirm_result",
+                        "action": "ask_user",
+                        "status": "answered",
+                        "fields": answered_fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Status(answered) = answer_result.action else {
+                panic!("confirm_result_answer should return a status action")
+            };
+            assert_eq!(answered.status, expected_status);
+            assert_evidence_fields_equal(&answered.fields, &all_evidence);
+
+            if expected_status == "changes_requested" {
+                assert_eq!(
+                    answered.fields["user_feedback"],
+                    serde_json::json!([
+                        "Initial request: keep evidence reproducible",
+                        "Result confirmation: Please include the manual screenshot"
+                    ])
+                );
+                let feedback_result = run_step(
+                    &compiled.source_bundle,
+                    "review_result_feedback",
+                    serde_json::json!({
+                        "request": "Provide reproducible evidence",
+                        "prev": {
+                            "step": "confirm_result_answer",
+                            "action": "status",
+                            "status": "changes_requested",
+                            "fields": answered.fields
+                        }
+                    }),
+                )
+                .unwrap();
+                let StepAction::Agent(feedback_review) = feedback_result.action else {
+                    panic!("review_result_feedback should request an agent action")
+                };
+                assert!(feedback_review.prompt.contains("User feedback history:"));
+                assert!(
+                    feedback_review
+                        .prompt
+                        .contains("Implementation evidence records:")
+                );
+                assert!(
+                    feedback_review
+                        .prompt
+                        .contains("Reviewer evidence records:")
+                );
+                assert!(feedback_review
+                    .prompt
+                    .contains("Keep raw `user_feedback`, reviewer assessment rationale/issues, and reviewer rerun evidence distinct"));
+                assert!(
+                    feedback_review
+                        .prompt
+                        .contains("Reviewer soundness assessments:")
+                );
+                let output = feedback_review
+                    .output
+                    .expect("result feedback reviewer should declare output");
+                for field in EVIDENCE_FIELD_NAMES {
+                    assert_eq!(output.fields[field], "array");
+                }
+            }
+        }
+    }
+
     #[test]
     fn examples_workflows_capture_cumulative_confirmation_feedback() {
         fn assert_common_context(fields: &serde_json::Value) {

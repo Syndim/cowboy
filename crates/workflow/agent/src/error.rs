@@ -20,6 +20,18 @@ pub enum Error {
     FrontmatterFieldNotString(String),
     #[error("YAML frontmatter is missing required status field")]
     MissingStatus,
+    #[error("agent output status {status:?} is not allowed; expected one of: {allowed}")]
+    DisallowedStatus { status: String, allowed: String },
+    #[error("agent output is missing required frontmatter field(s): {0}")]
+    MissingOutputFields(String),
+    #[error("agent output field {field:?} must be {expected}, got {actual}")]
+    InvalidOutputFieldType {
+        field: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("agent output field {field:?} uses unsupported descriptor {descriptor:?}")]
+    UnsupportedOutputFieldDescriptor { field: String, descriptor: String },
     #[error("agent action missing output for step record")]
     MissingOutput,
 }
@@ -39,6 +51,10 @@ impl Error {
             | Error::FrontmatterNotMapping
             | Error::FrontmatterFieldNotString(_)
             | Error::MissingStatus
+            | Error::DisallowedStatus { .. }
+            | Error::MissingOutputFields(_)
+            | Error::InvalidOutputFieldType { .. }
+            | Error::UnsupportedOutputFieldDescriptor { .. }
             | Error::MissingOutput => true,
             Error::MissingClient(_) | Error::Json(_) => false,
             Error::Workflow(err) => err.recoverable(),
@@ -66,6 +82,29 @@ mod tests {
         assert!(Error::FrontmatterNotMapping.recoverable());
         assert!(Error::FrontmatterFieldNotString("status".to_string()).recoverable());
         assert!(Error::MissingStatus.recoverable());
+        assert!(
+            Error::DisallowedStatus {
+                status: "bad".to_string(),
+                allowed: "ok".to_string()
+            }
+            .recoverable()
+        );
+        assert!(Error::MissingOutputFields("summary".to_string()).recoverable());
+        assert!(
+            Error::InvalidOutputFieldType {
+                field: "files".to_string(),
+                expected: "array".to_string(),
+                actual: "string".to_string()
+            }
+            .recoverable()
+        );
+        assert!(
+            Error::UnsupportedOutputFieldDescriptor {
+                field: "files".to_string(),
+                descriptor: "map".to_string()
+            }
+            .recoverable()
+        );
         assert!(Error::MissingOutput.recoverable());
         assert!(Error::Client(anyhow::anyhow!("transport reset")).recoverable());
     }

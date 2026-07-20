@@ -52,6 +52,9 @@ pub struct OutputSpec {
     /// Field specification for the structured output body.
     #[serde(default)]
     pub fields: Value,
+    /// Fields that must be present and non-null in the structured output.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_fields: Vec<String>,
 }
 
 /// Request to execute one command-line program directly, without a shell.

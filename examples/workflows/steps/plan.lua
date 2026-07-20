@@ -21,7 +21,7 @@ For every dev-loop planning pass, create or update one durable planning work fol
 
 This nested layout is mandatory for both initial planning and replanning. Reuse an existing tuple only when it already has this exact layout. Never return flat, mismatched, or incomplete dev-loop artifact paths. Return `work_dir`, `plan_doc`, and `validation_doc` exactly as written, and include both document paths in `files`.
 
-The validation guide must represent the user's exact Goal and Validation contract and contain prerequisites, ordered commands or manual checks, evidence to capture, explicit exit criteria for leaving the development loop, and continue/revise criteria for every failed check. Every exit criterion is mandatory.
+The validation guide must represent the user's exact Goal and Validation contract and contain prerequisites, ordered commands or manual checks, evidence to capture, explicit exit criteria for leaving the development loop, and continue/revise criteria for every failed check. Assign every ordered validation step and every exit criterion a stable `VAL-NN` identifier in document order. Each identified criterion must retain its exact text and define an executable command or ordered manual procedure plus an observable expected result. Never renumber existing `VAL-NN` identifiers during replanning; assign each new criterion the next unused number. Every exit criterion is mandatory.
 
 Apply one sensitive-data policy to both artifacts: redact, generalize, or omit credentials, secrets, personal data, private paths, and proprietary content. Preserve a redacted Goal or Validation procedure semantically with explicit safe placeholders such as `<REDACTED_VALUE>` or environment-variable references so the guide remains executable without retaining the sensitive literal.]]
   end
@@ -57,7 +57,7 @@ The plan document must contain these sections exactly:
 
 The plan document must not include sensitive user data. Redact, generalize, or omit secrets, credentials, personal data, private paths, and proprietary customer content while preserving actionable engineering detail.
 
-The TODO section must contain every implementation work item as Markdown task-list items (`- [ ] ...`). Return `plan_doc` exactly as the written plan path, and include that same path in `files`.
+The TODO section must contain every implementation work item as a Markdown task-list item in the form `- [ ] TODO-NN: <exact task text>`. Assign IDs in document order, never renumber or reuse existing IDs during replanning, and give every newly added task the next unused number. Beneath each TODO, define an executable command or ordered manual procedure and an observable expected result. The procedure and expected result are part of the stable subject definition. Do not use vague completion checks. Return `plan_doc` exactly as the written plan path, and include that same path in `files`.
 
 Return status "ready" when the request is specific enough to implement, or "unclear" when more user context is needed.]],
       output = {
