@@ -43,7 +43,8 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 
     let (_, viewport) = content_viewport(state, area, state.scroll_offset());
 
-    frame.render_widget(Paragraph::new(viewport.rows), area);
+    let rows = apply_selection_highlight(viewport.rows, state.transcript_selection());
+    frame.render_widget(Paragraph::new(rows), area);
 }
 
 pub(in crate::app) fn next_scroll_limit(state: &AppState, area: Rect) -> usize {
@@ -190,6 +191,73 @@ fn char_intersects_range(column: usize, width: usize, range: &std::ops::Range<us
     }
 
     column < range.end && column.saturating_add(width) > range.start
+}
+
+fn apply_selection_highlight(
+    rows: Vec<Line<'static>>,
+    selection: Option<&TranscriptSelection>,
+) -> Vec<Line<'static>> {
+    let Some(selection) = selection else {
+        return rows;
+    };
+
+    let (start, end) = normalize_selection(selection);
+    if start == end || rows.is_empty() {
+        return rows;
+    }
+
+    rows.into_iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let row_width = line_display_width(&row);
+            let Some(range) = row_selection_range_between(start, end, row_index, row_width) else {
+                return row;
+            };
+
+            line_with_selection_highlight(row, &range)
+        })
+        .collect()
+}
+
+fn line_with_selection_highlight(
+    line: Line<'static>,
+    range: &std::ops::Range<usize>,
+) -> Line<'static> {
+    let Line {
+        spans,
+        style,
+        alignment,
+    } = line;
+    let mut highlighted_spans = Vec::new();
+    let mut column = 0usize;
+
+    for span in spans {
+        let span_style = span.style;
+        let selected_style = span_style.add_modifier(ratatui::style::Modifier::REVERSED);
+        let mut unselected_segment = String::new();
+        let mut selected_segment = String::new();
+
+        for ch in span.content.chars() {
+            let width = ch.width().unwrap_or(0);
+            if char_intersects_range(column, width, range) {
+                push_span(&mut highlighted_spans, &mut unselected_segment, span_style);
+                selected_segment.push(ch);
+            } else {
+                push_span(&mut highlighted_spans, &mut selected_segment, selected_style);
+                unselected_segment.push(ch);
+            }
+
+            column = column.saturating_add(width);
+        }
+
+        push_span(&mut highlighted_spans, &mut unselected_segment, span_style);
+        push_span(&mut highlighted_spans, &mut selected_segment, selected_style);
+    }
+
+    let mut highlighted_line = Line::from(highlighted_spans);
+    highlighted_line.style = style;
+    highlighted_line.alignment = alignment;
+    highlighted_line
 }
 
 #[cfg(test)]
@@ -598,7 +666,60 @@ mod tests {
     }
 
     #[test]
-    fn card_mouse_selection_does_not_render_app_highlight_over_terminal_selection() {
+    fn card_mouse_selection_highlights_only_selected_text_while_mouse_is_captured() {
+        let mut state = test_state();
+        state.push_card("Transcript", ["selectable transcript text".to_string()]);
+        let area = Rect::new(0, 0, 80, 10);
+        let visual_rows = lines(&state, area.height as usize, area.width as usize);
+        let row_index = visual_rows
+            .iter()
+            .position(|row| row.to_string().contains("selectable transcript text"))
+            .unwrap();
+        let row_text = visual_rows[row_index].to_string();
+        let start_column =
+            UnicodeWidthStr::width(&row_text[..row_text.find("selectable").unwrap()]);
+        let end_column = start_column + "selectable".chars().count();
+
+        state.start_transcript_selection(TranscriptSelectionPoint::new(row_index, start_column));
+        state.update_transcript_selection(TranscriptSelectionPoint::new(row_index, end_column));
+
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, area, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered_cells = &buffer.content[row_index * width..(row_index + 1) * width];
+        let rendered_row = rendered_cells
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let selected_start =
+            UnicodeWidthStr::width(&rendered_row[..rendered_row.find("selectable").unwrap()]);
+        let selected_end = selected_start + "selectable".chars().count();
+        let selected_cells = &rendered_cells[selected_start..selected_end];
+
+        assert!(
+            selected_cells
+                .iter()
+                .all(|cell| cell.modifier.contains(Modifier::REVERSED)),
+            "captured mouse selection should render one app-owned highlight over selected text cells: {rendered_row:?}"
+        );
+        assert!(
+            rendered_cells[..selected_start]
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "selection highlight should not spill into the card border or leading padding: {rendered_row:?}"
+        );
+        assert!(
+            rendered_cells[selected_end..]
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "selection highlight should not spill into unselected text, trailing padding, or card border: {rendered_row:?}"
+        );
+    }
+
+    #[test]
+    fn card_mouse_selection_has_visible_app_highlight_while_mouse_is_captured() {
         let mut state = test_state();
         state.push_card("Transcript", ["selectable transcript text".to_string()]);
         let area = Rect::new(0, 0, 80, 10);
@@ -632,8 +753,8 @@ mod tests {
         assert!(
             selected_cells
                 .iter()
-                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
-            "mouse selection inside a card should not draw an application-owned reversed-video highlight on top of the terminal's native selection: {rendered_row:?}"
+                .any(|cell| cell.modifier.contains(Modifier::REVERSED)),
+            "mouse selection is captured by Cowboy, so selected transcript text needs a visible app-owned highlight; rendered selected cells had no reversed-video modifier: {rendered_row:?}"
         );
     }
 
@@ -670,6 +791,52 @@ mod tests {
         let selection = selection((0, 1), (0, 2));
 
         assert_eq!(selected_text_from_rows(&rows, &selection), "界");
+    }
+
+    #[test]
+    fn selection_highlight_preserves_existing_span_styles() {
+        let mut row = Line::from(vec![
+            Span::styled("abc", style_transcript_metadata()),
+            Span::styled("def", style_transcript_thought()),
+        ]);
+        row.style = style_transcript_normal();
+        row.alignment = Some(ratatui::layout::Alignment::Center);
+
+        let highlighted = apply_selection_highlight(vec![row], Some(&selection((0, 2), (0, 5))));
+
+        assert_eq!(highlighted[0].style, style_transcript_normal());
+        assert_eq!(highlighted[0].alignment, Some(ratatui::layout::Alignment::Center));
+        assert_eq!(highlighted[0].spans.len(), 4);
+        assert_eq!(highlighted[0].spans[0].content.as_ref(), "ab");
+        assert_eq!(highlighted[0].spans[0].style, style_transcript_metadata());
+        assert_eq!(highlighted[0].spans[1].content.as_ref(), "c");
+        assert_eq!(
+            highlighted[0].spans[1].style,
+            style_transcript_metadata().add_modifier(Modifier::REVERSED)
+        );
+        assert_eq!(highlighted[0].spans[2].content.as_ref(), "de");
+        assert_eq!(
+            highlighted[0].spans[2].style,
+            style_transcript_thought().add_modifier(Modifier::REVERSED)
+        );
+        assert_eq!(highlighted[0].spans[3].content.as_ref(), "f");
+        assert_eq!(highlighted[0].spans[3].style, style_transcript_thought());
+    }
+
+    #[test]
+    fn selection_highlight_skips_empty_selection() {
+        let rows = vec![Line::from(vec![Span::styled(
+            "abc",
+            style_transcript_metadata(),
+        )])];
+
+        let highlighted = apply_selection_highlight(rows, Some(&selection((0, 1), (0, 1))));
+
+        assert_eq!(highlighted[0].to_string(), "abc");
+        assert!(highlighted[0]
+            .spans
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::REVERSED)));
     }
 
     fn rendered_text(state: &AppState, height: usize, width: usize) -> String {
