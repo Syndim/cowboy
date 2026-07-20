@@ -15,8 +15,9 @@ use tokio::time;
 
 const CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
 
-const COMMAND_ENV_ALLOW_LIST: [&str; 7] = [
+const COMMAND_ENV_ALLOW_LIST: [&str; 8] = [
     "PATH",
+    "PATHEXT",
     "SystemRoot",
     "USERPROFILE",
     "LOCALAPPDATA",
@@ -314,8 +315,9 @@ mod tests {
 
     static COMMAND_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    const EXPECTED_COMMAND_ENV_ALLOW_LIST: [&str; 7] = [
+    const EXPECTED_COMMAND_ENV_ALLOW_LIST: [&str; 8] = [
         "PATH",
+        "PATHEXT",
         "SystemRoot",
         "USERPROFILE",
         "LOCALAPPDATA",
