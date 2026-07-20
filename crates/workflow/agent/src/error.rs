@@ -14,6 +14,8 @@ pub enum Error {
     MissingClient(String),
     #[error("agent response is missing YAML frontmatter")]
     MissingFrontmatter,
+    #[error("agent response has an opening `---` but is missing the closing `---` delimiter")]
+    MissingClosingDelimiter,
     #[error("YAML frontmatter must be a mapping")]
     FrontmatterNotMapping,
     #[error("YAML frontmatter field {0:?} must be a string")]
@@ -48,6 +50,7 @@ impl Error {
             Error::Client(_)
             | Error::Yaml(_)
             | Error::MissingFrontmatter
+            | Error::MissingClosingDelimiter
             | Error::FrontmatterNotMapping
             | Error::FrontmatterFieldNotString(_)
             | Error::MissingStatus
@@ -79,6 +82,7 @@ mod tests {
     #[test]
     fn parse_and_transient_errors_are_recoverable() {
         assert!(Error::MissingFrontmatter.recoverable());
+        assert!(Error::MissingClosingDelimiter.recoverable());
         assert!(Error::FrontmatterNotMapping.recoverable());
         assert!(Error::FrontmatterFieldNotString("status".to_string()).recoverable());
         assert!(Error::MissingStatus.recoverable());
@@ -120,6 +124,13 @@ mod tests {
         assert!(recoverable.recoverable());
         assert!(matches!(
             recoverable,
+            cowboy_workflow_core::WorkflowError::RecoverableAction(_)
+        ));
+
+        let closing: cowboy_workflow_core::WorkflowError = Error::MissingClosingDelimiter.into();
+        assert!(closing.recoverable());
+        assert!(matches!(
+            closing,
             cowboy_workflow_core::WorkflowError::RecoverableAction(_)
         ));
 
