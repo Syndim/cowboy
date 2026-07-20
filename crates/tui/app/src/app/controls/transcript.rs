@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -11,9 +10,7 @@ use super::super::state::{
     AppState, TranscriptEntry, TranscriptSelection, TranscriptSelectionPoint,
     render_pending_prompt_lines,
 };
-use super::super::styles::{
-    style_accent, style_muted, style_transcript_normal, style_transcript_selection,
-};
+use super::super::styles::{style_accent, style_muted, style_transcript_normal};
 
 #[derive(Debug)]
 struct TranscriptViewport {
@@ -46,10 +43,7 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 
     let (_, viewport) = content_viewport(state, area, state.scroll_offset());
 
-    frame.render_widget(
-        Paragraph::new(selected_rows(viewport.rows, state.transcript_selection())),
-        area,
-    );
+    frame.render_widget(Paragraph::new(viewport.rows), area);
 }
 
 pub(in crate::app) fn next_scroll_limit(state: &AppState, area: Rect) -> usize {
@@ -104,87 +98,6 @@ fn content_viewport(
     (area, viewport)
 }
 
-fn selected_rows(
-    rows: Vec<Line<'static>>,
-    selection: Option<&TranscriptSelection>,
-) -> Vec<Line<'static>> {
-    let Some(selection) = selection else {
-        return rows;
-    };
-
-    rows.into_iter()
-        .enumerate()
-        .map(|(row_index, row)| line_with_selection(row, row_index, selection))
-        .collect()
-}
-
-fn line_with_selection(
-    line: Line<'static>,
-    row_index: usize,
-    selection: &TranscriptSelection,
-) -> Line<'static> {
-    let line_width = line_display_width(&line);
-    let Some(range) = row_selection_range(selection, row_index, line_width) else {
-        return line;
-    };
-
-    let Line {
-        spans,
-        style,
-        alignment,
-    } = line;
-    let mut selected_spans = Vec::new();
-    for span in spans {
-        push_split_span(&mut selected_spans, span, range.clone());
-    }
-
-    let mut row = Line::from(selected_spans);
-    row.style = style;
-    row.alignment = alignment;
-    row
-}
-
-fn push_split_span(
-    output: &mut Vec<Span<'static>>,
-    span: Span<'static>,
-    range: std::ops::Range<usize>,
-) {
-    let mut segment = String::new();
-    let mut segment_style = span.style;
-    let mut segment_selected = None;
-    let mut column = 0usize;
-
-    for ch in span.content.chars() {
-        let width = ch.width().unwrap_or(0);
-        let selected = char_intersects_range(column, width, &range);
-        if segment_selected.is_some_and(|previous| previous != selected) {
-            push_selection_segment(output, &mut segment, segment_style);
-        }
-
-        if segment_selected != Some(selected) {
-            segment_style = if selected {
-                style_transcript_selection(span.style)
-            } else {
-                span.style
-            };
-            segment_selected = Some(selected);
-        }
-
-        segment.push(ch);
-        column = column.saturating_add(width);
-    }
-
-    push_selection_segment(output, &mut segment, segment_style);
-}
-
-fn push_selection_segment(output: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
-    if segment.is_empty() {
-        return;
-    }
-
-    output.push(Span::styled(std::mem::take(segment), style));
-}
-
 fn selected_text_from_rows(rows: &[Line<'static>], selection: &TranscriptSelection) -> String {
     let (start, end) = normalize_selection(selection);
     if start == end || rows.is_empty() {
@@ -224,15 +137,6 @@ fn line_selected_text(line: &Line<'static>, range: std::ops::Range<usize>) -> St
     }
 
     text
-}
-
-fn row_selection_range(
-    selection: &TranscriptSelection,
-    row_index: usize,
-    row_width: usize,
-) -> Option<std::ops::Range<usize>> {
-    let (start, end) = normalize_selection(selection);
-    row_selection_range_between(start, end, row_index, row_width)
 }
 
 fn row_selection_range_between(
@@ -686,18 +590,49 @@ mod tests {
     }
 
     #[test]
-    fn selected_text_extracts_single_row_and_highlights_range() {
+    fn selected_text_extracts_single_row_range() {
         let rows = vec![Line::from("abcdef")];
         let selection = selection((0, 1), (0, 4));
 
         assert_eq!(selected_text_from_rows(&rows, &selection), "bcd");
+    }
 
-        let highlighted = selected_rows(rows, Some(&selection));
-        let spans = &highlighted[0].spans;
-        assert_eq!(spans[0].content, "a");
-        assert_eq!(spans[1].content, "bcd");
-        assert!(spans[1].style.add_modifier.contains(Modifier::REVERSED));
-        assert_eq!(spans[2].content, "ef");
+    #[test]
+    fn card_mouse_selection_does_not_render_app_highlight_over_terminal_selection() {
+        let mut state = test_state();
+        state.push_card("Transcript", ["selectable transcript text".to_string()]);
+        let area = Rect::new(0, 0, 80, 10);
+        let visual_rows = lines(&state, area.height as usize, area.width as usize);
+        let row_index = visual_rows
+            .iter()
+            .position(|row| row.to_string().contains("selectable transcript text"))
+            .unwrap();
+        let row_text = visual_rows[row_index].to_string();
+        let start_column = UnicodeWidthStr::width(&row_text[..row_text.find("selectable").unwrap()]);
+        let end_column = start_column + "selectable".chars().count();
+
+        state.start_transcript_selection(TranscriptSelectionPoint::new(row_index, start_column));
+        state.update_transcript_selection(TranscriptSelectionPoint::new(row_index, end_column));
+
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, area, &state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+        let rendered_cells = &buffer.content[row_index * width..(row_index + 1) * width];
+        let rendered_row = rendered_cells
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let selected_start = rendered_row.find("selectable").unwrap();
+        let selected_cells = &rendered_cells[selected_start..selected_start + "selectable".chars().count()];
+
+        assert!(
+            selected_cells
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "mouse selection inside a card should not draw an application-owned reversed-video highlight on top of the terminal's native selection: {rendered_row:?}"
+        );
     }
 
     #[test]
