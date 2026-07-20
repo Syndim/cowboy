@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+pub const WORKFLOW_STORE_WAITING_MESSAGE: &str =
+    "Workflow store is busy; waiting for another Cowboy instance to finish a database operation.";
 /// UI-facing workflow event with a stable run id and timestamps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowEvent {
@@ -121,6 +123,9 @@ pub enum WorkflowEventKind {
     },
     StepProgress {
         step_id: String,
+        message: String,
+    },
+    WorkflowStoreWaiting {
         message: String,
     },
     AgentSessionReady {
@@ -363,6 +368,24 @@ mod tests {
         let value: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["run_started_at"], "2026-07-05T12:30:00Z");
         assert_eq!(value["run_active_duration_ms"], serde_json::json!(42_500));
+
+        let reparsed: WorkflowEvent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reparsed, event);
+    }
+
+    #[test]
+    fn workflow_store_waiting_event_round_trips() {
+        let event = WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WorkflowStoreWaiting {
+                message: WORKFLOW_STORE_WAITING_MESSAGE.to_string(),
+            },
+        );
+
+        let raw = serde_json::to_string(&event).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["kind"]["kind"], "workflow_store_waiting");
+        assert_eq!(value["kind"]["message"], WORKFLOW_STORE_WAITING_MESSAGE);
 
         let reparsed: WorkflowEvent = serde_json::from_str(&raw).unwrap();
         assert_eq!(reparsed, event);

@@ -24,13 +24,14 @@ use cowboy_workflow_core::{
     WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
 };
-use cowboy_workflow_store::RedbRunStore;
+use cowboy_workflow_store::{RedbRunStore, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::active_clock::ActiveRunClock;
 use crate::agent_resolver::AgentResolver;
+use crate::events::WORKFLOW_STORE_WAITING_MESSAGE;
 use crate::run_lock::RunExecutionLocks;
 use crate::runtime_dependencies::{
     ProductionRuntimeDependencies, RuntimeDependencies, transport_for,
@@ -627,7 +628,7 @@ impl WorkflowRuntime {
             created_at: now,
             updated_at: now,
         };
-        let store = self.store()?;
+        let store = self.store_for_run(&run.id)?;
         store.save_run(&run)?;
         store.update_run_head(&run.id, run_head(&run))?;
         let active_clock = ActiveRunClock::open(&run);
@@ -714,7 +715,8 @@ impl WorkflowRuntime {
     async fn resume_with(&self, run_id: &str, mode: RunMode) -> Result<RunReport> {
         tracing::debug!(run_id, mode = ?mode, "resuming workflow run");
         let _run_guard = self.run_locks.acquire(run_id)?;
-        let mut run = self.load_run(run_id)?;
+        let store = self.store_for_run(run_id)?;
+        let mut run = store.load_run(&run_id.to_string())?;
         tracing::debug!(
             run_id = %run.id,
             status = ?run.status,
@@ -742,7 +744,6 @@ impl WorkflowRuntime {
                     current_step = %run.current_step,
                     "resuming non-terminal run; re-executing the retained current step"
                 );
-                let store = self.store()?;
                 apply_run_status(&store, &mut run, RunStatus::Running)?;
             }
             RunStatus::Completed | RunStatus::Cancelled => {
@@ -776,7 +777,7 @@ impl WorkflowRuntime {
             "answering workflow prompt"
         );
         let _run_guard = self.run_locks.acquire(run_id)?;
-        let store = self.store()?;
+        let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(&run_id.to_string())?;
         let router = ResumeRouter::default();
         let answer = router.validate_answer(&run, prompt_id, answer)?;
@@ -830,7 +831,7 @@ impl WorkflowRuntime {
     /// Inspect a failed run and return the statuses it can be resolved to along
     /// with the information each status requires. See [`resolve_run`].
     pub fn resolution_options(&self, run_id: &str) -> Result<ResolutionOptions> {
-        let store = self.store()?;
+        let store = self.store_for_run(run_id)?;
         let run = store.load_run(&run_id.to_string())?;
         self.build_resolution_options(&run, &store)
     }
@@ -915,7 +916,7 @@ impl WorkflowRuntime {
     ) -> Result<RunReport> {
         tracing::info!(run_id, status, "resolving failed workflow run");
         let _run_guard = self.run_locks.acquire(run_id)?;
-        let store = self.store()?;
+        let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(&run_id.to_string())?;
         ensure_resolvable(&run)?;
 
@@ -1145,7 +1146,7 @@ impl WorkflowRuntime {
         let run_id = run.id.clone();
         let progress_clock = active_clock.clone();
         let mut rx = self.events.subscribe();
-        let store = self.store()?;
+        let store = self.store_for_run(&run_id)?;
         store.clear_agent_prompt_window(&run_id)?;
         let mut cancellation_guard =
             ActiveRunCancellationGuard::new(store.clone(), run_id.clone(), active_clock.clone());
@@ -1293,9 +1294,32 @@ impl WorkflowRuntime {
     }
 
     fn store(&self) -> Result<RedbRunStore> {
+        self.open_store(None)
+    }
+
+    fn store_for_run(&self, run_id: &str) -> Result<RedbRunStore> {
+        let run_id = run_id.to_string();
+        let events = self.events.clone();
+        let observer: StoreWaitObserver = Arc::new(move |_| {
+            events.emit(WorkflowEvent::new(
+                run_id.clone(),
+                WorkflowEventKind::WorkflowStoreWaiting {
+                    message: WORKFLOW_STORE_WAITING_MESSAGE.to_string(),
+                },
+            ));
+        });
+        self.open_store(Some(observer))
+    }
+
+    fn open_store(&self, wait_observer: Option<StoreWaitObserver>) -> Result<RedbRunStore> {
         tracing::debug!(path = %self.config.workflow_store.display(), "opening workflow store");
-        let store =
-            RedbRunStore::create(&self.config.workflow_store).map_err(WorkflowError::from)?;
+        let store = match wait_observer {
+            Some(observer) => {
+                RedbRunStore::create_with_wait_observer(&self.config.workflow_store, observer)
+            }
+            None => RedbRunStore::create(&self.config.workflow_store),
+        }
+        .map_err(WorkflowError::from)?;
         tracing::debug!(path = %self.config.workflow_store.display(), "workflow store ready");
         Ok(store)
     }
@@ -1459,6 +1483,8 @@ mod tests {
     use parking_lot::Mutex as SyncMutex;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
+    use std::thread;
+    use std::time::Duration;
 
     fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
@@ -2546,6 +2572,57 @@ exit 0
             return workflow("declared", start{config})
             "#
         )
+    }
+
+    #[tokio::test]
+    async fn workflow_store_wait_event_emits_once_during_contended_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(
+            &dir,
+            r#"
+            local first = step("first")
+            first.run = function(ctx) return action.status { status = "next" } end
+            local second = step("second")
+            second.run = function(ctx) return action.status { status = "success" } end
+            first:on("next", second)
+            return workflow("declared", first)
+            "#,
+        );
+        let started = runtime
+            .start_run_with_workflow_stepwise("aaa", "do it")
+            .await
+            .unwrap();
+        assert_eq!(started.run.status, RunStatus::Running);
+        let store_path = dir.path().join("state/workflow.redb");
+        let holder_path = store_path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let database = redb::Database::create(holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(750));
+            drop(database);
+        });
+        locked_rx.recv().unwrap();
+        let mut rx = runtime.events().subscribe();
+
+        let report = runtime.resume_run(&started.run.id).await.unwrap();
+
+        holder.join().unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let mut wait_events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let WorkflowEventKind::WorkflowStoreWaiting { message } = event.kind {
+                wait_events.push((event.run_id, message));
+            }
+        }
+        assert_eq!(wait_events.len(), 1, "{wait_events:?}");
+        assert_eq!(wait_events[0].0, report.run.id);
+        assert_eq!(wait_events[0].1, WORKFLOW_STORE_WAITING_MESSAGE);
+        assert!(
+            !wait_events[0]
+                .1
+                .contains(dir.path().to_string_lossy().as_ref())
+        );
     }
 
     #[tokio::test]

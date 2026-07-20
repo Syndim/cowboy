@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -17,8 +18,9 @@ use crate::tables::{
 };
 use crate::{Error, Result};
 
-const OPEN_RETRY_ATTEMPTS: usize = 20;
 const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+
+pub type StoreWaitObserver = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
 
 /// redb-backed implementation of workflow run storage.
 ///
@@ -30,26 +32,53 @@ const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 pub struct RedbRunStore {
     /// Path to the redb workflow database.
     path: PathBuf,
+    /// Optional notification hook fired once when a database-open wait begins.
+    wait_observer: Option<StoreWaitObserver>,
 }
 
 impl RedbRunStore {
     /// Create or open a database at `path`, then drop the validation handle.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::create_inner(path, None)
+    }
+
+    /// Create or open a database at `path` with a wait-start observer.
+    pub fn create_with_wait_observer(
+        path: impl AsRef<Path>,
+        wait_observer: StoreWaitObserver,
+    ) -> Result<Self> {
+        Self::create_inner(path, Some(wait_observer))
+    }
+
+    fn create_inner(
+        path: impl AsRef<Path>,
+        wait_observer: Option<StoreWaitObserver>,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         ensure_parent_dir(&path)?;
-        drop(open_database_with_retry(&path, |path| {
-            Database::create(path)
-        })?);
-        Ok(Self { path })
+        drop(open_database_when_available(
+            &path,
+            |path| Database::create(path),
+            wait_observer.as_ref(),
+        )?);
+        Ok(Self {
+            path,
+            wait_observer,
+        })
     }
 
     /// Open an existing database at `path`, then drop the validation handle.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        drop(open_database_with_retry(&path, |path| {
-            Database::open(path)
-        })?);
-        Ok(Self { path })
+        drop(open_database_when_available(
+            &path,
+            |path| Database::open(path),
+            None,
+        )?);
+        Ok(Self {
+            path,
+            wait_observer: None,
+        })
     }
 
     /// Save the mutable workflow run snapshot by run id.
@@ -505,7 +534,11 @@ impl RedbRunStore {
 
     fn open_database(&self) -> Result<Database> {
         ensure_parent_dir(&self.path)?;
-        open_database_with_retry(&self.path, |path| Database::create(path))
+        open_database_when_available(
+            &self.path,
+            |path| Database::create(path),
+            self.wait_observer.as_ref(),
+        )
     }
 }
 
@@ -516,24 +549,29 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_database_with_retry(
+fn open_database_when_available(
     path: &Path,
     mut open: impl FnMut(&Path) -> std::result::Result<Database, redb::DatabaseError>,
+    wait_observer: Option<&StoreWaitObserver>,
 ) -> Result<Database> {
-    for attempt in 0..=OPEN_RETRY_ATTEMPTS {
+    let mut waiting = false;
+    loop {
         match open(path) {
             Ok(db) => return Ok(db),
-            Err(redb::DatabaseError::DatabaseAlreadyOpen) if attempt < OPEN_RETRY_ATTEMPTS => {
-                thread::sleep(OPEN_RETRY_BACKOFF);
-            }
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
-                return Err(Error::TemporarilyBusy(path.to_path_buf()));
+                if !waiting {
+                    tracing::info!(workflow_store = %path.display(), "workflow store busy; waiting for availability");
+                    if let Some(observer) = wait_observer {
+                        observer(path);
+                    }
+                    waiting = true;
+                }
+
+                thread::sleep(OPEN_RETRY_BACKOFF);
             }
             Err(err) => return Err(err.into()),
         }
     }
-
-    Err(Error::TemporarilyBusy(path.to_path_buf()))
 }
 
 /// Decode a plain JSON value from table bytes.
@@ -917,6 +955,7 @@ mod tests {
         store_b.update_run_head(&run_b.id, head_b.clone()).unwrap();
 
         assert_eq!(store_a.load_run(&run_b.id).unwrap(), run_b);
+
         let mut run_ids = store_b
             .list_runs()
             .unwrap()
@@ -925,6 +964,56 @@ mod tests {
             .collect::<Vec<_>>();
         run_ids.sort();
         assert_eq!(run_ids, vec!["run-1", "run-2"]);
+    }
+
+    #[test]
+    fn transient_database_contention_outlasting_retry_window_does_not_fail() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let holder_path = path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let database = Database::create(holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(750));
+            drop(database);
+        });
+        locked_rx.recv().unwrap();
+
+        let store = RedbRunStore::create(&path);
+
+        holder.join().unwrap();
+        store.expect("transient database contention should wait for the lock to be released");
+    }
+
+    #[test]
+    fn store_wait_observer_fires_once_when_contention_starts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let holder_path = path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let database = Database::create(holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(200));
+            drop(database);
+        });
+        locked_rx.recv().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observer_calls = calls.clone();
+        let observer_paths = observed_paths.clone();
+        let observer: StoreWaitObserver = Arc::new(move |path| {
+            observer_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            observer_paths.lock().unwrap().push(path.to_path_buf());
+        });
+
+        let store = RedbRunStore::create_with_wait_observer(&path, observer);
+
+        holder.join().unwrap();
+        store.expect("observer-backed store should wait for contention to clear");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(*observed_paths.lock().unwrap(), vec![path]);
     }
 
     #[test]

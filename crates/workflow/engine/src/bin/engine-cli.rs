@@ -336,6 +336,9 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
         WorkflowEventKind::StepProgress { step_id, message } => {
             format!("{} step {step_id}: {message}", event.run_id)
         }
+        WorkflowEventKind::WorkflowStoreWaiting { message } => {
+            format!("{} workflow store waiting: {message}", event.run_id)
+        }
         WorkflowEventKind::AgentSessionReady {
             step_id,
             role,

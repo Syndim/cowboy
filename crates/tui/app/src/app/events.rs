@@ -85,6 +85,17 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             message,
             style_transcript_normal(),
         ))),
+        WorkflowEventKind::WorkflowStoreWaiting { message } => workflow_card(
+            event,
+            status_icon("waiting"),
+            "Workflow store waiting",
+            CardTone::Warning,
+        )
+        .metadata([CardMetadata::run(&event.run_id)])
+        .section(CardSection::body(render_content(
+            message,
+            style_transcript_normal(),
+        ))),
         WorkflowEventKind::AgentSessionReady { step_id, .. } => workflow_card(
             event,
             status_icon("running"),
@@ -669,6 +680,27 @@ mod tests {
         assert!(!rendered.contains("run="), "{rendered}");
         assert!(!rendered.contains("workflow="), "{rendered}");
         assert!(!rendered.contains("tasks="), "{rendered}");
+    }
+
+    #[test]
+    fn renders_workflow_store_waiting_card_with_sanitized_message() {
+        let rendered = render_workflow_event(&event(WorkflowEventKind::WorkflowStoreWaiting {
+            message: "Workflow store is busy; waiting for another Cowboy instance to finish a database operation.".to_string(),
+        }));
+        let text = rendered.text();
+
+        assert!(
+            text.contains("◔ Workflow store waiting · ▶ 170dc431"),
+            "{text}"
+        );
+        assert!(text.contains("Workflow store is busy; waiting"), "{text}");
+        assert!(!text.contains("/home/"), "{text}");
+        assert!(!text.contains("workflow.redb"), "{text}");
+        assert!(line_has_style(
+            rendered.lines(),
+            "Workflow store waiting",
+            style_warning()
+        ));
     }
 
     #[test]

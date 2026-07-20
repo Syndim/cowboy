@@ -1063,6 +1063,9 @@ impl AppState {
                 self.current_step = Some(current_step.clone());
                 self.run_state = "running".to_string();
             }
+            WorkflowEventKind::WorkflowStoreWaiting { .. } => {
+                self.run_state = "waiting".to_string();
+            }
             WorkflowEventKind::WaitingForInput {
                 step,
                 prompt_id,
@@ -1579,6 +1582,38 @@ mod tests {
 
         assert_eq!(state.event_entries().len(), 1);
         assert_eq!(state.display_state(), "running");
+    }
+
+    #[test]
+    fn workflow_store_waiting_updates_visible_state_without_pending_prompt() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "start".to_string(),
+                request_topic: None,
+            },
+        ));
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WorkflowStoreWaiting {
+                message: "Workflow store is busy; waiting for another Cowboy instance to finish a database operation.".to_string(),
+            },
+        ));
+
+        assert_eq!(state.display_state(), "waiting");
+        assert_eq!(state.durable_run_status, Some(RunStatusState::Running));
+        assert!(state.pending_prompt().is_none());
+        let rendered = state.event_entries().last().unwrap().plain_text();
+        assert!(rendered.contains("Workflow store waiting"), "{rendered}");
+        assert!(
+            rendered.contains("Workflow store is busy; waiting"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("/home/"), "{rendered}");
+        assert!(!rendered.contains("workflow.redb"), "{rendered}");
     }
 
     #[test]
