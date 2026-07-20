@@ -370,7 +370,10 @@ enum BackgroundTaskKind {
 #[derive(Debug)]
 enum BackgroundTaskResult {
     WorkflowReport(Box<RunReport>),
-    RunsList(Vec<RunSummaryLine>),
+    RunsList {
+        runs: Vec<RunSummaryLine>,
+        partial_run_id: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1011,8 +1014,12 @@ impl AppState {
         );
     }
 
-    pub(in crate::app) fn spawn_runs_list_task<F>(&mut self, status: String, future: F)
-    where
+    pub(in crate::app) fn spawn_runs_list_task<F>(
+        &mut self,
+        status: String,
+        partial_run_id: Option<String>,
+        future: F,
+    ) where
         F: Future<Output = Result<Vec<RunSummaryLine>, String>> + Send + 'static,
     {
         self.spawn_background_task(
@@ -1024,7 +1031,12 @@ impl AppState {
                 title_suffix: vec!["loading runs".to_string()],
                 details: vec!["Loading runs".to_string()],
             },
-            async move { future.await.map(BackgroundTaskResult::RunsList) },
+            async move {
+                future.await.map(|runs| BackgroundTaskResult::RunsList {
+                    runs,
+                    partial_run_id,
+                })
+            },
         );
     }
 
@@ -1297,7 +1309,9 @@ impl AppState {
                     Ok(Ok(BackgroundTaskResult::WorkflowReport(report))) => {
                         self.apply_report(*report);
                     }
-                    Ok(Ok(BackgroundTaskResult::RunsList(runs))) => self.apply_runs_list(runs),
+                    Ok(Ok(BackgroundTaskResult::RunsList { runs, partial_run_id })) => {
+                        self.apply_runs_list(runs, partial_run_id);
+                    }
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
                         self.push_card("Error", [self.status.clone()]);
@@ -1363,10 +1377,14 @@ impl AppState {
         self.current_run_topic = None;
     }
 
-    fn apply_runs_list(&mut self, runs: Vec<RunSummaryLine>) {
+    fn apply_runs_list(&mut self, runs: Vec<RunSummaryLine>, partial_run_id: Option<String>) {
         self.status = format!("{} run(s)", runs.len());
         if runs.is_empty() {
-            self.push_card("Runs", ["known runs: 0".to_string()]);
+            let message = match partial_run_id {
+                Some(partial_run_id) => format!("matching runs for {partial_run_id}: 0"),
+                None => "known runs: 0".to_string(),
+            };
+            self.push_card("Runs", [message]);
         } else {
             for run in runs {
                 self.push_card("Run", render_run_summary_lines(&run));
@@ -2059,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn runs_list_background_task_records_loading_card() {
         let mut pending_state = test_state();
-        pending_state.spawn_runs_list_task("loading runs".to_string(), async {
+        pending_state.spawn_runs_list_task("loading runs".to_string(), None, async {
             std::future::pending::<Result<Vec<RunSummaryLine>, String>>().await
         });
 
@@ -2073,7 +2091,9 @@ mod tests {
         pending_state.cancel_background_tasks();
 
         let mut completed_state = test_state();
-        completed_state.spawn_runs_list_task("loading runs".to_string(), async { Ok(Vec::new()) });
+        completed_state.spawn_runs_list_task("loading runs".to_string(), None, async {
+            Ok(Vec::new())
+        });
         let initial_entry = completed_state.event_entries()[0].plain_text();
         tokio::task::yield_now().await;
         assert!(completed_state.drain_background_tasks().await);

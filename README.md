@@ -42,7 +42,7 @@ For local development:
 cargo build
 cargo run                              # launch TUI
 cargo run -- run add a /healthz route  # start a workflow from CLI
-cargo run -- runs                      # list workflow runs
+cargo run -- runs [partial-run-id]     # list workflow runs, optionally filtered by id
 ```
 
 ## Quick start
@@ -62,10 +62,10 @@ cowboy run add a /healthz route
 cowboy run --workflow <workflow-id> add a /healthz route
 ```
 
-List existing runs:
+List existing runs, optionally filtering by a literal partial run id:
 
 ```bash
-cowboy runs
+cowboy runs [partial-run-id]
 ```
 
 Execute one additional step for a run, or continue it until it blocks, fails, or completes:
@@ -128,7 +128,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /step <run-id>                                    execute exactly one more step
 /resume <run-id>                                  continue a run until blocked
 /answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly
-/runs                                             list workflow runs
+/runs [partial-run-id]                         list workflow runs
 /workflows                                        list known workflows
 /improve <run-id>                                 improve workflow source from a run
 /resolve <run-id>                                 list statuses a failed run can resolve to

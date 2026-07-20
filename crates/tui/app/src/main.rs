@@ -97,8 +97,8 @@ async fn run_shared_command(
             println!("improvement={applied:?}");
             Ok(())
         }
-        SharedCommand::Runs => {
-            for run in runtime.list_runs()? {
+        SharedCommand::Runs(args) => {
+            for run in runtime.list_runs(args.partial_run_id.as_deref())? {
                 for line in cowboy::run_summary::render_run_summary_lines(&run) {
                     println!("{line}");
                 }

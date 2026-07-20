@@ -104,7 +104,7 @@ pub enum SharedCommand {
 
     /// List workflow runs.
     #[command(about = "list workflow runs")]
-    Runs,
+    Runs(RunsArgs),
 
     /// Resolve a failed run. Without <status>, lists resolvable statuses.
     #[command(about = "list or resolve a failed step")]
@@ -138,6 +138,13 @@ impl RunArgs {
 pub struct RunIdArgs {
     #[arg(value_name = "run-id")]
     pub run_id: String,
+}
+
+/// Arguments for listing workflow runs.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct RunsArgs {
+    #[arg(value_name = "partial-run-id")]
+    pub partial_run_id: Option<String>,
 }
 
 /// Arguments for answering a workflow prompt.
@@ -581,6 +588,28 @@ mod tests {
     }
 
     #[test]
+    fn runs_parses_optional_partial_run_id_on_both_surfaces() {
+        for (command, expected) in [
+            (shared_cli_command(["cowboy", "runs"]), None),
+            (shared_slash_command("/runs"), None),
+            (shared_cli_command(["cowboy", "runs", "abc"]), Some("abc")),
+            (shared_slash_command("/runs abc"), Some("abc")),
+        ] {
+            match command {
+                SharedCommand::Runs(args) => {
+                    assert_eq!(args.partial_run_id.as_deref(), expected);
+                }
+                other => panic!("expected runs command, got {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            slash_command_usage("runs").as_deref(),
+            Some("/runs [partial-run-id]")
+        );
+    }
+
+    #[test]
     fn quoted_and_unquoted_run_requests_parse_equivalently() {
         let expected = SharedCommand::Run(RunArgs {
             step: false,
@@ -970,7 +999,7 @@ mod tests {
         assert!(
             suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
         );
-        assert!(suggestions.contains(&"/runs".to_string()));
+        assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
         assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
         assert!(
             !suggestions
@@ -1000,6 +1029,12 @@ mod tests {
             row.name == "/run"
                 && row.usage == "/run [--step] [--workflow <workflow-id>] <request>"
                 && row.description == "start a workflow run"
+                && row.takes_arguments
+        }));
+        assert!(rows.iter().any(|row| {
+            row.name == "/runs"
+                && row.usage == "/runs [partial-run-id]"
+                && row.description == "list workflow runs"
                 && row.takes_arguments
         }));
         assert!(rows.iter().any(|row| {

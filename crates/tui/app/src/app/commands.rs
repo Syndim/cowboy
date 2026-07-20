@@ -143,7 +143,7 @@ fn command_conflicts_with_execution(command: &SlashCommand) -> bool {
         | SlashCommand::Exit
         | SlashCommand::Help
         | SlashCommand::Workflows
-        | SlashCommand::Shared(SharedCommand::Runs) => false,
+        | SlashCommand::Shared(SharedCommand::Runs(_)) => false,
         SlashCommand::Shared(SharedCommand::Resolve(args)) => args.status.is_some(),
         _ => true,
     }
@@ -186,7 +186,7 @@ async fn dispatch_shared_command(
             } = args;
             spawn_answer_task(state, runtime, run_id, prompt_id, answer.join(" "));
         }
-        SharedCommand::Runs => spawn_runs_list(state, runtime),
+        SharedCommand::Runs(args) => spawn_runs_list(state, runtime, args.partial_run_id),
         SharedCommand::Improve(args) => improve_run(state, runtime, &args.run_id).await?,
         SharedCommand::Resolve(args) => {
             let cowboy_command_parser::ResolveArgs {
@@ -391,13 +391,21 @@ fn spawn_answer_task(
     );
 }
 
-fn spawn_runs_list(state: &mut AppState, runtime: &WorkflowRuntime) {
+fn spawn_runs_list(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    partial_run_id: Option<String>,
+) {
     let runtime = runtime.clone();
-    state.spawn_runs_list_task("loading runs".to_string(), async move {
-        let runs =
-            tokio::task::spawn_blocking(move || runtime.list_runs().map_err(|err| err.to_string()))
-                .await
-                .map_err(|err| err.to_string())??;
+    let filter_for_task = partial_run_id.clone();
+    state.spawn_runs_list_task("loading runs".to_string(), partial_run_id, async move {
+        let runs = tokio::task::spawn_blocking(move || {
+            runtime
+                .list_runs(filter_for_task.as_deref())
+                .map_err(|err| err.to_string())
+        })
+        .await
+        .map_err(|err| err.to_string())??;
         Ok(runs)
     });
 }
@@ -996,6 +1004,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runs_submission_filters_by_partial_run_id_after_background_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            config_sets: std::collections::BTreeMap::from([(
+                "default".to_string(),
+                crate::config::ConfigSetConfig {
+                    max_steps_per_run: 1,
+                    max_visits_per_step: 1,
+                    ..Default::default()
+                },
+            )]),
+            ..AppConfig::default()
+        };
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let store = RedbRunStore::create(&config.workflow_store).unwrap();
+        let mut matching_state = AppState::new(config.clone());
+
+        seed_run(
+            &store,
+            workflow_run(
+                "run-completed",
+                Some("Ship deployment"),
+                RunStatus::Completed,
+                "done",
+                Some("record-completed"),
+            ),
+        );
+        seed_run(
+            &store,
+            workflow_run(
+                "run-waiting",
+                Some("Approve release"),
+                RunStatus::WaitingForInput {
+                    step: "approval".to_string(),
+                    prompt_id: "prompt-42".to_string(),
+                    message: "Approve the deployment?".to_string(),
+                    choices: vec!["yes".to_string(), "no".to_string()],
+                    resume_callback: ResumeCallback::new(
+                        "ask_user",
+                        serde_json::json!({ "prompt_id": "prompt-42" }),
+                    )
+                    .unwrap(),
+                },
+                "approval",
+                Some("record-waiting"),
+            ),
+        );
+
+        matching_state.push_input("/runs waiting");
+        submit_input(&mut matching_state, &runtime).await;
+        assert_eq!(matching_state.background_task_count(), 1);
+
+        drain_finished_background_task(&mut matching_state).await;
+
+        assert_eq!(matching_state.status(), "1 run(s)");
+        let rendered = rendered_entries(&matching_state);
+        assert_rendered_contains(&rendered, "run-waiting");
+        assert_rendered_contains(&rendered, "topic: Approve release");
+        assert!(
+            !rendered.contains("run-completed"),
+            "filtered /runs leaked a nonmatching run:\n{rendered}"
+        );
+
+        let mut empty_state = AppState::new(config);
+        empty_state.push_input("/runs missing");
+        submit_input(&mut empty_state, &runtime).await;
+        assert_eq!(empty_state.background_task_count(), 1);
+
+        drain_finished_background_task(&mut empty_state).await;
+
+        assert_eq!(empty_state.status(), "0 run(s)");
+        let rendered = rendered_entries(&empty_state);
+        assert_rendered_contains(&rendered, "matching runs for missing: 0");
+        assert!(
+            !rendered.contains("known runs: 0"),
+            "filtered empty state reused unfiltered empty text:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("run-completed") && !rendered.contains("run-waiting"),
+            "filtered empty state leaked run ids:\n{rendered}"
+        );
+    }
+
+    #[tokio::test]
     async fn runs_submission_eventually_renders_empty_state_card_after_background_drain() {
         let (_dir, runtime, mut state) = test_runtime_state();
 
@@ -1006,7 +1101,7 @@ mod tests {
         drain_finished_background_task(&mut state).await;
 
         assert_eq!(state.status(), "0 run(s)");
-        assert_eq!(state.event_entries().len(), 1);
+        assert_eq!(state.event_entries().len(), 2);
         let rendered = rendered_entries(&state);
         assert_rendered_contains(&rendered, "Runs");
         assert_rendered_contains(&rendered, "known runs: 0");
@@ -1026,7 +1121,7 @@ mod tests {
         assert!(
             suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
         );
-        assert!(suggestions.contains(&"/runs".to_string()));
+        assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
 
         assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
         assert!(
@@ -1218,7 +1313,7 @@ mod tests {
             .start_run_with_workflow("resolve-smoke", "do it")
             .await
             .unwrap_err();
-        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
         assert!(!state.workflow_execution_running());
 
         let options_input = format!("/resolve {run_id}");
@@ -1268,7 +1363,7 @@ mod tests {
         );
         tokio::task::yield_now().await;
         assert!(state.drain_background_tasks().await);
-        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
 
         let run = runtime.load_run(&run_id).unwrap();
         assert_eq!(run.status, RunStatus::Completed);
@@ -1792,7 +1887,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(idle_state.drain_background_tasks().await);
 
-        let idle_run = runtime.list_runs().unwrap().remove(0);
+        let idle_run = runtime.list_runs(None).unwrap().remove(0);
         assert_eq!(
             runtime.load_run(&idle_run.run_id).unwrap().original_request,
             "request"

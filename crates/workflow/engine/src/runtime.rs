@@ -433,10 +433,14 @@ impl WorkflowRuntime {
         Ok(catalog)
     }
 
-    pub fn list_runs(&self) -> Result<Vec<RunSummaryLine>> {
+    pub fn list_runs(&self, partial_run_id: Option<&str>) -> Result<Vec<RunSummaryLine>> {
         let store = self.store()?;
         let mut runs = Vec::new();
         for head in store.list_runs()? {
+            if partial_run_id.is_some_and(|partial| !head.run_id.contains(partial)) {
+                continue;
+            }
+
             if let Ok(run) = store.load_run(&head.run_id) {
                 let topic = self.summary_topic(&run);
                 let status_detail = RunStatusDetail::from_status(&head.status);
@@ -2701,7 +2705,7 @@ exit 0
             "{message}"
         );
         assert!(message.contains("careful, default"), "{message}");
-        assert!(runtime.list_runs().unwrap().is_empty());
+        assert!(runtime.list_runs(None).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3041,7 +3045,7 @@ exit 0
             store.update_run_head(&run.id, run_head(&run)).unwrap();
         }
 
-        let summaries = runtime.list_runs().unwrap();
+        let summaries = runtime.list_runs(None).unwrap();
 
         for (run_id, _, expected_detail) in cases {
             let summary = summaries
@@ -3063,6 +3067,55 @@ exit 0
         }
     }
 
+    #[test]
+    fn list_runs_filters_by_partial_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        for run in [
+            summary_test_run(
+                "alpha-wait-run",
+                RunStatus::WaitingForInput {
+                    step: "review".to_string(),
+                    prompt_id: "approval".to_string(),
+                    message: "Approve?".to_string(),
+                    choices: Vec::new(),
+                    resume_callback: ResumeCallback::new(
+                        "ask_user",
+                        serde_json::json!({ "prompt_id": "approval" }),
+                    )
+                    .unwrap(),
+                },
+                Some("Approve release"),
+            ),
+            summary_test_run("beta-completed-run", RunStatus::Completed, Some("Ship release")),
+            summary_test_run("gamma-running-run", RunStatus::Running, Some("Keep working")),
+        ] {
+            store.save_run(&run).unwrap();
+            store.update_run_head(&run.id, run_head(&run)).unwrap();
+        }
+
+        let mut all_ids = runtime
+            .list_runs(None)
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.run_id)
+            .collect::<Vec<_>>();
+        all_ids.sort();
+        assert_eq!(
+            all_ids,
+            vec!["alpha-wait-run", "beta-completed-run", "gamma-running-run"]
+        );
+
+        let filtered = runtime.list_runs(Some("wait")).unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].run_id, "alpha-wait-run");
+        assert_eq!(filtered[0].topic.as_deref(), Some("Approve release"));
+
+        let no_matches = runtime.list_runs(Some("WAIT")).unwrap();
+        assert!(no_matches.is_empty());
+    }
+
     #[tokio::test]
     async fn run_summary_start_run_persists_generated_topic_on_run_and_list_summary() {
         let dir = tempfile::tempdir().unwrap();
@@ -3082,7 +3135,7 @@ exit 0
         );
         runtime.persist_events(&run_id, &[]).unwrap();
         let summary = runtime
-            .list_runs()
+            .list_runs(None)
             .unwrap()
             .into_iter()
             .find(|summary| summary.run_id == run_id)
@@ -3110,7 +3163,7 @@ exit 0
             .unwrap();
 
         let summary = runtime
-            .list_runs()
+            .list_runs(None)
             .unwrap()
             .into_iter()
             .find(|summary| summary.run_id == run_id)
@@ -3354,7 +3407,7 @@ exit 0
             vec![agent("default", "definitely-missing-agent")],
         );
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
         let unchanged_active_ms = 5_000;
         persist_run_active_duration(
             &runtime,
@@ -3403,7 +3456,7 @@ exit 0
             err.to_string().contains("definitely-missing-agent"),
             "{err}"
         );
-        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
         let events = runtime.load_events(&run_id).unwrap();
 
         assert!(
@@ -3456,10 +3509,10 @@ exit 0
         // A missing agent command is retried until the snapshotted per-step
         // budget is exhausted, then reported as a distinct policy failure.
         assert!(err.to_string().contains("exhausted retry budget for step"));
-        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
         // The give-up path persists a clean Failed status for later resolution.
         let run = runtime
-            .load_run(&runtime.list_runs().unwrap()[0].run_id)
+            .load_run(&runtime.list_runs(None).unwrap()[0].run_id)
             .unwrap();
         assert!(matches!(run.status, RunStatus::Failed { .. }));
         assert_eq!(run.retries_used, 2);
@@ -3492,7 +3545,7 @@ exit 0
 
         // Fails on the agent step and persists a resolvable Failed run.
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
 
         let options = runtime.resolution_options(&run_id).unwrap();
         assert_eq!(options.failed_step, "start");
@@ -3602,7 +3655,7 @@ exit 0
         .with_deterministic_selector();
 
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs().unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
 
         // "planned" routes to `finish`; supply the required field and a body.
         let report = runtime
@@ -3740,7 +3793,7 @@ exit 0
 
         assert_eq!(report.run.workflow_name, "aaa");
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
     }
 
@@ -3789,7 +3842,7 @@ exit 0
             .unwrap();
         let output = record.output.expect("status output");
         assert_eq!(output.body, "review selected: do work");
-        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3837,7 +3890,7 @@ exit 0
         assert_eq!(report.run.status, RunStatus::Running);
         assert_eq!(report.run.current_step, "review-finish");
         assert_eq!(report.run.steps_executed, 1);
-        assert_eq!(runtime.list_runs().unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -3866,7 +3919,7 @@ exit 0
         assert!(err.to_string().contains("unknown workflow id"), "{err}");
         assert!(err.to_string().contains("review-declared"), "{err}");
         assert!(err.to_string().contains("review"), "{err}");
-        assert!(runtime.list_runs().unwrap().is_empty());
+        assert!(runtime.list_runs(None).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4086,7 +4139,7 @@ exit 0
             "unexpected start error: {start_err}"
         );
 
-        let runs = runtime.list_runs().unwrap();
+        let runs = runtime.list_runs(None).unwrap();
         assert_eq!(runs.len(), 1);
         let run_id = runs[0].run_id.clone();
         let failed = runtime.load_run(&run_id).unwrap();
@@ -4181,7 +4234,7 @@ exit 0
             start_err.to_string().contains("exhausted retry budget"),
             "unexpected start error: {start_err}"
         );
-        let runs = runtime.list_runs().unwrap();
+        let runs = runtime.list_runs(None).unwrap();
         assert_eq!(runs.len(), 1);
         let run_id = runs[0].run_id.clone();
         let failed = runtime.load_run(&run_id).unwrap();
@@ -4450,7 +4503,7 @@ exit 0
         assert_eq!(second.run.status, RunStatus::Completed);
         assert_ne!(first.run.id, second.run.id);
         let mut run_ids = runtime_a
-            .list_runs()
+            .list_runs(None)
             .unwrap()
             .into_iter()
             .map(|run| run.run_id)
@@ -5915,7 +5968,7 @@ Recovery implementation review"#
                 },
             )]),
         });
-        assert!(runtime.list_runs().unwrap().is_empty());
+        assert!(runtime.list_runs(None).unwrap().is_empty());
     }
 
     fn progress(kind: AgentProgressKind) -> AgentProgress {

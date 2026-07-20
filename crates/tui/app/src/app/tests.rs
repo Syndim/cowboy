@@ -502,7 +502,7 @@ async fn draw_active_background_task_shows_running_message_in_transcript() {
 #[tokio::test]
 async fn draw_runs_list_background_task_shows_loading_message_in_transcript() {
     let mut state = test_state();
-    state.spawn_runs_list_task("loading runs".to_string(), async {
+    state.spawn_runs_list_task("loading runs".to_string(), None, async {
         std::future::pending::<
             std::result::Result<Vec<cowboy_workflow_engine::RunSummaryLine>, String>,
         >()

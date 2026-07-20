@@ -218,7 +218,7 @@ fn catalog(rt: &WorkflowRuntime) -> CliResult {
 }
 
 fn runs(rt: &WorkflowRuntime) -> CliResult {
-    let runs = rt.list_runs()?;
+    let runs = rt.list_runs(None)?;
     println!("runs ({})", runs.len());
     for run in &runs {
         print_run_summary(run);
