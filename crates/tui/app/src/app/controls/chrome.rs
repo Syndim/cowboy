@@ -10,7 +10,6 @@ enum MetadataPartKind {
     Step,
     Run,
     Workflow,
-    Tasks,
 }
 
 struct MetadataPart {
@@ -69,7 +68,6 @@ fn joined_width(parts: &[MetadataPart]) -> usize {
 
 fn remove_lowest_priority_part(parts: &mut Vec<MetadataPart>) -> bool {
     for kind in [
-        MetadataPartKind::Tasks,
         MetadataPartKind::Workflow,
         MetadataPartKind::Run,
         MetadataPartKind::Step,
@@ -143,13 +141,6 @@ pub(super) fn status_metadata_text(state: &AppState, width: usize) -> String {
         ));
     }
 
-    if state.background_task_count() > 0 {
-        parts.push(MetadataPart::optional(
-            format!("◷ {}", state.background_task_count()),
-            MetadataPartKind::Tasks,
-        ));
-    }
-
     while width > 0 && joined_width(&parts) > width && remove_lowest_priority_part(&mut parts) {}
 
     truncate_to_display_width(join_parts(&parts), width)
@@ -211,7 +202,7 @@ mod tests {
         assert!(metadata.contains("↳ implement"), "{metadata}");
         assert!(metadata.contains("▶ 170dc431"), "{metadata}");
         assert!(metadata.contains("⎇ bugfix"), "{metadata}");
-        assert!(metadata.contains("◷ 1"), "{metadata}");
+        assert!(!metadata.contains("◷"), "{metadata}");
         assert!(metadata.contains(METADATA_SEPARATOR), "{metadata}");
         assert!(!metadata.contains("step="), "{metadata}");
         assert!(!metadata.contains("run="), "{metadata}");

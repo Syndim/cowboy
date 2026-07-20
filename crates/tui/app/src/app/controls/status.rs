@@ -100,7 +100,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_task_status_adds_task_count() {
+    async fn background_task_status_omits_task_count() {
+        let mut state = test_state();
+        apply_started_run(&mut state);
+        state.spawn_test_card_report_task("pending".to_string(), async {
+            std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+                .await
+        });
+
+        let rendered = rendered_text(&state, 160);
+
+        assert_eq!(rendered, "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature");
+        assert!(!rendered.contains("◷"), "{rendered}");
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn workflow_status_omits_ambiguous_background_task_count() {
         let mut state = test_state();
         apply_started_run(&mut state);
         state.spawn_test_card_report_task("pending".to_string(), async {
@@ -112,8 +128,9 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature · ◷ 1"
+            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
         );
+        assert!(!rendered.contains("◷"), "{rendered}");
         state.cancel_background_tasks();
     }
 

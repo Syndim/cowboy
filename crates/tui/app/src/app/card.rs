@@ -68,12 +68,6 @@ impl CardMetadata {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn tasks(count: usize) -> Self {
-        Self {
-            text: format!("◷ {count}"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,7 +345,6 @@ mod tests {
                 CardMetadata::step("implement"),
                 CardMetadata::run("run-170dc431-abc"),
                 CardMetadata::workflow("bugfix"),
-                CardMetadata::tasks(1),
             ])
             .section(CardSection::named(
                 "Output",
@@ -365,10 +358,8 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("● • Bash cargo test"), "{text}");
-        assert!(
-            text.contains("↳ implement · ▶ 170dc431 · ⎇ bugfix · ◷ 1"),
-            "{text}"
-        );
+        assert!(text.contains("↳ implement · ▶ 170dc431 · ⎇ bugfix"), "{text}");
+        assert!(!text.contains("◷"), "{text}");
         assert!(text.contains("╭"), "{text}");
         assert!(text.contains("╮"), "{text}");
         assert!(text.contains("╰"), "{text}");

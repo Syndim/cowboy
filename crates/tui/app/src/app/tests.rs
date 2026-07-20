@@ -907,7 +907,8 @@ async fn draw_active_run_composer_keeps_allowed_slash_suggestions() {
         .find(|row| row.contains("No agent accepting prompts") && row.contains("draft retained"))
         .unwrap_or_else(|| panic!("{rendered}"));
     assert!(title_row.contains("Esc cancels"), "{rendered}");
-    assert!(rendered.contains("● · ◷ 1"), "{rendered}");
+    assert!(rendered.contains("●"), "{rendered}");
+    assert!(!rendered.contains("◷"), "{rendered}");
     assert!(rendered.contains("> /"), "{rendered}");
     assert!(rendered.contains("slash command suggestions"), "{rendered}");
     assert!(rendered.contains("/resume <run-id>"), "{rendered}");
