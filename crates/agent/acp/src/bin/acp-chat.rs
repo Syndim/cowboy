@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use anyhow::{Context, anyhow};
 use cowboy_agent_acp::transport::StdioConfig;
 use cowboy_agent_acp::{BackendPreset, Client, TransportConfig, backend};
-use cowboy_agent_client::{Event, ModelInfo, PromptContent};
+use cowboy_agent_client::{Event, ModelInfo, PromptContent, PromptTurnCancellation};
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
             .prompt(
                 &session_id,
                 vec![PromptContent::text(prompt)],
+                PromptTurnCancellation::disabled(),
                 &mut |event| print_event(event, &mut wrote_chunk, config.verbose),
             )
             .await

@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent};
+use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent, PromptTurnCancellation};
 use cowboy_workflow_core::{
     Result, WorkflowCatalog, WorkflowError, WorkflowSelection, WorkflowSourceRef,
     WorkflowSummarizer, WorkflowSummary,
@@ -115,6 +115,7 @@ where
                 .prompt(
                     &session_id,
                     vec![PromptContent::text(prompt.clone())],
+                    PromptTurnCancellation::disabled(),
                     &mut |event| collect_text(event, &mut text),
                 )
                 .await
@@ -326,6 +327,7 @@ where
             .prompt(
                 &session_id,
                 vec![PromptContent::text(request_topic_prompt(request))],
+                PromptTurnCancellation::disabled(),
                 &mut |event| collect_text(event, &mut text),
             )
             .await
@@ -436,6 +438,7 @@ where
             .prompt(
                 &session_id,
                 vec![PromptContent::text(summary_prompt(run)?)],
+                PromptTurnCancellation::disabled(),
                 &mut |event| collect_text(event, &mut text),
             )
             .await
@@ -601,6 +604,7 @@ mod tests {
             &mut self,
             _session_id: &str,
             prompt_content: Vec<PromptContent>,
+            _cancellation: PromptTurnCancellation,
             event_handler: &mut (dyn FnMut(Event) + Send),
         ) -> anyhow::Result<StopReason> {
             self.prompts

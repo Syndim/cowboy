@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use cowboy_agent_acp::transport::StdioConfig;
 use cowboy_agent_acp::{BackendPreset, Client, TransportConfig};
-use cowboy_agent_client::{Event, ModelInfo, PromptContent, StopReason};
+use cowboy_agent_client::{Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason};
 use serde_json::Value;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -139,6 +139,7 @@ pub async fn run_session_prompt(backend: &AcpBackend) -> anyhow::Result<()> {
             vec![PromptContent::text(
                 "Reply with exactly one short sentence that contains the word cowboy.",
             )],
+            PromptTurnCancellation::disabled(),
             &mut |event| {
                 if let Event::MessageChunk { content } = event
                     && let Some(text) = chunk_text(&content)

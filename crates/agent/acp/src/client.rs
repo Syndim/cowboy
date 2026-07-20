@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use cowboy_agent_client::{AgentInfo, Event, ModelInfo, PromptContent, StopReason};
+use cowboy_agent_client::{
+    AgentInfo, Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason,
+};
 
 use super::messages::*;
 use super::transport::{Transport, TransportConfig};
@@ -375,17 +377,28 @@ impl Client {
     /// `agent_message_chunk` text, we automatically send a "Continue" follow-up
     /// in the same session (up to 5 times) so the agent can produce its final
     /// response.
+    async fn commit_automatic_continuation(cancellation: &mut PromptTurnCancellation) -> bool {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => false,
+            () = tokio::task::yield_now() => true,
+        }
+    }
+
     pub async fn prompt(
         &mut self,
         session_id: &str,
         prompt_content: Vec<PromptContent>,
+        mut cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason> {
         const MAX_CONTINUATIONS: u32 = 5;
         let mut content = prompt_content;
 
         for attempt in 0..=MAX_CONTINUATIONS {
-            let outcome = self.prompt_turn(session_id, content, event_handler).await?;
+            let outcome = self
+                .prompt_turn(session_id, content, &mut cancellation, event_handler)
+                .await?;
 
             // Done if the agent produced visible text, stopped for a reason
             // other than a normal end_turn, or completed after a permission
@@ -393,6 +406,16 @@ impl Client {
             // rather than a useful answer, even when it only emitted
             // housekeeping updates.
             if !outcome.should_continue() {
+                return Ok(outcome.stop_reason);
+            }
+
+            if !Self::commit_automatic_continuation(&mut cancellation).await {
+                tracing::debug!(
+                    session_id,
+                    attempt,
+                    activity = ?outcome.activity,
+                    "ACP prompt cancellation won automatic continuation dispatch"
+                );
                 return Ok(outcome.stop_reason);
             }
 
@@ -414,12 +437,23 @@ impl Client {
         unreachable!("prompt continuation loop always returns or errors")
     }
 
+    async fn send_prompt_turn_cancellation(&mut self, session_id: &str) -> anyhow::Result<()> {
+        self.send_notification(
+            "session/cancel",
+            SessionCancelParams {
+                session_id: session_id.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Execute a single prompt turn and report why it stopped plus which
     /// response/progress signals were observed during the turn.
     async fn prompt_turn(
         &mut self,
         session_id: &str,
         prompt_content: Vec<PromptContent>,
+        cancellation: &mut PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<PromptTurnOutcome> {
         let (content_count, prompt_chars) = prompt_content_stats(&prompt_content);
@@ -442,10 +476,48 @@ impl Client {
             "ACP prompt sent"
         );
 
+        const MAX_DEFERRED_UPDATES_AFTER_CANCELLATION: usize = 1;
         let mut activity = PromptTurnActivity::Empty;
+        let mut cancellation_sent = false;
+        let mut deferred_updates_after_cancellation = 0;
 
         let stop_reason = loop {
-            let msg = self.recv_message().await?;
+            let msg = if cancellation_sent {
+                self.recv_message().await?
+            } else {
+                let message = tokio::select! {
+                    biased;
+                    message = self.recv_message() => Some(message?),
+                    () = cancellation.cancelled() => None,
+                };
+                let Some(message) = message else {
+                    self.send_prompt_turn_cancellation(session_id).await?;
+                    cancellation_sent = true;
+                    tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
+                    continue;
+                };
+                message
+            };
+
+            let matching_prompt_response = matches!(
+                &msg,
+                Message::Response { id: response_id, .. } if *response_id == id
+            );
+            let cancellation_ready =
+                !cancellation_sent && !matching_prompt_response && cancellation.try_cancelled();
+            if cancellation_ready {
+                let defer_for_buffered_completion = matches!(&msg, Message::SessionUpdate { .. })
+                    && deferred_updates_after_cancellation
+                        < MAX_DEFERRED_UPDATES_AFTER_CANCELLATION;
+                if defer_for_buffered_completion {
+                    deferred_updates_after_cancellation += 1;
+                } else {
+                    self.send_prompt_turn_cancellation(session_id).await?;
+                    cancellation_sent = true;
+                    tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
+                }
+            }
+
             match msg {
                 Message::SessionUpdate { update, .. } => {
                     activity.observe_event(&update);
@@ -458,7 +530,11 @@ impl Client {
                     options,
                 } => {
                     activity.observe_permission_request();
-                    let outcome = PermissionOutcome::allow_from_options(&options);
+                    let outcome = if cancellation_sent {
+                        PermissionOutcome::cancelled()
+                    } else {
+                        PermissionOutcome::allow_from_options(&options)
+                    };
                     tracing::debug!(
                         session_id = %permission_session_id,
                         request_id = req_id,
@@ -466,6 +542,7 @@ impl Client {
                         tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
                         options = options.len(),
                         outcome = ?outcome,
+                        cancellation_sent,
                         "ACP permission request answered"
                     );
                     self.send_rpc_response(req_id, outcome).await?;
@@ -482,11 +559,33 @@ impl Client {
                     let prompt_result: SessionPromptResult =
                         serde_json::from_value(result.unwrap_or(Value::Null))
                             .unwrap_or(SessionPromptResult { stop_reason: None });
-                    break prompt_result.stop_reason.unwrap_or(StopReason::EndTurn);
+                    let stop_reason = prompt_result.stop_reason.unwrap_or(StopReason::EndTurn);
+                    if cancellation_sent && !matches!(stop_reason, StopReason::Cancelled) {
+                        tracing::debug!(
+                            session_id,
+                            id = resp_id,
+                            stop_reason = ?stop_reason,
+                            "ACP prompt completed before cancellation took effect"
+                        );
+                    }
+                    break stop_reason;
                 }
                 _ => {}
             }
         };
+
+        if matches!(stop_reason, StopReason::Cancelled) {
+            tracing::debug!(
+                session_id,
+                id,
+                activity = ?activity,
+                "ACP cancelled prompt turn completed"
+            );
+            return Ok(PromptTurnOutcome {
+                stop_reason,
+                activity,
+            });
+        }
 
         // Drain trailing session/update events that some agents stream around or
         // after the prompt Response. Whenever the turn produced no visible text
@@ -685,6 +784,19 @@ impl Client {
         Ok(id)
     }
 
+    /// Send a JSON-RPC notification with no request id or response.
+    async fn send_notification<P: Serialize>(
+        &mut self,
+        method: &'static str,
+        params: P,
+    ) -> anyhow::Result<()> {
+        let notification = JsonRpcNotification::new(method, params);
+        let line = serde_json::to_string(&notification)?;
+        tracing::debug!(method, payload = %line, "ACP >>> notification");
+        self.ensure_transport().await?.send(&line).await?;
+        Ok(())
+    }
+
     /// Send a JSON-RPC response to an agent request, such as a permission request.
     async fn send_rpc_response<R: Serialize>(&mut self, id: u64, result: R) -> anyhow::Result<()> {
         let response = JsonRpcResponse::new(id, result);
@@ -817,9 +929,17 @@ impl cowboy_agent_client::Client for Client {
         &mut self,
         session_id: &str,
         prompt_content: Vec<PromptContent>,
+        cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason> {
-        Client::prompt(self, session_id, prompt_content, event_handler).await
+        Client::prompt(
+            self,
+            session_id,
+            prompt_content,
+            cancellation,
+            event_handler,
+        )
+        .await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
@@ -848,6 +968,13 @@ mod tests {
     use super::*;
     use crate::test_util::*;
     use serde_json::Value;
+    use std::future::poll_fn;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use tokio::sync::{mpsc, oneshot};
 
     fn dummy_transport_config() -> TransportConfig {
         TransportConfig::Stdio(crate::transport::StdioConfig {
@@ -855,6 +982,59 @@ mod tests {
             args: vec![],
             env: vec![],
         })
+    }
+
+    #[derive(Default)]
+    struct ControlledTransportCounters {
+        received: AtomicUsize,
+        received_at_cancel: AtomicUsize,
+    }
+
+    struct ControlledTransport {
+        incoming: mpsc::UnboundedReceiver<String>,
+        outgoing: mpsc::UnboundedSender<String>,
+        counters: Option<Arc<ControlledTransportCounters>>,
+    }
+
+    #[async_trait]
+    impl Transport for ControlledTransport {
+        async fn send(&mut self, message: &str) -> anyhow::Result<()> {
+            if serde_json::from_str::<Value>(message)
+                .ok()
+                .and_then(|message| message.get("method").cloned())
+                .is_some_and(|method| method == "session/cancel")
+                && let Some(counters) = &self.counters
+            {
+                counters
+                    .received_at_cancel
+                    .store(counters.received.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            self.outgoing
+                .send(message.to_string())
+                .map_err(|_| anyhow::anyhow!("controlled outgoing channel closed"))
+        }
+
+        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+            let message = self.incoming.recv().await;
+            if message.is_some()
+                && let Some(counters) = &self.counters
+            {
+                counters.received.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(message)
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    async fn next_outgoing(receiver: &mut mpsc::UnboundedReceiver<String>) -> Value {
+        let message = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("client should send the next ACP message")
+            .expect("controlled outgoing channel should remain open");
+        serde_json::from_str(&message).unwrap()
     }
 
     #[tokio::test]
@@ -976,6 +1156,7 @@ mod tests {
             .prompt(
                 "sess_1",
                 vec![PromptContent::text("say hello")],
+                PromptTurnCancellation::disabled(),
                 &mut |update| updates.push(update),
             )
             .await
@@ -1014,9 +1195,12 @@ mod tests {
 
         let mut updates = Vec::new();
         let stop = client
-            .prompt("sess_1", vec![PromptContent::text("hi")], &mut |update| {
-                updates.push(update)
-            })
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("hi")],
+                PromptTurnCancellation::disabled(),
+                &mut |update| updates.push(update),
+            )
             .await
             .unwrap();
 
@@ -1058,9 +1242,12 @@ mod tests {
 
         let mut updates = Vec::new();
         let stop = client
-            .prompt("sess_1", vec![PromptContent::text("hi")], &mut |update| {
-                updates.push(update)
-            })
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("hi")],
+                PromptTurnCancellation::disabled(),
+                &mut |update| updates.push(update),
+            )
             .await
             .unwrap();
 
@@ -1106,6 +1293,7 @@ mod tests {
             .prompt(
                 "sess_1",
                 vec![PromptContent::text("select workflow")],
+                PromptTurnCancellation::disabled(),
                 &mut |_| {},
             )
             .await;
@@ -1134,6 +1322,7 @@ mod tests {
             .prompt(
                 "sess_1",
                 vec![PromptContent::text("write a file")],
+                PromptTurnCancellation::disabled(),
                 &mut |_| {},
             )
             .await
@@ -1151,6 +1340,375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_prompt_sends_session_cancel_notification_and_reuses_session() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let initialize = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initialize["method"], "initialize");
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let active_prompt = tokio::spawn(async move {
+            let stop_reason = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("initial")],
+                    PromptTurnCancellation::from_future(async move {
+                        let _ = cancel_rx.await;
+                    }),
+                    &mut |_| {},
+                )
+                .await;
+            (client, stop_reason)
+        });
+
+        let initial_prompt = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initial_prompt["method"], "session/prompt");
+        assert_eq!(initial_prompt["params"]["sessionId"], "sess_1");
+        cancel_tx.send(()).unwrap();
+
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "sess_1");
+        assert!(cancel.get("id").is_none());
+
+        incoming_tx
+            .send(permission_request(100, "sess_1", "write_file"))
+            .unwrap();
+        let permission = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(permission["id"], 100);
+        assert_eq!(permission["result"]["outcome"]["outcome"], "cancelled");
+        assert!(permission["result"]["outcome"].get("optionId").is_none());
+
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+        let (mut client, cancelled) = active_prompt.await.unwrap();
+        assert!(matches!(cancelled.unwrap(), StopReason::Cancelled));
+
+        incoming_tx
+            .send(text_chunk_update("sess_1", "replacement response"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+        let replacement_stop = client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("replacement")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(replacement_stop, StopReason::EndTurn));
+        let replacement = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(replacement["method"], "session/prompt");
+        assert_eq!(replacement["params"]["sessionId"], "sess_1");
+
+        let mut outgoing = vec![initialize, initial_prompt, cancel, permission, replacement];
+        while let Ok(message) = outgoing_rx.try_recv() {
+            outgoing.push(serde_json::from_str(&message).unwrap());
+        }
+        assert_eq!(
+            outgoing
+                .iter()
+                .filter(|message| message["method"] == "session/cancel")
+                .count(),
+            1
+        );
+        assert!(
+            outgoing
+                .iter()
+                .all(|message| message["method"] != "session/close")
+        );
+        let prompts = outgoing
+            .iter()
+            .filter(|message| message["method"] == "session/prompt")
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 2, "cancelled turn must not send Continue");
+        assert_eq!(prompts[1]["params"]["prompt"][0]["text"], "replacement");
+    }
+
+    #[tokio::test]
+    async fn sustained_updates_emit_bounded_cancel_and_cancel_later_permissions() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        let counters = Arc::new(ControlledTransportCounters::default());
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: Some(counters.clone()),
+        };
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let initialize = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initialize["method"], "initialize");
+        counters.received.store(0, Ordering::SeqCst);
+
+        for index in 0..8 {
+            incoming_tx
+                .send(session_update(
+                    "sess_1",
+                    serde_json::json!({
+                        "sessionUpdate": "agent_thought_chunk",
+                        "content": {"text": format!("update-{index}")}
+                    }),
+                ))
+                .unwrap();
+        }
+        let active_prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("initial")],
+                    PromptTurnCancellation::from_future(async {}),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+
+        let initial_prompt = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initial_prompt["method"], "session/prompt");
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(
+            counters.received_at_cancel.load(Ordering::SeqCst),
+            2,
+            "cancellation should be sent after at most one deferred update"
+        );
+
+        incoming_tx
+            .send(permission_request(100, "sess_1", "write_file"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+        let permission = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(permission["id"], 100);
+        assert_eq!(permission["result"]["outcome"]["outcome"], "cancelled");
+        assert!(permission["result"]["outcome"].get("optionId").is_none());
+
+        let (_client, result) = active_prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::Cancelled));
+        let outgoing = [initialize, initial_prompt, cancel, permission];
+        assert_eq!(
+            outgoing
+                .iter()
+                .filter(|message| message["method"] == "session/cancel")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_prompt_wins_ready_cancellation_and_allows_serial_replacement() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let initialize = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initialize["method"], "initialize");
+
+        incoming_tx
+            .send(session_update(
+                "sess_1",
+                serde_json::json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tool-1",
+                    "title": "Completed action",
+                    "kind": "other",
+                    "status": "completed"
+                }),
+            ))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        incoming_tx
+            .send(rpc_response(999, serde_json::json!({})))
+            .unwrap();
+        let active_prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("initial")],
+                    PromptTurnCancellation::from_future(async {}),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let first_prompt = next_outgoing(&mut outgoing_rx).await;
+        let (mut client, initial) = tokio::time::timeout(Duration::from_secs(1), active_prompt)
+            .await
+            .expect("completed prompt should return before automatic continuation")
+            .unwrap();
+        assert!(matches!(initial.unwrap(), StopReason::EndTurn));
+
+        incoming_tx
+            .send(text_chunk_update("sess_1", "replacement response"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+        let replacement = client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("accepted follow-up")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(replacement, StopReason::EndTurn));
+        let second_prompt = next_outgoing(&mut outgoing_rx).await;
+
+        let mut outgoing = vec![initialize, first_prompt, second_prompt];
+        while let Ok(message) = outgoing_rx.try_recv() {
+            outgoing.push(serde_json::from_str(&message).unwrap());
+        }
+        assert!(
+            outgoing
+                .iter()
+                .all(|message| message["method"] != "session/cancel")
+        );
+        let prompts = outgoing
+            .iter()
+            .filter(|message| message["method"] == "session/prompt")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "accepted follow-up must be the next prompt"
+        );
+        assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "initial");
+        assert_eq!(
+            prompts[1]["params"]["prompt"][0]["text"],
+            "accepted follow-up"
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt["params"]["prompt"][0]["text"] != "Continue")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_automatic_continuation_dispatch_boundary() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let initialize = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initialize["method"], "initialize");
+
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        incoming_tx
+            .send(rpc_response(999, serde_json::json!({})))
+            .unwrap();
+        let (boundary_tx, boundary_rx) = oneshot::channel();
+        let active_prompt = tokio::spawn(async move {
+            let mut polls = 0;
+            let mut boundary_tx = Some(boundary_tx);
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("initial")],
+                    PromptTurnCancellation::from_future(poll_fn(move |_context| {
+                        polls += 1;
+                        if polls == 1 {
+                            return Poll::Pending;
+                        }
+                        if let Some(boundary_tx) = boundary_tx.take() {
+                            boundary_tx
+                                .send(())
+                                .expect("boundary receiver should remain open");
+                        }
+                        Poll::Ready(())
+                    })),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let first_prompt = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::timeout(Duration::from_secs(1), boundary_rx)
+            .await
+            .expect("continuation dispatch boundary should be reached")
+            .expect("boundary sender should remain open");
+        let (mut client, initial) = tokio::time::timeout(Duration::from_secs(1), active_prompt)
+            .await
+            .expect("cancellation should win before Continue is committed")
+            .unwrap();
+        assert!(matches!(initial.unwrap(), StopReason::EndTurn));
+
+        incoming_tx
+            .send(text_chunk_update("sess_1", "replacement response"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+        let replacement = client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("accepted follow-up")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap();
+        assert!(matches!(replacement, StopReason::EndTurn));
+        let second_prompt = next_outgoing(&mut outgoing_rx).await;
+
+        let mut outgoing = vec![initialize, first_prompt, second_prompt];
+        while let Ok(message) = outgoing_rx.try_recv() {
+            outgoing.push(serde_json::from_str(&message).unwrap());
+        }
+        assert!(
+            outgoing
+                .iter()
+                .all(|message| message["method"] != "session/cancel")
+        );
+        let prompts = outgoing
+            .iter()
+            .filter(|message| message["method"] == "session/prompt")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prompts.len(),
+            2,
+            "accepted follow-up must be the next prompt"
+        );
+        assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "initial");
+        assert_eq!(
+            prompts[1]["params"]["prompt"][0]["text"],
+            "accepted follow-up"
+        );
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt["params"]["prompt"][0]["text"] != "Continue")
+        );
+    }
+
+    #[tokio::test]
     async fn test_prompt_agent_error() {
         let init_resp = init_response(0);
         let error_resp = rpc_error(1, -32000, "context window exceeded");
@@ -1162,7 +1720,12 @@ mod tests {
                 .unwrap();
 
         let result = client
-            .prompt("sess_1", vec![PromptContent::text("test")], &mut |_| {})
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("test")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
             .await;
 
         assert!(result.is_err());
@@ -1181,7 +1744,12 @@ mod tests {
                 .unwrap();
 
         let stop = client
-            .prompt("sess_1", vec![PromptContent::text("test")], &mut |_| {})
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("test")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
             .await
             .unwrap();
 
@@ -1200,7 +1768,12 @@ mod tests {
                 .unwrap();
 
         let result = client
-            .prompt("sess_1", vec![PromptContent::text("test")], &mut |_| {})
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("test")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
             .await;
 
         assert!(result.is_err());

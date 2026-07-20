@@ -1,22 +1,125 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::future::pending;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent, StopReason};
+use cowboy_agent_client::{
+    Client, Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason,
+};
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow,
     CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
     RoleDefinition, RoleId, RoleSession, RunId, RunStore, StepDetail, StepInput, StepRecord,
     TurnRecord, WorkflowError, ordered_user_inputs_from_parts,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::frontmatter::parse_frontmatter_output;
 use crate::prompt::{build_agent_prompt, build_correction_prompt};
 use crate::{Error, Result};
+
+type PromptTurnControls = HashMap<RunId, HashMap<String, watch::Sender<u64>>>;
+
+/// Process-local controls that connect durable prompt acceptance to active turns.
+#[derive(Clone, Default)]
+pub struct PromptTurnControlRegistry {
+    controls: Arc<SyncMutex<PromptTurnControls>>,
+}
+
+impl fmt::Debug for PromptTurnControlRegistry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptTurnControlRegistry")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PromptTurnControlRegistry {
+    /// Register one open prompt window at its durable sequence baseline.
+    pub fn register(&self, run_id: &str, window_id: &str, baseline_sequence: u64) {
+        let (sender, _receiver) = watch::channel(baseline_sequence);
+        self.controls
+            .lock()
+            .expect("prompt-turn control registry lock poisoned")
+            .entry(run_id.to_string())
+            .or_default()
+            .insert(window_id.to_string(), sender);
+    }
+
+    /// Publish a newly accepted durable sequence to the matching active window.
+    pub fn publish(&self, run_id: &str, window_id: &str, sequence: u64) -> bool {
+        let controls = self
+            .controls
+            .lock()
+            .expect("prompt-turn control registry lock poisoned");
+        let Some(sender) = controls
+            .get(run_id)
+            .and_then(|windows| windows.get(window_id))
+        else {
+            return false;
+        };
+        if sequence <= *sender.borrow() {
+            return false;
+        }
+        sender.send_replace(sequence);
+        true
+    }
+
+    /// Create a one-shot cancellation signal for sequences newer than this turn.
+    pub fn cancellation(
+        &self,
+        run_id: &str,
+        window_id: &str,
+        applied_sequence: u64,
+    ) -> PromptTurnCancellation {
+        let receiver = self
+            .controls
+            .lock()
+            .expect("prompt-turn control registry lock poisoned")
+            .get(run_id)
+            .and_then(|windows| windows.get(window_id))
+            .map(watch::Sender::subscribe);
+        let Some(mut receiver) = receiver else {
+            return PromptTurnCancellation::disabled();
+        };
+
+        PromptTurnCancellation::from_future(async move {
+            loop {
+                if *receiver.borrow_and_update() > applied_sequence {
+                    return;
+                }
+                if receiver.changed().await.is_err() {
+                    pending::<()>().await;
+                }
+            }
+        })
+    }
+
+    fn unregister(&self, run_id: &str, window_id: &str) {
+        let mut controls = self
+            .controls
+            .lock()
+            .expect("prompt-turn control registry lock poisoned");
+        let remove_run = controls.get_mut(run_id).is_some_and(|windows| {
+            windows.remove(window_id);
+            windows.is_empty()
+        });
+        if remove_run {
+            controls.remove(run_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.controls
+            .lock()
+            .expect("prompt-turn control registry lock poisoned")
+            .is_empty()
+    }
+}
 
 pub type ProgressSink = Arc<dyn Fn(AgentProgress) + Send + Sync>;
 
@@ -69,7 +172,7 @@ pub enum AgentProgressKind {
     },
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptWindowHandoffPoint {
     BeforeCompareAndSeal {
@@ -85,7 +188,7 @@ pub enum PromptWindowHandoffPoint {
     },
 }
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 pub trait PromptWindowHandoffObserver: Send + Sync {
     async fn observe(&self, point: PromptWindowHandoffPoint);
@@ -100,7 +203,7 @@ pub struct AgentExecutionConfig {
     pub mcp_servers: Vec<serde_json::Value>,
     /// Optional progress sink for streaming UI-visible agent/tool updates.
     pub progress: Option<ProgressSink>,
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     /// Optional observer used by deterministic handoff-boundary tests.
     pub handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
@@ -112,7 +215,7 @@ impl fmt::Debug for AgentExecutionConfig {
             .field("cwd", &self.cwd)
             .field("mcp_servers", &self.mcp_servers)
             .field("progress", &self.progress.as_ref().map(|_| "<sink>"));
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         debug.field(
             "handoff_observer",
             &self.handoff_observer.as_ref().map(|_| "<observer>"),
@@ -127,7 +230,7 @@ impl Default for AgentExecutionConfig {
             cwd: ".".to_string(),
             mcp_servers: Vec::new(),
             progress: None,
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             handoff_observer: None,
         }
     }
@@ -174,6 +277,7 @@ pub struct AgentExecutor<F, S> {
     store: Arc<S>,
     config: AgentExecutionConfig,
     clients: Arc<Mutex<HashMap<RoleSessionKey, ActiveClient>>>,
+    prompt_turn_controls: PromptTurnControlRegistry,
 }
 
 struct PromptWindowGuard<S: RunStore> {
@@ -182,6 +286,7 @@ struct PromptWindowGuard<S: RunStore> {
     role: String,
     window_id: String,
     progress: Option<ProgressSink>,
+    prompt_turn_controls: PromptTurnControlRegistry,
     closed: bool,
 }
 
@@ -190,6 +295,8 @@ impl<S: RunStore> PromptWindowGuard<S> {
         if self.closed {
             return;
         }
+        self.prompt_turn_controls
+            .unregister(&self.context.run_id, &self.window_id);
         self.closed = true;
         emit_progress_kind(
             self.progress.as_ref(),
@@ -237,7 +344,14 @@ impl<F, S> AgentExecutor<F, S> {
             store: Arc::new(store),
             config,
             clients: Arc::new(Mutex::new(HashMap::new())),
+            prompt_turn_controls: PromptTurnControlRegistry::default(),
         }
+    }
+
+    /// Use shared prompt-turn controls owned by the product runtime.
+    pub fn with_prompt_turn_controls(mut self, controls: PromptTurnControlRegistry) -> Self {
+        self.prompt_turn_controls = controls;
+        self
     }
 }
 
@@ -350,6 +464,17 @@ where
             ))
             .into());
         }
+        self.prompt_turn_controls
+            .register(&context.run_id, &window_id, expected_baseline);
+        let mut window_guard = PromptWindowGuard {
+            store: self.store.clone(),
+            context: context.clone(),
+            role: action.role.clone(),
+            window_id: window_id.clone(),
+            progress: self.config.progress.clone(),
+            prompt_turn_controls: self.prompt_turn_controls.clone(),
+            closed: false,
+        };
         emit_progress_kind(
             self.config.progress.as_ref(),
             &context,
@@ -358,14 +483,6 @@ where
                 window_id: window_id.clone(),
             },
         );
-        let mut window_guard = PromptWindowGuard {
-            store: self.store.clone(),
-            context: context.clone(),
-            role: action.role.clone(),
-            window_id: window_id.clone(),
-            progress: self.config.progress.clone(),
-            closed: false,
-        };
 
         emit_progress_kind(
             self.config.progress.as_ref(),
@@ -381,6 +498,8 @@ where
             active.client.as_mut(),
             &session_id,
             vec![PromptContent::text(prompt.clone())],
+            self.prompt_turn_controls
+                .cancellation(&context.run_id, &window_id, expected_baseline),
             &context,
             self.config.progress.clone(),
             &mut turn_cursor,
@@ -391,7 +510,7 @@ where
         let mut applied_sequence = expected_baseline;
         let mut correction_turns = Vec::new();
         loop {
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(observer) = &self.config.handoff_observer {
                 observer
                     .observe(PromptWindowHandoffPoint::BeforeCompareAndSeal {
@@ -410,7 +529,7 @@ where
                     Utc::now(),
                 )
                 .map_err(Error::from)?;
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(observer) = &self.config.handoff_observer {
                 observer
                     .observe(PromptWindowHandoffPoint::AfterCompareAndSeal {
@@ -459,6 +578,11 @@ where
                         active.client.as_mut(),
                         &session_id,
                         blocks,
+                        self.prompt_turn_controls.cancellation(
+                            &context.run_id,
+                            &window_id,
+                            applied_sequence,
+                        ),
                         &context,
                         self.config.progress.clone(),
                         &mut turn_cursor,
@@ -635,6 +759,7 @@ async fn run_prompt_turn(
     client: &mut dyn Client,
     session_id: &str,
     content: Vec<PromptContent>,
+    cancellation: PromptTurnCancellation,
     context: &ExecutionContext,
     progress: Option<ProgressSink>,
     turn_cursor: &mut TurnCursor,
@@ -643,7 +768,7 @@ async fn run_prompt_turn(
     let mut turns = Vec::new();
     let mut tool_titles = HashMap::new();
     let stop_reason = client
-        .prompt(session_id, content, &mut |event| {
+        .prompt(session_id, content, cancellation, &mut |event| {
             collect_event(
                 context,
                 event,
@@ -823,6 +948,7 @@ fn unknown_tool_title() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
+    use std::time::Duration;
 
     use anyhow::anyhow;
     use cowboy_agent_client::{AgentInfo, StopReason};
@@ -832,8 +958,16 @@ mod tests {
     };
     use parking_lot::Mutex as SyncMutex;
     use serde::{Serialize, de::DeserializeOwned};
+    use tokio::sync::mpsc;
 
     use super::*;
+
+    #[derive(Debug)]
+    enum FakePromptBehavior {
+        Reply,
+        Error(String),
+        Pending,
+    }
 
     #[derive(Debug)]
     struct FakeClient {
@@ -844,6 +978,7 @@ mod tests {
         loaded_sessions: Vec<String>,
         new_session_models: Arc<SyncMutex<Vec<ModelInfo>>>,
         prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
+        prompt_behavior: FakePromptBehavior,
     }
 
     impl FakeClient {
@@ -856,6 +991,7 @@ mod tests {
                 loaded_sessions: Vec::new(),
                 new_session_models: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_calls: Arc::new(SyncMutex::new(Vec::new())),
+                prompt_behavior: FakePromptBehavior::Reply,
             }
         }
 
@@ -863,6 +999,20 @@ mod tests {
             Self {
                 supports_load: true,
                 ..Self::new(events)
+            }
+        }
+
+        fn with_prompt_error(message: impl Into<String>) -> Self {
+            Self {
+                prompt_behavior: FakePromptBehavior::Error(message.into()),
+                ..Self::new(Vec::new())
+            }
+        }
+
+        fn blocking() -> Self {
+            Self {
+                prompt_behavior: FakePromptBehavior::Pending,
+                ..Self::new(Vec::new())
             }
         }
     }
@@ -916,9 +1066,15 @@ mod tests {
             &mut self,
             _session_id: &str,
             prompt_content: Vec<PromptContent>,
+            _cancellation: PromptTurnCancellation,
             event_handler: &mut (dyn FnMut(Event) + Send),
         ) -> anyhow::Result<StopReason> {
             self.prompt_calls.lock().push(prompt_content);
+            match &self.prompt_behavior {
+                FakePromptBehavior::Reply => {}
+                FakePromptBehavior::Error(message) => return Err(anyhow!(message.clone())),
+                FakePromptBehavior::Pending => pending::<()>().await,
+            }
             while let Some(event) = self.events.lock().pop_front() {
                 let completes_reply = matches!(event, Event::MessageChunk { .. });
                 event_handler(event);
@@ -969,6 +1125,137 @@ mod tests {
                 model: self.model.clone(),
                 backend: "fake-agent".to_string(),
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SequencedCancellationClient {
+        session_id: Option<String>,
+        prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
+        started: mpsc::UnboundedSender<usize>,
+        cancelled: mpsc::UnboundedSender<usize>,
+        next_call: usize,
+    }
+
+    #[async_trait]
+    impl Client for SequencedCancellationClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn agent_info(&self) -> Option<&AgentInfo> {
+            None
+        }
+
+        fn session_id(&self) -> Option<&str> {
+            self.session_id.as_deref()
+        }
+
+        async fn new_session(
+            &mut self,
+            _cwd: &str,
+            _mcp_servers: &[serde_json::Value],
+            _model: &ModelInfo,
+        ) -> anyhow::Result<String> {
+            let session_id = "session-1".to_string();
+            self.session_id = Some(session_id.clone());
+            Ok(session_id)
+        }
+
+        fn supports_load_session(&self) -> bool {
+            false
+        }
+
+        async fn load_session(
+            &mut self,
+            _session_id: &str,
+            _cwd: &str,
+            _mcp_servers: &[serde_json::Value],
+        ) -> anyhow::Result<Vec<Event>> {
+            Err(anyhow!("unsupported"))
+        }
+
+        async fn prompt(
+            &mut self,
+            _session_id: &str,
+            prompt_content: Vec<PromptContent>,
+            mut cancellation: PromptTurnCancellation,
+            event_handler: &mut (dyn FnMut(Event) + Send),
+        ) -> anyhow::Result<StopReason> {
+            self.next_call += 1;
+            let call = self.next_call;
+            self.prompt_calls.lock().push(prompt_content);
+            self.started
+                .send(call)
+                .map_err(|_| anyhow!("prompt-start receiver closed"))?;
+            match call {
+                1 | 2 => {
+                    cancellation.cancelled().await;
+                    self.cancelled
+                        .send(call)
+                        .map_err(|_| anyhow!("prompt-cancellation receiver closed"))?;
+                    Ok(StopReason::Cancelled)
+                }
+                3 => {
+                    event_handler(Event::MessageChunk {
+                        content: serde_json::json!({
+                            "text": "---\nstatus: success\nsummary: final\n---\nfinal"
+                        }),
+                    });
+                    Ok(StopReason::EndTurn)
+                }
+                _ => Err(anyhow!("unexpected prompt call {call}")),
+            }
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SequencedClientFactory {
+        client: SyncMutex<Option<SequencedCancellationClient>>,
+    }
+
+    #[async_trait]
+    impl ClientFactory for SequencedClientFactory {
+        async fn create_client(&self, _role: &RoleDefinition) -> Result<ResolvedAgentClient> {
+            let client = self
+                .client
+                .lock()
+                .take()
+                .ok_or_else(|| Error::MissingClient("developer".to_string()))?;
+            Ok(ResolvedAgentClient {
+                client: Box::new(client),
+                model: ModelInfo {
+                    id: "fake-model".to_string(),
+                    provider: Some("fake-provider".to_string()),
+                },
+                backend: "fake-agent".to_string(),
+            })
+        }
+    }
+
+    struct BlockingHandoffObserver {
+        before: mpsc::UnboundedSender<PromptWindowHandoffPoint>,
+        resume: Mutex<mpsc::UnboundedReceiver<()>>,
+    }
+
+    #[async_trait]
+    impl PromptWindowHandoffObserver for BlockingHandoffObserver {
+        async fn observe(&self, point: PromptWindowHandoffPoint) {
+            if !matches!(point, PromptWindowHandoffPoint::BeforeCompareAndSeal { .. }) {
+                return;
+            }
+            self.before
+                .send(point)
+                .expect("handoff-point receiver should remain open");
+            self.resume
+                .lock()
+                .await
+                .recv()
+                .await
+                .expect("handoff resume sender should remain open");
         }
     }
 
@@ -1752,6 +2039,315 @@ mod tests {
         assert_eq!(
             input.context["correction_turns"][0]["content"][2]["text"],
             "  preserve\nthis correction  "
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_cancellation_sequences_coalesce_without_cancelling_replacement() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (cancelled_tx, mut cancelled_rx) = mpsc::unbounded_channel();
+        let prompt_calls = Arc::new(SyncMutex::new(Vec::new()));
+        let factory = SequencedClientFactory {
+            client: SyncMutex::new(Some(SequencedCancellationClient {
+                session_id: None,
+                prompt_calls: prompt_calls.clone(),
+                started: started_tx,
+                cancelled: cancelled_tx,
+                next_call: 0,
+            })),
+        };
+        let (window_tx, mut window_rx) = mpsc::unbounded_channel();
+        let progress = Arc::new(move |progress: AgentProgress| {
+            if let AgentProgressKind::PromptWindowOpened { window_id, .. } = progress.kind {
+                window_tx
+                    .send(window_id)
+                    .expect("window receiver should remain open");
+            }
+        });
+        let (handoff_tx, mut handoff_rx) = mpsc::unbounded_channel();
+        let (resume_tx, resume_rx) = mpsc::unbounded_channel();
+        let controls = PromptTurnControlRegistry::default();
+        let executor = AgentExecutor::new(
+            factory,
+            FakeStore::default(),
+            AgentExecutionConfig {
+                progress: Some(progress),
+                handoff_observer: Some(Arc::new(BlockingHandoffObserver {
+                    before: handoff_tx,
+                    resume: Mutex::new(resume_rx),
+                })),
+                ..AgentExecutionConfig::default()
+            },
+        )
+        .with_prompt_turn_controls(controls.clone());
+        let store = executor.store.clone();
+        let execution = tokio::spawn(async move {
+            executor
+                .execute_agent(action("developer"), context("run", "record"))
+                .await
+        });
+
+        let window_id = tokio::time::timeout(Duration::from_secs(1), window_rx.recv())
+            .await
+            .expect("prompt window should open")
+            .expect("window sender should remain open");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("initial prompt should start"),
+            Some(1)
+        );
+
+        let first = match store
+            .append_user_prompt("run", &window_id, "first follow-up".to_string())
+            .unwrap()
+        {
+            AppendUserPromptOutcome::Accepted(prompt) => prompt,
+            outcome => panic!("first follow-up was not accepted: {outcome:?}"),
+        };
+        let second = match store
+            .append_user_prompt("run", &window_id, "second follow-up".to_string())
+            .unwrap()
+        {
+            AppendUserPromptOutcome::Accepted(prompt) => prompt,
+            outcome => panic!("second follow-up was not accepted: {outcome:?}"),
+        };
+        store
+            .pending_prompt_batches
+            .lock()
+            .push_back(vec![first.clone(), second.clone()]);
+        assert!(controls.publish("run", &window_id, first.sequence));
+        assert!(controls.publish("run", &window_id, second.sequence));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cancelled_rx.recv())
+                .await
+                .expect("initial prompt should be cancelled"),
+            Some(1)
+        );
+
+        let first_handoff = tokio::time::timeout(Duration::from_secs(1), handoff_rx.recv())
+            .await
+            .expect("first compare-and-seal handoff should be observed")
+            .expect("handoff sender should remain open");
+        assert!(matches!(
+            first_handoff,
+            PromptWindowHandoffPoint::BeforeCompareAndSeal {
+                applied_sequence: 0,
+                ..
+            }
+        ));
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("first replacement should start"),
+            Some(2)
+        );
+        assert!(!controls.publish("run", &window_id, second.sequence));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), cancelled_rx.recv())
+                .await
+                .is_err(),
+            "already-applied sequences must not cancel the first replacement"
+        );
+
+        let third = match store
+            .append_user_prompt("run", &window_id, "third follow-up".to_string())
+            .unwrap()
+        {
+            AppendUserPromptOutcome::Accepted(prompt) => prompt,
+            outcome => panic!("third follow-up was not accepted: {outcome:?}"),
+        };
+        store
+            .pending_prompt_batches
+            .lock()
+            .push_back(vec![third.clone()]);
+        assert!(controls.publish("run", &window_id, third.sequence));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), cancelled_rx.recv())
+                .await
+                .expect("new sequence should cancel the first replacement"),
+            Some(2)
+        );
+
+        let second_handoff = tokio::time::timeout(Duration::from_secs(1), handoff_rx.recv())
+            .await
+            .expect("second compare-and-seal handoff should be observed")
+            .expect("handoff sender should remain open");
+        assert!(matches!(
+            second_handoff,
+            PromptWindowHandoffPoint::BeforeCompareAndSeal {
+                applied_sequence: 2,
+                ..
+            }
+        ));
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("second replacement should start"),
+            Some(3)
+        );
+        let final_handoff = tokio::time::timeout(Duration::from_secs(1), handoff_rx.recv())
+            .await
+            .expect("final compare-and-seal handoff should be observed")
+            .expect("handoff sender should remain open");
+        assert!(matches!(
+            final_handoff,
+            PromptWindowHandoffPoint::BeforeCompareAndSeal {
+                applied_sequence: 3,
+                ..
+            }
+        ));
+        resume_tx.send(()).unwrap();
+
+        let execution = execution.await.unwrap().unwrap();
+        assert_eq!(execution.record.output.as_ref().unwrap().body, "final");
+        assert_eq!(
+            execution.record.input.context["correction_turns"][0]["applied_sequences"],
+            serde_json::json!([1, 2])
+        );
+        assert_eq!(
+            execution.record.input.context["correction_turns"][1]["applied_sequences"],
+            serde_json::json!([3])
+        );
+        assert_eq!(execution.record.input.context["final_applied_sequence"], 3);
+
+        let calls = prompt_calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[1].len(), 6);
+        assert!(calls[1][1].text.contains("sequence 1"));
+        assert_eq!(calls[1][2].text, "first follow-up");
+        assert!(calls[1][3].text.contains("sequence 2"));
+        assert_eq!(calls[1][4].text, "second follow-up");
+        assert_eq!(calls[2].len(), 4);
+        assert!(calls[2][1].text.contains("sequence 3"));
+        assert_eq!(calls[2][2].text, "third follow-up");
+        drop(calls);
+
+        assert!(cancelled_rx.try_recv().is_err());
+        assert!(controls.is_empty());
+        assert_eq!(
+            store
+                .accepted_prompts
+                .lock()
+                .iter()
+                .map(|prompt| prompt.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(
+            store
+                .window
+                .lock()
+                .as_ref()
+                .is_some_and(|window| !window.is_open())
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_window_controls_cleanup_on_success_and_backend_error() {
+        let success_controls = PromptTurnControlRegistry::default();
+        let success_executor = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        )
+        .with_prompt_turn_controls(success_controls.clone());
+        success_executor
+            .execute_agent(
+                action("developer"),
+                context("success-run", "success-record"),
+            )
+            .await
+            .unwrap();
+        assert!(success_controls.is_empty());
+        assert!(
+            success_executor
+                .store
+                .window
+                .lock()
+                .as_ref()
+                .is_some_and(|window| !window.is_open())
+        );
+
+        let error_controls = PromptTurnControlRegistry::default();
+        let error_executor = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::with_prompt_error("transport reset")]),
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        )
+        .with_prompt_turn_controls(error_controls.clone());
+        let error = error_executor
+            .execute_agent(action("developer"), context("error-run", "error-record"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Client(_)));
+        assert!(error_controls.is_empty());
+        assert!(
+            error_executor
+                .store
+                .window
+                .lock()
+                .as_ref()
+                .is_some_and(|window| !window.is_open())
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_execution_removes_prompt_window_control_and_aborts_window() {
+        let opened = Arc::new(tokio::sync::Notify::new());
+        let progress = {
+            let opened = opened.clone();
+            Arc::new(move |progress: AgentProgress| {
+                if matches!(progress.kind, AgentProgressKind::PromptWindowOpened { .. }) {
+                    opened.notify_one();
+                }
+            })
+        };
+        let controls = PromptTurnControlRegistry::default();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::blocking()]),
+            FakeStore::default(),
+            AgentExecutionConfig {
+                progress: Some(progress),
+                ..AgentExecutionConfig::default()
+            },
+        )
+        .with_prompt_turn_controls(controls.clone());
+        let store = executor.store.clone();
+        let execution = tokio::spawn(async move {
+            executor
+                .execute_agent(
+                    action("developer"),
+                    context("dropped-run", "dropped-record"),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), opened.notified())
+            .await
+            .expect("prompt window should open before the blocking turn");
+        assert!(!controls.is_empty());
+        assert!(
+            store
+                .window
+                .lock()
+                .as_ref()
+                .is_some_and(AgentPromptWindow::is_open)
+        );
+
+        execution.abort();
+        assert!(execution.await.unwrap_err().is_cancelled());
+        assert!(controls.is_empty());
+        assert!(
+            store
+                .window
+                .lock()
+                .as_ref()
+                .is_some_and(|window| !window.is_open())
         );
     }
 

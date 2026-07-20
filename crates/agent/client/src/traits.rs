@@ -1,7 +1,71 @@
+use std::future::{Future, pending};
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
 use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::{AgentInfo, Event, ModelInfo, PromptContent, StopReason};
+
+/// Awaitable signal that cancels only the currently active prompt turn.
+///
+/// Backend adapters intentionally receive no workflow ids, prompt-window ids,
+/// or durable prompt sequences through this provider-neutral input.
+pub struct PromptTurnCancellation {
+    signal: Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    fired: bool,
+}
+
+impl PromptTurnCancellation {
+    /// Create a cancellation input that never fires.
+    pub fn disabled() -> Self {
+        Self::from_future(pending())
+    }
+
+    /// Create a cancellation input from a one-shot awaitable signal.
+    pub fn from_future(signal: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            signal: Box::pin(signal),
+            fired: false,
+        }
+    }
+
+    /// Wait until the active prompt turn should be cancelled.
+    pub async fn cancelled(&mut self) {
+        if self.fired {
+            return;
+        }
+        self.signal.as_mut().await;
+        self.fired = true;
+    }
+
+    /// Poll once without waiting, preserving the signal for a later await.
+    pub fn try_cancelled(&mut self) -> bool {
+        if self.fired {
+            return true;
+        }
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        if matches!(self.signal.as_mut().poll(&mut context), Poll::Ready(())) {
+            self.fired = true;
+        }
+        self.fired
+    }
+}
+
+impl Default for PromptTurnCancellation {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl std::fmt::Debug for PromptTurnCancellation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PromptTurnCancellation")
+            .finish_non_exhaustive()
+    }
+}
 
 /// Common runtime interface between Cowboy and an agent backend.
 ///
@@ -44,6 +108,7 @@ pub trait Client: Send + Sync + std::fmt::Debug {
         &mut self,
         session_id: &str,
         prompt_content: Vec<PromptContent>,
+        cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason>;
 

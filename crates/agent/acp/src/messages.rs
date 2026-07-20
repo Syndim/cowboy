@@ -27,6 +27,24 @@ impl<P: Serialize> JsonRpcRequest<P> {
     }
 }
 
+/// JSON-RPC 2.0 notification with no request id.
+#[derive(Debug, Clone, Serialize)]
+pub struct JsonRpcNotification<P: Serialize> {
+    pub jsonrpc: &'static str,
+    pub method: &'static str,
+    pub params: P,
+}
+
+impl<P: Serialize> JsonRpcNotification<P> {
+    pub fn new(method: &'static str, params: P) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method,
+            params,
+        }
+    }
+}
+
 /// JSON-RPC 2.0 Response (outgoing — for replying to Agent requests)
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcResponse<R: Serialize> {
@@ -103,6 +121,13 @@ pub struct SessionModelMeta {
     pub provider: Option<String>,
 }
 
+/// session/cancel notification params
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCancelParams {
+    pub session_id: String,
+}
+
 /// session/prompt request params
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -145,6 +170,12 @@ impl PermissionOutcome {
         }
     }
 
+    pub fn cancelled() -> Self {
+        Self {
+            outcome: PermissionDecision::Cancelled,
+        }
+    }
+
     pub fn allow_from_options(options: &[Value]) -> Self {
         let Some(option_id) = options
             .iter()
@@ -157,9 +188,7 @@ impl PermissionOutcome {
             .and_then(|option| option.get("optionId"))
             .and_then(|option_id| option_id.as_str())
         else {
-            return Self {
-                outcome: PermissionDecision::Cancelled,
-            };
+            return Self::cancelled();
         };
 
         Self::selected(option_id)

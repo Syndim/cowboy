@@ -139,20 +139,28 @@ ceilings are exhausted.
 
 - builds the role prompt, including the complete ordered initial request and durable follow-ups
 - opens a durable prompt window identified by an opaque token and bound to the run, step record, step, and role
-- sends the initial prompt through `cowboy-agent-client::Client`
-- after each turn, atomically compares the applied prompt sequence with the latest accepted sequence
+- registers a process-local sequence watch at the window's durable baseline before publishing the open-window event
+- sends the initial prompt through `cowboy-agent-client::Client` with an awaitable turn-cancellation input
+- when the watch observes a newer accepted sequence, cancels the active turn and then atomically compares the applied sequence with the latest durable sequence
 - sends each pending correction as a separate serial turn on the same backend session until the store seals the window
 - parses only the latest complete replacement response into `StepOutput`
 - stores per-role backend sessions keyed by `(run_id, role_id)`
 - captures visible output and turn records from every initial/correction turn
 
-ACP v1 permits one `session/prompt` turn at a time and has no concurrent
-steering primitive. Cowboy therefore applies on-the-fly prompts only at safe
-turn boundaries. The redb append and compare-and-seal operations are totally
-ordered: a prompt committed before seal is returned for another correction
-turn; a prompt serialized after seal is rejected. Cancellation, failure,
-retry, dropped futures, and guarded process recovery abort or replace stale
-window tokens.
+ACP v1 permits one `session/prompt` turn at a time. After the store durably
+accepts an on-the-fly prompt, the runtime publishes its sequence to the active
+window control. The ACP receive loop sends one id-less `session/cancel`
+notification, answers later permission requests as cancelled, and continues
+consuming updates until the original `session/prompt` returns
+`stopReason: cancelled`. The executor then loads the authoritative pending
+batch through compare-and-seal and sends the replacement `session/prompt`
+serially on the same session. If the active turn completes before cancellation
+is sent, the same compare-and-seal path provides the post-turn fallback. The
+redb append and compare-and-seal operations remain totally ordered: a prompt
+committed before seal is returned for another correction turn; a prompt
+serialized after seal is rejected. Cancellation, failure, retry, dropped
+futures, and guarded process recovery abort or replace stale window tokens and
+remove their process-local controls.
 
 `StepInput.prompt` remains the exact initial composed prompt. Replay metadata
 under `StepInput.context.correction_turns` stores each correction's exact

@@ -6,10 +6,13 @@ use std::sync::Arc;
 use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_client::ModelInfo;
+#[cfg(test)]
+use cowboy_agent_client::PromptTurnCancellation;
 #[cfg(feature = "test-support")]
 use cowboy_workflow_agent::PromptWindowHandoffObserver;
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind,
+    PromptTurnControlRegistry,
 };
 use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
@@ -299,6 +302,7 @@ pub struct WorkflowRuntime {
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
     dependencies: Arc<dyn RuntimeDependencies>,
+    prompt_turn_controls: PromptTurnControlRegistry,
     #[cfg(feature = "test-support")]
     handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
@@ -386,6 +390,7 @@ impl WorkflowRuntime {
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
+            prompt_turn_controls: PromptTurnControlRegistry::default(),
             #[cfg(feature = "test-support")]
             handoff_observer: None,
         }
@@ -476,7 +481,11 @@ impl WorkflowRuntime {
             .store()?
             .append_user_prompt(run_id, window_id, content)?;
         Ok(match outcome {
-            AppendUserPromptOutcome::Accepted(prompt) => UserPromptSubmission::Accepted(prompt),
+            AppendUserPromptOutcome::Accepted(prompt) => {
+                self.prompt_turn_controls
+                    .publish(run_id, window_id, prompt.sequence);
+                UserPromptSubmission::Accepted(prompt)
+            }
             AppendUserPromptOutcome::MissingRun => {
                 UserPromptSubmission::Rejected(UserPromptRejection::MissingRun)
             }
@@ -1155,7 +1164,8 @@ impl WorkflowRuntime {
             handoff_observer: self.handoff_observer.clone(),
         };
         let factory = self.dependencies.agent_factory(&self.config)?;
-        let executor = AgentExecutor::new(factory, agent_store, agent_config);
+        let executor = AgentExecutor::new(factory, agent_store, agent_config)
+            .with_prompt_turn_controls(self.prompt_turn_controls.clone());
         let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
         let provider = LuaStepActionProvider::new(snapshot);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
@@ -1551,6 +1561,7 @@ mod tests {
             &mut self,
             _session_id: &str,
             prompt_content: Vec<PromptContent>,
+            _cancellation: PromptTurnCancellation,
             event_handler: &mut (dyn FnMut(Event) + Send),
         ) -> anyhow::Result<StopReason> {
             let prompt = prompt_content
@@ -1871,6 +1882,136 @@ mod tests {
                 },
             )]),
         )
+    }
+
+    #[tokio::test]
+    async fn accepted_prompt_cancels_active_turn_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_control = dir.path().join("first-control.json");
+        let replacement_prompt = dir.path().join("replacement-prompt.json");
+        let delivery_order = dir.path().join("delivery-order");
+        let handoff_gate = dir.path().join("handoff-gate");
+        let agent_script = dir.path().join("cancel-aware-agent.sh");
+        fs::write(
+            &agent_script,
+            r#"#!/bin/sh
+first_control="$1"
+replacement_prompt="$2"
+delivery_order="$3"
+handoff_gate="$4"
+
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"agentInfo":{"name":"cancel-aware-agent","version":"1"}}}'
+IFS= read -r new_session
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"session-1"}}'
+IFS= read -r initial_prompt
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","toolCallId":"action-1","title":"Current action","kind":"other","status":"pending"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"action-1","status":"completed"}}}'
+
+(
+  sleep 1
+  if mkdir "$handoff_gate" 2>/dev/null; then
+    printf '%s' 'after_current_turn' > "$delivery_order"
+    printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"---\nstatus: success\nsummary: initial\n---\ninitial"}}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
+  fi
+) &
+
+IFS= read -r control
+printf '%s' "$control" > "$first_control"
+case "$control" in
+  *'"method":"session/cancel"'*)
+    if mkdir "$handoff_gate" 2>/dev/null; then
+      printf '%s' 'before_replacement' > "$delivery_order"
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"cancelled"}}'
+    fi
+    IFS= read -r replacement
+    ;;
+  *)
+    replacement="$control"
+    ;;
+esac
+wait
+printf '%s' "$replacement" > "$replacement_prompt"
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"---\nstatus: success\nsummary: corrected\n---\ncorrected"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&agent_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&agent_script, permissions).unwrap();
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![AgentRuntimeConfig {
+                name: "default".to_string(),
+                command: agent_script.to_string_lossy().to_string(),
+                args: vec![
+                    first_control.to_string_lossy().to_string(),
+                    replacement_prompt.to_string_lossy().to_string(),
+                    delivery_order.to_string_lossy().to_string(),
+                    handoff_gate.to_string_lossy().to_string(),
+                ],
+                model: ModelInfo::default(),
+            }],
+        );
+        let submit_runtime = runtime.clone();
+        let mut events = runtime.events().subscribe();
+        let executing_runtime = runtime.clone();
+        let run_task = tokio::spawn(async move { executing_runtime.start_run("original").await });
+        let mut window_id = None;
+        let mut run_id = None;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("agent action boundary should be observed")
+                .expect("workflow event channel should remain open");
+            let event_run_id = event.run_id.clone();
+            match event.kind {
+                WorkflowEventKind::AgentPromptWindowOpened { window_id: id, .. } => {
+                    window_id = Some(id);
+                    run_id = Some(event_run_id);
+                }
+                WorkflowEventKind::AgentToolCallUpdate { status, .. } if status == "completed" => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let run_id = run_id.expect("prompt window event should identify the active run");
+        let window_id = window_id.expect("prompt window should open before the action boundary");
+        let accepted_content = "steer by cancelling the active turn";
+        let accepted = submit_runtime
+            .submit_user_prompt(&run_id, &window_id, accepted_content.to_string())
+            .unwrap();
+        assert!(matches!(accepted, UserPromptSubmission::Accepted(_)));
+
+        let report = run_task.await.unwrap().unwrap();
+        let store = runtime.store().unwrap();
+        let record = store
+            .get_object::<StepRecord>(report.run.head.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(record.output.as_ref().unwrap().body, "corrected");
+
+        let replacement: Value =
+            serde_json::from_str(&fs::read_to_string(&replacement_prompt).unwrap()).unwrap();
+        assert_eq!(replacement["method"], "session/prompt");
+        assert_eq!(replacement["params"]["sessionId"], "session-1");
+        assert_eq!(replacement["params"]["prompt"][2]["type"], "text");
+        assert_eq!(replacement["params"]["prompt"][2]["text"], accepted_content);
+
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&first_control).unwrap()).unwrap();
+        assert_eq!(
+            control["method"], "session/cancel",
+            "accepted prompt did not cancel the active ACP turn"
+        );
+        assert_eq!(control["params"]["sessionId"], "session-1");
+        assert_eq!(
+            fs::read_to_string(&delivery_order).unwrap(),
+            "before_replacement"
+        );
     }
 
     #[cfg(feature = "test-support")]
