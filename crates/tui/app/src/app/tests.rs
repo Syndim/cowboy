@@ -472,6 +472,52 @@ async fn paste_appends_to_active_run_draft_input() {
     state.cancel_background_tasks();
 }
 
+#[tokio::test]
+async fn draw_active_background_task_shows_running_message_in_transcript() {
+    let mut state = test_state();
+    state.spawn_card_report_task(
+        "Run",
+        ["00:00:00".to_string()],
+        ["submitted run --workflow slow".to_string()],
+        "submitted run --workflow slow: smoke-main-message".to_string(),
+        ["smoke-main-message".to_string()],
+        async {
+            std::future::pending::<std::result::Result<cowboy_workflow_engine::RunReport, String>>()
+                .await
+        },
+    );
+
+    let rendered = rendered_rows(&state, 100, 14).join("\n");
+
+    assert!(rendered.contains("● Run"), "{rendered}");
+    assert!(
+        rendered.contains("submitted run --workflow slow"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("smoke-main-message"), "{rendered}");
+    assert!(!rendered.contains("◷"), "{rendered}");
+    state.cancel_background_tasks();
+}
+
+#[tokio::test]
+async fn draw_runs_list_background_task_shows_loading_message_in_transcript() {
+    let mut state = test_state();
+    state.spawn_runs_list_task("loading runs".to_string(), async {
+        std::future::pending::<
+            std::result::Result<Vec<cowboy_workflow_engine::RunSummaryLine>, String>,
+        >()
+        .await
+    });
+
+    let rendered = rendered_rows(&state, 100, 14).join("\n");
+
+    assert!(rendered.contains("● Runs"), "{rendered}");
+    assert!(rendered.contains("loading runs"), "{rendered}");
+    assert!(rendered.contains("Loading runs"), "{rendered}");
+    assert!(!rendered.contains("◷"), "{rendered}");
+    state.cancel_background_tasks();
+}
+
 #[test]
 fn draw_places_cursor_at_moved_single_line_position() {
     let mut state = test_state();

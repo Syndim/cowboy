@@ -179,10 +179,8 @@ fn app_card(
 }
 
 fn app_card_status_and_tone(title: &str, title_suffix: &[String]) -> (&'static str, CardTone) {
-    if title == "Resolve"
-        && title_suffix
-            .iter()
-            .any(|suffix| suffix == "submitted resolve")
+    if is_submitted_background_task_card(title, title_suffix)
+        || is_loading_runs_background_card(title, title_suffix)
     {
         return (status_icon("running"), CardTone::Accent);
     }
@@ -198,6 +196,21 @@ fn app_card_status_and_tone(title: &str, title_suffix: &[String]) -> (&'static s
         }
         _ => (status_icon("idle"), CardTone::Accent),
     }
+}
+
+fn is_submitted_background_task_card(title: &str, title_suffix: &[String]) -> bool {
+    title_suffix.iter().any(|suffix| match title {
+        "Run" => suffix == "submitted run" || suffix.starts_with("submitted run "),
+        "Step" => suffix == "submitted step",
+        "Resume" => suffix == "submitted resume",
+        "Answer" => suffix == "submitted answer",
+        "Resolve" => suffix == "submitted resolve",
+        _ => false,
+    })
+}
+
+fn is_loading_runs_background_card(title: &str, title_suffix: &[String]) -> bool {
+    title == "Runs" && title_suffix.iter().any(|suffix| suffix == "loading runs")
 }
 
 #[derive(Debug, Clone)]
@@ -1002,13 +1015,17 @@ impl AppState {
     where
         F: Future<Output = Result<Vec<RunSummaryLine>, String>> + Send + 'static,
     {
-        self.status = status;
-        self.background.push(BackgroundTask {
-            kind: BackgroundTaskKind::RunsList,
-            handle: tokio::spawn(async move {
-                future.await.map(BackgroundTaskResult::RunsList)
-            }),
-        });
+        self.spawn_background_task(
+            BackgroundTaskKind::RunsList,
+            status,
+            TranscriptEntry::Card {
+                title: "Runs".to_string(),
+                title_prefix: Vec::new(),
+                title_suffix: vec!["loading runs".to_string()],
+                details: vec!["Loading runs".to_string()],
+            },
+            async move { future.await.map(BackgroundTaskResult::RunsList) },
+        );
     }
 
     #[cfg(test)]
@@ -1023,16 +1040,36 @@ impl AppState {
     where
         F: Future<Output = Result<RunReport, String>> + Send + 'static,
     {
-        self.status = status;
-        self.run_state = "running".to_string();
-        self.push_event(entry);
-        self.background.push(BackgroundTask {
-            kind: BackgroundTaskKind::WorkflowExecution,
-            handle: tokio::spawn(async move {
+        self.spawn_background_task(
+            BackgroundTaskKind::WorkflowExecution,
+            status,
+            entry,
+            async move {
                 future
                     .await
                     .map(|report| BackgroundTaskResult::WorkflowReport(Box::new(report)))
-            }),
+            },
+        );
+    }
+
+    fn spawn_background_task<F>(
+        &mut self,
+        kind: BackgroundTaskKind,
+        status: String,
+        entry: TranscriptEntry,
+        future: F,
+    ) where
+        F: Future<Output = Result<BackgroundTaskResult, String>> + Send + 'static,
+    {
+        self.status = status;
+        if kind == BackgroundTaskKind::WorkflowExecution {
+            self.run_state = "running".to_string();
+        }
+
+        self.push_event(entry);
+        self.background.push(BackgroundTask {
+            kind,
+            handle: tokio::spawn(future),
         });
     }
 
@@ -1520,6 +1557,45 @@ mod tests {
     }
 
     #[test]
+    fn submitted_background_task_cards_use_running_status() {
+        for (title, suffix) in [
+            ("Run", "submitted run"),
+            ("Run", "submitted run --workflow slow"),
+            ("Step", "submitted step"),
+            ("Resume", "submitted resume"),
+            ("Answer", "submitted answer"),
+            ("Resolve", "submitted resolve"),
+        ] {
+            let entry = TranscriptEntry::Card {
+                title: title.to_string(),
+                title_prefix: Vec::new(),
+                title_suffix: vec![suffix.to_string()],
+                details: vec!["background work is pending".to_string()],
+            };
+            let rendered = entry.plain_text();
+
+            assert!(rendered.starts_with(&format!("● {title}")), "{rendered}");
+            assert!(rendered.contains(suffix), "{rendered}");
+        }
+
+        let run_summary = TranscriptEntry::Card {
+            title: "Run".to_string(),
+            title_prefix: Vec::new(),
+            title_suffix: Vec::new(),
+            details: vec!["run summary".to_string()],
+        };
+        let resolve_options = TranscriptEntry::Card {
+            title: "Resolve".to_string(),
+            title_prefix: Vec::new(),
+            title_suffix: Vec::new(),
+            details: vec!["resolve options".to_string()],
+        };
+
+        assert!(run_summary.plain_text().starts_with("◌ Run"));
+        assert!(resolve_options.plain_text().starts_with("✓ Resolve"));
+    }
+
+    #[test]
     fn consecutive_agent_response_chunks_append_to_current_transcript_entry() {
         let mut state = test_state();
 
@@ -1911,6 +1987,108 @@ mod tests {
             assert!(terminal_state.composer_accepts_edits());
             assert!(terminal_state.composer_accepts_submit());
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_background_task_records_running_card() {
+        let mut pending_state = test_state();
+        pending_state.spawn_card_report_task(
+            "Run",
+            ["00:00:00".to_string()],
+            ["submitted run --workflow slow".to_string()],
+            "submitted run --workflow slow: smoke-main-message".to_string(),
+            ["smoke-main-message".to_string()],
+            async { std::future::pending::<Result<RunReport, String>>().await },
+        );
+
+        assert_eq!(pending_state.background_task_count(), 1);
+        assert_eq!(pending_state.event_entries().len(), 1);
+        let started = pending_state.event_entries()[0].plain_text();
+        assert!(started.contains("● Run"), "{started}");
+        assert!(
+            started.contains("submitted run --workflow slow"),
+            "{started}"
+        );
+        assert!(started.contains("smoke-main-message"), "{started}");
+
+        pending_state.cancel_background_tasks();
+
+        let mut completed_state = test_state();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_completed_workflow(&dir);
+        completed_state.spawn_card_report_task(
+            "Run",
+            ["00:00:00".to_string()],
+            ["submitted run".to_string()],
+            "submitted run: complete".to_string(),
+            ["complete".to_string()],
+            async move {
+                runtime
+                    .start_run_with_workflow("complete", "complete")
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+        );
+        let initial_entry = completed_state.event_entries()[0].plain_text();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completed_state.background_task_count() > 0 {
+                tokio::task::yield_now().await;
+                completed_state.drain_background_tasks().await;
+            }
+        })
+        .await
+        .expect("completed workflow task should drain");
+
+        assert_eq!(completed_state.background_task_count(), 0);
+        assert!(completed_state.event_entries().len() > 1);
+        assert_eq!(
+            completed_state.event_entries()[0].plain_text(),
+            initial_entry
+        );
+        assert!(
+            completed_state
+                .event_entries()
+                .iter()
+                .any(|entry| entry.contains("Run completed")),
+            "{:?}",
+            completed_state.event_entries()
+        );
+    }
+
+    #[tokio::test]
+    async fn runs_list_background_task_records_loading_card() {
+        let mut pending_state = test_state();
+        pending_state.spawn_runs_list_task("loading runs".to_string(), async {
+            std::future::pending::<Result<Vec<RunSummaryLine>, String>>().await
+        });
+
+        assert_eq!(pending_state.background_task_count(), 1);
+        assert_eq!(pending_state.event_entries().len(), 1);
+        let started = pending_state.event_entries()[0].plain_text();
+        assert!(started.contains("● Runs"), "{started}");
+        assert!(started.contains("loading runs"), "{started}");
+        assert!(started.contains("Loading runs"), "{started}");
+
+        pending_state.cancel_background_tasks();
+
+        let mut completed_state = test_state();
+        completed_state.spawn_runs_list_task("loading runs".to_string(), async { Ok(Vec::new()) });
+        let initial_entry = completed_state.event_entries()[0].plain_text();
+        tokio::task::yield_now().await;
+        assert!(completed_state.drain_background_tasks().await);
+
+        assert_eq!(completed_state.background_task_count(), 0);
+        assert_eq!(
+            completed_state.event_entries()[0].plain_text(),
+            initial_entry
+        );
+        assert!(
+            completed_state
+                .event_entries()
+                .last()
+                .is_some_and(|entry| entry.contains("known runs: 0"))
+        );
     }
 
     #[tokio::test]

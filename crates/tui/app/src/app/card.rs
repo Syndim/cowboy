@@ -67,7 +67,6 @@ impl CardMetadata {
             text: format!("⎇ {}", workflow.as_ref()),
         }
     }
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -391,7 +390,10 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("● • Bash cargo test"), "{text}");
-        assert!(text.contains("↳ implement · ▶ 170dc431 · ⎇ bugfix"), "{text}");
+        assert!(
+            text.contains("↳ implement · ▶ 170dc431 · ⎇ bugfix"),
+            "{text}"
+        );
         assert!(!text.contains("◷"), "{text}");
         assert!(text.contains("╭"), "{text}");
         assert!(text.contains("╮"), "{text}");

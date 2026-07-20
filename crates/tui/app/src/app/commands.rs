@@ -394,11 +394,10 @@ fn spawn_answer_task(
 fn spawn_runs_list(state: &mut AppState, runtime: &WorkflowRuntime) {
     let runtime = runtime.clone();
     state.spawn_runs_list_task("loading runs".to_string(), async move {
-        let runs = tokio::task::spawn_blocking(move || {
-            runtime.list_runs().map_err(|err| err.to_string())
-        })
-        .await
-        .map_err(|err| err.to_string())??;
+        let runs =
+            tokio::task::spawn_blocking(move || runtime.list_runs().map_err(|err| err.to_string()))
+                .await
+                .map_err(|err| err.to_string())??;
         Ok(runs)
     });
 }
@@ -499,7 +498,6 @@ pub(in crate::app) fn show_workflows(
     state.push_card("Workflows", details);
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -645,7 +643,6 @@ mod tests {
         panic!("background task did not finish");
     }
 
-
     #[tokio::test]
     async fn plain_request_submission_renders_initial_input_as_card() {
         let (_dir, runtime, mut state) = test_runtime_state();
@@ -760,7 +757,10 @@ mod tests {
 
         assert_eq!(state.background_task_count(), 1);
         assert!(!state.workflow_execution_running());
-        assert_eq!(state.composer_submission_mode(), ComposerSubmissionMode::Idle);
+        assert_eq!(
+            state.composer_submission_mode(),
+            ComposerSubmissionMode::Idle
+        );
 
         state.push_input("new workflow request");
         submit_input(&mut state, &runtime).await;
@@ -769,7 +769,6 @@ mod tests {
         assert!(state.workflow_execution_running());
         state.cancel_background_tasks();
     }
-
 
     #[test]
     fn help_uses_generated_slash_command_rows() {
@@ -827,7 +826,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runs_submission_eventually_renders_structured_runtime_summaries_after_background_drain() {
+    async fn runs_submission_eventually_renders_structured_runtime_summaries_after_background_drain()
+     {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
@@ -904,9 +904,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             run_cards.len(),
-            3,
-            "expected one card per run: {run_cards:#?}"
+            4,
+            "expected loading card plus one card per run: {run_cards:#?}"
         );
+        assert_rendered_contains(&run_cards[0], "● Runs");
+        assert_rendered_contains(&run_cards[0], "Loading runs");
 
         let completed_card = run_cards
             .iter()

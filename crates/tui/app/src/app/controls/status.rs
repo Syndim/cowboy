@@ -110,7 +110,10 @@ mod tests {
 
         let rendered = rendered_text(&state, 160);
 
-        assert_eq!(rendered, "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature");
+        assert_eq!(
+            rendered,
+            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
+        );
         assert!(!rendered.contains("◷"), "{rendered}");
         state.cancel_background_tasks();
     }
