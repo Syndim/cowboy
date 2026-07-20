@@ -1,3 +1,4 @@
+use chrono::{DateTime, FixedOffset, Local};
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 use ratatui::text::{Line, Span};
 
@@ -379,27 +380,41 @@ fn workflow_card(
     title: impl Into<String>,
     tone: CardTone,
 ) -> Card {
-    let card = Card::new(status, title, tone);
-    match elapsed_stamp(event) {
-        Some(elapsed) => card.title_prefix(elapsed),
-        None => card,
+    Card::new(status, title, tone).title_prefix(workflow_title_prefix(event))
+}
+
+fn workflow_title_prefix(event: &WorkflowEvent) -> String {
+    let local_timestamp = event.timestamp.with_timezone(&Local).fixed_offset();
+
+    format_workflow_title_prefix(local_timestamp, elapsed_ms(event))
+}
+
+fn format_workflow_title_prefix(
+    local_timestamp: DateTime<FixedOffset>,
+    elapsed_ms: Option<u64>,
+) -> String {
+    let wall_clock = local_timestamp.format("%H:%M:%S %:z");
+
+    match elapsed_ms {
+        Some(elapsed_ms) => format!("{wall_clock} (+{})", format_elapsed_ms(elapsed_ms)),
+        None => wall_clock.to_string(),
     }
 }
 
-fn elapsed_stamp(event: &WorkflowEvent) -> Option<String> {
-    let elapsed_ms = match event.run_active_duration_ms {
-        Some(elapsed_ms) => elapsed_ms,
+fn elapsed_ms(event: &WorkflowEvent) -> Option<u64> {
+    match event.run_active_duration_ms {
+        Some(elapsed_ms) => Some(elapsed_ms),
         None => {
             let run_started_at = event.run_started_at?;
-            event
-                .timestamp
-                .signed_duration_since(run_started_at)
-                .num_milliseconds()
-                .max(0) as u64
+            Some(
+                event
+                    .timestamp
+                    .signed_duration_since(run_started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+            )
         }
-    };
-
-    Some(format_elapsed_ms(elapsed_ms))
+    }
 }
 
 fn format_elapsed_ms(elapsed_ms: u64) -> String {
@@ -543,7 +558,7 @@ fn non_empty(text: String) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{FixedOffset, TimeZone, Utc};
     use ratatui::style::{Color, Modifier, Style};
 
     use super::*;
@@ -562,6 +577,20 @@ mod tests {
     }
 
     #[test]
+    fn formats_fixed_offset_title_prefix_with_non_utc_wall_clock_and_elapsed() {
+        let offset = FixedOffset::west_opt(7 * 3_600).unwrap();
+        let timestamp = Utc
+            .with_ymd_and_hms(2026, 7, 5, 13, 23, 45)
+            .unwrap()
+            .with_timezone(&offset);
+
+        let prefix = format_workflow_title_prefix(timestamp, Some(296_000));
+
+        assert_eq!(prefix, "06:23:45 -07:00 (+00:04:56)");
+        assert!(!prefix.contains("13:23:45 +00:00"), "{prefix}");
+    }
+
+    #[test]
     fn run_completed_title_uses_active_elapsed_duration() {
         let run_started_at = Utc.with_ymd_and_hms(2026, 7, 5, 12, 0, 0).unwrap();
         let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 13, 23, 45).unwrap();
@@ -577,8 +606,9 @@ mod tests {
         let title = rendered.lines()[0].to_string();
 
         assert!(title.contains("✓ Run completed"), "{title}");
-        assert!(title.contains("00:04:56"), "{title}");
-        assert!(!title.contains("01:23:45"), "{title}");
+        assert!(title.contains("(+00:04:56)"), "{title}");
+        assert!(!title.starts_with("00:04:56 ·"), "{title}");
+        assert!(!title.contains("(+01:23:45)"), "{title}");
     }
 
     #[test]
@@ -596,7 +626,7 @@ mod tests {
         let rendered = render_workflow_event(&event);
         let title = rendered.lines()[0].to_string();
 
-        assert_eq!(title, "01:23:45 · ✓ Run completed · ▶ 170dc431");
+        assert!(title.contains("(+01:23:45) · ✓ Run completed"), "{title}");
     }
 
     #[test]
@@ -614,7 +644,61 @@ mod tests {
         let rendered = render_workflow_event(&event);
         let title = rendered.lines()[0].to_string();
 
-        assert_eq!(title, "00:00:00 · ✓ Run completed · ▶ 170dc431");
+        assert!(title.contains("(+00:00:00) · ✓ Run completed"), "{title}");
+    }
+
+    #[test]
+    fn run_completed_title_omits_elapsed_when_no_elapsed_source_exists() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 13, 23, 45).unwrap();
+        let event = WorkflowEvent::with_timing(
+            "run-170dc431-abc",
+            timestamp,
+            None,
+            None,
+            WorkflowEventKind::RunCompleted,
+        );
+
+        let rendered = render_workflow_event(&event);
+        let title = rendered.lines()[0].to_string();
+        let prefix = title
+            .split(" · ")
+            .next()
+            .expect("workflow title should include a prefix");
+
+        assert!(title.contains(" · ✓ Run completed"), "{title}");
+        assert_eq!(prefix.len(), "06:23:45 -07:00".len(), "{title}");
+        assert!(!prefix.contains("(+"), "{title}");
+    }
+
+    #[test]
+    fn narrow_workflow_title_keeps_event_title_ahead_of_metadata() {
+        let timestamp = Utc.with_ymd_and_hms(2026, 7, 5, 13, 23, 45).unwrap();
+        let event = WorkflowEvent::with_timing(
+            "run-170dc431-abc",
+            timestamp,
+            None,
+            Some(296_000),
+            WorkflowEventKind::WaitingForInput {
+                step: "review".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["approve".to_string(), "reject".to_string()],
+            },
+        );
+
+        let normal_title =
+            render_workflow_event_width(&event, DEFAULT_CARD_WIDTH).lines()[0].to_string();
+        let narrow_title = render_workflow_event_width(&event, 36).lines()[0].to_string();
+
+        assert!(
+            normal_title.contains("(+00:04:56) · ◔ Waiting for input · ↳ review · ▶ 170dc431"),
+            "{normal_title}"
+        );
+        assert!(
+            narrow_title.contains("◔ Waiting for input"),
+            "{narrow_title}"
+        );
+        assert!(!narrow_title.contains("▶ 170dc431"), "{narrow_title}");
     }
 
     #[test]

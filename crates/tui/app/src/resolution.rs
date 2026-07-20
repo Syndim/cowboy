@@ -9,7 +9,7 @@ pub fn resolution_command(command_prefix: &str, run_id: &str, status: &Resolutio
         quote_command_argument(run_id),
         quote_command_argument(&status.status)
     );
-    for field in &status.required_fields {
+    for field in status.required_fields.iter().chain(&status.optional_fields) {
         command.push_str(" --field ");
         command.push_str(&quote_command_argument(field));
         command.push(' ');

@@ -662,7 +662,10 @@ mod tests {
     #[test]
     fn overflowing_transcript_keeps_last_column_selectable_without_scrollbar_chrome() {
         let mut state = test_state();
-        state.push_card("Transcript", (0..20).map(|index| format!("selectable row {index}")));
+        state.push_card(
+            "Transcript",
+            (0..20).map(|index| format!("selectable row {index}")),
+        );
         let area = Rect::new(0, 0, 24, 6);
         let rows = rendered_rows(&state, area.height, area.width);
         let rightmost_column = area.right().saturating_sub(1);

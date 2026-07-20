@@ -187,16 +187,49 @@ impl Card {
     fn title_line(&self, width: usize) -> Line<'static> {
         let marker = if self.tool_marker { " • " } else { " " };
         let leading = format!("{}{}{}", self.status, marker, self.title);
-        let mut parts = Vec::with_capacity(
-            self.title_prefix.len() + self.title_suffix.len() + self.metadata.len() + 1,
-        );
-        parts.extend(self.title_prefix.iter().cloned());
-        parts.push(leading);
-        parts.extend(self.title_suffix.iter().cloned());
-        parts.extend(self.metadata.iter().map(|metadata| metadata.text.clone()));
+        let mut prefixes = self.title_prefix.clone();
+        let mut suffixes = self.title_suffix.clone();
+        let mut metadata = self
+            .metadata
+            .iter()
+            .map(|metadata| metadata.text.clone())
+            .collect::<Vec<_>>();
+        let mut parts = title_parts(&prefixes, &leading, &suffixes, &metadata);
+
+        while joined_title_width(&parts) > width && metadata.pop().is_some() {
+            parts = title_parts(&prefixes, &leading, &suffixes, &metadata);
+        }
+
+        while joined_title_width(&parts) > width && suffixes.pop().is_some() {
+            parts = title_parts(&prefixes, &leading, &suffixes, &metadata);
+        }
+
+        while joined_title_width(&parts) > width && !prefixes.is_empty() {
+            prefixes.remove(0);
+            parts = title_parts(&prefixes, &leading, &suffixes, &metadata);
+        }
+
         let title = truncate_to_display_width(parts.join(METADATA_SEPARATOR), width);
         Line::from(Span::styled(title, self.tone.title_style()))
     }
+}
+
+fn title_parts(
+    prefixes: &[String],
+    leading: &str,
+    suffixes: &[String],
+    metadata: &[String],
+) -> Vec<String> {
+    let mut parts = Vec::with_capacity(prefixes.len() + suffixes.len() + metadata.len() + 1);
+    parts.extend(prefixes.iter().cloned());
+    parts.push(leading.to_string());
+    parts.extend(suffixes.iter().cloned());
+    parts.extend(metadata.iter().cloned());
+    parts
+}
+
+fn joined_title_width(parts: &[String]) -> usize {
+    UnicodeWidthStr::width(parts.join(METADATA_SEPARATOR).as_str())
 }
 
 fn section_wrapped_lines(section: &CardSection, interior_width: usize) -> Vec<Line<'static>> {
