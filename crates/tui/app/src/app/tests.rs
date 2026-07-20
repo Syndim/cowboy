@@ -169,6 +169,21 @@ fn windows_terminal_mode_does_not_execute_unsupported_keyboard_enhancement_on_wi
     );
 }
 
+#[test]
+fn windows_keyboard_enhancement_path_preserves_modified_enter_support() {
+    let source = include_str!("../app.rs");
+    let windows_noop = source.contains(
+        "#[cfg(windows)]\nfn push_keyboard_enhancement_flags(_stdout: &mut io::Stdout) -> Result<bool> {\n    Ok(false)\n}",
+    );
+
+    assert!(
+        !windows_noop,
+        "Windows terminal setup disables keyboard enhancement entirely; without \
+         DISAMBIGUATE_ESCAPE_CODES, Shift/Ctrl-Enter can arrive as plain Enter and submit instead \
+         of inserting a newline"
+    );
+}
+
 struct FailAfterMouseCapture {
     bytes: Vec<u8>,
     failures_remaining: usize,

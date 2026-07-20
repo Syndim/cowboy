@@ -1,4 +1,6 @@
 use std::io;
+#[cfg(windows)]
+use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -8,8 +10,6 @@ use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEventKind,
 };
-
-#[cfg(not(windows))]
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -194,8 +194,14 @@ fn push_keyboard_enhancement_flags(stdout: &mut io::Stdout) -> Result<bool> {
 }
 
 #[cfg(windows)]
-fn push_keyboard_enhancement_flags(_stdout: &mut io::Stdout) -> Result<bool> {
-    Ok(false)
+fn push_keyboard_enhancement_flags(stdout: &mut io::Stdout) -> Result<bool> {
+    if !crossterm::ansi_support::supports_ansi() {
+        return Ok(false);
+    }
+
+    let command = PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
+    write_keyboard_enhancement_ansi(stdout, command)?;
+    Ok(true)
 }
 
 #[cfg(not(windows))]
@@ -211,7 +217,26 @@ fn pop_keyboard_enhancement_flags(stdout: &mut io::Stdout, active: bool) -> Resu
 }
 
 #[cfg(windows)]
-fn pop_keyboard_enhancement_flags(_stdout: &mut io::Stdout, _active: bool) -> Result<()> {
+fn pop_keyboard_enhancement_flags(stdout: &mut io::Stdout, active: bool) -> Result<()> {
+    if !active {
+        return Ok(());
+    }
+
+    let command = PopKeyboardEnhancementFlags;
+    write_keyboard_enhancement_ansi(stdout, command)
+}
+
+#[cfg(windows)]
+fn write_keyboard_enhancement_ansi(
+    stdout: &mut io::Stdout,
+    command: impl crossterm::Command,
+) -> Result<()> {
+    let mut sequence = String::new();
+    command
+        .write_ansi(&mut sequence)
+        .map_err(|err| anyhow::anyhow!("failed to build keyboard enhancement sequence: {err}"))?;
+    stdout.write_all(sequence.as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
 
