@@ -608,7 +608,8 @@ mod tests {
             .position(|row| row.to_string().contains("selectable transcript text"))
             .unwrap();
         let row_text = visual_rows[row_index].to_string();
-        let start_column = UnicodeWidthStr::width(&row_text[..row_text.find("selectable").unwrap()]);
+        let start_column =
+            UnicodeWidthStr::width(&row_text[..row_text.find("selectable").unwrap()]);
         let end_column = start_column + "selectable".chars().count();
 
         state.start_transcript_selection(TranscriptSelectionPoint::new(row_index, start_column));
@@ -625,7 +626,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         let selected_start = rendered_row.find("selectable").unwrap();
-        let selected_cells = &rendered_cells[selected_start..selected_start + "selectable".chars().count()];
+        let selected_cells =
+            &rendered_cells[selected_start..selected_start + "selectable".chars().count()];
 
         assert!(
             selected_cells

@@ -8,8 +8,6 @@ use crate::app::styles::{
     style_border_accent, style_muted, style_transcript_thought, style_warning,
 };
 use crate::config::AppConfig;
-use std::cell::Cell;
-use std::io::{self, Write};
 
 fn test_state() -> AppState {
     let dir = tempfile::tempdir().unwrap();
@@ -123,105 +121,70 @@ fn slash_suggestions_are_safe_in_short_terminals() {
 }
 
 #[test]
-fn tui_input_cursor_style_uses_unix_block_cursor() {
-    assert_eq!(tui_input_cursor_style(), SetCursorStyle::BlinkingBlock);
+fn terminal_platform_code_lives_in_terminal_crate() {
+    let app_source = include_str!("../app.rs");
+
+    assert!(app_source.contains("cowboy_tui_terminal::TerminalModeGuard"));
+    assert!(!app_source.contains("fn push_keyboard_enhancement_flags"));
+    assert!(!app_source.contains("fn pop_keyboard_enhancement_flags"));
+    assert!(!app_source.contains("PushKeyboardEnhancementFlags"));
+    assert!(!app_source.contains("PopKeyboardEnhancementFlags"));
 }
 
 #[test]
 fn windows_terminal_mode_does_not_execute_unsupported_keyboard_enhancement_on_windows() {
-    let source = include_str!("../app.rs");
-    let lines: Vec<_> = source.lines().collect();
+    let windows_source = include_str!("../../../terminal/src/windows.rs");
     let unsupported_commands = [
         "PushKeyboardEnhancementFlags",
         "PopKeyboardEnhancementFlags",
+        "ExecutableCommand",
+        "execute!",
+        "queue!",
     ];
-    let mut unguarded_commands = Vec::new();
 
     for command in unsupported_commands {
-        for (index, line) in lines.iter().enumerate() {
-            let trimmed = line.trim_start();
-            let executes_command =
-                trimmed.starts_with(command) && (trimmed.contains(',') || trimmed.contains('('));
-
-            if !executes_command {
-                continue;
-            }
-
-            let guard_start = index.saturating_sub(4);
-            let guard_context = lines[guard_start..=index].join("\n");
-            let guarded_for_non_windows = guard_context.contains("not(windows)")
-                || guard_context.contains("cfg(unix)")
-                || guard_context.contains("cfg!(unix)")
-                || guard_context.contains("!cfg!(windows)");
-
-            if !guarded_for_non_windows {
-                unguarded_commands.push(format!("line {}: {}", index + 1, trimmed));
-            }
-        }
+        assert!(
+            !windows_source.contains(command),
+            "Windows legacy console rejects unsupported keyboard enhancement command execution; found `{command}` in Windows terminal source: {windows_source}"
+        );
     }
-
-    assert!(
-        unguarded_commands.is_empty(),
-        "Windows legacy console rejects crossterm keyboard enhancement commands with \
-         `Keyboard progressive enhancement not implemented for the legacy Windows API.`; \
-         gate these commands away from Windows before entering or restoring terminal mode: {}",
-        unguarded_commands.join("; ")
-    );
 }
 
 #[test]
 fn windows_keyboard_enhancement_path_preserves_modified_enter_support() {
-    let source = include_str!("../app.rs");
-    let windows_noop = source.contains(
-        "#[cfg(windows)]\nfn push_keyboard_enhancement_flags(_stdout: &mut io::Stdout) -> Result<bool> {\n    Ok(false)\n}",
-    );
+    let windows_source = include_str!("../../../terminal/src/windows.rs");
+    let terminal_source = include_str!("../../../terminal/src/lib.rs");
 
     assert!(
-        !windows_noop,
-        "Windows terminal setup disables keyboard enhancement entirely; without \
-         DISAMBIGUATE_ESCAPE_CODES, Shift/Ctrl-Enter can arrive as plain Enter and submit instead \
-         of inserting a newline"
+        windows_source.contains("KeyboardInputStrategy::WindowsConsoleKeyRecords"),
+        "Windows terminal setup must use an explicit native console key-record strategy: {windows_source}"
     );
-}
-
-struct FailAfterMouseCapture {
-    bytes: Vec<u8>,
-    failures_remaining: usize,
-}
-
-impl Write for FailAfterMouseCapture {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        if self.failures_remaining > 0
-            && self
-                .bytes
-                .windows(b"?1000h".len())
-                .any(|part| part == b"?1000h")
-        {
-            self.failures_remaining -= 1;
-            return Err(io::Error::other("injected terminal setup failure"));
-        }
-
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    assert!(
+        windows_source.contains("KeyEventRecord")
+            && windows_source.contains("KeyModifiers::SHIFT")
+            && windows_source.contains("KeyModifiers::CONTROL"),
+        "Windows strategy must document and test modified-Enter delivery through native key records: {windows_source}"
+    );
+    assert!(
+        terminal_source.contains("WindowsConsoleKeyRecords")
+            && terminal_source.contains("preserves_modified_enter"),
+        "Terminal crate must expose the Windows strategy as preserving modified Enter: {terminal_source}"
+    );
+    assert!(!windows_source.contains("Ok(false)"));
 }
 
 #[test]
-fn terminal_screen_commands_pair_mouse_capture_and_bracketed_paste() {
-    let mut bytes = Vec::new();
+fn windows_keyboard_enhancement_path_does_not_emit_csi_u_sequences() {
+    let windows_source = include_str!("../../../terminal/src/windows.rs");
 
-    enter_terminal_screen(&mut bytes).unwrap();
-    restore_terminal_screen(&mut bytes).unwrap();
-
-    let commands = String::from_utf8(bytes).unwrap();
-    assert!(commands.contains("?1000h"), "{commands:?}");
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004h"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
+    assert!(
+        !windows_source.contains("PushKeyboardEnhancementFlags")
+            && !windows_source.contains("write_keyboard_enhancement_ansi")
+            && !windows_source.contains("CsiUDisambiguateEscapeCodes"),
+        "Windows crossterm reads WinAPI KeyEventRecord events, not CSI-u bytes; \
+         emitting keyboard enhancement ANSI can make Esc/Ctrl+C arrive as unhandled sequences: \
+         {windows_source}"
+    );
 }
 
 #[test]
@@ -231,111 +194,6 @@ fn osc52_clipboard_command_encodes_selected_text() {
     write_osc52_clipboard(&mut bytes, "hello").unwrap();
 
     assert_eq!(String::from_utf8(bytes).unwrap(), "\x1b]52;c;aGVsbG8=\x07");
-}
-
-#[test]
-fn terminal_screen_setup_failure_rolls_back_mouse_capture() {
-    let mut writer = FailAfterMouseCapture {
-        bytes: Vec::new(),
-        failures_remaining: 1,
-    };
-
-    let error = enter_terminal_screen(&mut writer).unwrap_err();
-
-    let commands = String::from_utf8(writer.bytes).unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::Other);
-    assert_eq!(writer.failures_remaining, 0);
-    assert!(commands.contains("?1000h"), "{commands:?}");
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
-}
-
-#[test]
-fn terminal_guard_retries_screen_cleanup_after_setup_rollback_fails() {
-    let mut writer = FailAfterMouseCapture {
-        bytes: Vec::new(),
-        failures_remaining: 2,
-    };
-    let mut guard = TerminalModeGuard {
-        raw_mode_active: false,
-        screen_active: false,
-        keyboard_enhancement_active: false,
-    };
-
-    let setup_result =
-        guard.activate_screen(|| enter_terminal_screen(&mut writer).map_err(anyhow::Error::from));
-
-    assert!(setup_result.is_err());
-    assert!(guard.screen_active);
-    assert_eq!(writer.failures_remaining, 0);
-
-    guard
-        .restore_with(
-            || Ok(()),
-            || Ok(()),
-            || restore_terminal_screen(&mut writer).map_err(anyhow::Error::from),
-        )
-        .unwrap();
-
-    let commands = String::from_utf8(writer.bytes).unwrap();
-    assert!(guard.is_restored());
-    assert!(commands.contains("?1000l"), "{commands:?}");
-    assert!(commands.contains("?2004l"), "{commands:?}");
-}
-
-#[test]
-fn terminal_guard_retries_only_failed_restoration_components() {
-    let raw_calls = Cell::new(0);
-    let keyboard_calls = Cell::new(0);
-    let screen_calls = Cell::new(0);
-    let mut guard = TerminalModeGuard {
-        raw_mode_active: true,
-        screen_active: true,
-        keyboard_enhancement_active: true,
-    };
-
-    let first_result = guard.restore_with(
-        || {
-            raw_calls.set(raw_calls.get() + 1);
-            Ok(())
-        },
-        || {
-            keyboard_calls.set(keyboard_calls.get() + 1);
-            Ok(())
-        },
-        || {
-            screen_calls.set(screen_calls.get() + 1);
-            Err(anyhow::anyhow!("injected screen restoration failure"))
-        },
-    );
-
-    assert!(first_result.is_err());
-    assert!(!guard.is_restored());
-    assert!(!guard.raw_mode_active);
-    assert!(!guard.keyboard_enhancement_active);
-    assert!(guard.screen_active);
-
-    guard
-        .restore_with(
-            || {
-                raw_calls.set(raw_calls.get() + 1);
-                Ok(())
-            },
-            || {
-                keyboard_calls.set(keyboard_calls.get() + 1);
-                Ok(())
-            },
-            || {
-                screen_calls.set(screen_calls.get() + 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-
-    assert!(guard.is_restored());
-    assert_eq!(raw_calls.get(), 1);
-    assert_eq!(keyboard_calls.get(), 1);
-    assert_eq!(screen_calls.get(), 2);
 }
 
 #[test]

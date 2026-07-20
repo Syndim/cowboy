@@ -369,6 +369,7 @@ dependencies = [
  "chrono",
  "cowboy-command-parser",
  "cowboy-log",
+ "cowboy-tui-terminal",
  "cowboy-workflow-core",
  "cowboy-workflow-engine",
  "cowboy-workflow-store",
@@ -430,6 +431,15 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cowboy-tui-terminal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "tracing",
 ]
 
 [[package]]

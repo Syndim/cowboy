@@ -660,7 +660,7 @@ mod tests {
 
         let rendered = assert_last_entry_is_card(
             &state,
-            "00:00:00 · ◌ Run · submitted run",
+            "00:00:00 · ● Run · submitted run",
             &["build health route"],
         );
         assert!(!rendered.contains("│submitted run:"), "{rendered}");
@@ -674,22 +674,22 @@ mod tests {
         for (input, expected_title, expected_status) in [
             (
                 "/run build health route",
-                "00:00:00 · ◌ Run · submitted run",
+                "00:00:00 · ● Run · submitted run",
                 "submitted run: build health route",
             ),
             (
                 "/run --step build health route",
-                "00:00:00 · ◌ Run · submitted run --step",
+                "00:00:00 · ● Run · submitted run --step",
                 "submitted run --step: build health route",
             ),
             (
                 "/run --workflow test-failure-fix build health route",
-                "00:00:00 · ◌ Run · submitted run --workflow test-failure-fix",
+                "00:00:00 · ● Run · submitted run --workflow test-failure-fix",
                 "submitted run --workflow test-failure-fix: build health route",
             ),
             (
                 "/run --step --workflow test-failure-fix build health route",
-                "00:00:00 · ◌ Run · submitted run --step --workflow test-failure-fix",
+                "00:00:00 · ● Run · submitted run --step --workflow test-failure-fix",
                 "submitted run --step --workflow test-failure-fix: build health route",
             ),
         ] {
@@ -712,13 +712,13 @@ mod tests {
         for (input, expected_title, expected_status, expected_body) in [
             (
                 "/step run-123",
-                "○ Step · submitted step",
+                "● Step · submitted step",
                 "submitted step: run-123",
                 vec!["run-123"],
             ),
             (
                 "/resume run-123",
-                "○ Resume · submitted resume",
+                "● Resume · submitted resume",
                 "submitted resume: run-123",
                 vec!["run-123"],
             ),
@@ -1565,7 +1565,7 @@ mod tests {
         assert_eq!(state.pending_prompt_answer_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
-            "○ Answer · submitted answer",
+            "● Answer · submitted answer",
             &["pending-run", "prompt-42"],
         );
         assert!(!rendered.contains("answer with spaces"), "{rendered}");
@@ -1596,12 +1596,13 @@ mod tests {
         assert_eq!(state.pending_prompt_answer_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
-            "○ Answer · submitted answer",
+            "● Answer · submitted answer",
             &["explicit-run", "explicit-prompt"],
         );
         assert!(!rendered.contains("answer with spaces"), "{rendered}");
         state.cancel_background_tasks();
     }
+
     #[test]
     fn complete_slash_suggestion_updates_input() {
         let mut state = test_state();

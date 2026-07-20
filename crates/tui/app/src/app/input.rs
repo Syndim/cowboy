@@ -283,6 +283,26 @@ mod tests {
         assert_eq!(state.input(), "hello");
     }
 
+    #[tokio::test]
+    async fn control_c_exits_even_when_composer_is_blocked() {
+        let mut state = test_state();
+        state.push_input("hello");
+        lock_composer_with_pending_task(&mut state);
+        assert!(!state.composer_accepts_submit());
+
+        let handling = handle_key_press(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert_eq!(handling, KeyHandling::Exit);
+        assert_eq!(state.input(), "hello");
+        assert_eq!(state.background_task_count(), 1);
+        assert!(!state.composer_accepts_submit());
+
+        state.cancel_background_tasks();
+    }
+
     #[test]
     fn plain_q_appends_to_composer() {
         let mut state = test_state();

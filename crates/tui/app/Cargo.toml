@@ -9,10 +9,11 @@ description = "Workflow-first terminal UI for Cowboy"
 [dependencies]
 base64.workspace = true
 cowboy-command-parser.workspace = true
+cowboy-tui-terminal.workspace = true
 cowboy-workflow-engine = { path = "../../workflow/engine" }
 anyhow.workspace = true
 chrono = { workspace = true, features = ["serde"] }
-crossterm = "0"
+crossterm.workspace = true
 fs2.workspace = true
 dirs = "6"
 pulldown-cmark = "0.13"
