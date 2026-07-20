@@ -1,0 +1,57 @@
+diff --git a/crates/tui/app/src/app/input.rs b/crates/tui/app/src/app/input.rs
+index 9e26ed0..0836802 100644
+--- a/crates/tui/app/src/app/input.rs
++++ b/crates/tui/app/src/app/input.rs
+@@ -612,6 +612,52 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn composer_mouse_wheel_does_not_switch_input_history() {
++        let mut observed_inputs = Vec::new();
++        let mut expected_inputs = Vec::new();
++
++        for (kind, history_steps, expected) in [
++            (crossterm::event::MouseEventKind::ScrollUp, 1, "newer input"),
++            (
++                crossterm::event::MouseEventKind::ScrollDown,
++                2,
++                "older input",
++            ),
++        ] {
++            let mut state = test_state();
++            for entry in ["older input", "newer input"] {
++                state.push_input(entry);
++                assert_eq!(state.take_submitted_input(), Some(entry.to_string()));
++            }
++
++            for _ in 0..history_steps {
++                handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
++            }
++
++            assert_eq!(state.input(), expected);
++            let layout =
++                crate::app::AppLayout::new(ratatui::layout::Rect::new(0, 0, 80, 20), &state);
++            handle_mouse_event(
++                &mut state,
++                crossterm::event::MouseEvent {
++                    kind,
++                    column: layout.composer.x,
++                    row: layout.composer.y,
++                    modifiers: KeyModifiers::NONE,
++                },
++                layout,
++            );
++            observed_inputs.push(state.input().to_string());
++            expected_inputs.push(expected.to_string());
++        }
++
++        assert_eq!(
++            observed_inputs, expected_inputs,
++            "composer input changed after mouse scrolling"
++        );
++    }
++
+     #[test]
+     fn up_restores_persisted_history_from_fresh_state() {
+         let dir = tempfile::tempdir().unwrap();

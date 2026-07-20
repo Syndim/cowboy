@@ -1,7 +1,10 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::Position;
 
+use super::AppLayout;
 use super::commands;
 use super::controls::composer;
+use super::controls::transcript;
 use super::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,10 +109,61 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
     }
 }
 
+pub(super) fn handle_key_press_with_layout(
+    state: &mut AppState,
+    key: KeyEvent,
+    layout: AppLayout,
+) -> KeyHandling {
+    let transcript_is_collapsed = layout.transcript.width == 0 || layout.transcript.height == 0;
+    let is_transcript_scroll = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('u') | KeyCode::Char('d'));
+    if transcript_is_collapsed && is_transcript_scroll {
+        return KeyHandling::Continue;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let limit = match key.code {
+            KeyCode::Char('u') => Some(transcript::next_scroll_limit(state, layout.transcript)),
+            KeyCode::Char('d') => Some(transcript::current_scroll_limit(state, layout.transcript)),
+            _ => None,
+        };
+
+        if let Some(limit) = limit {
+            state.set_transcript_scroll_limit(limit);
+        }
+    }
+
+    handle_key_press(state, key)
+}
+
+pub(super) fn handle_mouse_event(
+    state: &mut AppState,
+    event: MouseEvent,
+    layout: AppLayout,
+) -> bool {
+    let position = Position::new(event.column, event.row);
+
+    match event.kind {
+        MouseEventKind::ScrollUp if layout.transcript.contains(position) => {
+            let limit = transcript::next_scroll_limit(state, layout.transcript);
+            state.set_transcript_scroll_limit(limit);
+            state.scroll_events_up()
+        }
+        MouseEventKind::ScrollDown if layout.transcript.contains(position) => {
+            let limit = transcript::current_scroll_limit(state, layout.transcript);
+            state.set_transcript_scroll_limit(limit);
+            state.scroll_events_down()
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crossterm::event::MouseButton;
+    use ratatui::layout::Rect;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -137,6 +191,22 @@ mod tests {
         assert!(state.pending_prompt().is_none());
     }
 
+    fn seed_history(state: &mut AppState) {
+        state.push_input("from history");
+        assert_eq!(
+            state.take_submitted_input(),
+            Some("from history".to_string())
+        );
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
     #[test]
     fn modified_enter_adds_newline_without_submitting() {
         let mut state = test_state();
@@ -396,6 +466,17 @@ mod tests {
         state.push_card("Transcript", (0..20).map(|index| format!("line {index}")));
     }
 
+    fn visible_transcript_rows(state: &AppState, layout: AppLayout) -> Vec<String> {
+        transcript::lines(
+            state,
+            layout.transcript.height as usize,
+            layout.transcript.width as usize,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect()
+    }
+
     #[tokio::test]
     async fn active_run_allows_draft_edits_but_plain_enter_does_not_submit() {
         let mut state = test_state();
@@ -613,6 +694,52 @@ mod tests {
     }
 
     #[test]
+    fn composer_mouse_wheel_does_not_switch_input_history() {
+        let mut observed_inputs = Vec::new();
+        let mut expected_inputs = Vec::new();
+
+        for (kind, history_steps, expected) in [
+            (crossterm::event::MouseEventKind::ScrollUp, 1, "newer input"),
+            (
+                crossterm::event::MouseEventKind::ScrollDown,
+                2,
+                "older input",
+            ),
+        ] {
+            let mut state = test_state();
+            for entry in ["older input", "newer input"] {
+                state.push_input(entry);
+                assert_eq!(state.take_submitted_input(), Some(entry.to_string()));
+            }
+
+            for _ in 0..history_steps {
+                handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+
+            assert_eq!(state.input(), expected);
+            let layout =
+                crate::app::AppLayout::new(ratatui::layout::Rect::new(0, 0, 80, 20), &state);
+            handle_mouse_event(
+                &mut state,
+                crossterm::event::MouseEvent {
+                    kind,
+                    column: layout.composer.x,
+                    row: layout.composer.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                layout,
+            );
+            observed_inputs.push(state.input().to_string());
+            expected_inputs.push(expected.to_string());
+        }
+
+        assert_eq!(
+            observed_inputs, expected_inputs,
+            "composer input changed after mouse scrolling"
+        );
+    }
+
+    #[test]
     fn up_restores_persisted_history_from_fresh_state() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
@@ -741,5 +868,263 @@ mod tests {
         handle_key_press(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(state.input(), "newer one\nnewer two");
         assert_eq!(state.input_cursor(), "newer one\nnewer two".chars().count());
+    }
+
+    #[test]
+    fn up_on_oldest_history_entry_resets_cursor_to_start() {
+        let mut state = test_state();
+        for entry in ["oldest entry", "newest entry"] {
+            state.push_input(entry);
+            assert_eq!(state.take_submitted_input(), Some(entry.to_string()));
+        }
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.input(), "oldest entry");
+        assert_eq!(state.input_cursor(), 0);
+
+        for _ in 0..3 {
+            handle_key_press(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(state.input_cursor(), 3);
+
+        handle_key_press(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(state.input(), "oldest entry");
+        assert_eq!(state.input_cursor(), 0);
+    }
+
+    #[test]
+    fn transcript_wheel_changes_only_transcript_scroll_state() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        state.push_input("draft");
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+        let point = (layout.transcript.x, layout.transcript.y);
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(MouseEventKind::ScrollUp, point.0, point.1),
+            layout,
+        ));
+        assert!((1..=10).contains(&state.scroll_offset()));
+        assert!(!state.is_following_events());
+        assert_eq!(state.input(), "draft");
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(MouseEventKind::ScrollDown, point.0, point.1),
+            layout,
+        ));
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+        assert_eq!(state.input(), "draft");
+    }
+
+    #[test]
+    fn transcript_wheel_does_not_scroll_empty_or_short_content() {
+        let area = Rect::new(0, 0, 80, 20);
+
+        for mut state in [test_state(), {
+            let mut state = test_state();
+            state.push_card("Notice", ["short".to_string()]);
+            state
+        }] {
+            let layout = AppLayout::new(area, &state);
+            let event = mouse(
+                MouseEventKind::ScrollUp,
+                layout.transcript.x,
+                layout.transcript.y,
+            );
+
+            assert!(!handle_mouse_event(&mut state, event, layout));
+            assert!(!handle_mouse_event(&mut state, event, layout));
+            assert_eq!(state.scroll_offset(), 0);
+            assert!(state.is_following_events());
+        }
+    }
+
+    #[test]
+    fn transcript_wheel_stops_at_oldest_reachable_row() {
+        let mut state = test_state();
+        populate_scrollable_transcript(&mut state);
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+        let scroll_up = mouse(
+            MouseEventKind::ScrollUp,
+            layout.transcript.x,
+            layout.transcript.y,
+        );
+
+        let mut handled = 0;
+        while handle_mouse_event(&mut state, scroll_up, layout) {
+            handled += 1;
+            assert!(handled < 20, "scrolling never reached the oldest row");
+        }
+
+        let oldest_offset = state.scroll_offset();
+        assert!(oldest_offset > 0);
+        assert!(!handle_mouse_event(&mut state, scroll_up, layout));
+        assert_eq!(state.scroll_offset(), oldest_offset);
+
+        assert!(handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::ScrollDown,
+                layout.transcript.x,
+                layout.transcript.y,
+            ),
+            layout,
+        ));
+        assert!(state.scroll_offset() < oldest_offset);
+    }
+
+    #[test]
+    fn keyboard_scroll_preserves_position_in_zero_dimension_layouts() {
+        for collapsed_area in [Rect::new(0, 0, 80, 5), Rect::new(0, 0, 0, 20)] {
+            let mut state = test_state();
+            state.push_card("Transcript", (0..40).map(|index| format!("line {index}")));
+            let usable_layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+            let handling = handle_key_press_with_layout(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                usable_layout,
+            );
+            assert_eq!(handling, KeyHandling::Continue);
+            let saved_offset = state.scroll_offset();
+            let saved_rows = visible_transcript_rows(&state, usable_layout);
+            assert!(saved_offset > 0);
+            assert!(!state.is_following_events());
+
+            let collapsed_layout = AppLayout::new(collapsed_area, &state);
+            assert!(
+                collapsed_layout.transcript.width == 0 || collapsed_layout.transcript.height == 0
+            );
+            for code in [KeyCode::Char('u'), KeyCode::Char('d')] {
+                let handling = handle_key_press_with_layout(
+                    &mut state,
+                    KeyEvent::new(code, KeyModifiers::CONTROL),
+                    collapsed_layout,
+                );
+
+                assert_eq!(handling, KeyHandling::Continue);
+                assert_eq!(state.scroll_offset(), saved_offset);
+                assert!(!state.is_following_events());
+            }
+
+            assert_eq!(visible_transcript_rows(&state, usable_layout), saved_rows);
+        }
+    }
+
+    #[test]
+    fn scroll_down_routes_move_immediately_after_viewport_grows() {
+        for use_mouse in [true, false] {
+            let mut state = test_state();
+            state.push_card("Transcript", (0..40).map(|index| format!("line {index}")));
+            let short_layout = AppLayout::new(Rect::new(0, 0, 80, 9), &state);
+            let scroll_up = mouse(
+                MouseEventKind::ScrollUp,
+                short_layout.transcript.x,
+                short_layout.transcript.y,
+            );
+            while handle_mouse_event(&mut state, scroll_up, short_layout) {}
+
+            let tall_layout = AppLayout::new(Rect::new(0, 0, 80, 25), &state);
+            let resized_limit = transcript::current_scroll_limit(&state, tall_layout.transcript);
+            assert!(state.scroll_offset() > resized_limit.saturating_add(10));
+            let before = visible_transcript_rows(&state, tall_layout);
+
+            if use_mouse {
+                assert!(handle_mouse_event(
+                    &mut state,
+                    mouse(
+                        MouseEventKind::ScrollDown,
+                        tall_layout.transcript.x,
+                        tall_layout.transcript.y,
+                    ),
+                    tall_layout,
+                ));
+            } else {
+                let handling = handle_key_press_with_layout(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+                    tall_layout,
+                );
+                assert_eq!(handling, KeyHandling::Continue);
+            }
+
+            let after = visible_transcript_rows(&state, tall_layout);
+            assert_ne!(after, before, "ScrollDown only drained hidden overscroll");
+            assert_eq!(
+                state.scroll_offset(),
+                resized_limit.saturating_sub(10),
+                "stored offset retained hidden overscroll"
+            );
+        }
+    }
+
+    #[test]
+    fn non_scrollable_regions_and_unsupported_mouse_events_are_no_ops() {
+        let mut state = test_state();
+        seed_history(&mut state);
+        state.push_input("draft");
+        let layout = AppLayout::new(Rect::new(0, 0, 80, 20), &state);
+
+        for (column, row) in [
+            (layout.header.x, layout.header.y),
+            (layout.status.x, layout.status.y),
+            (layout.composer.right(), layout.composer.bottom()),
+        ] {
+            assert!(!handle_mouse_event(
+                &mut state,
+                mouse(MouseEventKind::ScrollUp, column, row),
+                layout,
+            ));
+        }
+
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            assert!(!handle_mouse_event(
+                &mut state,
+                mouse(kind, layout.transcript.x, layout.transcript.y),
+                layout,
+            ));
+        }
+
+        assert_eq!(state.input(), "draft");
+        assert_eq!(state.scroll_offset(), 0);
+        assert!(state.is_following_events());
+    }
+
+    #[test]
+    fn expanded_composer_boundary_uses_current_shared_layout() {
+        let mut state = test_state();
+        seed_history(&mut state);
+        let area = Rect::new(0, 0, 40, 20);
+        let compact = AppLayout::new(area, &state);
+        state.push_input("one\ntwo\nthree\nfour");
+        let expanded = AppLayout::new(area, &state);
+
+        assert!(expanded.composer.y < compact.composer.y);
+        assert_eq!(expanded.transcript.bottom(), expanded.status.y);
+        assert_eq!(expanded.status.bottom(), expanded.composer.y);
+        let input = state.input().to_string();
+        handle_mouse_event(
+            &mut state,
+            mouse(
+                MouseEventKind::ScrollUp,
+                expanded.composer.x,
+                expanded.composer.y,
+            ),
+            expanded,
+        );
+        assert_eq!(state.input(), input);
+        assert_eq!(state.scroll_offset(), 0);
     }
 }
