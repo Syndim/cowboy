@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
@@ -19,15 +19,12 @@ use super::super::styles::{
 struct TranscriptViewport {
     rows: Vec<Line<'static>>,
     effective_offset: usize,
+    #[cfg(test)]
     older_overflow: bool,
+    #[cfg(test)]
     newer_overflow: bool,
+    #[cfg(test)]
     content_length: usize,
-}
-
-impl TranscriptViewport {
-    fn has_overflow(&self) -> bool {
-        self.older_overflow || self.newer_overflow
-    }
 }
 
 #[derive(Debug)]
@@ -47,34 +44,12 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
         return;
     }
 
-    let visible_height = area.height as usize;
-    let (content_area, viewport) = content_viewport(state, area, state.scroll_offset());
-    let show_scrollbar = content_area != area;
-    let scrollbar_position = scrollbar_position(&viewport, visible_height);
+    let (_, viewport) = content_viewport(state, area, state.scroll_offset());
 
     frame.render_widget(
         Paragraph::new(selected_rows(viewport.rows, state.transcript_selection())),
-        content_area,
+        area,
     );
-
-    if show_scrollbar {
-        let scrollbar_area = Rect {
-            x: area.right() - 1,
-            width: 1,
-            ..area
-        };
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(None)
-            .end_symbol(None)
-            .thumb_symbol("█")
-            .thumb_style(style_accent())
-            .track_symbol(Some("│"))
-            .track_style(style_muted());
-        let mut scrollbar_state = ScrollbarState::new(viewport.content_length)
-            .position(scrollbar_position)
-            .viewport_content_length(visible_height);
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
 }
 
 pub(in crate::app) fn next_scroll_limit(state: &AppState, area: Rect) -> usize {
@@ -125,35 +100,8 @@ fn content_viewport(
     requested_offset: usize,
 ) -> (Rect, TranscriptViewport) {
     let visible_height = area.height as usize;
-    let full_viewport =
-        viewport_at_offset(state, visible_height, area.width as usize, requested_offset);
-    if area.width < 2 || !full_viewport.has_overflow() {
-        return (area, full_viewport);
-    }
-
-    let content_area = Rect {
-        width: area.width - 1,
-        ..area
-    };
-    let viewport = viewport_at_offset(
-        state,
-        visible_height,
-        content_area.width as usize,
-        requested_offset,
-    );
-    (content_area, viewport)
-}
-
-fn scrollbar_position(viewport: &TranscriptViewport, visible_height: usize) -> usize {
-    let maximum_offset = viewport.content_length.saturating_sub(visible_height);
-    if maximum_offset == 0 {
-        return 0;
-    }
-
-    maximum_offset
-        .saturating_sub(viewport.effective_offset)
-        .saturating_mul(viewport.content_length.saturating_sub(1))
-        / maximum_offset
+    let viewport = viewport_at_offset(state, visible_height, area.width as usize, requested_offset);
+    (area, viewport)
 }
 
 fn selected_rows(
@@ -364,8 +312,11 @@ fn viewport_at_offset(
         return TranscriptViewport {
             rows: Vec::new(),
             effective_offset: 0,
+            #[cfg(test)]
             older_overflow: false,
+            #[cfg(test)]
             newer_overflow: false,
+            #[cfg(test)]
             content_length: 0,
         };
     }
@@ -406,16 +357,23 @@ fn select_viewport(
     let effective_offset = requested_offset.min(max_offset);
     let end = rows.len().saturating_sub(effective_offset);
     let start = end.saturating_sub(max_visible_lines);
+    #[cfg(test)]
     let older_overflow = older_unmeasured || start > 0;
+    #[cfg(test)]
     let newer_overflow = end < rows.len();
+    #[cfg(test)]
     let unmeasured_sentinel = usize::from(older_unmeasured);
+    #[cfg(test)]
     let content_length = rows.len().saturating_add(unmeasured_sentinel);
 
     TranscriptViewport {
         rows: rows[start..end].to_vec(),
         effective_offset,
+        #[cfg(test)]
         older_overflow,
+        #[cfg(test)]
         newer_overflow,
+        #[cfg(test)]
         content_length,
     }
 }
@@ -692,13 +650,36 @@ mod tests {
     }
 
     #[test]
-    fn selection_point_hit_testing_excludes_scrollbar_column() {
+    fn selection_point_hit_testing_includes_rightmost_column() {
         let mut state = test_state();
         state.push_card("Transcript", (0..20).map(|index| format!("row {index}")));
         let area = Rect::new(0, 0, 24, 6);
 
         assert!(selection_point_at(&state, area, Position::new(22, 1)).is_some());
-        assert_eq!(selection_point_at(&state, area, Position::new(23, 1)), None);
+        assert!(selection_point_at(&state, area, Position::new(23, 1)).is_some());
+    }
+
+    #[test]
+    fn overflowing_transcript_keeps_last_column_selectable_without_scrollbar_chrome() {
+        let mut state = test_state();
+        state.push_card("Transcript", (0..20).map(|index| format!("selectable row {index}")));
+        let area = Rect::new(0, 0, 24, 6);
+        let rows = rendered_rows(&state, area.height, area.width);
+        let rightmost_column = area.right().saturating_sub(1);
+
+        assert!(
+            selection_point_at(&state, area, Position::new(rightmost_column, 1)).is_some(),
+            "overflowing transcripts should keep the last visible column selectable instead of reserving it for scrollbar chrome: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|row| !row.ends_with('█')),
+            "overflowing transcripts should not render a scrollbar thumb in the final column: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| !row.ends_with("││") && !row.ends_with("╯│")),
+            "overflowing transcripts should not render an extra scrollbar track after normal transcript borders: {rows:?}"
+        );
     }
 
     #[test]
@@ -774,13 +755,6 @@ mod tests {
             .content
             .chunks(width)
             .map(|row| row.iter().map(|cell| cell.symbol()).collect())
-            .collect()
-    }
-
-    fn scrollbar_column(state: &AppState, height: u16, width: u16) -> Vec<String> {
-        rendered_rows(state, height, width)
-            .into_iter()
-            .map(|row| row.chars().last().unwrap_or(' ').to_string())
             .collect()
     }
 
@@ -1086,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn overflowing_content_reserves_rightmost_scrollbar_column() {
+    fn overflowing_content_uses_full_width_without_scrollbar_chrome() {
         let mut state = test_state();
         state.apply_workflow_event(WorkflowEvent::new(
             "run-2",
@@ -1097,42 +1071,41 @@ mod tests {
         ));
 
         let rows = rendered_rows(&state, 8, 24);
-        let scrollbar = scrollbar_column(&state, 8, 24);
 
-        assert!(scrollbar.iter().any(|symbol| symbol == "█"), "{rows:?}");
         assert!(
-            scrollbar
-                .iter()
-                .all(|symbol| matches!(symbol.as_str(), "█" | "│" | " ")),
-            "{rows:?}"
+            rows.iter().all(|row| !row.ends_with('█')),
+            "overflowing content should not draw a scrollbar thumb: {rows:?}"
         );
         assert!(
-            rows.iter().all(|row| !row.ends_with("END_MARKER")),
-            "{rows:?}"
+            rows.iter()
+                .all(|row| !row.ends_with("││") && !row.ends_with("╯│")),
+            "overflowing content should not draw scrollbar chrome after normal transcript borders: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("END_MARKER")),
+            "overflowing content should keep tail content visible across the full transcript width: {rows:?}"
         );
     }
 
     #[test]
-    fn scrollbar_thumb_moves_up_and_returns_to_bottom() {
+    fn scroll_offset_moves_up_and_returns_to_bottom_without_scrollbar_chrome() {
         let mut state = test_state();
         for index in 0..20 {
             state.push_card("Notice", [format!("transcript row {index}")]);
         }
 
-        let following = scrollbar_column(&state, 10, 40);
-        assert_eq!(following.last().map(String::as_str), Some("█"));
-        let following_bottom = following.iter().rposition(|symbol| symbol == "█").unwrap();
+        let following = rendered_rows(&state, 10, 40);
 
         assert!(state.scroll_events_up());
-        let scrolled = scrollbar_column(&state, 10, 40);
-        let scrolled_bottom = scrolled.iter().rposition(|symbol| symbol == "█").unwrap();
+        let scrolled = rendered_rows(&state, 10, 40);
 
+        assert_ne!(scrolled, following);
         assert!(
-            scrolled_bottom < following_bottom,
-            "{following:?}\n{scrolled:?}"
+            scrolled.iter().all(|row| !row.ends_with('█')),
+            "{scrolled:?}"
         );
         assert!(state.scroll_events_down());
-        assert_eq!(scrollbar_column(&state, 10, 40), following);
+        assert_eq!(rendered_rows(&state, 10, 40), following);
     }
 
     #[test]
@@ -1151,11 +1124,6 @@ mod tests {
         assert!(!following.newer_overflow);
         assert_eq!(following.effective_offset, 0);
         assert!(following.content_length > following.rows.len());
-        assert!(
-            scrollbar_column(&state, 6, 20)
-                .iter()
-                .any(|symbol| symbol == "█")
-        );
 
         assert!(state.scroll_events_up());
         let scrolled = viewport(&state, 6, 20);
@@ -1179,15 +1147,16 @@ mod tests {
     }
 
     #[test]
-    fn short_content_has_no_scrollbar() {
+    fn short_content_has_no_overflow() {
         let mut state = test_state();
         state.push_card("Notice", ["short".to_string()]);
 
         let viewport = viewport(&state, 20, 40);
-        let column = scrollbar_column(&state, 20, 40);
+        let rows = rendered_rows(&state, 20, 40);
 
-        assert!(!viewport.has_overflow());
-        assert!(column.iter().all(|symbol| symbol != "█"), "{column:?}");
+        assert!(!viewport.older_overflow);
+        assert!(!viewport.newer_overflow);
+        assert!(rows.iter().all(|row| !row.ends_with('█')), "{rows:?}");
     }
 
     #[test]

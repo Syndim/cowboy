@@ -853,7 +853,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
 }
 
 #[test]
-fn draw_shows_transcript_scrollbar_without_overwriting_status_or_composer() {
+fn draw_omits_transcript_scrollbar_without_overwriting_status_or_composer() {
     let mut state = test_state();
     for index in 0..30 {
         state.push_card("Notice", [format!("overflowing transcript entry {index}")]);
@@ -863,12 +863,17 @@ fn draw_shows_transcript_scrollbar_without_overwriting_status_or_composer() {
     let layout = AppLayout::new(area, &state);
     let rows = rendered_rows(&state, area.width, area.height);
     let rendered = rows.join("\n");
-    let scrollbar_column = usize::from(layout.transcript.right() - 1);
+    let transcript_rows =
+        &rows[usize::from(layout.transcript.y)..usize::from(layout.transcript.bottom())];
 
     assert!(
-        rows[usize::from(layout.transcript.y)..usize::from(layout.transcript.bottom())]
+        transcript_rows.iter().all(|row| !row.ends_with('█')),
+        "{rendered}"
+    );
+    assert!(
+        transcript_rows
             .iter()
-            .any(|row| row.chars().nth(scrollbar_column) == Some('█')),
+            .all(|row| !row.ends_with("││") && !row.ends_with("╯│")),
         "{rendered}"
     );
     assert!(
