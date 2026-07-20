@@ -710,6 +710,7 @@ impl AppState {
         self.history_index.is_some()
     }
 
+    #[cfg(test)]
     pub(in crate::app) fn background_task_count(&self) -> usize {
         self.background.len()
     }
