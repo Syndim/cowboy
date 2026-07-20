@@ -236,11 +236,17 @@ fn section_wrapped_lines(section: &CardSection, interior_width: usize) -> Vec<Li
         return Vec::new();
     }
 
+    let wrap_width = if interior_width > 1 {
+        interior_width - 1
+    } else {
+        interior_width
+    };
+
     section
         .lines
         .iter()
         .cloned()
-        .flat_map(|line| wrap_line(line, interior_width))
+        .flat_map(|line| wrap_line(line, wrap_width))
         .collect()
 }
 
@@ -488,14 +494,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("│123456│"), "{text}");
-        assert!(text.contains("│7890  │"), "{text}");
-        assert!(text.contains("│line 2│"), "{text}");
-        assert!(text.contains("│line 3│"), "{text}");
+        assert!(text.contains("│12345 │"), "{text}");
+        assert!(text.contains("│67890 │"), "{text}");
+        assert!(text.contains("│line  │"), "{text}");
+        assert!(text.contains("│2     │"), "{text}");
+        assert!(text.contains("│3     │"), "{text}");
         assert!(!text.contains("more rows"), "{text}");
         assert!(
             rows.iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 8)
+        );
+    }
+
+    #[test]
+    fn card_body_rows_keep_padding_before_right_border() {
+        let rows = Card::new("●", "Plan", CardTone::Plan)
+            .section(CardSection::body(vec![Line::from(
+                "- Keep scroll amount, saturation, and follow-latest transitions in crates/tui/app/src/app/state.rs.",
+            )]))
+            .render(24);
+        let body_rows = rows
+            .iter()
+            .map(|line| line.to_string())
+            .filter(|row| row.starts_with('│') && row.ends_with('│'))
+            .collect::<Vec<_>>();
+
+        assert!(
+            body_rows
+                .iter()
+                .all(|row| row.chars().rev().nth(1).is_some_and(|ch| ch == ' ')),
+            "card body rows should keep one blank column before the right border so wrapped text does not look cut off: {body_rows:?}"
         );
     }
 
@@ -513,16 +541,33 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("│abcdefgh│"), "{text}");
-        assert!(text.contains("│ijklmnop│"), "{text}");
-        assert!(text.contains("│qrstuvwx│"), "{text}");
-        assert!(text.contains("│yz      │"), "{text}");
+        assert!(text.contains("│abcdefg │"), "{text}");
+        assert!(text.contains("│hijklmn │"), "{text}");
+        assert!(text.contains("│opqrstu │"), "{text}");
+        assert!(text.contains("│vwxyz   │"), "{text}");
         assert!(!text.contains("more rows"), "{text}");
         assert_eq!(rows.len(), 8, "{rows:?}");
         assert!(
             rows.iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 10)
         );
+    }
+
+    #[test]
+    fn narrow_body_cards_stay_within_normalized_width() {
+        for width in [0, 1, 2, 3] {
+            let normalized_width = width.max(MIN_CARD_WIDTH);
+            let rows = Card::new("●", "Narrow", CardTone::Neutral)
+                .section(CardSection::body(vec![Line::from("abcd")]))
+                .render(width);
+
+            assert!(
+                rows.iter().all(|line| {
+                    UnicodeWidthStr::width(line.to_string().as_str()) <= normalized_width
+                }),
+                "width {width} rendered rows outside normalized width {normalized_width}: {rows:?}"
+            );
+        }
     }
 
     #[test]
