@@ -426,6 +426,28 @@ pub struct WorkflowSourceSnapshot {
     pub files: BTreeMap<String, String>,
 }
 
+/// Summary data denormalized into a run head for listing runs without loading full run records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunHeadSummary {
+    /// Workflow name/id shown in run listings.
+    pub workflow_name: WorkflowId,
+    /// Short generated topic shown in run listings when available.
+    pub request_topic: Option<String>,
+    /// Step id that should run next when the run resumes.
+    pub current_step: StepId,
+}
+
+impl RunHeadSummary {
+    /// Build summary data from the mutable workflow run state.
+    pub fn from_run(run: &WorkflowRun) -> Self {
+        Self {
+            workflow_name: run.workflow_name.clone(),
+            request_topic: run.request_topic.clone(),
+            current_step: run.current_step.clone(),
+        }
+    }
+}
+
 /// Mutable run pointer stored separately from immutable objects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunHead {
@@ -439,6 +461,23 @@ pub struct RunHead {
     pub status: RunStatus,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Summary-only fields used by run listings.
+    #[serde(default)]
+    pub summary: Option<RunHeadSummary>,
+}
+
+impl RunHead {
+    /// Build a run head from the mutable workflow run state.
+    pub fn from_run(run: &WorkflowRun) -> Self {
+        Self {
+            run_id: run.id.clone(),
+            workflow_hash: run.workflow_hash.clone(),
+            head_step: run.head.clone(),
+            status: run.status.clone(),
+            updated_at: run.updated_at,
+            summary: Some(RunHeadSummary::from_run(run)),
+        }
+    }
 }
 
 /// Persisted backend session for one role within one workflow run.
@@ -559,6 +598,44 @@ mod tests {
         assert_eq!(run.config_set, ResolvedConfigSet::default());
         assert_eq!(run.retries_used, 0);
         assert!(run.step_retries_used.is_empty());
+    }
+
+    #[test]
+    fn run_head_defaults_legacy_summary_and_builds_from_run() {
+        let legacy: RunHead = serde_json::from_value(serde_json::json!({
+            "run_id": "legacy",
+            "workflow_hash": "hash",
+            "head_step": null,
+            "status": { "status": "running" },
+            "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.summary, None);
+
+        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+            "id": "run",
+            "workflow_name": "wf",
+            "workflow_api_version": 1,
+            "workflow_hash": "hash",
+            "workflow_sources": {},
+            "original_request": "do it",
+            "request_topic": "topic",
+            "status": { "status": "running" },
+            "current_step": "start",
+            "head": "record-hash",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-02T00:00:00Z"
+        }))
+        .unwrap();
+
+        let head = RunHead::from_run(&run);
+        assert_eq!(head.run_id, "run");
+        assert_eq!(head.workflow_hash, "hash");
+        assert_eq!(head.head_step.as_deref(), Some("record-hash"));
+        let summary = head.summary.expect("summary");
+        assert_eq!(summary.workflow_name, "wf");
+        assert_eq!(summary.request_topic.as_deref(), Some("topic"));
+        assert_eq!(summary.current_step, "start");
     }
 
     #[test]

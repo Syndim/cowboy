@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -19,24 +20,57 @@ use crate::tables::{
 use crate::{Error, Result};
 
 const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+static DATABASE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Database>>>> = OnceLock::new();
+
 
 pub type StoreWaitObserver = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
 
 /// redb-backed implementation of workflow run storage.
 ///
-/// The store keeps immutable content-addressed objects in `OBJECTS` and mutable
-/// run state in dedicated tables. The value is path-backed and opens redb only
+/// The default store keeps immutable content-addressed objects in `OBJECTS` and mutable
+/// run state in dedicated tables. Most values are path-backed and open redb only
 /// inside each operation, so idle Cowboy processes do not retain redb's
-/// exclusive writable database lock.
+/// exclusive writable database lock. Runtime-owned values may opt into a
+/// process-wide shared cached handle so multiple runtimes in one process reuse
+/// the same redb owner instead of contending with each other.
 #[derive(Clone)]
 pub struct RedbRunStore {
     /// Path to the redb workflow database.
     path: PathBuf,
     /// Optional notification hook fired once when a database-open wait begins.
     wait_observer: Option<StoreWaitObserver>,
+    /// Whether operations use the process-wide database cache for this path.
+    cache_database: bool,
 }
 
 impl RedbRunStore {
+    /// Build a cloneable store value that opens and caches redb on first use.
+    pub fn cached(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            wait_observer: None,
+            cache_database: true,
+        }
+    }
+
+    /// Build a cloneable store value without opening redb until an operation runs.
+    pub fn lazy(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            wait_observer: None,
+            cache_database: false,
+        }
+    }
+
+    /// Return a store clone for the same path with a per-operation wait observer.
+    pub fn with_wait_observer(&self, wait_observer: StoreWaitObserver) -> Self {
+        Self {
+            path: self.path.clone(),
+            wait_observer: Some(wait_observer),
+            cache_database: self.cache_database,
+        }
+    }
+
     /// Create or open a database at `path`, then drop the validation handle.
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         Self::create_inner(path, None)
@@ -64,6 +98,7 @@ impl RedbRunStore {
         Ok(Self {
             path,
             wait_observer,
+            cache_database: false,
         })
     }
 
@@ -78,6 +113,7 @@ impl RedbRunStore {
         Ok(Self {
             path,
             wait_observer: None,
+            cache_database: false,
         })
     }
 
@@ -532,13 +568,35 @@ impl RedbRunStore {
         Ok(value)
     }
 
-    fn open_database(&self) -> Result<Database> {
+    fn open_database(&self) -> Result<Arc<Database>> {
+        if self.cache_database {
+            return self.open_cached_database();
+        }
+
         ensure_parent_dir(&self.path)?;
         open_database_when_available(
             &self.path,
             |path| Database::create(path),
             self.wait_observer.as_ref(),
         )
+        .map(Arc::new)
+    }
+
+    fn open_cached_database(&self) -> Result<Arc<Database>> {
+        let cache = DATABASE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache.lock().map_err(|_| Error::CachePoisoned)?;
+        if let Some(db) = cache.get(&self.path) {
+            return Ok(db.clone());
+        }
+
+        ensure_parent_dir(&self.path)?;
+        let db = Arc::new(open_database_when_available(
+            &self.path,
+            |path| Database::create(path),
+            self.wait_observer.as_ref(),
+        )?);
+        cache.insert(self.path.clone(), db.clone());
+        Ok(db)
     }
 }
 
@@ -717,6 +775,7 @@ mod tests {
     };
     use serde_json::Value;
 
+    use cowboy_workflow_core::RunHeadSummary;
     use super::*;
 
     fn store() -> (tempfile::NamedTempFile, RedbRunStore) {
@@ -819,6 +878,11 @@ mod tests {
             head_step: Some("step-hash".into()),
             status: RunStatus::Completed,
             updated_at: now,
+            summary: Some(RunHeadSummary {
+                workflow_name: "wf".into(),
+                request_topic: Some("topic".into()),
+                current_step: "step-1".into(),
+            }),
         };
         store.update_run_head("run-1", head.clone()).unwrap();
         assert_eq!(store.load_run_head("run-1").unwrap(), head);
@@ -911,6 +975,7 @@ mod tests {
             head_step: Some(record_hash.clone()),
             status: RunStatus::Completed,
             updated_at: Utc::now(),
+            summary: Some(RunHeadSummary::from_run(&run)),
         };
         store.save_run(&run).unwrap();
         store.update_run_head(&run.id, head.clone()).unwrap();
@@ -935,6 +1000,7 @@ mod tests {
             head_step: None,
             status: RunStatus::Running,
             updated_at: Utc::now(),
+            summary: Some(RunHeadSummary::from_run(&run_a)),
         };
         store_a.save_run(&run_a).unwrap();
         store_a.update_run_head(&run_a.id, head_a.clone()).unwrap();
@@ -950,6 +1016,7 @@ mod tests {
             head_step: None,
             status: RunStatus::Running,
             updated_at: Utc::now(),
+            summary: Some(RunHeadSummary::from_run(&run_b)),
         };
         store_b.save_run(&run_b).unwrap();
         store_b.update_run_head(&run_b.id, head_b.clone()).unwrap();
@@ -1039,6 +1106,7 @@ mod tests {
             head_step: Some(record_hash.clone()),
             status: RunStatus::Completed,
             updated_at: Utc::now(),
+            summary: Some(RunHeadSummary::from_run(&run)),
         };
         store.save_run(&run).unwrap();
         store.update_run_head(&run.id, head).unwrap();

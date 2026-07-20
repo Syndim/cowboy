@@ -193,7 +193,7 @@ pub fn apply_step_record<S: RunStore>(
     };
     run.status = status.clone();
     store.save_run(run)?;
-    store.update_run_head(&run.id, run_head(run))?;
+    store.update_run_head(&run.id, RunHead::from_run(run))?;
     Ok(status)
 }
 
@@ -206,18 +206,8 @@ pub fn apply_run_status<S: RunStore>(
     run.status = status.clone();
     run.updated_at = Utc::now();
     store.save_run(run)?;
-    store.update_run_head(&run.id, run_head(run))?;
+    store.update_run_head(&run.id, RunHead::from_run(run))?;
     Ok(status)
-}
-
-fn run_head(run: &WorkflowRun) -> RunHead {
-    RunHead {
-        run_id: run.id.clone(),
-        workflow_hash: run.workflow_hash.clone(),
-        head_step: run.head.clone(),
-        status: run.status.clone(),
-        updated_at: run.updated_at,
-    }
 }
 
 fn next_record_id(run: &WorkflowRun) -> String {

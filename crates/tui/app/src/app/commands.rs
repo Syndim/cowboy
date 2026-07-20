@@ -622,13 +622,7 @@ mod tests {
     }
 
     fn seed_run(store: &RedbRunStore, run: WorkflowRun) {
-        let head = RunHead {
-            run_id: run.id.clone(),
-            workflow_hash: run.workflow_hash.clone(),
-            head_step: run.head.clone(),
-            status: run.status.clone(),
-            updated_at: run.updated_at,
-        };
+        let head = RunHead::from_run(&run);
         store.save_run(&run).unwrap();
         store.update_run_head(&run.id, head).unwrap();
     }

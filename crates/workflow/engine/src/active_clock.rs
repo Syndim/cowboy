@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use cowboy_workflow_core::{Result, RunHead, RunStore, StepRecord, WorkflowRun};
+use cowboy_workflow_core::{Result, RunStore, StepRecord, WorkflowRun};
 
 use crate::events::{WorkflowEvent, WorkflowEventKind};
 
@@ -106,7 +106,7 @@ impl ActiveRunClock {
     ) -> Result<()> {
         run.active_duration_ms = self.active_duration_at(timestamp);
         store.save_run(run)?;
-        store.update_run_head(&run.id, run_head(run))?;
+        store.update_run_head(&run.id, cowboy_workflow_core::RunHead::from_run(run))?;
         Ok(())
     }
 }
@@ -114,16 +114,6 @@ impl ActiveRunClock {
 fn nonnegative_milliseconds_since(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
     let elapsed_ms = end.signed_duration_since(start).num_milliseconds();
     u64::try_from(elapsed_ms).unwrap_or(0)
-}
-
-fn run_head(run: &WorkflowRun) -> RunHead {
-    RunHead {
-        run_id: run.id.clone(),
-        workflow_hash: run.workflow_hash.clone(),
-        head_step: run.head.clone(),
-        status: run.status.clone(),
-        updated_at: run.updated_at,
-    }
 }
 
 #[cfg(test)]

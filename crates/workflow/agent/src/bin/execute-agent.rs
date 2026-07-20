@@ -123,13 +123,7 @@ fn ensure_standalone_run(store: &RedbRunStore, config: &Args) -> Result<Workflow
             if !has_head {
                 store.update_run_head(
                     &run.id,
-                    RunHead {
-                        run_id: run.id.clone(),
-                        workflow_hash: run.workflow_hash.clone(),
-                        head_step: None,
-                        status: run.status.clone(),
-                        updated_at: run.updated_at,
-                    },
+                    RunHead::from_run(&run),
                 )?;
             }
             Ok(run)

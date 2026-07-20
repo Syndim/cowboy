@@ -74,6 +74,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 head_step: none_if_dash(&rest[2]),
                 status: parse_status(&rest[3]),
                 updated_at: Utc::now(),
+                summary: None,
             };
             store.update_run_head(&head.run_id, head.clone())?;
             println!("saved head {}", head.run_id);

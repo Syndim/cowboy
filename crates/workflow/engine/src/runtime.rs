@@ -299,6 +299,7 @@ pub struct ResolutionStatus {
 #[derive(Clone)]
 pub struct WorkflowRuntime {
     config: RuntimeConfig,
+    store: RedbRunStore,
     events: Arc<EventBus>,
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
@@ -385,9 +386,12 @@ impl WorkflowRuntime {
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
     ) -> Self {
+        let store = RedbRunStore::cached(&config.workflow_store);
+
         Self {
             run_locks: RunExecutionLocks::new(config.workflow_store.clone()),
             config,
+            store,
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
@@ -441,17 +445,39 @@ impl WorkflowRuntime {
                 continue;
             }
 
-            if let Ok(run) = store.load_run(&head.run_id) {
+            let RunHead {
+                run_id,
+                workflow_hash: _,
+                head_step,
+                status,
+                updated_at: _,
+                summary,
+            } = head;
+            let status_detail = RunStatusDetail::from_status(&status);
+
+            if let Some(summary) = summary {
+                runs.push(RunSummaryLine {
+                    run_id,
+                    workflow_name: summary.workflow_name,
+                    topic: summary.request_topic,
+                    status,
+                    status_detail,
+                    current_step: summary.current_step,
+                    head_step,
+                });
+                continue;
+            }
+
+            if let Ok(run) = store.load_run(&run_id) {
                 let topic = self.summary_topic(&run);
-                let status_detail = RunStatusDetail::from_status(&head.status);
                 runs.push(RunSummaryLine {
                     run_id: run.id,
                     workflow_name: run.workflow_name,
                     topic,
-                    status: head.status,
+                    status,
                     status_detail,
                     current_step: run.current_step,
-                    head_step: head.head_step,
+                    head_step,
                 });
             }
         }
@@ -1298,7 +1324,7 @@ impl WorkflowRuntime {
     }
 
     fn store(&self) -> Result<RedbRunStore> {
-        self.open_store(None)
+        Ok(self.store.clone())
     }
 
     fn store_for_run(&self, run_id: &str) -> Result<RedbRunStore> {
@@ -1312,20 +1338,7 @@ impl WorkflowRuntime {
                 },
             ));
         });
-        self.open_store(Some(observer))
-    }
-
-    fn open_store(&self, wait_observer: Option<StoreWaitObserver>) -> Result<RedbRunStore> {
-        tracing::debug!(path = %self.config.workflow_store.display(), "opening workflow store");
-        let store = match wait_observer {
-            Some(observer) => {
-                RedbRunStore::create_with_wait_observer(&self.config.workflow_store, observer)
-            }
-            None => RedbRunStore::create(&self.config.workflow_store),
-        }
-        .map_err(WorkflowError::from)?;
-        tracing::debug!(path = %self.config.workflow_store.display(), "workflow store ready");
-        Ok(store)
+        Ok(self.store.with_wait_observer(observer))
     }
 
     fn persist_events(&self, run_id: &str, events: &[WorkflowEvent]) -> Result<()> {
@@ -1473,13 +1486,7 @@ fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
 }
 
 fn run_head(run: &WorkflowRun) -> RunHead {
-    RunHead {
-        run_id: run.id.clone(),
-        workflow_hash: run.workflow_hash.clone(),
-        head_step: run.head.clone(),
-        status: run.status.clone(),
-        updated_at: run.updated_at,
-    }
+    RunHead::from_run(run)
 }
 
 #[cfg(test)]
@@ -3111,9 +3118,45 @@ exit 0
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].run_id, "alpha-wait-run");
         assert_eq!(filtered[0].topic.as_deref(), Some("Approve release"));
+        assert_eq!(filtered[0].workflow_name, "aaa");
+        assert_eq!(filtered[0].status_detail.state, RunStatusState::WaitingForInput);
+        assert_eq!(filtered[0].current_step, "start");
+        assert_eq!(filtered[0].head_step, None);
 
         let no_matches = runtime.list_runs(Some("WAIT")).unwrap();
         assert!(no_matches.is_empty());
+    }
+
+    #[test]
+    fn list_runs_returns_many_disk_persisted_summaries_quickly() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        let store = runtime.store().unwrap();
+        let large_snapshotted_source = "return workflow('bulk', step('done'))".repeat(512);
+
+        for index in 0..100 {
+            let mut run = summary_test_run(
+                &format!("run-bulk-{index:04}"),
+                RunStatus::Completed,
+                Some(&format!("Bulk run {index}")),
+            );
+            run.workflow_sources.insert(
+                "default.lua".to_string(),
+                large_snapshotted_source.clone(),
+            );
+            store.save_run(&run).unwrap();
+            store.update_run_head(&run.id, run_head(&run)).unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let summaries = runtime.list_runs(None).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(summaries.len(), 100);
+        assert!(
+            elapsed < Duration::from_millis(25),
+            "listing 100 disk-persisted run summaries took {elapsed:?}; /runs should read summary data without reopening the database and deserializing every full workflow snapshot"
+        );
     }
 
     #[tokio::test]
@@ -3151,7 +3194,9 @@ exit 0
         let run_id = run.id.clone();
         let store = runtime.store().unwrap();
         store.save_run(&run).unwrap();
-        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        let mut head = run_head(&run);
+        head.summary = None;
+        store.update_run_head(&run.id, head).unwrap();
         runtime
             .persist_events(
                 &run.id,
