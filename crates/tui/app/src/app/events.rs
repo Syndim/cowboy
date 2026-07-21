@@ -393,7 +393,7 @@ fn format_workflow_title_prefix(
     local_timestamp: DateTime<FixedOffset>,
     elapsed_ms: Option<u64>,
 ) -> String {
-    let wall_clock = local_timestamp.format("%H:%M:%S %:z");
+    let wall_clock = local_timestamp.format("%H:%M");
 
     match elapsed_ms {
         Some(elapsed_ms) => format!("{wall_clock} (+{})", format_elapsed_ms(elapsed_ms)),
@@ -586,8 +586,9 @@ mod tests {
 
         let prefix = format_workflow_title_prefix(timestamp, Some(296_000));
 
-        assert_eq!(prefix, "06:23:45 -07:00 (+00:04:56)");
-        assert!(!prefix.contains("13:23:45 +00:00"), "{prefix}");
+        assert_eq!(prefix, "06:23 (+00:04:56)");
+        assert!(!prefix.contains("13:23"), "{prefix}");
+        assert!(!prefix.contains("-07:00"), "{prefix}");
     }
 
     #[test]
@@ -666,7 +667,7 @@ mod tests {
             .expect("workflow title should include a prefix");
 
         assert!(title.contains(" · ✓ Run completed"), "{title}");
-        assert_eq!(prefix.len(), "06:23:45 -07:00".len(), "{title}");
+        assert_eq!(prefix.len(), "06:23".len(), "{title}");
         assert!(!prefix.contains("(+"), "{title}");
     }
 
