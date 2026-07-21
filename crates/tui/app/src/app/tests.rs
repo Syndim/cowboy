@@ -1,4 +1,5 @@
-use cowboy_workflow_engine::WorkflowEventKind;
+use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
+use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 use ratatui::Terminal;
 use ratatui::layout::Position;
 
@@ -811,7 +812,7 @@ async fn draw_active_run_composer_keeps_allowed_slash_suggestions() {
         .find(|row| row.contains("No agent accepting prompts") && row.contains("draft retained"))
         .unwrap_or_else(|| panic!("{rendered}"));
     assert!(title_row.contains("Esc cancels"), "{rendered}");
-    assert!(rendered.contains("●"), "{rendered}");
+    assert!(rendered.contains(RUNNING_STATUS_FRAMES[0]), "{rendered}");
     assert!(!rendered.contains("◷"), "{rendered}");
     assert!(rendered.contains("> /"), "{rendered}");
     assert!(rendered.contains("slash command suggestions"), "{rendered}");
@@ -961,4 +962,40 @@ fn draw_scheduler_only_marks_dirty_for_changed_state() {
 
     scheduler.mark_dirty_if(true);
     assert!(scheduler.should_draw());
+}
+
+#[test]
+fn status_animation_tick_marks_dirty_only_while_running() {
+    let mut state = test_state();
+    let mut scheduler = DrawScheduler::new();
+    scheduler.mark_clean();
+
+    tick_status_animation(&mut state, &mut scheduler);
+    assert!(!scheduler.should_draw());
+
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "default".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        },
+    ));
+
+    tick_status_animation(&mut state, &mut scheduler);
+    assert!(scheduler.should_draw());
+
+    scheduler.mark_clean();
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::WaitingForInput {
+            step: "confirm".to_string(),
+            prompt_id: "approval".to_string(),
+            message: "Approve?".to_string(),
+            choices: vec!["yes".to_string()],
+        },
+    ));
+
+    tick_status_animation(&mut state, &mut scheduler);
+    assert!(!scheduler.should_draw());
 }

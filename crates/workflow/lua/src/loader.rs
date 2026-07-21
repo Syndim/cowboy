@@ -1511,7 +1511,10 @@ mod tests {
             panic!("blocked_answer should return a status action")
         };
 
-        assert_eq!(answered.fields["blocked_response"], serde_json::json!(user_answer));
+        assert_eq!(
+            answered.fields["blocked_response"],
+            serde_json::json!(user_answer)
+        );
 
         let triage_result = run_step(
             &compiled.source_bundle,

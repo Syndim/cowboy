@@ -1,0 +1,10 @@
+[package]
+name = "cowboy-tui-animation"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Terminal animation primitives for Cowboy TUI surfaces"
+
+[dev-dependencies]
+unicode-width.workspace = true

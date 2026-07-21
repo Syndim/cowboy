@@ -108,6 +108,10 @@ impl DrawScheduler {
     }
 }
 
+fn tick_status_animation(state: &mut AppState, draw_scheduler: &mut DrawScheduler) {
+    draw_scheduler.mark_dirty_if(state.advance_status_animation());
+}
+
 async fn run_loop<B>(
     terminal: &mut Terminal<B>,
     mut state: AppState,
@@ -145,6 +149,7 @@ where
             }
         };
         if !has_event {
+            tick_status_animation(&mut state, &mut draw_scheduler);
             continue;
         }
 

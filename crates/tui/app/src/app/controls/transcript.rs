@@ -251,7 +251,11 @@ fn line_with_selection_highlight(
                 push_span(&mut highlighted_spans, &mut unselected_segment, span_style);
                 selected_segment.push(ch);
             } else {
-                push_span(&mut highlighted_spans, &mut selected_segment, selected_style);
+                push_span(
+                    &mut highlighted_spans,
+                    &mut selected_segment,
+                    selected_style,
+                );
                 unselected_segment.push(ch);
             }
 
@@ -259,7 +263,11 @@ fn line_with_selection_highlight(
         }
 
         push_span(&mut highlighted_spans, &mut unselected_segment, span_style);
-        push_span(&mut highlighted_spans, &mut selected_segment, selected_style);
+        push_span(
+            &mut highlighted_spans,
+            &mut selected_segment,
+            selected_style,
+        );
     }
 
     let mut highlighted_line = Line::from(highlighted_spans);
@@ -813,7 +821,10 @@ mod tests {
         let highlighted = apply_selection_highlight(vec![row], Some(&selection((0, 2), (0, 5))));
 
         assert_eq!(highlighted[0].style, style_transcript_normal());
-        assert_eq!(highlighted[0].alignment, Some(ratatui::layout::Alignment::Center));
+        assert_eq!(
+            highlighted[0].alignment,
+            Some(ratatui::layout::Alignment::Center)
+        );
         assert_eq!(highlighted[0].spans.len(), 4);
         assert_eq!(highlighted[0].spans[0].content.as_ref(), "ab");
         assert_eq!(highlighted[0].spans[0].style, style_transcript_metadata());
@@ -841,10 +852,12 @@ mod tests {
         let highlighted = apply_selection_highlight(rows, Some(&selection((0, 1), (0, 1))));
 
         assert_eq!(highlighted[0].to_string(), "abc");
-        assert!(highlighted[0]
-            .spans
-            .iter()
-            .all(|span| !span.style.add_modifier.contains(Modifier::REVERSED)));
+        assert!(
+            highlighted[0]
+                .spans
+                .iter()
+                .all(|span| !span.style.add_modifier.contains(Modifier::REVERSED))
+        );
     }
 
     fn rendered_text(state: &AppState, height: usize, width: usize) -> String {

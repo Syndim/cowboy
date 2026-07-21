@@ -1,6 +1,7 @@
 use std::cell::Cell;
 
 use anyhow::Result;
+use cowboy_tui_animation::FrameCycle;
 use cowboy_workflow_engine::{
     RunReport, RunStatusDetail, RunStatusState, RunSummaryLine, WorkflowEvent, WorkflowEventKind,
 };
@@ -433,6 +434,7 @@ pub(super) struct AppState {
     history: Vec<String>,
     history_index: Option<usize>,
     composer_view: Cell<ComposerViewState>,
+    status_animation: FrameCycle,
     history_store: InputHistory,
     background: Vec<BackgroundTask>,
     exit_requested: bool,
@@ -465,6 +467,7 @@ impl AppState {
             input: Input::default(),
             history,
             history_index: None,
+            status_animation: FrameCycle::running_status(),
             composer_view: Cell::new(ComposerViewState::default()),
             history_store,
             background: Vec::new(),
@@ -536,6 +539,24 @@ impl AppState {
         } else {
             self.run_state.clone()
         }
+    }
+
+    pub(in crate::app) fn status_animation_active(&self) -> bool {
+        self.pending_prompt.is_none() && self.run_state == "running"
+    }
+
+    pub(in crate::app) fn status_animation_frame(&self) -> &'static str {
+        self.status_animation.current()
+    }
+
+    pub(in crate::app) fn advance_status_animation(&mut self) -> bool {
+        if self.status_animation_active() {
+            self.status_animation.advance();
+            return true;
+        }
+
+        self.status_animation.reset();
+        false
     }
 
     pub(in crate::app) fn status(&self) -> &str {
@@ -1324,7 +1345,10 @@ impl AppState {
                     Ok(Ok(BackgroundTaskResult::WorkflowReport(report))) => {
                         self.apply_report(*report);
                     }
-                    Ok(Ok(BackgroundTaskResult::RunsList { runs, partial_run_id })) => {
+                    Ok(Ok(BackgroundTaskResult::RunsList {
+                        runs,
+                        partial_run_id,
+                    })) => {
                         self.apply_runs_list(runs, partial_run_id);
                     }
                     Ok(Err(err)) => {
@@ -1459,6 +1483,46 @@ mod tests {
             )]),
             ..AppConfig::default()
         })
+    }
+
+    #[test]
+    fn status_animation_advances_only_while_running() {
+        let mut state = test_state();
+        assert!(!state.status_animation_active());
+        assert!(!state.advance_status_animation());
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+
+        let first = state.status_animation_frame();
+        assert!(state.status_animation_active());
+        assert!(state.advance_status_animation());
+        let second = state.status_animation_frame();
+        assert_ne!(first, second);
+        assert!(state.advance_status_animation());
+        assert_ne!(second, state.status_animation_frame());
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["yes".to_string()],
+            },
+        ));
+
+        let waiting_frame = state.status_animation_frame();
+        assert!(!state.status_animation_active());
+        assert!(!state.advance_status_animation());
+        assert_eq!(state.status_animation_frame(), first);
+        assert_ne!(waiting_frame, state.status_animation_frame());
     }
 
     #[test]
@@ -2127,9 +2191,8 @@ mod tests {
         pending_state.cancel_background_tasks();
 
         let mut completed_state = test_state();
-        completed_state.spawn_runs_list_task("loading runs".to_string(), None, async {
-            Ok(Vec::new())
-        });
+        completed_state
+            .spawn_runs_list_task("loading runs".to_string(), None, async { Ok(Vec::new()) });
         let initial_entry = completed_state.event_entries()[0].plain_text();
         tokio::task::yield_now().await;
         assert!(completed_state.drain_background_tasks().await);

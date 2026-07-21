@@ -10,6 +10,7 @@ description = "Workflow-first terminal UI for Cowboy"
 base64.workspace = true
 cowboy-command-parser.workspace = true
 cowboy-tui-terminal.workspace = true
+cowboy-tui-animation.workspace = true
 cowboy-workflow-engine = { path = "../../workflow/engine" }
 anyhow.workspace = true
 chrono = { workspace = true, features = ["serde"] }
@@ -19,7 +20,7 @@ dirs = "6"
 pulldown-cmark = "0.13"
 ratatui = { version = "0", features = ["unstable-rendered-line-info"] }
 tui-input = { version = "0", default-features = false, features = ["crossterm"] }
-unicode-width = "0"
+unicode-width.workspace = true
 unicode-segmentation = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

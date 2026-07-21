@@ -46,6 +46,14 @@ pub(in crate::app) fn status_icon(status: &str) -> &'static str {
     }
 }
 
+pub(in crate::app) fn status_icon_for_state<'a>(status: &str, running_frame: &'a str) -> &'a str {
+    if status == "running" {
+        running_frame
+    } else {
+        status_icon(status)
+    }
+}
+
 pub(in crate::app) fn short_run_id(run_id: &str) -> &str {
     run_id
         .strip_prefix("run-")
@@ -118,7 +126,10 @@ pub(in crate::app) fn truncate_to_display_width(text: impl AsRef<str>, width: us
 
 pub(super) fn status_metadata_text(state: &AppState, width: usize) -> String {
     let display_state = state.display_state();
-    let mut parts = vec![MetadataPart::fixed(status_icon(&display_state))];
+    let mut parts = vec![MetadataPart::fixed(status_icon_for_state(
+        &display_state,
+        state.status_animation_frame(),
+    ))];
 
     if let Some(step) = state.current_step() {
         parts.push(MetadataPart::optional(
@@ -151,6 +162,7 @@ mod tests {
     use super::*;
     use crate::app::state::AppState;
     use crate::config::AppConfig;
+    use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -181,6 +193,25 @@ mod tests {
         assert_eq!(status_icon("unknown"), "?");
     }
 
+    #[test]
+    fn animated_status_icon_contract_covers_running_and_static_fallbacks() {
+        let running_frame = RUNNING_STATUS_FRAMES[0];
+
+        assert_eq!(
+            status_icon_for_state("running", running_frame),
+            running_frame
+        );
+        assert_eq!(status_icon_for_state("waiting", running_frame), "◔");
+        assert_eq!(status_icon_for_state("idle", running_frame), "○");
+    }
+
+    #[test]
+    fn running_status_frames_have_one_cell_width() {
+        for frame in RUNNING_STATUS_FRAMES {
+            assert_eq!(display_width(frame), 1, "frame {frame:?}");
+        }
+    }
+
     #[tokio::test]
     async fn metadata_uses_shared_icons_and_separator() {
         let mut state = test_state();
@@ -198,7 +229,8 @@ mod tests {
 
         let metadata = status_metadata_text(&state, 80);
 
-        assert!(metadata.contains("●"), "{metadata}");
+        assert!(metadata.contains(RUNNING_STATUS_FRAMES[0]), "{metadata}");
+        assert!(!metadata.contains("●"), "{metadata}");
         assert!(metadata.contains("↳ implement"), "{metadata}");
         assert!(metadata.contains("▶ 170dc431"), "{metadata}");
         assert!(metadata.contains("⎇ bugfix"), "{metadata}");
@@ -208,6 +240,18 @@ mod tests {
         assert!(!metadata.contains("run="), "{metadata}");
         assert!(!metadata.contains("workflow="), "{metadata}");
         assert!(!metadata.contains("tasks="), "{metadata}");
+        state.cancel_background_tasks();
+    }
+
+    #[test]
+    fn chrome_does_not_define_spinner_frame_sequence() {
+        let source = include_str!("chrome.rs");
+        for frame in RUNNING_STATUS_FRAMES {
+            assert!(
+                !source.contains(&format!("\"{frame}\"")),
+                "duplicated frame {frame}"
+            );
+        }
     }
 
     #[test]

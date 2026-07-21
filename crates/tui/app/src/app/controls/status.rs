@@ -20,6 +20,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
     use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 
     use super::*;
@@ -73,7 +74,20 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
+            format!(
+                "{} · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature",
+                RUNNING_STATUS_FRAMES[0]
+            )
+        );
+
+        assert!(state.advance_status_animation());
+        let advanced = rendered_text(&state, 160);
+        assert_eq!(
+            advanced,
+            format!(
+                "{} · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature",
+                RUNNING_STATUS_FRAMES[1]
+            )
         );
         assert!(!rendered.contains("draft allowed"));
         assert!(!rendered.contains("Enter waits for active run"));
@@ -112,7 +126,10 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
+            format!(
+                "{} · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature",
+                RUNNING_STATUS_FRAMES[0]
+            )
         );
         assert!(!rendered.contains("◷"), "{rendered}");
         state.cancel_background_tasks();
@@ -131,7 +148,10 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "● · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature"
+            format!(
+                "{} · ↳ implement · ▶ 170dc431 · ⎇ agent/00-feature",
+                RUNNING_STATUS_FRAMES[0]
+            )
         );
         assert!(!rendered.contains("◷"), "{rendered}");
         state.cancel_background_tasks();
@@ -148,7 +168,10 @@ mod tests {
 
         let rendered = rendered_text(&state, 42);
 
-        assert_eq!(rendered, "● · ↳ implement · ▶ 170dc431");
+        assert_eq!(
+            rendered,
+            format!("{} · ↳ implement · ▶ 170dc431", RUNNING_STATUS_FRAMES[0])
+        );
         state.cancel_background_tasks();
     }
 }

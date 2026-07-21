@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
-default-members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
+members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/animation", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
+default-members = ["crates/agent/acp", "crates/agent/client", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/animation", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
 resolver = "3"
 
 [workspace.package]
@@ -22,12 +22,14 @@ tempfile = "3"
 thiserror = "2"
 tokio = "1"
 tracing = "0"
+unicode-width = "0"
 
 cowboy-agent-acp = { path = "crates/agent/acp" }
 cowboy-agent-client = { path = "crates/agent/client" }
 cowboy-log = { path = "crates/log" }
 cowboy-command-parser = { path = "crates/tui/command-parser" }
 cowboy-tui-terminal = { path = "crates/tui/terminal" }
+cowboy-tui-animation = { path = "crates/tui/animation" }
 cowboy-workflow-agent = { path = "crates/workflow/agent" }
 cowboy-workflow-core = { path = "crates/workflow/core" }
 cowboy-workflow-lua = { path = "crates/workflow/lua" }

@@ -369,6 +369,7 @@ dependencies = [
  "chrono",
  "cowboy-command-parser",
  "cowboy-log",
+ "cowboy-tui-animation",
  "cowboy-tui-terminal",
  "cowboy-workflow-core",
  "cowboy-workflow-engine",
@@ -431,6 +432,13 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cowboy-tui-animation"
+version = "0.1.0"
+dependencies = [
+ "unicode-width",
 ]
 
 [[package]]

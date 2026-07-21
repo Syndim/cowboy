@@ -3095,8 +3095,16 @@ exit 0
                 },
                 Some("Approve release"),
             ),
-            summary_test_run("beta-completed-run", RunStatus::Completed, Some("Ship release")),
-            summary_test_run("gamma-running-run", RunStatus::Running, Some("Keep working")),
+            summary_test_run(
+                "beta-completed-run",
+                RunStatus::Completed,
+                Some("Ship release"),
+            ),
+            summary_test_run(
+                "gamma-running-run",
+                RunStatus::Running,
+                Some("Keep working"),
+            ),
         ] {
             store.save_run(&run).unwrap();
             store.update_run_head(&run.id, run_head(&run)).unwrap();
