@@ -1,7 +1,11 @@
 use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+use std::io;
+
 use ratatui::Terminal;
-use ratatui::layout::Position;
+use ratatui::backend::{Backend, ClearType, WindowSize};
+use ratatui::buffer::Cell as RatatuiCell;
+use ratatui::layout::{Position, Size};
 
 use super::state::AppState;
 use super::*;
@@ -81,6 +85,83 @@ fn composer_border_fg_for_title(
         "composer title containing `{title_marker}` not found in rendered buffer:\n{}",
         rendered_rows.join("\n")
     );
+}
+
+#[derive(Debug)]
+struct CursorVisibilityProbeBackend {
+    size: Size,
+    cursor_visible: bool,
+    draw_calls: usize,
+    visible_redraw_painted_cells: usize,
+}
+
+impl CursorVisibilityProbeBackend {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            size: Size::new(width, height),
+            cursor_visible: false,
+            draw_calls: 0,
+            visible_redraw_painted_cells: 0,
+        }
+    }
+}
+
+impl Backend for CursorVisibilityProbeBackend {
+    type Error = io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a RatatuiCell)>,
+    {
+        let painted_cells = content.count();
+        if self.draw_calls > 0 && self.cursor_visible {
+            self.visible_redraw_painted_cells += painted_cells;
+        }
+
+        self.draw_calls += 1;
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = false;
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.cursor_visible = true;
+        Ok(())
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        Ok(Position::ORIGIN)
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        Ok(self.size)
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        Ok(WindowSize {
+            columns_rows: self.size,
+            pixels: Size::ZERO,
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -292,6 +373,34 @@ fn draw_places_cursor_at_input_end() {
     terminal
         .backend_mut()
         .assert_cursor_position(Position::new(6, 8));
+}
+
+#[test]
+fn status_animation_redraw_hides_cursor_before_painting_changed_cell() {
+    let mut state = test_state();
+    state.push_input("abc");
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "default".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        },
+    ));
+    let backend = CursorVisibilityProbeBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    let mut layout = AppLayout::new(Rect::default(), &state);
+    layout = draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+    assert!(state.advance_status_animation());
+    draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+
+    assert_eq!(
+        terminal.backend().visible_redraw_painted_cells,
+        0,
+        "animation redraw painted {} changed cells while the cursor was visible; redraws must hide the composer cursor before painting changed cells and show it again only after restoring the composer cursor position",
+        terminal.backend().visible_redraw_painted_cells
+    );
 }
 
 #[tokio::test]

@@ -112,6 +112,24 @@ fn tick_status_animation(state: &mut AppState, draw_scheduler: &mut DrawSchedule
     draw_scheduler.mark_dirty_if(state.advance_status_animation());
 }
 
+fn draw_cursor_safe_production_frame<B>(
+    terminal: &mut Terminal<B>,
+    state: &mut AppState,
+    previous_layout: AppLayout,
+) -> Result<AppLayout, B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    terminal.hide_cursor()?;
+
+    let mut next_layout = previous_layout;
+    terminal.draw(|frame| {
+        next_layout = draw_production_frame(frame, state, previous_layout);
+    })?;
+
+    Ok(next_layout)
+}
+
 async fn run_loop<B>(
     terminal: &mut Terminal<B>,
     mut state: AppState,
@@ -131,11 +149,12 @@ where
             return Ok(());
         }
         if draw_scheduler.should_draw() {
-            if let Err(err) = terminal.draw(|frame| {
-                current_layout = draw_production_frame(frame, &mut state, current_layout);
-            }) {
-                tracing::error!(error = ?err, "TUI draw failed");
-                return Err(err.into());
+            match draw_cursor_safe_production_frame(terminal, &mut state, current_layout) {
+                Ok(layout) => current_layout = layout,
+                Err(err) => {
+                    tracing::error!(error = ?err, "TUI draw failed");
+                    return Err(err.into());
+                }
             }
 
             draw_scheduler.mark_clean();
