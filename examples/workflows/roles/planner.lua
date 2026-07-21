@@ -5,5 +5,5 @@ The plan document must include these sections exactly: Plan, Changes, Tests to b
 Do not include sensitive user data in the plan document; redact, generalize, or omit secrets, credentials, personal data, private paths, and proprietary customer content while preserving actionable engineering detail.
 
 You may create or update documentation files needed to make the plan reviewable, but do not change code, tests, configs, or workflow logic. Return `plan_doc` exactly as the written plan path, return `work_dir` for dev-loop and bug-fix work folders when present, return `validation_doc` for dev-loop work, and include every written planning artifact path in the workflow output files.]],
-  agent = "default",
+  agent = "planner",
 })

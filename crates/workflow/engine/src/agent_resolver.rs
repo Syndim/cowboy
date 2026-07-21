@@ -122,6 +122,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_selects_named_committer_agent_with_low_cost_args() {
+        let committer = AgentRuntimeConfig {
+            name: "committer".to_string(),
+            command: "omp".to_string(),
+            args: vec![
+                "--model=github-copilot/claude-haiku-4.5".to_string(),
+                "--thinking=low".to_string(),
+                "acp".to_string(),
+            ],
+            model: Some(ModelInfo::default()),
+        };
+        let resolver =
+            AgentResolver::new(vec![agent("default"), agent("reviewer"), committer]).unwrap();
+
+        let resolved = resolver.resolve(&role(Some("committer"))).unwrap();
+
+        assert_eq!(resolved.name, "committer");
+        assert_eq!(resolved.command, "omp");
+        assert_eq!(
+            resolved.args,
+            [
+                "--model=github-copilot/claude-haiku-4.5",
+                "--thinking=low",
+                "acp",
+            ]
+        );
+    }
+
+    #[test]
     fn explicit_missing_agent_fails() {
         let resolver = AgentResolver::new(vec![agent("default")]).unwrap();
 

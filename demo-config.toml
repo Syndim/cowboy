@@ -21,18 +21,28 @@ max_retries_per_step = 4
 name = "default"
 # Switch to "copilot" + ["--acp"] if you prefer GitHub Copilot's ACP backend.
 command = "omp"
-args = ["acp"]
+args = ["--thinking=auto", "acp"]
 
 [agents.model]
 id = "opus-4.8-1m"
 provider = "github-copilot"
 
 [[agents]]
-name = "reviewer"
-# Switch to "copilot" + ["--acp"] if you prefer GitHub Copilot's ACP backend.
+name = "planner"
 command = "omp"
-args = ["acp"]
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 
-[agents.model]
-id = "gpt-5.5-1m"
-provider = "github-copilot"
+[[agents]]
+name = "reviewer"
+command = "omp"
+args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
+
+[[agents]]
+name = "implementer"
+command = "omp"
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=medium", "acp"]
+
+[[agents]]
+name = "committer"
+command = "omp"
+args = ["--model=github-copilot/claude-haiku-4.5", "--thinking=low", "acp"]

@@ -541,6 +541,59 @@ max_retries_per_step = 4
     }
 
     #[test]
+    fn shipped_demo_config_defines_workflow_agents() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("demo-config.toml");
+
+        let config = load_config(&path).unwrap();
+        let assert_agent = |name: &str, expected_args: &[&str]| {
+            let agent = config
+                .agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .unwrap_or_else(|| panic!("demo config should define the {name} agent"));
+
+            assert_eq!(agent.command, "omp");
+            assert_eq!(agent.args, expected_args);
+        };
+
+        assert_agent("default", &["--thinking=auto", "acp"]);
+        assert_agent(
+            "planner",
+            &[
+                "--model=github-copilot/claude-opus-4.8",
+                "--thinking=xhigh",
+                "acp",
+            ],
+        );
+        assert_agent(
+            "reviewer",
+            &[
+                "--model=github-copilot/gpt-5.6-sol",
+                "--thinking=high",
+                "acp",
+            ],
+        );
+        assert_agent(
+            "implementer",
+            &[
+                "--model=github-copilot/claude-opus-4.8",
+                "--thinking=medium",
+                "acp",
+            ],
+        );
+        assert_agent(
+            "committer",
+            &[
+                "--model=github-copilot/claude-haiku-4.5",
+                "--thinking=low",
+                "acp",
+            ],
+        );
+    }
+
+    #[test]
     fn parses_named_agents_and_runtime_conversion_preserves_them() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

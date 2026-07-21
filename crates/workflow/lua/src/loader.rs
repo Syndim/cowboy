@@ -3350,9 +3350,10 @@ mod tests {
             "feature",
             &feature,
             &[
-                ("planner", "default"),
-                ("implementer", "default"),
+                ("planner", "planner"),
+                ("implementer", "implementer"),
                 ("reviewer", "reviewer"),
+                ("committer", "committer"),
             ],
         );
 
@@ -3362,10 +3363,25 @@ mod tests {
             &bugfix,
             &[
                 ("investigator", "default"),
-                ("planner", "default"),
-                ("implementer", "default"),
+                ("planner", "planner"),
+                ("implementer", "implementer"),
                 ("reviewer", "reviewer"),
+                ("committer", "committer"),
             ],
+        );
+    }
+
+    #[test]
+    fn committer_role_preserves_instructions_verbatim() {
+        let definition = load_example_workflow("feature");
+        let committer = definition
+            .roles
+            .get("committer")
+            .expect("feature workflow should include committer role");
+
+        assert_eq!(
+            committer.instructions,
+            "You are a release-minded committer.\nInspect the current changes, stage all request-related files including code, tests, documentation, generated plan documents, and other artifacts for the user's request, then create a local conventional commit. Never push, amend, rebase, or reset. Report the commit hash and message."
         );
     }
 
@@ -3409,10 +3425,11 @@ mod tests {
             "dev-loop",
             &definition,
             &[
-                ("planner", "default"),
-                ("implementer", "default"),
+                ("planner", "planner"),
+                ("implementer", "implementer"),
                 ("validator", "reviewer"),
                 ("reviewer", "reviewer"),
+                ("committer", "committer"),
             ],
         );
     }

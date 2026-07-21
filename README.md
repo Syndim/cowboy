@@ -202,19 +202,34 @@ id = "opus-4.8-1m"
 provider = "github-copilot"
 
 [[agents]]
-name = "reviewer"
-command = "copilot"
-args = ["--acp"]
+name = "planner"
+command = "omp"
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 
-[agents.model]
-id = "gpt-5.5-1m"
-provider = "github-copilot"
+[[agents]]
+name = "reviewer"
+command = "omp"
+args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
+
+[[agents]]
+name = "implementer"
+command = "omp"
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=medium", "acp"]
+
+[[agents]]
+name = "committer"
+command = "omp"
+args = ["--model=github-copilot/claude-haiku-4.5", "--thinking=low", "acp"]
 ```
 
 `agents.model` is optional. When omitted, Cowboy does not send a model hint or
 change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
+
+The workflow roles select dedicated `planner`, `reviewer`, `implementer`, and
+`committer` agents. Their backend launch arguments set thinking to `xhigh`,
+`high`, `medium`, and `low`, respectively; `[agents.model]` does not control it.
 
 Every config-set field is optional and defaults independently to the values
 shown above. The built-in `default` set always exists, even when the file only
