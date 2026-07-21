@@ -248,13 +248,13 @@ pub struct AgentExecution {
 /// Client plus backend metadata resolved for a workflow role.
 pub struct ResolvedAgentClient {
     pub client: Box<dyn Client>,
-    pub model: ModelInfo,
+    pub model: Option<ModelInfo>,
     pub backend: String,
 }
 
 struct ActiveClient {
     client: Box<dyn Client>,
-    model: ModelInfo,
+    model: Option<ModelInfo>,
     backend: String,
 }
 
@@ -704,12 +704,16 @@ where
             run_id = %key.run_id,
             role = %key.role_id,
             cwd = %self.config.cwd,
-            model_id = %active.model.id,
-            provider = ?active.model.provider,
+            model_id = ?active.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?active.model.as_ref().and_then(|model| model.provider.as_deref()),
             "agent session: creating new backend session"
         );
         let session_id = client
-            .new_session(&self.config.cwd, &self.config.mcp_servers, &active.model)
+            .new_session(
+                &self.config.cwd,
+                &self.config.mcp_servers,
+                active.model.as_ref(),
+            )
             .await?;
         self.store
             .save_role_session(RoleSession {
@@ -1082,7 +1086,7 @@ mod tests {
         supports_load: bool,
         new_sessions: usize,
         loaded_sessions: Vec<String>,
-        new_session_models: Arc<SyncMutex<Vec<ModelInfo>>>,
+        new_session_models: Arc<SyncMutex<Vec<Option<ModelInfo>>>>,
         prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
         prompt_behavior: FakePromptBehavior,
     }
@@ -1141,9 +1145,10 @@ mod tests {
             &mut self,
             _cwd: &str,
             _mcp_servers: &[serde_json::Value],
-            model: &ModelInfo,
+            model: Option<&ModelInfo>,
         ) -> anyhow::Result<String> {
-            self.new_session_models.lock().push(model.clone());
+            self.new_session_models.lock().push(model.cloned());
+
             self.new_sessions += 1;
             let session_id = format!("session-{}", self.new_sessions);
             self.session_id = Some(session_id.clone());
@@ -1200,7 +1205,7 @@ mod tests {
     struct FakeFactory {
         clients: SyncMutex<VecDeque<FakeClient>>,
         created_for_roles: SyncMutex<Vec<RoleDefinition>>,
-        model: ModelInfo,
+        model: Option<ModelInfo>,
     }
 
     impl FakeFactory {
@@ -1208,10 +1213,10 @@ mod tests {
             Self {
                 clients: SyncMutex::new(clients.into()),
                 created_for_roles: SyncMutex::new(Vec::new()),
-                model: ModelInfo {
+                model: Some(ModelInfo {
                     id: "fake-model".to_string(),
                     provider: Some("fake-provider".to_string()),
-                },
+                }),
             }
         }
     }
@@ -1261,7 +1266,7 @@ mod tests {
             &mut self,
             _cwd: &str,
             _mcp_servers: &[serde_json::Value],
-            _model: &ModelInfo,
+            _model: Option<&ModelInfo>,
         ) -> anyhow::Result<String> {
             let session_id = "session-1".to_string();
             self.session_id = Some(session_id.clone());
@@ -1333,10 +1338,10 @@ mod tests {
                 .ok_or_else(|| Error::MissingClient("developer".to_string()))?;
             Ok(ResolvedAgentClient {
                 client: Box::new(client),
-                model: ModelInfo {
+                model: Some(ModelInfo {
                     id: "fake-model".to_string(),
                     provider: Some("fake-provider".to_string()),
-                },
+                }),
                 backend: "fake-agent".to_string(),
             })
         }
@@ -1806,8 +1811,33 @@ mod tests {
 
         let observed_models = observed_models.lock();
         assert_eq!(observed_models.len(), 1);
-        assert_eq!(observed_models[0].id, executor.factory.model.id);
-        assert_eq!(observed_models[0].provider, executor.factory.model.provider);
+        assert_eq!(
+            observed_models[0].as_ref().unwrap().id,
+            executor.factory.model.as_ref().unwrap().id
+        );
+        assert_eq!(
+            observed_models[0].as_ref().unwrap().provider,
+            executor.factory.model.as_ref().unwrap().provider
+        );
+    }
+
+    #[tokio::test]
+    async fn session_creation_preserves_absent_agent_model() {
+        let client = FakeClient::new(vec![event()]);
+        let observed_models = client.new_session_models.clone();
+        let mut factory = FakeFactory::new(vec![client]);
+        factory.model = None;
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap();
+
+        let observed_models = observed_models.lock();
+        assert_eq!(observed_models.len(), 1);
+        assert!(observed_models[0].is_none());
     }
 
     #[tokio::test]

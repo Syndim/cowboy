@@ -99,7 +99,7 @@ mod tests {
             name: name.to_string(),
             command: format!("{name}-cmd"),
             args: Vec::new(),
-            model: ModelInfo::default(),
+            model: Some(ModelInfo::default()),
         }
     }
 

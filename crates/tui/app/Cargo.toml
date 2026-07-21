@@ -8,6 +8,7 @@ description = "Workflow-first terminal UI for Cowboy"
 
 [dependencies]
 base64.workspace = true
+cowboy-agent-client.workspace = true
 cowboy-command-parser.workspace = true
 cowboy-tui-terminal.workspace = true
 cowboy-tui-animation.workspace = true

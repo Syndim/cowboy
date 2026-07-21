@@ -108,8 +108,8 @@ impl ClientFactory for AcpClientFactory {
             agent = %agent.name,
             command = %agent.command,
             args = ?agent.args,
-            model_id = %agent.model.id,
-            provider = ?agent.model.provider,
+            model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
             "resolving ACP client for role"
         );
         let client = AcpClient::connect(transport_for(agent)).await?;

@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
-use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
 };
@@ -208,7 +207,7 @@ impl ClientFactory for AcpFactory {
     ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
         Ok(ResolvedAgentClient {
             client: Box::new(AcpClient::connect(self.transport.clone()).await?),
-            model: ModelInfo::default(),
+            model: None,
             backend: "acp".to_string(),
         })
     }

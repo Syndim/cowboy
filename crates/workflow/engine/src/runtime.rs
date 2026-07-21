@@ -59,7 +59,7 @@ pub struct AgentRuntimeConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    pub model: ModelInfo,
+    pub model: Option<ModelInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,17 +87,13 @@ impl AgentRuntimeConfig {
         name: impl Into<String>,
         command: impl Into<String>,
         args: Vec<String>,
-        model_id: impl Into<String>,
-        provider: Option<String>,
+        model: Option<ModelInfo>,
     ) -> Self {
         Self {
             name: name.into(),
             command: command.into(),
             args,
-            model: ModelInfo {
-                id: model_id.into(),
-                provider,
-            },
+            model,
         }
     }
 }
@@ -1512,7 +1508,7 @@ mod tests {
             name: name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
-            model: ModelInfo::default(),
+            model: Some(ModelInfo::default()),
         }
     }
 
@@ -1581,7 +1577,7 @@ mod tests {
             &mut self,
             _cwd: &str,
             _mcp_servers: &[Value],
-            _model: &ModelInfo,
+            _model: Option<&ModelInfo>,
         ) -> anyhow::Result<String> {
             let mut state = self.state.lock();
             state.next_session += 1;
@@ -1648,10 +1644,10 @@ mod tests {
                     state: self.state.clone(),
                     session_id: None,
                 }),
-                model: ModelInfo {
+                model: Some(ModelInfo {
                     id: "scripted-model".to_string(),
                     provider: Some("test".to_string()),
-                },
+                }),
                 backend: "scripted-agent".to_string(),
             })
         }
@@ -2000,7 +1996,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     delivery_order.to_string_lossy().to_string(),
                     handoff_gate.to_string_lossy().to_string(),
                 ],
-                model: ModelInfo::default(),
+                model: Some(ModelInfo::default()),
             }],
         );
         let submit_runtime = runtime.clone();
@@ -3127,7 +3123,10 @@ exit 0
         assert_eq!(filtered[0].run_id, "alpha-wait-run");
         assert_eq!(filtered[0].topic.as_deref(), Some("Approve release"));
         assert_eq!(filtered[0].workflow_name, "aaa");
-        assert_eq!(filtered[0].status_detail.state, RunStatusState::WaitingForInput);
+        assert_eq!(
+            filtered[0].status_detail.state,
+            RunStatusState::WaitingForInput
+        );
         assert_eq!(filtered[0].current_step, "start");
         assert_eq!(filtered[0].head_step, None);
 
@@ -3148,10 +3147,8 @@ exit 0
                 RunStatus::Completed,
                 Some(&format!("Bulk run {index}")),
             );
-            run.workflow_sources.insert(
-                "default.lua".to_string(),
-                large_snapshotted_source.clone(),
-            );
+            run.workflow_sources
+                .insert("default.lua".to_string(), large_snapshotted_source.clone());
             store.save_run(&run).unwrap();
             store.update_run_head(&run.id, run_head(&run)).unwrap();
         }
@@ -3544,7 +3541,7 @@ exit 0
                 name: "default".to_string(),
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
-                model: ModelInfo::default(),
+                model: Some(ModelInfo::default()),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -3828,7 +3825,7 @@ exit 0
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
-                model: ModelInfo::default(),
+                model: Some(ModelInfo::default()),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5930,7 +5927,7 @@ Recovery implementation review"#
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
-                model: ModelInfo::default(),
+                model: Some(ModelInfo::default()),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6009,7 +6006,7 @@ Recovery implementation review"#
                 name: "default".to_string(),
                 command: "agent".to_string(),
                 args: Vec::new(),
-                model: ModelInfo::default(),
+                model: Some(ModelInfo::default()),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),

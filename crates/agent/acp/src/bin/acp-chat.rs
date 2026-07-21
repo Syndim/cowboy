@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let session_id = client
-        .new_session(&config.cwd, &[], &config.model)
+        .new_session(&config.cwd, &[], Some(&config.model))
         .await
         .context("failed to create ACP session")?;
     eprintln!("Session: {session_id}");

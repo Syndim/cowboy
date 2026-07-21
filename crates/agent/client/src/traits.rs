@@ -84,12 +84,12 @@ pub trait Client: Send + Sync + std::fmt::Debug {
     /// Current backend session id, when one exists.
     fn session_id(&self) -> Option<&str>;
 
-    /// Create a new agent session.
+    /// Create a new agent session, optionally requesting a specific model.
     async fn new_session(
         &mut self,
         cwd: &str,
         mcp_servers: &[Value],
-        model: &ModelInfo,
+        model: Option<&ModelInfo>,
     ) -> anyhow::Result<String>;
 
     /// Whether this backend can load an existing session by id.

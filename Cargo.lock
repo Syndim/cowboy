@@ -367,6 +367,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "cowboy-agent-client",
  "cowboy-command-parser",
  "cowboy-log",
  "cowboy-tui-animation",

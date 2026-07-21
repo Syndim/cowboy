@@ -211,6 +211,11 @@ id = "gpt-5.5-1m"
 provider = "github-copilot"
 ```
 
+`agents.model` is optional. When omitted, Cowboy does not send a model hint or
+change the model through ACP; the backend's launch arguments or own default stay
+authoritative. When provided, Cowboy selects that model through ACP session
+configuration and fails if the agent does not offer it.
+
 Every config-set field is optional and defaults independently to the values
 shown above. The built-in `default` set always exists, even when the file only
 declares custom sets. Set either retry limit to `0` to disable that retry

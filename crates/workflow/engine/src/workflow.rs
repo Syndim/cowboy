@@ -72,11 +72,11 @@ pub struct AgentWorkflowSelector<C> {
     session_id: Mutex<Option<String>>,
     cwd: String,
     mcp_servers: Vec<serde_json::Value>,
-    model: ModelInfo,
+    model: Option<ModelInfo>,
 }
 
 impl<C> AgentWorkflowSelector<C> {
-    pub fn new(client: C, cwd: impl Into<String>, model: ModelInfo) -> Self {
+    pub fn new(client: C, cwd: impl Into<String>, model: Option<ModelInfo>) -> Self {
         Self {
             client: Mutex::new(client),
             session_id: Mutex::new(None),
@@ -194,7 +194,7 @@ where
             return Ok(session_id);
         }
         let session_id = client
-            .new_session(&self.cwd, &self.mcp_servers, &self.model)
+            .new_session(&self.cwd, &self.mcp_servers, self.model.as_ref())
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         *self.session_id.lock().await = Some(session_id.clone());
@@ -295,11 +295,11 @@ pub struct AgentRequestTopicGenerator<C> {
     session_id: Mutex<Option<String>>,
     cwd: String,
     mcp_servers: Vec<serde_json::Value>,
-    model: ModelInfo,
+    model: Option<ModelInfo>,
 }
 
 impl<C> AgentRequestTopicGenerator<C> {
-    pub fn new(client: C, cwd: impl Into<String>, model: ModelInfo) -> Self {
+    pub fn new(client: C, cwd: impl Into<String>, model: Option<ModelInfo>) -> Self {
         Self {
             client: Mutex::new(client),
             session_id: Mutex::new(None),
@@ -345,7 +345,7 @@ where
             return Ok(session_id);
         }
         let session_id = client
-            .new_session(&self.cwd, &self.mcp_servers, &self.model)
+            .new_session(&self.cwd, &self.mcp_servers, self.model.as_ref())
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         *self.session_id.lock().await = Some(session_id.clone());
@@ -405,11 +405,11 @@ pub struct AgentWorkflowSummarizer<C> {
     session_id: Mutex<Option<String>>,
     cwd: String,
     mcp_servers: Vec<serde_json::Value>,
-    model: ModelInfo,
+    model: Option<ModelInfo>,
 }
 
 impl<C> AgentWorkflowSummarizer<C> {
-    pub fn new(client: C, cwd: impl Into<String>, model: ModelInfo) -> Self {
+    pub fn new(client: C, cwd: impl Into<String>, model: Option<ModelInfo>) -> Self {
         Self {
             client: Mutex::new(client),
             session_id: Mutex::new(None),
@@ -468,7 +468,7 @@ where
             return Ok(session_id);
         }
         let session_id = client
-            .new_session(&self.cwd, &self.mcp_servers, &self.model)
+            .new_session(&self.cwd, &self.mcp_servers, self.model.as_ref())
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         *self.session_id.lock().await = Some(session_id.clone());
@@ -581,7 +581,7 @@ mod tests {
             &mut self,
             _cwd: &str,
             _mcp_servers: &[Value],
-            _model: &ModelInfo,
+            _model: Option<&ModelInfo>,
         ) -> anyhow::Result<String> {
             self.session_id = Some("selector-session".to_string());
             Ok("selector-session".to_string())
@@ -649,7 +649,7 @@ mod tests {
                 r#"{"workflow_id":"special","rationale":"best fit","confidence":0.82}"#,
             ),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let selection = selector.select("fix bug", &catalog()).await.unwrap();
@@ -664,7 +664,7 @@ mod tests {
         let selector = AgentWorkflowSelector::new(
             FakeClient::new(r#"{"workflow_id":"missing","rationale":"bad","confidence":0.1}"#),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let err = selector.select("fix bug", &catalog()).await.unwrap_err();
@@ -678,7 +678,7 @@ mod tests {
         let selector = AgentWorkflowSelector::new(
             FakeClient::with_responses([reply, reply]),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let err = selector.select("fix bug", &catalog()).await.unwrap_err();
@@ -696,7 +696,7 @@ mod tests {
         let generator = AgentRequestTopicGenerator::new(
             FakeClient::new(r#"{"topic":"  Header Topic  "}"#),
             "/repo",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let topic = generator.generate("Add compact UI chrome").await.unwrap();
@@ -745,7 +745,7 @@ mod tests {
         let generator = AgentRequestTopicGenerator::new(
             FakeClient::new(r#"{"topic":"Add health route"}"#),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let topic = generator.generate("add a /healthz route").await.unwrap();
@@ -764,7 +764,7 @@ mod tests {
         let generator = AgentRequestTopicGenerator::new(
             FakeClient::new(r#"Here is JSON: {"topic":"Review branch"}."#),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let topic = generator.generate("review this branch").await.unwrap();
@@ -774,8 +774,11 @@ mod tests {
 
     #[tokio::test]
     async fn request_topic_generator_rejects_invalid_json() {
-        let generator =
-            AgentRequestTopicGenerator::new(FakeClient::new("not json"), ".", ModelInfo::default());
+        let generator = AgentRequestTopicGenerator::new(
+            FakeClient::new("not json"),
+            ".",
+            Some(ModelInfo::default()),
+        );
 
         let err = generator.generate("fix it").await.unwrap_err();
 
@@ -837,7 +840,7 @@ mod tests {
                 }"#,
             ),
             ".",
-            ModelInfo::default(),
+            Some(ModelInfo::default()),
         );
 
         let summary = summarizer.summarize(&run).await.unwrap();

@@ -104,8 +104,8 @@ pub struct ClientInfo {
 pub struct SessionNewParams {
     pub cwd: String,
     pub mcp_servers: Vec<Value>,
-    #[serde(rename = "_meta")]
-    pub meta: SessionMeta,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<SessionMeta>,
 }
 
 /// _meta extension field in session/new
@@ -119,6 +119,15 @@ pub struct SessionModelMeta {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+}
+
+/// session/set_config_option request params for a select option
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionParams<'a> {
+    pub session_id: &'a str,
+    pub config_id: &'a str,
+    pub value: &'a str,
 }
 
 /// session/cancel notification params
@@ -212,6 +221,34 @@ pub struct InitializeResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionNewResult {
     pub session_id: String,
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
+}
+
+/// A session-level configuration option exposed by the ACP agent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigOption {
+    pub id: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    pub current_value: Value,
+    #[serde(default)]
+    pub options: Vec<SessionConfigOptionValue>,
+}
+
+/// A selectable value for an ACP session configuration option.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionConfigOptionValue {
+    pub value: String,
+}
+
+/// session/set_config_option response result
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionConfigOptionResult {
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
 }
 
 /// session/prompt response result

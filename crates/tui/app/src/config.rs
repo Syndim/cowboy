@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_engine::{AgentRuntimeConfig, RunnerLimitsConfig, RuntimeConfig};
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +95,7 @@ pub struct AgentConfig {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
-    pub model: ModelConfig,
+    pub model: Option<ModelConfig>,
 }
 
 fn default_agent_command() -> String {
@@ -111,7 +112,7 @@ impl Default for AgentConfig {
             name: "default".to_string(),
             command: default_agent_command(),
             args: default_agent_args(),
-            model: ModelConfig::default(),
+            model: None,
         }
     }
 }
@@ -269,8 +270,10 @@ impl AppConfig {
                         agent.name.clone(),
                         agent.command.clone(),
                         agent.args.clone(),
-                        agent.model.id.clone(),
-                        agent.model.provider.clone(),
+                        agent.model.clone().map(|model| ModelInfo {
+                            id: model.id,
+                            provider: model.provider,
+                        }),
                     )
                 })
                 .collect(),
@@ -564,25 +567,47 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
         let config = load_config(&path).unwrap();
         assert_eq!(config.agents.len(), 2);
         assert_eq!(config.agents[0].name, "default");
-        assert_eq!(config.agents[0].model.id, "opus-4.8-1m");
+        assert_eq!(config.agents[0].model.as_ref().unwrap().id, "opus-4.8-1m");
         assert_eq!(
-            config.agents[0].model.provider.as_deref(),
+            config.agents[0].model.as_ref().unwrap().provider.as_deref(),
             Some("github-copilot")
         );
         assert_eq!(config.agents[1].name, "reviewer");
-        assert_eq!(config.agents[1].model.id, "gpt-5.5-1m");
+        assert_eq!(config.agents[1].model.as_ref().unwrap().id, "gpt-5.5-1m");
         assert_eq!(
-            config.agents[1].model.provider.as_deref(),
+            config.agents[1].model.as_ref().unwrap().provider.as_deref(),
             Some("github-copilot")
         );
 
         let runtime = config.runtime_config(dir.path().to_path_buf());
         assert_eq!(runtime.agents.len(), 2);
         assert_eq!(runtime.agents[0].name, "default");
-        assert_eq!(runtime.agents[0].model.id, "opus-4.8-1m");
+        assert_eq!(runtime.agents[0].model.as_ref().unwrap().id, "opus-4.8-1m");
         assert_eq!(runtime.agents[1].name, "reviewer");
         assert_eq!(runtime.agents[1].command, "copilot");
-        assert_eq!(runtime.agents[1].model.id, "gpt-5.5-1m");
+        assert_eq!(runtime.agents[1].model.as_ref().unwrap().id, "gpt-5.5-1m");
+    }
+
+    #[test]
+    fn agent_model_is_optional_and_runtime_preserves_absence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+name = "default"
+command = "copilot"
+args = ["--acp", "--model=claude-opus-4.8", "--context=long_context"]
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+
+        assert!(config.agents[0].model.is_none());
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert!(runtime.agents[0].model.is_none());
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::future::Future;
 use std::path::PathBuf;
 
 use cowboy_agent_acp::BackendPreset;
+use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_core::{Result as CoreResult, RunStatus};
 use cowboy_workflow_engine::{
     AgentRuntimeConfig, RunReport, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig,
@@ -136,7 +137,7 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         selector,
         agent.command,
         agent.args.join(" "),
-        agent.model.id,
+        agent.model.as_ref().map(|model| model.id.as_str()),
     );
     tracing::info!(
         cwd = %cwd.display(),
@@ -147,8 +148,8 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         agent_name = %agent.name,
         agent_command = %agent.command,
         agent_args = ?agent.args,
-        model_id = %agent.model.id,
-        provider = ?agent.model.provider,
+        model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
+        provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
         max_steps_per_run = limits.max_steps_per_run,
         max_visits_per_step = limits.max_visits_per_step,
         "engine-cli runtime configured"
@@ -194,7 +195,13 @@ fn resolve_agent() -> Result<AgentRuntimeConfig, Box<dyn std::error::Error>> {
         Err(_) => Some(preset.provider.to_string()),
     };
     Ok(AgentRuntimeConfig::new(
-        "default", command, args, model, provider,
+        "default",
+        command,
+        args,
+        Some(ModelInfo {
+            id: model,
+            provider,
+        }),
     ))
 }
 

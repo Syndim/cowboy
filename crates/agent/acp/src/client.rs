@@ -320,43 +320,149 @@ impl Client {
 
     /// Create a new ACP session.
     ///
-    /// Passes model configuration to the agent through the ACP `_meta` extension field.
-    /// ACP-aware agents read model settings from `_meta.model`.
-    /// Agents that do not support it ignore the `_meta` field, as allowed by the ACP spec.
+    /// When a model is configured, sends `_meta.model` as a compatibility hint and
+    /// applies it through ACP session config options when the agent exposes a model
+    /// selector. Without a configured model, the agent keeps its own default.
     pub async fn new_session(
         &mut self,
         cwd: &str,
         mcp_servers: &[Value],
-        model: &ModelInfo,
+        model: Option<&ModelInfo>,
     ) -> anyhow::Result<String> {
         tracing::debug!(
             cwd,
             mcp_server_count = mcp_servers.len(),
-            model_id = %model.id,
-            provider = ?model.provider,
+            model_id = ?model.map(|model| model.id.as_str()),
+            provider = ?model.and_then(|model| model.provider.as_deref()),
             "ACP session/new starting"
         );
         let params = SessionNewParams {
             cwd: cwd.to_string(),
             mcp_servers: mcp_servers.to_vec(),
-            meta: SessionMeta {
+            meta: model.map(|model| SessionMeta {
                 model: SessionModelMeta {
                     id: model.id.clone(),
                     provider: model.provider.clone(),
                 },
-            },
+            }),
         };
 
         let result = self.send_request("session/new", params).await?;
         let session: SessionNewResult = serde_json::from_value(result)?;
+        if let Some(model) = model {
+            self.apply_model_config_option(&session.session_id, &session.config_options, model)
+                .await?;
+        }
         self.session_id = Some(session.session_id.clone());
         tracing::info!(
             session_id = %session.session_id,
-            model_id = %model.id,
-            provider = ?model.provider,
+            model_id = ?model.map(|model| model.id.as_str()),
+            provider = ?model.and_then(|model| model.provider.as_deref()),
             "ACP session created"
         );
         Ok(session.session_id)
+    }
+
+    async fn apply_model_config_option(
+        &mut self,
+        session_id: &str,
+        config_options: &[SessionConfigOption],
+        model: &ModelInfo,
+    ) -> anyhow::Result<()> {
+        let model_option = config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("model"))
+            .or_else(|| config_options.iter().find(|option| option.id == "model"));
+        let Some(model_option) = model_option else {
+            tracing::debug!(
+                session_id,
+                model_id = %model.id,
+                provider = ?model.provider,
+                "ACP agent exposes no model config option; relying on session metadata"
+            );
+            return Ok(());
+        };
+
+        if model_option
+            .current_value
+            .as_str()
+            .is_some_and(|value| Self::model_value_matches(value, model))
+        {
+            return Ok(());
+        }
+
+        let Some(value) = model_option
+            .options
+            .iter()
+            .map(|option| option.value.as_str())
+            .find(|value| Self::model_value_matches(value, model))
+        else {
+            let available = model_option
+                .options
+                .iter()
+                .map(|option| option.value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "ACP agent does not offer configured model id '{}' for provider {:?}; available values: [{}]",
+                model.id,
+                model.provider,
+                available
+            );
+        };
+
+        tracing::debug!(
+            session_id,
+            config_id = %model_option.id,
+            model_value = value,
+            "ACP session model selection starting"
+        );
+        let params = SetSessionConfigOptionParams {
+            session_id,
+            config_id: &model_option.id,
+            value,
+        };
+        let result = self
+            .send_request("session/set_config_option", params)
+            .await?;
+        let result: SetSessionConfigOptionResult = serde_json::from_value(result)?;
+        let applied_value = result
+            .config_options
+            .iter()
+            .find(|option| option.id == model_option.id)
+            .and_then(|option| option.current_value.as_str());
+
+        if !applied_value.is_some_and(|value| Self::model_value_matches(value, model)) {
+            anyhow::bail!(
+                "ACP agent did not apply configured model id '{}' for provider {:?}; reported value: {:?}",
+                model.id,
+                model.provider,
+                applied_value
+            );
+        }
+
+        tracing::info!(
+            session_id,
+            config_id = %model_option.id,
+            model_value = applied_value,
+            "ACP session model configured"
+        );
+        Ok(())
+    }
+
+    fn model_value_matches(value: &str, model: &ModelInfo) -> bool {
+        if value == model.id {
+            return true;
+        }
+
+        let Some(provider) = model.provider.as_deref() else {
+            return false;
+        };
+
+        value
+            .strip_prefix(provider)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+            == Some(model.id.as_str())
     }
 
     /// Return the current session ID, if any.
@@ -907,7 +1013,7 @@ impl cowboy_agent_client::Client for Client {
         &mut self,
         cwd: &str,
         mcp_servers: &[Value],
-        model: &ModelInfo,
+        model: Option<&ModelInfo>,
     ) -> anyhow::Result<String> {
         Client::new_session(self, cwd, mcp_servers, model).await
     }
@@ -1125,7 +1231,10 @@ mod tests {
             provider: Some("anthropic".into()),
         };
 
-        let session_id = client.new_session("/project", &[], &model).await.unwrap();
+        let session_id = client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap();
         assert_eq!(session_id, "sess_123");
 
         // Verify session/new request
@@ -1135,6 +1244,198 @@ mod tests {
         assert_eq!(req["params"]["cwd"], "/project");
         assert_eq!(req["params"]["_meta"]["model"]["id"], "sonnet");
         assert_eq!(req["params"]["_meta"]["model"]["provider"], "anthropic");
+    }
+
+    #[tokio::test]
+    async fn test_new_session_without_model_skips_acp_model_configuration() {
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "agent-default",
+                    "options": [{"value": "other-model", "name": "Other Model"}]
+                }]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp]);
+        let outgoing = transport.outgoing();
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        let session_id = client.new_session("/project", &[], None).await.unwrap();
+
+        assert_eq!(session_id, "sess_123");
+        let sent = outgoing.lock();
+        assert_eq!(sent.len(), 2);
+        let request: Value = serde_json::from_str(&sent[1]).unwrap();
+        assert!(request["params"].get("_meta").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_new_session_sets_qualified_model_config_option() {
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "github-copilot/gpt-5.5",
+                    "options": [{
+                        "value": "github-copilot/claude-opus-4.8",
+                        "name": "Claude Opus 4.8"
+                    }]
+                }]
+            }),
+        );
+        let set_resp = rpc_response(
+            2,
+            serde_json::json!({
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "github-copilot/claude-opus-4.8",
+                    "options": [{
+                        "value": "github-copilot/claude-opus-4.8",
+                        "name": "Claude Opus 4.8"
+                    }]
+                }]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp, &set_resp]);
+        let outgoing = transport.outgoing();
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let model = ModelInfo {
+            id: "claude-opus-4.8".into(),
+            provider: Some("github-copilot".into()),
+        };
+
+        let session_id = client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap();
+
+        assert_eq!(session_id, "sess_123");
+        let sent = outgoing.lock();
+        assert_eq!(sent.len(), 3);
+        let request: Value = serde_json::from_str(&sent[2]).unwrap();
+        assert_eq!(request["method"], "session/set_config_option");
+        assert_eq!(request["params"]["sessionId"], "sess_123");
+        assert_eq!(request["params"]["configId"], "model");
+        assert_eq!(request["params"]["value"], "github-copilot/claude-opus-4.8");
+    }
+
+    #[tokio::test]
+    async fn test_new_session_sets_unqualified_model_config_option() {
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "claude-sonnet-5",
+                    "options": [{"value": "gpt-5.6-sol", "name": "GPT-5.6 Sol"}]
+                }]
+            }),
+        );
+        let set_resp = rpc_response(
+            2,
+            serde_json::json!({
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.6-sol",
+                    "options": [{"value": "gpt-5.6-sol", "name": "GPT-5.6 Sol"}]
+                }]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp, &set_resp]);
+        let outgoing = transport.outgoing();
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let model = ModelInfo {
+            id: "gpt-5.6-sol".into(),
+            provider: Some("github-copilot".into()),
+        };
+
+        client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap();
+
+        let sent = outgoing.lock();
+        assert_eq!(sent.len(), 3);
+        let request: Value = serde_json::from_str(&sent[2]).unwrap();
+        assert_eq!(request["params"]["value"], "gpt-5.6-sol");
+    }
+
+    #[tokio::test]
+    async fn test_new_session_rejects_unavailable_configured_model() {
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [{
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.5",
+                    "options": [{"value": "gpt-5.5", "name": "GPT-5.5"}]
+                }]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp]);
+        let outgoing = transport.outgoing();
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let model = ModelInfo {
+            id: "gpt-5.6-sol".into(),
+            provider: Some("github-copilot".into()),
+        };
+
+        let error = client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not offer configured model")
+        );
+        assert_eq!(outgoing.lock().len(), 2);
     }
 
     #[tokio::test]
@@ -1870,7 +2171,10 @@ mod tests {
         };
 
         // Should succeed despite garbage in the stream
-        let sid = client.new_session("/project", &[], &model).await.unwrap();
+        let sid = client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap();
         assert_eq!(sid, "sess_1");
     }
 
@@ -1894,8 +2198,8 @@ mod tests {
             provider: None,
         };
 
-        client.new_session("/a", &[], &model).await.unwrap();
-        client.new_session("/b", &[], &model).await.unwrap();
+        client.new_session("/a", &[], Some(&model)).await.unwrap();
+        client.new_session("/b", &[], Some(&model)).await.unwrap();
 
         // IDs should be 0 (init), 1, 2
         let sent = outgoing.lock();

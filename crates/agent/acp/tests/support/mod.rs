@@ -125,9 +125,12 @@ pub async fn run_session_prompt(backend: &AcpBackend) -> anyhow::Result<()> {
     let model = backend.model();
     let cwd = backend.cwd()?;
 
-    let session_id = tokio::time::timeout(backend.timeout(), client.new_session(&cwd, &[], &model))
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out creating {} ACP session", backend.name))??;
+    let session_id = tokio::time::timeout(
+        backend.timeout(),
+        client.new_session(&cwd, &[], Some(&model)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out creating {} ACP session", backend.name))??;
     assert!(!session_id.trim().is_empty());
     assert_eq!(client.session_id(), Some(session_id.as_str()));
 
