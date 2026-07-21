@@ -7,4 +7,4 @@ mod tables;
 
 pub use error::{Error, Result};
 pub use hash::{canonical_object_bytes, object_hash};
-pub use redb_store::{RedbRunStore, StoreWaitObserver};
+pub use redb_store::{RedbRunStore, StoreWaitCancellation, StoreWaitObserver};

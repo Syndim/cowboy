@@ -26,9 +26,9 @@ pub enum Error {
     /// JSON serialization/deserialization failed.
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
-    /// A process-wide cached database handle lock was poisoned.
-    #[error("cached database handle lock was poisoned")]
-    CachePoisoned,
+    /// Waiting for another process to release the database was interrupted.
+    #[error("workflow store wait cancelled")]
+    WaitCancelled,
     /// Stored object envelope did not include a `payload` field.
     #[error("stored object envelope is missing payload")]
     MissingPayload,

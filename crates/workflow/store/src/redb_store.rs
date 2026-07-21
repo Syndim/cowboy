@@ -1,6 +1,8 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::thread;
 use std::time::Duration;
 
@@ -20,45 +22,50 @@ use crate::tables::{
 use crate::{Error, Result};
 
 const OPEN_RETRY_BACKOFF: Duration = Duration::from_millis(25);
-static DATABASE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Database>>>> = OnceLock::new();
-
 
 pub type StoreWaitObserver = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
+/// Snapshot used to interrupt an in-progress database availability wait.
+#[derive(Clone)]
+pub struct StoreWaitCancellation {
+    generation: Arc<AtomicU64>,
+    expected_generation: u64,
+}
+
+impl StoreWaitCancellation {
+    pub fn new(generation: Arc<AtomicU64>, expected_generation: u64) -> Self {
+        Self {
+            generation,
+            expected_generation,
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.generation.load(Ordering::Acquire) != self.expected_generation
+    }
+}
 
 /// redb-backed implementation of workflow run storage.
 ///
-/// The default store keeps immutable content-addressed objects in `OBJECTS` and mutable
-/// run state in dedicated tables. Most values are path-backed and open redb only
-/// inside each operation, so idle Cowboy processes do not retain redb's
-/// exclusive writable database lock. Runtime-owned values may opt into a
-/// process-wide shared cached handle so multiple runtimes in one process reuse
-/// the same redb owner instead of contending with each other.
+/// The store keeps immutable content-addressed objects in `OBJECTS` and mutable
+/// run state in dedicated tables. It opens redb only inside each operation, so
+/// idle Cowboy processes do not retain redb's exclusive writable database lock.
 #[derive(Clone)]
 pub struct RedbRunStore {
     /// Path to the redb workflow database.
     path: PathBuf,
     /// Optional notification hook fired once when a database-open wait begins.
     wait_observer: Option<StoreWaitObserver>,
-    /// Whether operations use the process-wide database cache for this path.
-    cache_database: bool,
+    /// Optional cancellation check evaluated while the database remains busy.
+    wait_cancellation: Option<StoreWaitCancellation>,
 }
 
 impl RedbRunStore {
-    /// Build a cloneable store value that opens and caches redb on first use.
-    pub fn cached(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-            wait_observer: None,
-            cache_database: true,
-        }
-    }
-
     /// Build a cloneable store value without opening redb until an operation runs.
     pub fn lazy(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
             wait_observer: None,
-            cache_database: false,
+            wait_cancellation: None,
         }
     }
 
@@ -67,7 +74,16 @@ impl RedbRunStore {
         Self {
             path: self.path.clone(),
             wait_observer: Some(wait_observer),
-            cache_database: self.cache_database,
+            wait_cancellation: self.wait_cancellation.clone(),
+        }
+    }
+
+    /// Return a store clone whose database-open wait can be interrupted.
+    pub fn with_wait_cancellation(&self, wait_cancellation: StoreWaitCancellation) -> Self {
+        Self {
+            path: self.path.clone(),
+            wait_observer: self.wait_observer.clone(),
+            wait_cancellation: Some(wait_cancellation),
         }
     }
 
@@ -94,11 +110,12 @@ impl RedbRunStore {
             &path,
             |path| Database::create(path),
             wait_observer.as_ref(),
+            None,
         )?);
         Ok(Self {
             path,
             wait_observer,
-            cache_database: false,
+            wait_cancellation: None,
         })
     }
 
@@ -109,11 +126,12 @@ impl RedbRunStore {
             &path,
             |path| Database::open(path),
             None,
+            None,
         )?);
         Ok(Self {
             path,
             wait_observer: None,
-            cache_database: false,
+            wait_cancellation: None,
         })
     }
 
@@ -568,35 +586,14 @@ impl RedbRunStore {
         Ok(value)
     }
 
-    fn open_database(&self) -> Result<Arc<Database>> {
-        if self.cache_database {
-            return self.open_cached_database();
-        }
-
+    fn open_database(&self) -> Result<Database> {
         ensure_parent_dir(&self.path)?;
         open_database_when_available(
             &self.path,
             |path| Database::create(path),
             self.wait_observer.as_ref(),
+            self.wait_cancellation.as_ref(),
         )
-        .map(Arc::new)
-    }
-
-    fn open_cached_database(&self) -> Result<Arc<Database>> {
-        let cache = DATABASE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache.lock().map_err(|_| Error::CachePoisoned)?;
-        if let Some(db) = cache.get(&self.path) {
-            return Ok(db.clone());
-        }
-
-        ensure_parent_dir(&self.path)?;
-        let db = Arc::new(open_database_when_available(
-            &self.path,
-            |path| Database::create(path),
-            self.wait_observer.as_ref(),
-        )?);
-        cache.insert(self.path.clone(), db.clone());
-        Ok(db)
     }
 }
 
@@ -611,17 +608,30 @@ fn open_database_when_available(
     path: &Path,
     mut open: impl FnMut(&Path) -> std::result::Result<Database, redb::DatabaseError>,
     wait_observer: Option<&StoreWaitObserver>,
+    wait_cancellation: Option<&StoreWaitCancellation>,
 ) -> Result<Database> {
     let mut waiting = false;
     loop {
         match open(path) {
-            Ok(db) => return Ok(db),
+            Ok(db) => {
+                if waiting {
+                    tracing::info!(workflow_store = %path.display(), "workflow store available; continuing");
+                }
+
+                return Ok(db);
+            }
             Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                if wait_cancellation.is_some_and(StoreWaitCancellation::is_cancelled) {
+                    tracing::debug!(workflow_store = %path.display(), "workflow store wait cancelled");
+                    return Err(Error::WaitCancelled);
+                }
+
                 if !waiting {
                     tracing::info!(workflow_store = %path.display(), "workflow store busy; waiting for availability");
                     if let Some(observer) = wait_observer {
                         observer(path);
                     }
+
                     waiting = true;
                 }
 
@@ -775,8 +785,8 @@ mod tests {
     };
     use serde_json::Value;
 
-    use cowboy_workflow_core::RunHeadSummary;
     use super::*;
+    use cowboy_workflow_core::RunHeadSummary;
 
     fn store() -> (tempfile::NamedTempFile, RedbRunStore) {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1051,6 +1061,43 @@ mod tests {
 
         holder.join().unwrap();
         store.expect("transient database contention should wait for the lock to be released");
+    }
+
+    #[test]
+    fn store_wait_cancellation_interrupts_contention() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let path = file.path().to_path_buf();
+        let holder_path = path.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let database = Database::create(holder_path).unwrap();
+            locked_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(250));
+            drop(database);
+        });
+        locked_rx.recv().unwrap();
+        let generation = Arc::new(AtomicU64::new(0));
+        let cancellation = StoreWaitCancellation::new(generation.clone(), 0);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let observer: StoreWaitObserver = Arc::new(move |_| {
+            waiting_tx.send(()).unwrap();
+        });
+        let store = RedbRunStore::lazy(&path)
+            .with_wait_observer(observer)
+            .with_wait_cancellation(cancellation);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            result_tx.send(store.list_runs()).unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        generation.fetch_add(1, Ordering::AcqRel);
+        let result = result_rx.recv_timeout(Duration::from_millis(100));
+
+        holder.join().unwrap();
+        waiter.join().unwrap();
+        let result = result.expect("cancelled store wait should finish promptly");
+        assert!(matches!(result, Err(Error::WaitCancelled)), "{result:?}");
     }
 
     #[test]

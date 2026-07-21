@@ -157,7 +157,10 @@ async fn dispatch_slash_command(
     match command {
         SlashCommand::Shared(command) => dispatch_shared_command(state, runtime, command).await?,
         SlashCommand::Workflows => show_workflows(state, runtime)?,
-        SlashCommand::Cancel => state.cancel_background_tasks(),
+        SlashCommand::Cancel => {
+            runtime.cancel_store_waits();
+            state.cancel_background_tasks();
+        }
         SlashCommand::Exit => {
             state.mark_exit_requested();
             state.set_status("exiting");

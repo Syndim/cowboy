@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
@@ -24,7 +27,7 @@ use cowboy_workflow_core::{
     WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
 };
-use cowboy_workflow_store::{RedbRunStore, StoreWaitObserver};
+use cowboy_workflow_store::{RedbRunStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -296,6 +299,7 @@ pub struct ResolutionStatus {
 pub struct WorkflowRuntime {
     config: RuntimeConfig,
     store: RedbRunStore,
+    store_wait_generation: Arc<AtomicU64>,
     events: Arc<EventBus>,
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
@@ -382,12 +386,13 @@ impl WorkflowRuntime {
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
     ) -> Self {
-        let store = RedbRunStore::cached(&config.workflow_store);
+        let store = RedbRunStore::lazy(&config.workflow_store);
 
         Self {
             run_locks: RunExecutionLocks::new(config.workflow_store.clone()),
             config,
             store,
+            store_wait_generation: Arc::new(AtomicU64::new(0)),
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
@@ -402,6 +407,12 @@ impl WorkflowRuntime {
     pub fn with_deterministic_selector(mut self) -> Self {
         self.selector = SelectorMode::Deterministic;
         self
+    }
+
+    /// Interrupt database availability waits started by current runtime operations.
+    pub fn cancel_store_waits(&self) {
+        let generation = self.store_wait_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        tracing::debug!(generation, "cancelled pending workflow store waits");
     }
 
     #[cfg(all(test, feature = "test-support"))]
@@ -1320,7 +1331,7 @@ impl WorkflowRuntime {
     }
 
     fn store(&self) -> Result<RedbRunStore> {
-        Ok(self.store.clone())
+        Ok(self.store_with_cancellation(self.store.clone()))
     }
 
     fn store_for_run(&self, run_id: &str) -> Result<RedbRunStore> {
@@ -1334,7 +1345,14 @@ impl WorkflowRuntime {
                 },
             ));
         });
-        Ok(self.store.with_wait_observer(observer))
+        Ok(self.store_with_cancellation(self.store.with_wait_observer(observer)))
+    }
+
+    fn store_with_cancellation(&self, store: RedbRunStore) -> RedbRunStore {
+        let expected_generation = self.store_wait_generation.load(Ordering::Acquire);
+        let cancellation =
+            StoreWaitCancellation::new(self.store_wait_generation.clone(), expected_generation);
+        store.with_wait_cancellation(cancellation)
     }
 
     fn persist_events(&self, run_id: &str, events: &[WorkflowEvent]) -> Result<()> {
@@ -2591,6 +2609,85 @@ exit 0
         )
     }
 
+    #[test]
+    fn idle_runtime_does_not_keep_workflow_store_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir);
+        assert!(runtime.list_runs(None).unwrap().is_empty());
+        let store_path = dir.path().join("state/workflow.redb");
+
+        let database = redb::Database::create(&store_path).unwrap_or_else(|err| {
+            panic!(
+                "idle runtime retained the workflow store lock at {}: {err}",
+                store_path.display()
+            )
+        });
+
+        drop(database);
+    }
+
+    #[test]
+    fn cancelling_runtime_store_wait_interrupts_contended_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(
+            &dir,
+            r#"
+            local first = step("first")
+            first.run = function(ctx) return action.status { status = "next" } end
+            local second = step("second")
+            second.run = function(ctx) return action.status { status = "success" } end
+            first:on("next", second)
+            return workflow("declared", first)
+            "#,
+        );
+        let async_runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let started = async_runtime
+            .block_on(runtime.start_run_with_workflow_stepwise("aaa", "do it"))
+            .unwrap();
+        let store_path = dir.path().join("state/workflow.redb");
+        let database = redb::Database::create(store_path).unwrap();
+        let mut events = runtime.events().subscribe();
+        let executing_runtime = runtime.clone();
+        let run_id = started.run.id.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let async_runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let result = async_runtime.block_on(executing_runtime.resume_run(&run_id));
+            result_tx.send(result).unwrap();
+        });
+        let wait_started = std::time::Instant::now();
+        'waiting: loop {
+            while let Ok(event) = events.try_recv() {
+                if matches!(event.kind, WorkflowEventKind::WorkflowStoreWaiting { .. }) {
+                    break 'waiting;
+                }
+            }
+
+            assert!(
+                wait_started.elapsed() < Duration::from_secs(1),
+                "runtime did not report the contended store wait"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        runtime.cancel_store_waits();
+        let result = result_rx.recv_timeout(Duration::from_millis(250));
+        drop(database);
+        worker.join().unwrap();
+        let error = result
+            .expect("cancelled runtime store wait should finish promptly")
+            .expect_err("cancelled store wait should fail the runtime operation");
+
+        assert!(
+            error.to_string().contains("workflow store wait cancelled"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn workflow_store_wait_event_emits_once_during_contended_resume() {
         let dir = tempfile::tempdir().unwrap();
@@ -3135,33 +3232,29 @@ exit 0
     }
 
     #[test]
-    fn list_runs_returns_many_disk_persisted_summaries_quickly() {
+    fn list_runs_reads_persisted_head_summaries_without_full_runs() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_empty_state(&dir);
         let store = runtime.store().unwrap();
-        let large_snapshotted_source = "return workflow('bulk', step('done'))".repeat(512);
 
         for index in 0..100 {
-            let mut run = summary_test_run(
+            let run = summary_test_run(
                 &format!("run-bulk-{index:04}"),
                 RunStatus::Completed,
                 Some(&format!("Bulk run {index}")),
             );
-            run.workflow_sources
-                .insert("default.lua".to_string(), large_snapshotted_source.clone());
-            store.save_run(&run).unwrap();
             store.update_run_head(&run.id, run_head(&run)).unwrap();
         }
 
-        let started = std::time::Instant::now();
         let summaries = runtime.list_runs(None).unwrap();
-        let elapsed = started.elapsed();
 
         assert_eq!(summaries.len(), 100);
-        assert!(
-            elapsed < Duration::from_millis(25),
-            "listing 100 disk-persisted run summaries took {elapsed:?}; /runs should read summary data without reopening the database and deserializing every full workflow snapshot"
-        );
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.run_id == "run-bulk-0042")
+            .expect("persisted run-head summary");
+        assert_eq!(summary.topic.as_deref(), Some("Bulk run 42"));
+        assert_eq!(summary.workflow_name, "aaa");
     }
 
     #[tokio::test]

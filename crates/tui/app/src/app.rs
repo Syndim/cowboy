@@ -39,6 +39,7 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     tracing::debug!("TUI terminal session started");
 
     let result = run_loop(&mut terminal, state, &runtime, &mut workflow_events).await;
+    runtime.cancel_store_waits();
     if let Err(err) = &result {
         tracing::error!(error = ?err, "TUI loop exited with error");
     }
@@ -194,6 +195,10 @@ where
                 );
                 match input::handle_key_press_with_layout(&mut state, key, current_layout) {
                     KeyHandling::Continue => draw_scheduler.mark_dirty(),
+                    KeyHandling::Cancel => {
+                        runtime.cancel_store_waits();
+                        draw_scheduler.mark_dirty();
+                    }
                     KeyHandling::Submit => {
                         commands::submit_input(&mut state, runtime).await;
                         draw_scheduler.mark_dirty();

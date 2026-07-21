@@ -10,6 +10,7 @@ use super::state::AppState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum KeyHandling {
     Continue,
+    Cancel,
     Submit,
     Exit,
 }
@@ -19,7 +20,7 @@ pub(super) fn handle_key_press(state: &mut AppState, key: KeyEvent) -> KeyHandli
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => KeyHandling::Exit,
         KeyCode::Esc => {
             state.cancel_background_tasks();
-            KeyHandling::Continue
+            KeyHandling::Cancel
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.scroll_events_up();
@@ -480,7 +481,7 @@ mod tests {
         let handling =
             handle_key_press(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert_eq!(handling, KeyHandling::Continue);
+        assert_eq!(handling, KeyHandling::Cancel);
         assert_eq!(state.input(), "hello");
         assert_eq!(state.status(), "cancelled 1 background task(s)");
         assert_eq!(state.background_task_count(), 0);
