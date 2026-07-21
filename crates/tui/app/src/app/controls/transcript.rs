@@ -1199,6 +1199,13 @@ mod tests {
         ));
 
         let rows = rendered_rows(&state, 8, 24);
+        let visible_body_text = rows
+            .iter()
+            .filter_map(|row| row.strip_prefix('│')?.strip_suffix('│'))
+            .fold(String::new(), |mut text, row| {
+                text.push_str(row.trim_end());
+                text
+            });
 
         assert!(
             rows.iter().all(|row| !row.ends_with('█')),
@@ -1210,8 +1217,8 @@ mod tests {
             "overflowing content should not draw scrollbar chrome after normal transcript borders: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("END_MARKER")),
-            "overflowing content should keep tail content visible across the full transcript width: {rows:?}"
+            visible_body_text.contains("END_MARKER"),
+            "overflowing content should keep tail content visible across wrapped body rows: {rows:?}"
         );
     }
 
