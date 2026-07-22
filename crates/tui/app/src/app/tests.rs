@@ -93,6 +93,15 @@ struct CursorVisibilityProbeBackend {
     cursor_visible: bool,
     draw_calls: usize,
     visible_redraw_painted_cells: usize,
+    cursor_show_calls: usize,
+    cursor_hide_calls: usize,
+    visibility_transitions: Vec<CursorVisibility>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorVisibility {
+    Shown,
+    Hidden,
 }
 
 impl CursorVisibilityProbeBackend {
@@ -102,6 +111,9 @@ impl CursorVisibilityProbeBackend {
             cursor_visible: false,
             draw_calls: 0,
             visible_redraw_painted_cells: 0,
+            cursor_show_calls: 0,
+            cursor_hide_calls: 0,
+            visibility_transitions: Vec::new(),
         }
     }
 }
@@ -124,11 +136,15 @@ impl Backend for CursorVisibilityProbeBackend {
 
     fn hide_cursor(&mut self) -> io::Result<()> {
         self.cursor_visible = false;
+        self.cursor_hide_calls += 1;
+        self.visibility_transitions.push(CursorVisibility::Hidden);
         Ok(())
     }
 
     fn show_cursor(&mut self) -> io::Result<()> {
         self.cursor_visible = true;
+        self.cursor_show_calls += 1;
+        self.visibility_transitions.push(CursorVisibility::Shown);
         Ok(())
     }
 
@@ -403,8 +419,72 @@ fn status_animation_redraw_hides_cursor_before_painting_changed_cell() {
     );
 }
 
+#[test]
+fn running_state_does_not_toggle_cursor_visibility_across_animation_frames() {
+    let mut state = test_state();
+    state.push_input("abc");
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "default".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        },
+    ));
+    assert!(
+        state.status_animation_active(),
+        "precondition: the running status animation must be active so these frames are on the blink-prone redraw path"
+    );
+
+    let backend = CursorVisibilityProbeBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut scheduler = DrawScheduler::new();
+    let mut layout = AppLayout::new(Rect::default(), &state);
+
+    // Mirror the production run_loop: render an initial frame, then repeatedly
+    // advance the running status animation and redraw exactly as the 100 ms idle
+    // poll path does. Each pass is one animation-driven production frame.
+    layout = draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+    scheduler.mark_clean();
+    for _ in 0..3 {
+        tick_status_animation(&mut state, &mut scheduler);
+        assert!(
+            scheduler.should_draw(),
+            "the running status animation must dirty every tick so the frame is redrawn"
+        );
+        layout = draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+        scheduler.mark_clean();
+    }
+
+    // The reported blink is the application repeatedly hiding then re-showing the
+    // blinking-block cursor on every animation redraw. Detect that toggle
+    // directly: while running, no production frame may re-show the cursor, so
+    // there must be zero Hidden->Shown transitions and zero show calls across
+    // all four frames. A final-state-only check would be satisfied by a sham
+    // `hide -> paint -> show -> position -> hide` sequence that still blinks.
+    let backend = terminal.backend();
+    let shown_after_hidden = backend
+        .visibility_transitions
+        .windows(2)
+        .filter(|pair| pair == &[CursorVisibility::Hidden, CursorVisibility::Shown])
+        .count();
+    assert_eq!(
+        backend.cursor_show_calls, 0,
+        "running-state frames re-showed the cursor {} time(s) across 4 animation-driven redraws (transitions: {:?}); each show after the pre-draw hide is one blink cycle, so the blinking-block cursor blinks rapidly. Running-state frames must keep the composer cursor hidden throughout the animation.",
+        backend.cursor_show_calls, backend.visibility_transitions
+    );
+    assert_eq!(
+        shown_after_hidden, 0,
+        "running-state frames toggled the cursor Hidden->Shown {} time(s) (transitions: {:?}); that repeated visibility toggle IS the reported rapid blink. The cursor must stay hidden across running animation frames.",
+        shown_after_hidden, backend.visibility_transitions
+    );
+}
+
 #[tokio::test]
-async fn draw_places_cursor_in_active_run_draft_input() {
+async fn draw_hides_composer_cursor_during_active_run_animation() {
+    // Draft typing stays enabled while a run is active, but the visible cursor
+    // is suppressed during the running status animation so the blinking-block
+    // cursor does not blink rapidly.
     let mut state = test_state();
     state.push_input("abc");
     state.spawn_test_card_report_task("pending".to_string(), async {
@@ -416,9 +496,10 @@ async fn draw_places_cursor_in_active_run_draft_input() {
 
     terminal.draw(|frame| draw(frame, &state)).unwrap();
 
-    terminal
-        .backend_mut()
-        .assert_cursor_position(Position::new(6, 8));
+    assert!(
+        !terminal.backend().cursor_visible(),
+        "running-animation frames must hide the composer cursor"
+    );
     state.cancel_background_tasks();
 }
 

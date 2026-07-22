@@ -533,6 +533,10 @@ impl AppState {
             || self.input().trim().starts_with('/')
     }
 
+    pub(in crate::app) fn composer_shows_cursor(&self) -> bool {
+        self.composer_accepts_edits() && !self.status_animation_active()
+    }
+
     pub(in crate::app) fn display_state(&self) -> String {
         if self.pending_prompt.is_some() {
             "waiting".to_string()
@@ -1523,6 +1527,35 @@ mod tests {
         assert!(!state.advance_status_animation());
         assert_eq!(state.status_animation_frame(), first);
         assert_ne!(waiting_frame, state.status_animation_frame());
+    }
+
+    #[test]
+    fn composer_hides_cursor_only_during_running_animation() {
+        let mut state = test_state();
+        assert!(state.composer_shows_cursor());
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        assert!(state.status_animation_active());
+        assert!(!state.composer_shows_cursor());
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::WaitingForInput {
+                step: "confirm".to_string(),
+                prompt_id: "approval".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["yes".to_string()],
+            },
+        ));
+        assert!(!state.status_animation_active());
+        assert!(state.composer_shows_cursor());
     }
 
     #[test]

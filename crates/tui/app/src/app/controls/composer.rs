@@ -88,7 +88,7 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
             .border_style(style),
     );
     frame.render_widget(composer, area);
-    if state.composer_accepts_edits() {
+    if state.composer_shows_cursor() {
         set_input_cursor(frame, area, visible_height, &rendered);
     }
 }

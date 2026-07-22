@@ -1,0 +1,205 @@
+{
+  "workspace_snapshot": {
+    "id": "SNAP-01",
+    "base_revision": "8818e9e2c6dce8e618f5da848b70fd62b9e6be12",
+    "dirty": true,
+    "dirty_files": [
+      {
+        "status": "M",
+        "path": "crates/tui/app/src/app/tests.rs"
+      },
+      {
+        "status": "??",
+        "path": "docs/plans/cursor_blinks_rapidly_in_running_state/"
+      }
+    ],
+    "tested_source": {
+      "path": "crates/tui/app/src/app/tests.rs",
+      "content_sha256": "29062dcdda67e8a922247640e43e53001311a059642a282cbda56ea0649e58cb",
+      "content_sha256_verified_by": "INV-CMD-05",
+      "unstaged_diff_sha256": "4d92a6b5f7e39648ff47d08190c0b823c30f15137b363ce17b7d0f45133ac36c",
+      "unstaged_diff_sha256_verified_by": "INV-CMD-06",
+      "canonical_diff_command": "bash -o pipefail -c 'git --no-pager diff --no-color -- crates/tui/app/src/app/tests.rs | sha256sum'"
+    },
+    "rca_doc": {
+      "path": "docs/plans/cursor_blinks_rapidly_in_running_state/rca.md",
+      "note": "content hash omitted; hashing this file would be self-referential"
+    }
+  },
+  "investigator_command_records": [
+    {
+      "id": "INV-CMD-01",
+      "source": "investigator",
+      "command": "cargo test -p cowboy --lib app::tests::running_state_does_not_toggle_cursor_visibility_across_animation_frames",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:38:41Z",
+      "exit_status": 101,
+      "exit_meaning": "expected: libtest exits non-zero (101) because the regression test fails before the fix",
+      "purpose": "Run the strengthened regression test and confirm it fails before any product fix."
+    },
+    {
+      "id": "INV-CMD-02",
+      "source": "investigator",
+      "command": "git status --porcelain",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:38:41Z",
+      "exit_status": 0,
+      "purpose": "Confirm only the test file and the new RCA folder changed; no product code was modified."
+    },
+    {
+      "id": "INV-CMD-03",
+      "source": "investigator",
+      "command": "cargo clippy -p cowboy --tests",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:38:31Z",
+      "exit_status": 0,
+      "purpose": "Confirm Clippy completes successfully with no warnings or errors from the strengthened test and extended probe backend."
+    },
+    {
+      "id": "INV-CMD-04",
+      "source": "investigator",
+      "command": "cargo test -p cowboy --lib app::tests::",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:38:41Z",
+      "exit_status": 101,
+      "exit_meaning": "expected: libtest exits non-zero (101) because the one new regression test fails; all 34 sibling tests pass",
+      "purpose": "Confirm the new regression test is the only failure and no sibling cursor/animation test regressed."
+    },
+    {
+      "id": "INV-CMD-05",
+      "source": "investigator",
+      "command": "sha256sum crates/tui/app/src/app/tests.rs",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:38:16Z",
+      "exit_status": 0,
+      "purpose": "Executable verification of the tested-source content digest recorded in SNAP-01.tested_source.content_sha256."
+    },
+    {
+      "id": "INV-CMD-06",
+      "source": "investigator",
+      "command": "bash -o pipefail -c 'git --no-pager diff --no-color -- crates/tui/app/src/app/tests.rs | sha256sum'",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:44:33Z",
+      "exit_status": 0,
+      "exit_meaning": "run under `bash -o pipefail` so the overall status is nonzero if EITHER git diff or sha256sum fails; observed overall exit 0. A cross-checked run without the pipe (INV-CMD-06b, explicit PIPESTATUS) confirmed git_status=0 and sha256sum_status=0.",
+      "purpose": "Executable, failure-propagating verification of the canonical unstaged-diff digest recorded in SNAP-01.tested_source.unstaged_diff_sha256, hashing the bytes of the pinned canonical diff command."
+    },
+    {
+      "id": "INV-CMD-06b",
+      "source": "investigator",
+      "command": "git --no-pager diff --no-color -- crates/tui/app/src/app/tests.rs | sha256sum; echo \"git_status=${PIPESTATUS[0]} sha256sum_status=${PIPESTATUS[1]}\"",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:44:33Z",
+      "exit_status": 0,
+      "purpose": "Cross-check that captures each pipeline stage status explicitly, so INV-EV-06 can assert per-stage success rather than only sha256sum's status."
+    },
+    {
+      "id": "INV-CMD-06c",
+      "source": "investigator",
+      "command": "bash -c 'bash -o pipefail -c \"git --no-pager diff --no-color --this-option-does-not-exist -- crates/tui/app/src/app/tests.rs 2>/dev/null | sha256sum >/dev/null\"; pf=$?; git --no-pager diff --no-color --this-option-does-not-exist -- crates/tui/app/src/app/tests.rs 2>/dev/null | sha256sum >/dev/null; bare=$?; echo \"pipefail_variant_exit=$pf non_pipefail_variant_exit=$bare\"'",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-21T07:49:54Z",
+      "exit_status": 0,
+      "exit_meaning": "single negative-control command that runs BOTH variants against an intentionally failing git-diff first stage and reports each status: the pipefail variant exits 129 (failure propagated); the bare-pipe variant exits 0 (failure masked). Both outcomes now have command provenance from this one execution.",
+      "purpose": "Prove, from one recorded command, that the pipefail form propagates a first-stage failure the bare pipe masks \u2014 giving INV-EV-06c full provenance for both reported statuses."
+    }
+  ],
+  "investigator_evidence_records": [
+    {
+      "id": "INV-EV-01",
+      "source": "investigator",
+      "matches_command": "INV-CMD-01",
+      "source_snapshot": "SNAP-01",
+      "assertion_site": "crates/tui/app/src/app/tests.rs:471",
+      "observed_result": "FAILED: cursor_show_calls == 4 (left 4, right 0) across 4 animation-driven production frames; recorded transitions [Hidden, Shown, Hidden, Shown, Hidden, Shown, Hidden, Shown].",
+      "test_outcome_line": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 311 filtered out; finished in 0.01s",
+      "observed_exit_status": 101,
+      "conclusion": "fails_before_fix"
+    },
+    {
+      "id": "INV-EV-02",
+      "source": "investigator",
+      "matches_command": "INV-CMD-02",
+      "source_snapshot": "SNAP-01",
+      "observed_result": " M crates/tui/app/src/app/tests.rs / ?? docs/plans/cursor_blinks_rapidly_in_running_state/",
+      "observed_exit_status": 0,
+      "conclusion": "tests_and_docs_only_no_product_code_changed"
+    },
+    {
+      "id": "INV-EV-03",
+      "source": "investigator",
+      "matches_command": "INV-CMD-03",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.23s; zero warning/error lines emitted.",
+      "observed_exit_status": 0,
+      "conclusion": "clippy_completed_successfully_no_warnings"
+    },
+    {
+      "id": "INV-EV-04",
+      "source": "investigator",
+      "matches_command": "INV-CMD-04",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "test result: FAILED. 34 passed; 1 failed; 0 ignored; 0 measured; 277 filtered out; finished in 0.08s",
+      "observed_exit_status": 101,
+      "conclusion": "only_new_regression_test_fails_siblings_pass"
+    },
+    {
+      "id": "INV-EV-05",
+      "source": "investigator",
+      "matches_command": "INV-CMD-05",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "29062dcdda67e8a922247640e43e53001311a059642a282cbda56ea0649e58cb  crates/tui/app/src/app/tests.rs",
+      "observed_exit_status": 0,
+      "conclusion": "content_digest_matches_SNAP-01"
+    },
+    {
+      "id": "INV-EV-06",
+      "source": "investigator",
+      "matches_command": "INV-CMD-06",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "4d92a6b5f7e39648ff47d08190c0b823c30f15137b363ce17b7d0f45133ac36c  -",
+      "observed_exit_status": 0,
+      "exit_propagation": "bash -o pipefail; overall nonzero if git diff OR sha256sum fails",
+      "conclusion": "canonical_diff_digest_matches_SNAP-01_with_failure_propagation"
+    },
+    {
+      "id": "INV-EV-06b",
+      "source": "investigator",
+      "matches_command": "INV-CMD-06b",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "4d92a6b5f7e39648ff47d08190c0b823c30f15137b363ce17b7d0f45133ac36c  -\\ngit_status=0 sha256sum_status=0",
+      "observed_exit_status": 0,
+      "conclusion": "both_pipeline_stages_succeeded_individually"
+    },
+    {
+      "id": "INV-EV-06c",
+      "source": "investigator",
+      "matches_command": "INV-CMD-06c",
+      "source_snapshot": "SNAP-01",
+      "observed_result": "pipefail_variant_exit=129 non_pipefail_variant_exit=0",
+      "observed_exit_status": 0,
+      "both_variants_from_one_command": true,
+      "conclusion": "pipefail_propagates_first_stage_failure_129_bare_pipe_masks_it_0"
+    }
+  ],
+  "implementation_command_records": [],
+  "implementation_evidence_records": [],
+  "tester_command_records": [],
+  "tester_evidence_records": [],
+  "validator_command_records": [],
+  "validator_evidence_records": [],
+  "reviewer_command_records": [],
+  "reviewer_evidence_records": [],
+  "reviewer_soundness_assessments": [],
+  "stage": "investigation",
+  "repro_test": "crates/tui/app/src/app/tests.rs::running_state_does_not_toggle_cursor_visibility_across_animation_frames",
+  "rca_doc": "docs/plans/cursor_blinks_rapidly_in_running_state/rca.md"
+}
