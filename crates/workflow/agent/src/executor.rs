@@ -613,14 +613,19 @@ where
             }
         }
 
-        let parsed = parse_frontmatter_output(&visible).inspect_err(|_err| {
-            tracing::error!(
-                run_id = %context.run_id,
-                step = %context.step_id,
-                reply = %visible,
-                "agent step: failed to parse frontmatter output"
-            );
-        })?;
+        let parsed = parse_frontmatter_output(&visible)
+            .map_err(|err| match err {
+                Error::MissingFrontmatter => Error::NoWorkflowResult,
+                other => other,
+            })
+            .inspect_err(|_err| {
+                tracing::error!(
+                    run_id = %context.run_id,
+                    step = %context.step_id,
+                    reply = %visible,
+                    "agent step: failed to parse frontmatter output"
+                );
+            })?;
         validate_output_spec(action.output.as_ref(), &parsed.output)?;
         let completed_at = Utc::now();
         let record = StepRecord {
@@ -1707,6 +1712,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_prompt_selects_no_result_branch_for_no_result_reason() {
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![event()])]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        let mut context = context("run", "record");
+        context.attempt = 2;
+        // Full wrapped runner-style reason produced by Error::NoWorkflowResult.
+        context.retry_reason = Some(
+            "recoverable action failure: agent reply did not contain a workflow result".to_string(),
+        );
+
+        let execution = executor
+            .execute_agent(action("developer"), context)
+            .await
+            .unwrap();
+
+        let prompt = execution.record.input.prompt.as_ref().unwrap();
+        assert!(prompt.contains("## Retry"));
+        // Selects the no-result branch: inspect/continue/complete-as-needed guidance
+        // and the do-not-repeat-completed-side-effects protection.
+        assert!(prompt.contains("Inspect the existing work"));
+        assert!(prompt.contains("Continue or complete any unfinished work"));
+        assert!(prompt.contains("without repeating actions or side effects already completed"));
+        // Does NOT select the malformed-frontmatter branch.
+        assert!(!prompt.contains("Do not redo the work"));
+    }
+
+    #[tokio::test]
     async fn rejects_agent_output_missing_declared_required_fields() {
         let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
             content: serde_json::json!({"text":"---\nstatus: passed\nsummary: ok\n---\nbody"}),
@@ -2745,7 +2779,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, Error::MissingFrontmatter));
+        assert!(matches!(error, Error::NoWorkflowResult));
         let window = executor.store.window.lock();
         assert!(window.as_ref().is_some_and(|window| !window.is_open()));
     }
@@ -2891,5 +2925,74 @@ mod tests {
             AgentProgressKind::SessionReady { descriptor, .. }
                 if descriptor.as_deref() == Some("gpt-5.6-sol-1m-high")
         ));
+    }
+
+    // Regression (systemic missing-frontmatter volume): the genuine executor
+    // `failed to parse frontmatter output` emissions across the diagnostic logs
+    // (11 across 5 runs; see
+    // docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/) are
+    // nonempty replies that carry NO parseable workflow result — 8 are
+    // unambiguous backend notices (7 stall, 1 stream-close) and 3 are ambiguous
+    // prose/preamble. Such a reply returns `StopReason::EndTurn` with the notice
+    // text as its only content, so at the provider-neutral `Client::prompt` seam
+    // it is shaped like an ordinary completed prose reply that omitted
+    // frontmatter — Cowboy has NO structured signal that the turn was incomplete
+    // (`PromptTurnActivity` is private to `cowboy-agent-acp` and consumed inside
+    // `prompt()`; only `StopReason` crosses the boundary). The feasible, grounded
+    // contract is therefore an ACCURATE GENERIC diagnostic for a reply that
+    // contained no workflow result, NOT a claim that the turn was incomplete and
+    // NOT any change to the (already complete-replacement) retry nudge.
+    //
+    // Observable contract this test pins, exercised through the real
+    // executor/client seam:
+    //   (a) POSITIVE: the diagnostic must accurately say the reply contained no
+    //       workflow result (asserted on the user-visible message text), so an
+    //       unrelated recoverable error does not satisfy it;
+    //   (b) it must be classified distinctly from `Error::MissingFrontmatter`
+    //       (asserted on the variant, so a bare message rewording of that variant
+    //       is rejected); and
+    //   (c) the failure must stay recoverable so the retry/back-off policy still
+    //       applies.
+    // (a) and (b) fail before the fix: the executor returns `MissingFrontmatter`,
+    // whose message is "agent response is missing YAML frontmatter".
+    #[tokio::test]
+    async fn no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter() {
+        let stall_notice = "Anthropic stream stalled while waiting for the next event";
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({ "text": stall_notice }),
+        }])]);
+        let executor = AgentExecutor::new(
+            factory,
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap_err();
+
+        // (a) Positive: the user-visible diagnostic accurately describes a reply
+        // that carried no workflow result.
+        assert!(
+            error
+                .to_string()
+                .contains("did not contain a workflow result"),
+            "a nonempty reply carrying no parseable result must be diagnosed as \
+\"agent reply did not contain a workflow result\", got: {error} ({error:?})"
+        );
+        // (b) Distinct classification — not the misleading missing-frontmatter
+        // variant (rejects a fix that only reworded `MissingFrontmatter`).
+        assert!(
+            !matches!(error, Error::MissingFrontmatter),
+            "a no-result reply must be classified distinctly from \
+MissingFrontmatter, got: {error:?}"
+        );
+        // (c) Still recoverable, so retry/back-off policy is preserved.
+        assert!(
+            error.recoverable(),
+            "a no-result reply must stay recoverable so retry/back-off policy \
+still applies, got non-recoverable: {error:?}"
+        );
     }
 }

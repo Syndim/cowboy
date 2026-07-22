@@ -1,0 +1,32 @@
+{
+  "note": "Frozen source-log manifest for the missing-frontmatter investigation. These are the ONLY diagnostic log files (by basename + SHA-256) that contained genuine executor `failed to parse frontmatter output` emissions at investigation time. extract_genuine_emissions.py consumes THIS manifest (a frozen file list under <state_dir>/logs), verifies each file's SHA-256, and processes them in listed order, so its output is reproducible independent of later log growth. Absolute directory generalized to <state_dir>/logs.",
+  "logs_dir": "<state_dir>/logs",
+  "total_genuine_emissions": 11,
+  "files": [
+    {
+      "basename": "cowboy.2026-07-21.1480208.log",
+      "sha256": "2cda801d710e9d498c34e72dfb2d8c6a369a64f0fa8a9d4a32cc802efedc0d93",
+      "genuine_emissions": 1
+    },
+    {
+      "basename": "cowboy.2026-07-21.1485796.log",
+      "sha256": "752d71f32cd78586a73874d06f288bf2989e9f6f652939b5a9b4727b1740f6c3",
+      "genuine_emissions": 1
+    },
+    {
+      "basename": "cowboy.2026-07-21.1504098.log",
+      "sha256": "e5d8268da140fc06e76bee167eed8570b9f8c77069b2a91ad7eeef17147d882d",
+      "genuine_emissions": 1
+    },
+    {
+      "basename": "cowboy.2026-07-21.1625323.log",
+      "sha256": "94585305c9cfd5b61d76127d34dfee90507d572cf669938e1ec3936b6a5eeebb",
+      "genuine_emissions": 4
+    },
+    {
+      "basename": "cowboy.2026-07-21.1631015.log",
+      "sha256": "72b2c0094d1e3008b6db261ea9f23fee7ad9310d4069d1ad8de7a697d9ea0357",
+      "genuine_emissions": 4
+    }
+  ]
+}

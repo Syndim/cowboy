@@ -51,25 +51,63 @@ pub(crate) fn build_correction_prompt(
     blocks
 }
 
-/// Build a corrective instruction appended to a retry prompt after a
-/// frontmatter/parse failure. Reuses the required-frontmatter description so the
-/// agent re-emits its already-completed work with a valid frontmatter block. The
-/// generic instruction covers the opening delimiter, the fields/`status`, and the
-/// closing delimiter so it is accurate whether the previous reply was missing the
-/// opening `---`, the closing `---`, or the `status` field; the precise `reason`
-/// (surfaced in parentheses) names the specific defect.
+/// Marker substring identifying a retry `reason` produced by a no-result reply
+/// (`Error::NoWorkflowResult`). Matches both the bare variant message and the
+/// wrapped runner form `recoverable action failure: agent reply did not contain
+/// a workflow result`.
+const NO_RESULT_REASON_MARKER: &str = "did not contain a workflow result";
+
+/// Whether the retry `reason` indicates the previous reply carried no parseable
+/// workflow result (as opposed to a malformed frontmatter block).
+fn is_no_result_reason(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| reason.contains(NO_RESULT_REASON_MARKER))
+}
+
+/// Build a corrective instruction appended to a retry prompt after a parse or
+/// no-result failure.
+///
+/// For a malformed-frontmatter reason the nudge reuses the required-frontmatter
+/// description so the agent re-emits its already-completed work with a valid
+/// frontmatter block; the precise `reason` (surfaced in parentheses) names the
+/// specific defect.
+///
+/// For a no-result reason (`Error::NoWorkflowResult`) the previous reply carried
+/// no parseable workflow result, and Cowboy cannot tell a stalled/interrupted
+/// turn from a completed turn whose final prose omitted frontmatter. The nudge is
+/// therefore best-effort and side-effect-safe: inspect existing work, continue or
+/// complete only what remains without repeating completed side effects, then
+/// return a complete workflow result.
 pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
-    let mut nudge =
-        String::from("## Retry\n\nYour previous response could not be parsed as a workflow result");
-    if let Some(reason) = reason {
-        nudge.push_str(&format!(" ({reason})"));
-    }
-    nudge.push_str(
-        ".\n\nDo not redo the work. Re-emit your result now as a complete replacement with a \
+    let mut nudge = if is_no_result_reason(reason) {
+        let mut nudge = String::from(
+            "## Retry\n\nYour previous turn did not produce a parseable workflow result",
+        );
+        if let Some(reason) = reason {
+            nudge.push_str(&format!(" ({reason})"));
+        }
+        nudge.push_str(
+            ".\n\nInspect the existing work and conversation state. Continue or complete any \
+unfinished work as needed, without repeating actions or side effects already completed (for \
+example edited files, run commands, or commits). Then return one complete workflow result: \
+begin the response with an opening `---` line, include the frontmatter fields (with a `status` \
+field), and end the frontmatter with a closing `---` line on its own before the Markdown body.",
+        );
+        nudge
+    } else {
+        let mut nudge = String::from(
+            "## Retry\n\nYour previous response could not be parsed as a workflow result",
+        );
+        if let Some(reason) = reason {
+            nudge.push_str(&format!(" ({reason})"));
+        }
+        nudge.push_str(
+            ".\n\nDo not redo the work. Re-emit your result now as a complete replacement with a \
 valid YAML frontmatter block: begin the response with an opening `---` line, include the \
 frontmatter fields (with a `status` field), and end the frontmatter with a closing `---` line \
 on its own before the Markdown body.",
-    );
+        );
+        nudge
+    };
     if let Some(output) = &action.output {
         nudge.push_str("\n\n");
         nudge.push_str(&build_output_instruction(output));
@@ -223,5 +261,47 @@ mod tests {
         let nudge = build_retry_nudge(&action, Some(reason));
         assert!(nudge.contains(reason));
         assert!(nudge.contains("closing `---`"));
+    }
+
+    #[test]
+    fn retry_nudge_no_result_reason_is_side_effect_safe() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: Some(OutputSpec {
+                statuses: vec!["success".into(), "blocked".into()],
+                fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec![],
+            }),
+        };
+        // Full wrapped runner-style reason threaded through context.retry_reason.
+        let reason = "recoverable action failure: agent reply did not contain a workflow result";
+        let nudge = build_retry_nudge(&action, Some(reason));
+        // (a) acknowledges no parseable result was received.
+        assert!(nudge.contains("did not produce a parseable workflow result"));
+        // (b) inspect / continue-or-complete-as-needed guidance.
+        assert!(nudge.contains("Inspect the existing work"));
+        assert!(nudge.contains("Continue or complete any unfinished work"));
+        // (c) do-not-repeat-completed-side-effects instruction.
+        assert!(nudge.contains("without repeating actions or side effects already completed"));
+        // (d) complete workflow-result / status / YAML-frontmatter requirement.
+        assert!(nudge.contains("one complete workflow result"));
+        assert!(nudge.contains("`status`"));
+        assert!(nudge.contains("opening `---`"));
+        assert!(nudge.contains("closing `---`"));
+        // (e) must NOT reuse the malformed-frontmatter wording.
+        assert!(!nudge.contains("Do not redo the work"));
+    }
+
+    #[test]
+    fn retry_nudge_none_reason_uses_frontmatter_wording() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        let nudge = build_retry_nudge(&action, None);
+        assert!(nudge.contains("Do not redo the work"));
+        assert!(!nudge.contains("did not produce a parseable workflow result"));
     }
 }

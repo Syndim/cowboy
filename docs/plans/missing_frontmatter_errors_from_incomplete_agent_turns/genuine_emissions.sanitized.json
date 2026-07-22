@@ -1,0 +1,101 @@
+[
+  {
+    "run": "5da935cc",
+    "step": "review_rca",
+    "rendered_reply_len": 76,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "openai_stream_closed",
+    "rendered_reply_sanitized": "OpenAI responses stream closed before a terminal response event was received"
+  },
+  {
+    "run": "81af7212",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "81af7212",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "81af7212",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "81af7212",
+    "step": "plan",
+    "rendered_reply_len": 1163,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "878d3336",
+    "step": "implement",
+    "rendered_reply_len": 1043,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": null,
+    "rendered_reply_sanitized": "<sanitized nonempty reply: no frontmatter delimiter, no known backend notice>"
+  },
+  {
+    "run": "ab8630a2",
+    "step": "plan",
+    "rendered_reply_len": 757,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": null,
+    "rendered_reply_sanitized": "<sanitized nonempty reply: no frontmatter delimiter, no known backend notice>"
+  },
+  {
+    "run": "ca3f4e0a",
+    "step": "plan",
+    "rendered_reply_len": 418,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": null,
+    "rendered_reply_sanitized": "<sanitized nonempty reply: no frontmatter delimiter, no known backend notice>"
+  },
+  {
+    "run": "ca3f4e0a",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "ca3f4e0a",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  },
+  {
+    "run": "ca3f4e0a",
+    "step": "plan",
+    "rendered_reply_len": 57,
+    "has_frontmatter_delim": false,
+    "has_yaml_fence": false,
+    "matched_backend_notice": "anthropic_stall",
+    "rendered_reply_sanitized": "Anthropic stream stalled while waiting for the next event"
+  }
+]

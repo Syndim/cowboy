@@ -14,6 +14,8 @@ pub enum Error {
     MissingClient(String),
     #[error("agent response is missing YAML frontmatter")]
     MissingFrontmatter,
+    #[error("agent reply did not contain a workflow result")]
+    NoWorkflowResult,
     #[error("agent response has an opening `---` but is missing the closing `---` delimiter")]
     MissingClosingDelimiter,
     #[error("YAML frontmatter must be a mapping")]
@@ -41,15 +43,18 @@ pub enum Error {
 impl Error {
     /// Whether the failure is worth retrying with the same intact session.
     ///
-    /// Parse/frontmatter failures mean the agent finished its work but its final
-    /// message was malformed; a corrective nudge on the reused session usually
-    /// recovers. Transient transport/ACP (`Client`) errors are also retryable.
-    /// Missing client wiring and internal conversion errors are not.
+    /// Parse/frontmatter failures mean the agent's reply carried no parseable
+    /// workflow result: either it finished its work but its final message was
+    /// malformed, or the reply contained no workflow result at all (a
+    /// stall/stream-close or no-result reply). A corrective nudge on the reused
+    /// session usually recovers. Transient transport/ACP (`Client`) errors are
+    /// also retryable. Missing client wiring and internal conversion errors are not.
     pub fn recoverable(&self) -> bool {
         match self {
             Error::Client(_)
             | Error::Yaml(_)
             | Error::MissingFrontmatter
+            | Error::NoWorkflowResult
             | Error::MissingClosingDelimiter
             | Error::FrontmatterNotMapping
             | Error::FrontmatterFieldNotString(_)
@@ -82,6 +87,7 @@ mod tests {
     #[test]
     fn parse_and_transient_errors_are_recoverable() {
         assert!(Error::MissingFrontmatter.recoverable());
+        assert!(Error::NoWorkflowResult.recoverable());
         assert!(Error::MissingClosingDelimiter.recoverable());
         assert!(Error::FrontmatterNotMapping.recoverable());
         assert!(Error::FrontmatterFieldNotString("status".to_string()).recoverable());

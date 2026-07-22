@@ -1,0 +1,31 @@
+# Evidence-preserving step lifecycle for run <redacted> (ca3f4e0a)
+# Every row: [ts] SRC=<basename>:<lineno> — parsed sanitized fields.
+# StepRetrying records live in the mutable events/<run>.json, not these
+# frozen tracing logs; retry consumption is derived from a same-step
+# re-dispatch immediately after a same-step parse failure (runner.rs:221-231).
+
+[2026-07-21T09:31:06.9352] SRC=cowboy.2026-07-21.1631015.log:182 START: visit-start (step=plan, visit 1)
+[2026-07-21T09:47:05.2884] SRC=cowboy.2026-07-21.1631015.log:9341 reply: step=plan initial stop_reason=EndTurn reply_chars=5442
+
+[2026-07-21T09:47:05.8177] SRC=cowboy.2026-07-21.1631015.log:9342 START: visit-start (step=review_plan, visit 1)
+[2026-07-21T09:53:34.7877] SRC=cowboy.2026-07-21.1631015.log:36020 reply: step=review_plan initial stop_reason=EndTurn reply_chars=7355
+
+[2026-07-21T09:53:35.3263] SRC=cowboy.2026-07-21.1631015.log:36021 START: visit-start (step=plan, visit 2)
+[2026-07-21T11:21:22.7018] SRC=cowboy.2026-07-21.1631015.log:54214 reply: step=plan initial stop_reason=EndTurn reply_chars=2054
+[2026-07-21T11:21:22.8168] SRC=cowboy.2026-07-21.1631015.log:54215 PARSE-FAIL (MissingFrontmatter): step=plan shape=prose/preamble (ambiguous); reply=The reviewer requires a replan. Let me inv… <prose redacted>
+
+[2026-07-21T11:21:23.1711] SRC=cowboy.2026-07-21.1631015.log:54223 START: retry (step=plan, step_retries_used=1, proof: immediately follows a same-step parse failure with no intervening different-step start)
+[2026-07-21T11:57:59.7970] SRC=cowboy.2026-07-21.1631015.log:61537 reply: step=plan initial stop_reason=EndTurn reply_chars=57
+[2026-07-21T11:57:59.9510] SRC=cowboy.2026-07-21.1631015.log:61538 PARSE-FAIL (MissingFrontmatter): step=plan shape=stall-notice; reply=Anthropic stream stalled while waiting for the next event
+
+[2026-07-21T11:58:00.3424] SRC=cowboy.2026-07-21.1631015.log:61539 START: retry (step=plan, step_retries_used=2, proof: immediately follows a same-step parse failure with no intervening different-step start)
+[2026-07-21T12:35:16.1186] SRC=cowboy.2026-07-21.1631015.log:67863 reply: step=plan initial stop_reason=EndTurn reply_chars=57
+[2026-07-21T12:35:16.2505] SRC=cowboy.2026-07-21.1631015.log:67864 PARSE-FAIL (MissingFrontmatter): step=plan shape=stall-notice; reply=Anthropic stream stalled while waiting for the next event
+[2026-07-21T12:35:16.9229] SRC=cowboy.2026-07-21.1631015.log:67865 RUN-ERROR: event_count=11296; kind=retry-exhaustion step=plan counters=2/2; reason=invalid action: config set "default" exhausted retry budget for step "plan": 2/2 retries used; last recoverable error: r…
+[2026-07-22T02:32:49.9798] SRC=cowboy.2026-07-21.1631015.log:67905 LOADED-RUN: status=Failed current_step=plan steps_executed=3
+[2026-07-22T02:32:49.9799] SRC=cowboy.2026-07-21.1631015.log:67906 RESUME: status=Failed current_step=plan (separate invocation re-executing the retained current step)
+
+[2026-07-22T02:32:50.6577] SRC=cowboy.2026-07-21.1631015.log:67909 START: visit-start (step=plan, visit 3)
+[2026-07-22T03:11:43.9602] SRC=cowboy.2026-07-21.1631015.log:76618 reply: step=plan initial stop_reason=EndTurn reply_chars=57
+[2026-07-22T03:11:44.3559] SRC=cowboy.2026-07-21.1631015.log:76619 PARSE-FAIL (MissingFrontmatter): step=plan shape=stall-notice; reply=Anthropic stream stalled while waiting for the next event
+[2026-07-22T03:11:44.9372] SRC=cowboy.2026-07-21.1631015.log:76620 RUN-ERROR: event_count=1297; kind=retry-exhaustion step=plan counters=2/2; reason=invalid action: config set "default" exhausted retry budget for step "plan": 2/2 retries used; last recoverable error: r…

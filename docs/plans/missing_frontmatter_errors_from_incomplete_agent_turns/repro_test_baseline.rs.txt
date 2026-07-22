@@ -1,0 +1,37 @@
+    async fn no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter() {
+        let stall_notice = "Anthropic stream stalled while waiting for the next event";
+        let factory = FakeFactory::new(vec![FakeClient::new(vec![Event::MessageChunk {
+            content: serde_json::json!({ "text": stall_notice }),
+        }])]);
+        let executor = AgentExecutor::new(
+            factory,
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap_err();
+
+        // (a) Positive: the user-visible diagnostic accurately describes a reply
+        // that carried no workflow result.
+        assert!(
+            error.to_string().contains("did not contain a workflow result"),
+            "a nonempty reply carrying no parseable result must be diagnosed as \
+\"agent reply did not contain a workflow result\", got: {error} ({error:?})"
+        );
+        // (b) Distinct classification — not the misleading missing-frontmatter
+        // variant (rejects a fix that only reworded `MissingFrontmatter`).
+        assert!(
+            !matches!(error, Error::MissingFrontmatter),
+            "a no-result reply must be classified distinctly from \
+MissingFrontmatter, got: {error:?}"
+        );
+        // (c) Still recoverable, so retry/back-off policy is preserved.
+        assert!(
+            error.recoverable(),
+            "a no-result reply must stay recoverable so retry/back-off policy \
+still applies, got non-recoverable: {error:?}"
+        );
+    }

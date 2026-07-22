@@ -1,0 +1,49 @@
+{
+  "note": "Frequency-by-shape of genuine executor `failed to parse frontmatter output` emissions. Regenerated deterministically from genuine_emissions.sanitized.json by aggregate_frontmatter_failures.py.",
+  "distinct_runs": 5,
+  "total_genuine_parse_failures": 11,
+  "parser_recoverable_frontmatter_count": 0,
+  "by_shape": {
+    "backend_stall_notice": 7,
+    "incomplete_preamble_or_prose": 3,
+    "backend_stream_closed_notice": 1
+  },
+  "by_run_step_shape": [
+    {
+      "run": "5da935cc",
+      "step": "review_rca",
+      "shape": "backend_stream_closed_notice",
+      "count": 1
+    },
+    {
+      "run": "81af7212",
+      "step": "plan",
+      "shape": "backend_stall_notice",
+      "count": 4
+    },
+    {
+      "run": "878d3336",
+      "step": "implement",
+      "shape": "incomplete_preamble_or_prose",
+      "count": 1
+    },
+    {
+      "run": "ab8630a2",
+      "step": "plan",
+      "shape": "incomplete_preamble_or_prose",
+      "count": 1
+    },
+    {
+      "run": "ca3f4e0a",
+      "step": "plan",
+      "shape": "backend_stall_notice",
+      "count": 3
+    },
+    {
+      "run": "ca3f4e0a",
+      "step": "plan",
+      "shape": "incomplete_preamble_or_prose",
+      "count": 1
+    }
+  ]
+}

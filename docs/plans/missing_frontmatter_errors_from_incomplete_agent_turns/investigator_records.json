@@ -1,0 +1,262 @@
+{
+  "workspace_snapshot": {
+    "id": "SNAP-01",
+    "base_revision": "370cabd4179e0b7364e956be3f08416d1c3b37c0",
+    "dirty": true,
+    "dirty_files": [
+      "crates/workflow/agent/src/executor.rs"
+    ],
+    "untracked_paths": [
+      "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/"
+    ],
+    "tested_source": {
+      "path": "crates/workflow/agent/src/executor.rs",
+      "note": "Only the executor-seam regression test was added; no product code changed. frontmatter.rs is pristine."
+    },
+    "frequency_chain": {
+      "source_log_manifest": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/source_log_manifest.json",
+        "content_sha256": "e50dac3a6c1c22d3df196f880017ac0dbe26ba3328b39c1e4606c656ff772b21",
+        "note": "Frozen, ordered manifest of the 5 diagnostic log basenames + SHA-256 (11 total emissions) used for the investigation. Pins the source population so live log growth cannot silently change the fixture."
+      },
+      "log_to_fixture_extractor": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/extract_genuine_emissions.py",
+        "content_sha256": "f0e9273f92cda94aa031619ee88b23082e34a87e8ecfbce00e39d363e225f292",
+        "note": "Consumes source_log_manifest.json as a FROZEN FILE LIST (not a live directory glob), verifies each file's SHA-256 (exits non-zero on missing file or hash mismatch), then COMPUTES all classification fields from the TRACING-RENDERED reply= field (not raw bytes). Fields: rendered_reply_len, has_frontmatter_delim, has_yaml_fence, matched_backend_notice, rendered_reply_sanitized. Invoked with --manifest and --logs-dir."
+      },
+      "sanitized_fixture": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/genuine_emissions.sanitized.json",
+        "content_sha256": "de29736c8eac2b3786feddf421e2be6aba3b914183c9251f3d8b8a1725c5e5a4"
+      },
+      "aggregator_script": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/aggregate_frontmatter_failures.py",
+        "content_sha256": "7b95436ff98c803d198ba94e1c08f8e9719ccc7630d568e00df2700ec85e49b2"
+      },
+      "frequency_output": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/missing_frontmatter_frequency.json",
+        "content_sha256": "361b756160dc086efd566f3d9ba67bf81eaa82cd0e1907762591fdd192ec5f5c"
+      },
+      "evidence_excerpt_emitter": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/emit_evidence_excerpts.py",
+        "content_sha256": "413e5f777f07a7a16adb5ad048eed3e4c1f38720ebb8b1be0f5b892197ec7349",
+        "note": "Emits sanitized CORRELATED log excerpts from the frozen hash-verified manifest logs. For each executor.rs:610 parse-failure it joins the nearest preceding executor reply-debug line (same run_id+step, yielding session_id and reply_chars) and the nearest preceding ACP completion line with that session_id — a session_id + file-adjacency join grounded in executor.rs emission order (ACP-complete -> executor.rs:508 initial/correction reply -> executor.rs:610 parse-failure). All 11 emissions correlate. Answers the user's 'do we have logs indicating this case?' with direct, per-turn-correlated evidence."
+      },
+      "evidence_excerpts": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/evidence_excerpts.txt",
+        "content_sha256": "92eba306760954c1a1e1d8db66585c8cb5a5694255b3909513f05efc6a84012b"
+      },
+      "lifecycle_trace_generator": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/trace_run_lifecycle.py",
+        "content_sha256": "5da45b120f22e763baa6c50f7257b5423e268777bbdc8799dddd2b8f103403b5",
+        "note": "Evidence-preserving manifest-backed step-lifecycle generator (--run only). For a run handle it emits, with source basename + line number and parsed sanitized fields: ALL step starts (including intervening different-step visits), replies, parse failures with shape, and the runtime RUN-ERROR/LOADED-RUN/RESUME lines with fields PARSED from the log (error kind/step/counters, status, current_step) — nothing hard-coded. A same-step re-dispatch is labeled retry only when it immediately follows a same-step parse failure with no intervening different-step start (runner.rs:221-231); the emitted row states that proof. StepRetrying records live in the mutable events/<run>.json, not these frozen logs; not fabricated."
+      },
+      "lifecycle_trace_output": {
+        "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/run_lifecycle.txt",
+        "content_sha256": "a13dc42fe564a7a5de50283cc9aacb2aade82288808b6fa3d34c6338ac6e77d1"
+      }
+    },
+    "private_source_logs": {
+      "logical_path": "<state_dir>/logs (files enumerated by source_log_manifest.json)",
+      "reproducibility": "source-labeled investigator evidence only; private, not committed. The extractor hash-verifies the 5 manifest files, so re-running --manifest/--logs-dir reproduces genuine_emissions.sanitized.json byte-for-byte or exits non-zero with an attributable missing/changed-source error."
+    },
+    "rca_doc": {
+      "path": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/rca.md"
+    }
+  },
+  "investigation_conclusion": "The high volume of 'agent response is missing YAML frontmatter' errors is caused by NO-RESULT agent replies funneled into one misleading diagnostic. Log->fixture->summary chain (all executable) over the diagnostic logs: 11 genuine executor parse-failure emissions across 5 runs; parser_recoverable_frontmatter_count=0; 8 unambiguous backend notices (7 stall + 1 stream-close) and 3 ambiguous incomplete_preamble_or_prose (which carried no parseable result but cannot be proven incomplete from their tracing-rendered bytes). At the provider-neutral Client::prompt seam all failing turns are StopReason::EndTurn + text with no '---' (PromptTurnActivity is private to cowboy-agent-acp, consumed inside prompt()), so a no-result reply is indistinguishable from an ordinary completed prose reply lacking frontmatter; no structured incomplete-turn signal exists. The ESTABLISHED defect is the misleading CLASSIFICATION: parse_frontmatter_output runs unconditionally (executor.rs:609) and every no-result reply collapses to Error::MissingFrontmatter. The existing retry nudge already requests a complete replacement result, so the nudge wording is NOT an established defect and its delimiter guidance is not shown to cause non-convergence. Grounded fix: an accurate generic no-result classification (e.g. 'agent reply did not contain a workflow result') distinct from MissingFrontmatter, preserving recoverability; the nudge is optional to adjust and must keep the frontmatter requirement. Regression test at the execute_agent/Client seam asserts (a) POSITIVE user-visible 'did not contain a workflow result' message, (b) distinct variant from MissingFrontmatter, (c) preserved recoverability; it fails before the fix on (a).",
+  "investigator_command_records": [
+    {
+      "id": "INV-CMD-01",
+      "source": "investigator",
+      "subject": "no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter",
+      "procedure_index": 0,
+      "command": "cargo test -p cowboy-workflow-agent --lib executor::tests::no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:05:00Z",
+      "exit_status": 101,
+      "exit_meaning": "expected: libtest exits 101 because the executor-seam regression test fails before the fix — execute_agent returns Error::MissingFrontmatter (message 'agent response is missing YAML frontmatter') for a no-result reply, so the positive diagnostic assertion (a) fails.",
+      "purpose": "Run the executor/client-seam regression test (positive no-result diagnostic + distinct variant + recoverability) and confirm it fails before any product fix."
+    },
+    {
+      "id": "INV-CMD-02",
+      "source": "investigator",
+      "subject": "log-to-fixture-extraction",
+      "procedure_index": 0,
+      "command": "python3 docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/extract_genuine_emissions.py --manifest docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/source_log_manifest.json --logs-dir <state_dir>/logs | diff - docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/genuine_emissions.sanitized.json",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:25:00Z",
+      "exit_status": 0,
+      "exit_meaning": "exit 0: the manifest-based extractor hash-verifies the 5 frozen source-log files and regenerates the committed sanitized fixture byte-for-byte, independent of live log growth. Fields computed from the tracing-rendered reply= field; rendered_reply_len is the rendered-field length, not original bytes. If any manifest file were missing or its SHA-256 changed, the extractor exits non-zero (attributable), never silently drifting.",
+      "purpose": "Provide the manifest-pinned log->fixture transform linking the frozen, hashed source logs to genuine_emissions.sanitized.json."
+    },
+    {
+      "id": "INV-CMD-03",
+      "source": "investigator",
+      "subject": "fixture-to-summary-aggregation",
+      "procedure_index": 0,
+      "command": "python3 docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/aggregate_frontmatter_failures.py docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/genuine_emissions.sanitized.json | diff - docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/missing_frontmatter_frequency.json",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:05:00Z",
+      "exit_status": 0,
+      "exit_meaning": "exit 0: aggregator over the committed sanitized fixture regenerates the committed summary byte-for-byte (11 failures / 5 runs; parser_recoverable_frontmatter_count=0; 8 notices + 3 ambiguous).",
+      "purpose": "Provide the fixture->summary transform, computing the 8-unambiguous + 3-ambiguous breakdown and the zero-recoverable count."
+    },
+    {
+      "id": "INV-CMD-06",
+      "source": "investigator",
+      "subject": "direct-log-evidence",
+      "procedure_index": 0,
+      "command": "python3 docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/emit_evidence_excerpts.py --manifest docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/source_log_manifest.json --logs-dir <state_dir>/logs | diff - docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/evidence_excerpts.txt",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:45:00Z",
+      "exit_status": 0,
+      "exit_meaning": "exit 0: the emitter regenerates the committed sanitized evidence excerpts byte-for-byte from the hash-verified manifest logs. Output is per-turn CORRELATED: each executor.rs:610 parse-failure is joined to the nearest preceding executor reply-debug line (same run_id+step -> session_id, reply_chars) and the nearest preceding ACP completion line with that session_id. All 11 emissions correlate. The stall-notice turns (reply='Anthropic stream stalled...') correlate to 'agent step: initial reply ... session_id=<redacted> stop_reason=EndTurn reply_chars=57' and 'ACP prompt turn completed ... stop_reason=EndTurn activity=Text', tying the 57-char no-result reply to a nonempty EndTurn text turn with no --- block; the stream-close turn (review_rca, reply_chars=76) and the prose/preamble turns correlate the same way.",
+      "purpose": "Answer the user's 'do we have logs indicating this case?' with direct, sanitized, reproducible log evidence that the frontmatter parser runs on no-result replies and mislabels them MissingFrontmatter."
+    },
+    {
+      "id": "INV-CMD-07",
+      "source": "investigator",
+      "subject": "retry-accounting-lifecycle-trace",
+      "procedure_index": 0,
+      "command": "python3 docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/trace_run_lifecycle.py --manifest docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/source_log_manifest.json --logs-dir <state_dir>/logs --run ca3f4e0a | diff - docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/run_lifecycle.txt",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T05:35:00Z",
+      "exit_status": 0,
+      "exit_meaning": "exit 0: the evidence-preserving generator regenerates run_lifecycle.txt byte-for-byte, each row carrying source basename+line number and parsed fields. It emits ALL step starts: L182 START plan (visit 1); L9341 reply plan reply_chars=5442 (parsed OK); L9342 START review_plan (intervening different-step visit); L36020 reply review_plan reply_chars=7355 (parsed OK); L36021 START plan (visit 2); L54214/L54215 reply+PARSE-FAIL prose/preamble (visit-2 initial attempt, no retry slot); L54223 START plan retry step_retries_used=1 (immediately follows L54215 same-step); L61537/L61538 stall PARSE-FAIL (retry 1); L61539 START plan retry step_retries_used=2; L67863/L67864 stall PARSE-FAIL (retry 2); L67865 RUN-ERROR kind=retry-exhaustion step=plan counters=2/2 (parsed from the error reason) -> Failed; L67905 LOADED-RUN status=Failed current_step=plan steps_executed=3; L67906 RESUME status=Failed current_step=plan; L67909 START plan (visit 3); L76618/L76619 stall PARSE-FAIL; L76620 RUN-ERROR kind=retry-exhaustion step=plan counters=2/2. The two durable retry slots were consumed by the L54223 and L61539 retries; the intervening review_plan visit proves L36021 is a new visit-start not a retry. review_plan's routing status is NOT in the tracing log, so no changes_requested claim is asserted.",
+      "purpose": "Make the retry accounting reproducible: map each parse failure to visit/attempt, show which two dispatches consumed the 2 retry slots, and emit exhaustion + resume from a manifest-backed procedure."
+    },
+    {
+      "id": "INV-CMD-04",
+      "source": "investigator",
+      "subject": "notice-literal-presence",
+      "procedure_index": 0,
+      "command": "grep tool (pattern 'stream stalled|stalled while waiting|stream closed before a terminal|terminal response event', path crates)",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:05:00Z",
+      "exit_status": 0,
+      "exit_meaning": "the specialized grep tool over crates/ returns only the literal embedded in this investigation's own regression-test fixture (executor.rs test); no PRODUCT-code author of the notice strings. Establishes exact-literal absence in product source only; it does NOT attribute the strings to a specific provider.",
+      "purpose": "Establish (via the repository's specialized search tool, not shell grep) that the notice literals are not authored in product code, narrowly, without over-claiming provider origin."
+    },
+    {
+      "id": "INV-CMD-05",
+      "source": "investigator",
+      "subject": "acp-signal-flow-and-nudge-path",
+      "procedure_index": 0,
+      "command": "read crates/agent/client/src/traits.rs (Client::prompt -> Result<StopReason>), crates/agent/acp/src/client.rs (PromptTurnActivity 74-108 private/consumed; continuation 494-544; stop_reason default 668), crates/workflow/agent/src/executor.rs (parse call 609; retry nudge build 408-415), crates/workflow/agent/src/prompt.rs (build_retry_nudge 61-78), crates/workflow/engine/src/runner.rs (reason=last_error.to_string() 240,250)",
+      "cwd": "<repo-root>",
+      "source_snapshot": "SNAP-01",
+      "timestamp_utc": "2026-07-22T04:05:00Z",
+      "exit_status": 0,
+      "exit_meaning": "confirmed: only StopReason crosses Client::prompt; PromptTurnActivity is private to ACP and consumed inside prompt(); the executor calls parse_frontmatter_output(&visible) unconditionally and appends build_retry_nudge on attempt>1; build_retry_nudge ALREADY requests a complete replacement result ('Do not redo the work. Re-emit your result now as a complete replacement ...'); the runner feeds error.to_string() back as the retry reason. The established defect is the classification, not the nudge wording; no evidence the delimiter guidance caused non-convergence.",
+      "purpose": "Ground the feasible fix contract (generic no-result classification) and correct the earlier over-claim that the nudge merely asks to re-delimit."
+    }
+  ],
+  "investigator_evidence_records": [
+    {
+      "id": "INV-EV-01",
+      "source": "investigator",
+      "matches_command": "INV-CMD-01",
+      "source_snapshot": "SNAP-01",
+      "subject": "no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter",
+      "assertion_site": "crates/workflow/agent/src/executor.rs:2712",
+      "observed_result": "panicked: 'a nonempty reply carrying no parseable result must be diagnosed as \"agent reply did not contain a workflow result\", got: agent response is missing YAML frontmatter (MissingFrontmatter)'",
+      "test_outcome_line": "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 50 filtered out; finished in 0.00s",
+      "observed_exit_status": 101,
+      "conclusion": "fails_before_fix_on_positive_no_result_diagnostic_assertion"
+    },
+    {
+      "id": "INV-EV-02",
+      "source": "investigator",
+      "matches_command": "INV-CMD-02",
+      "source_snapshot": "SNAP-01",
+      "subject": "log-to-fixture-extraction",
+      "observed_result": "diff reports no differences; extract_genuine_emissions.py(<state_dir>/logs) == genuine_emissions.sanitized.json; 11 records; matched_backend_notice Counter: anthropic_stall=7, openai_stream_closed=1, null=3; has_frontmatter_delim/has_yaml_fence all false. Fields named rendered_reply_len / rendered_reply_sanitized (tracing-rendered).",
+      "observed_exit_status": 0,
+      "conclusion": "fixture_is_computed_transform_of_tracing_rendered_logs_not_asserted_labels"
+    },
+    {
+      "id": "INV-EV-03",
+      "source": "investigator",
+      "matches_command": "INV-CMD-03",
+      "source_snapshot": "SNAP-01",
+      "subject": "fixture-to-summary-aggregation",
+      "observed_result": "diff reports no differences; distinct_runs=5; total=11; parser_recoverable_frontmatter_count=0; by_shape={backend_stall_notice:7, incomplete_preamble_or_prose:3, backend_stream_closed_notice:1}.",
+      "observed_exit_status": 0,
+      "conclusion": "eight_unambiguous_notices_plus_three_ambiguous_prose_zero_parser_recoverable"
+    },
+    {
+      "id": "INV-EV-04",
+      "source": "investigator",
+      "matches_command": "INV-CMD-04",
+      "source_snapshot": "SNAP-01",
+      "subject": "notice-literal-presence",
+      "observed_result": "grep tool over crates/ matches only the stall-notice literal inside the new executor.rs regression-test fixture; no product-code source authors the notices.",
+      "observed_exit_status": 0,
+      "conclusion": "notice_literals_absent_from_product_code_provider_attribution_not_claimed"
+    },
+    {
+      "id": "INV-EV-05",
+      "source": "investigator",
+      "matches_command": "INV-CMD-05",
+      "source_snapshot": "SNAP-01",
+      "subject": "acp-signal-flow-and-nudge-path",
+      "observed_result": "traits.rs:107-113 Client::prompt -> Result<StopReason>; client.rs:74-108 PromptTurnActivity private/consumed; executor.rs:609 unconditional parse; prompt.rs:61-78 build_retry_nudge already asks for a complete replacement result; runner.rs:240,250 reason=last_error.to_string().",
+      "observed_exit_status": 0,
+      "conclusion": "established_defect_is_classification_not_nudge_wording_no_incomplete_turn_signal_available"
+    }
+    ,
+    {
+      "id": "INV-EV-06",
+      "source": "investigator",
+      "matches_command": "INV-CMD-06",
+      "source_snapshot": "SNAP-01",
+      "subject": "direct-log-evidence",
+      "observed_result": "diff reports no differences; emit_evidence_excerpts.py reproduces evidence_excerpts.txt as per-turn CORRELATED triples (parse-failure joined by run_id+step to the preceding executor reply-debug line, joined by session_id to the preceding ACP completion line). All 11 emissions correlate. Examples: (stall) 'ACP prompt turn completed session_id=<redacted> id=4 stop_reason=EndTurn activity=Text' + 'agent step: initial reply run_id=<redacted> step=plan session_id=<redacted> stop_reason=EndTurn reply_chars=57' + 'executor.rs:610: ... reply=Anthropic stream stalled while waiting for the next event'; (stream-close) reply_chars=76, step=review_rca, reply='OpenAI responses stream closed...'; (prose) reply_chars=2054, step=plan, reply='The reviewer requires a replan. Let me i… <prose redacted>'. The initial-reply line is now present in the deterministic output and associated to its parse-failure.",
+      "observed_exit_status": 0,
+      "conclusion": "real_logs_show_frontmatter_parser_run_on_no_result_replies_labeled_MissingFrontmatter"
+    },
+    {
+      "id": "INV-EV-07",
+      "source": "investigator",
+      "matches_command": "INV-CMD-06",
+      "source_snapshot": "SNAP-01",
+      "subject": "worked-example-acp-to-parser-triple",
+      "observed_result": "For the REPORTED run ca3f4e0a step plan (frozen log cowboy.2026-07-21.1631015.log, SHA-256 72b2c0094d1e... matches manifest), the emit_evidence_excerpts.py output contains the correlated ACP->reply->parser triple for one failing turn: 'ACP prompt turn completed session_id=<redacted> id=4 stop_reason=EndTurn activity=Text' + 'agent step: initial reply run_id=<redacted> step=plan session_id=<redacted> stop_reason=EndTurn reply_chars=57' + 'executor.rs:610: ... reply=Anthropic stream stalled while waiting for the next event'. reply_chars=57 == length of the stall notice == the visible string parsed at executor.rs:609 -> find_frontmatter_open finds no ---newline -> Error::MissingFrontmatter (frontmatter.rs:112-114). Scope: this record covers ONLY the ACP/reply/parser correlation for one turn; visit/attempt/retry-counter/exhaustion/run_failed accounting is INV-EV-08 (INV-CMD-07).",
+      "observed_exit_status": 0,
+      "conclusion": "one_reported_run_turn_acp_completion_reply_and_parse_failure_correlated_to_MissingFrontmatter"
+    },
+    {
+      "id": "INV-EV-08",
+      "source": "investigator",
+      "matches_command": "INV-CMD-07",
+      "source_snapshot": "SNAP-01",
+      "subject": "retry-accounting-lifecycle-trace",
+      "observed_result": "trace_run_lifecycle.py reproduces run_lifecycle.txt byte-for-byte; every row carries source basename+line number and parsed fields. Reported run ca3f4e0a: L182 START plan visit1; L9341 reply reply_chars=5442 (parsed OK, no parse fail); L9342 START review_plan (intervening different-step visit); L36020 reply review_plan reply_chars=7355 (parsed OK); L36021 START plan visit2; L54215 PARSE-FAIL prose/preamble (visit-2 initial attempt, does NOT consume a retry slot); L54223 START plan retry step_retries_used=1 (proof: immediately follows same-step parse failure L54215, no intervening different-step start); L61538 PARSE-FAIL stall; L61539 START plan retry step_retries_used=2; L67864 PARSE-FAIL stall; L67865 RUN-ERROR kind=retry-exhaustion step=plan counters=2/2 (parsed from error reason) -> Failed; L67905 LOADED-RUN status=Failed current_step=plan steps_executed=3; L67906 RESUME status=Failed current_step=plan; L67909 START plan visit3; L76619 PARSE-FAIL stall; L76620 RUN-ERROR kind=retry-exhaustion step=plan counters=2/2. Two durable retry slots consumed by the L54223 and L61539 retries; reported exhaustion sequence = 1 ambiguous prose/preamble + 2 stalls; the 4th parse failure (L76619) is a post-resume re-exhaustion, NOT part of the original 2/2. The intervening review_plan visit is emitted as proof that L36021 is a new visit-start; review_plan's routing status is not in the tracing log so changes_requested is not asserted.",
+      "observed_exit_status": 0,
+      "conclusion": "four_parse_failures_reconciled_with_2of2_via_visit_attempt_accounting_exhaustion_by_1_prose_plus_2_stalls_plus_separate_resume"
+    }
+  ],
+  "implementation_command_records": [],
+  "implementation_evidence_records": [],
+  "tester_command_records": [],
+  "tester_evidence_records": [],
+  "validator_command_records": [],
+  "validator_evidence_records": [],
+  "reviewer_command_records": [],
+  "reviewer_evidence_records": [],
+  "reviewer_soundness_assessments": [],
+  "stage": "investigation",
+  "adjacent_test_to_migrate": {
+    "test": "crates/workflow/agent/src/executor.rs::executor::tests::malformed_final_response_leaves_prompt_window_closed",
+    "current_behavior": "feeds plain \"not frontmatter\" prose and asserts Error::MissingFrontmatter plus that the prompt window is left closed.",
+    "required_migration": "under the generic no-result classification, the plain-prose reply carries no workflow result and must receive the new no-result category; the fix must update the classification expectation WHILE PRESERVING the prompt-window-closure assertion."
+  },
+  "repro_test": "crates/workflow/agent/src/executor.rs::executor::tests::no_result_reply_gets_accurate_no_result_diagnostic_not_missing_frontmatter",
+  "rca_doc": "docs/plans/missing_frontmatter_errors_from_incomplete_agent_turns/rca.md"
+}
