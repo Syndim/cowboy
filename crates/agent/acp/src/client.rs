@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use cowboy_agent_client::{
-    AgentInfo, Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason,
+    AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, PromptTurnCancellation,
+    StopReason,
 };
 
 use super::messages::*;
@@ -31,6 +32,11 @@ pub struct Client {
     /// Push-back buffer for messages consumed during trailing event drain
     #[serde(skip)]
     pushback: Vec<String>,
+    /// Agent-returned session descriptor captured from `session/new` (or the
+    /// post-`set_config_option`) config options; never derived from the
+    /// configured `ModelInfo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_descriptor: Option<AgentSessionDescriptor>,
 }
 
 impl Clone for Client {
@@ -43,6 +49,7 @@ impl Clone for Client {
             agent_info: self.agent_info.clone(),
             session_id: self.session_id.clone(),
             pushback: Vec::new(),
+            session_descriptor: self.session_descriptor.clone(),
         }
     }
 }
@@ -55,6 +62,7 @@ impl std::fmt::Debug for Client {
             .field("next_id", &self.next_id)
             .field("session_id", &self.session_id)
             .field("agent_info", &self.agent_info)
+            .field("session_descriptor", &self.session_descriptor)
             .finish()
     }
 }
@@ -307,6 +315,7 @@ impl Client {
             agent_info: None,
             session_id: None,
             pushback: Vec::new(),
+            session_descriptor: None,
         };
 
         client.initialize().await?;
@@ -349,10 +358,15 @@ impl Client {
 
         let result = self.send_request("session/new", params).await?;
         let session: SessionNewResult = serde_json::from_value(result)?;
-        if let Some(model) = model {
-            self.apply_model_config_option(&session.session_id, &session.config_options, model)
-                .await?;
+        let mut descriptor_options = session.config_options.clone();
+        if let Some(model) = model
+            && let Some(applied_options) = self
+                .apply_model_config_option(&session.session_id, &session.config_options, model)
+                .await?
+        {
+            descriptor_options = applied_options;
         }
+        self.session_descriptor = Self::descriptor_from_config_options(&descriptor_options);
         self.session_id = Some(session.session_id.clone());
         tracing::info!(
             session_id = %session.session_id,
@@ -368,7 +382,7 @@ impl Client {
         session_id: &str,
         config_options: &[SessionConfigOption],
         model: &ModelInfo,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<Vec<SessionConfigOption>>> {
         let model_option = config_options
             .iter()
             .find(|option| option.category.as_deref() == Some("model"))
@@ -380,7 +394,7 @@ impl Client {
                 provider = ?model.provider,
                 "ACP agent exposes no model config option; relying on session metadata"
             );
-            return Ok(());
+            return Ok(None);
         };
 
         if model_option
@@ -388,7 +402,7 @@ impl Client {
             .as_str()
             .is_some_and(|value| Self::model_value_matches(value, model))
         {
-            return Ok(());
+            return Ok(None);
         }
 
         let Some(value) = model_option
@@ -447,7 +461,7 @@ impl Client {
             model_value = applied_value,
             "ACP session model configured"
         );
-        Ok(())
+        Ok(Some(result.config_options))
     }
 
     fn model_value_matches(value: &str, model: &ModelInfo) -> bool {
@@ -463,6 +477,58 @@ impl Client {
             .strip_prefix(provider)
             .and_then(|suffix| suffix.strip_prefix('/'))
             == Some(model.id.as_str())
+    }
+
+    /// Build an `AgentSessionDescriptor` from agent-returned config options only.
+    ///
+    /// Reads solely the returned `current_value`/`category`/`id` fields; the
+    /// configured `ModelInfo` is never consulted, so the descriptor reflects only
+    /// what the agent reported. Returns `None` when no facet is present.
+    ///
+    /// - Model: `category == "model"`, else `id == "model"`.
+    /// - Reasoning: `category == "thought_level"` (ACP-standard reasoning
+    ///   category). No backend-specific alias id is recognized without captured
+    ///   evidence that it appears in real ACP `configOptions` output.
+    /// - Context: semantic context ids only (`context_size`, `context_length`,
+    ///   `context_window`), never a blanket `model_config` match.
+    fn descriptor_from_config_options(
+        config_options: &[SessionConfigOption],
+    ) -> Option<AgentSessionDescriptor> {
+        fn current_string(option: &SessionConfigOption) -> Option<String> {
+            option
+                .current_value
+                .as_str()
+                .map(|value| value.to_string())
+        }
+
+        let model = config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("model"))
+            .or_else(|| config_options.iter().find(|option| option.id == "model"))
+            .and_then(current_string);
+        let reasoning = config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .and_then(current_string);
+        let context = config_options
+            .iter()
+            .find(|option| {
+                matches!(
+                    option.id.as_str(),
+                    "context_size" | "context_length" | "context_window"
+                )
+            })
+            .and_then(current_string);
+
+        if model.is_none() && reasoning.is_none() && context.is_none() {
+            return None;
+        }
+
+        Some(AgentSessionDescriptor {
+            model,
+            context,
+            reasoning,
+        })
     }
 
     /// Return the current session ID, if any.
@@ -1005,6 +1071,10 @@ impl cowboy_agent_client::Client for Client {
         self.agent_info.as_ref()
     }
 
+    fn session_descriptor(&self) -> Option<&AgentSessionDescriptor> {
+        self.session_descriptor.as_ref()
+    }
+
     fn session_id(&self) -> Option<&str> {
         Client::session_id(self)
     }
@@ -1394,6 +1464,161 @@ mod tests {
         assert_eq!(sent.len(), 3);
         let request: Value = serde_json::from_str(&sent[2]).unwrap();
         assert_eq!(request["params"]["value"], "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn descriptor_from_config_options_reads_returned_values_only() {
+        let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "model",
+                "category": "model",
+                "currentValue": "github-copilot/gpt-5.6-sol",
+                "options": [{"value": "github-copilot/gpt-5.6-sol"}]
+            },
+            {
+                "id": "thought_level",
+                "category": "thought_level",
+                "currentValue": "high",
+                "options": [{"value": "high"}]
+            },
+            {
+                "id": "context_size",
+                "category": "model_config",
+                "currentValue": "1m",
+                "options": [{"value": "1m"}]
+            }
+        ]))
+        .unwrap();
+
+        let descriptor = Client::descriptor_from_config_options(&options).unwrap();
+        assert_eq!(descriptor.model.as_deref(), Some("github-copilot/gpt-5.6-sol"));
+        assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
+        assert_eq!(descriptor.context.as_deref(), Some("1m"));
+    }
+
+    #[test]
+    fn descriptor_from_config_options_ignores_non_context_model_config() {
+        // A `model_config` option that is NOT a semantic context id (e.g. speed
+        // mode) must never be taken as context.
+        let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "model",
+                "category": "model",
+                "currentValue": "gpt-5.6-sol",
+                "options": [{"value": "gpt-5.6-sol"}]
+            },
+            {
+                "id": "speed_mode",
+                "category": "model_config",
+                "currentValue": "fast",
+                "options": [{"value": "fast"}]
+            }
+        ]))
+        .unwrap();
+
+        let descriptor = Client::descriptor_from_config_options(&options).unwrap();
+        assert_eq!(descriptor.model.as_deref(), Some("gpt-5.6-sol"));
+        assert!(descriptor.context.is_none());
+        assert!(descriptor.reasoning.is_none());
+    }
+
+    #[test]
+    fn descriptor_from_config_options_uses_id_model_fallback() {
+        let options: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {
+                "id": "model",
+                "currentValue": "gpt-5.6-sol",
+                "options": [{"value": "gpt-5.6-sol"}]
+            }
+        ]))
+        .unwrap();
+
+        let descriptor = Client::descriptor_from_config_options(&options).unwrap();
+        assert_eq!(descriptor.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn descriptor_from_config_options_none_when_empty() {
+        assert!(Client::descriptor_from_config_options(&[]).is_none());
+
+        let unrelated: Vec<SessionConfigOption> = serde_json::from_value(serde_json::json!([
+            {"id": "speed_mode", "category": "model_config", "currentValue": "fast", "options": []}
+        ]))
+        .unwrap();
+        assert!(Client::descriptor_from_config_options(&unrelated).is_none());
+    }
+
+    #[tokio::test]
+    async fn new_session_captures_descriptor_case_a_no_configured_model() {
+        // Case A: no model configured, so model-selection enforcement never runs.
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [
+                    {"id": "model", "category": "model", "currentValue": "gpt-5.6-sol", "options": []},
+                    {"id": "context_size", "category": "model_config", "currentValue": "1m", "options": []},
+                    {"id": "thought_level", "category": "thought_level", "currentValue": "high", "options": []}
+                ]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp]);
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        client.new_session("/project", &[], None).await.unwrap();
+
+        let descriptor = cowboy_agent_client::Client::session_descriptor(&client).unwrap();
+        assert_eq!(descriptor.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(descriptor.context.as_deref(), Some("1m"));
+        assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn new_session_captures_descriptor_case_b_exact_id_ignores_sentinel_provider() {
+        // Case B: configured id equals the returned unqualified model id, but the
+        // configured provider is a distinct sentinel. Selection succeeds through
+        // the exact-id branch (`value == model.id`), so the sentinel provider is
+        // never consulted and never enters the descriptor.
+        let init_resp = init_response(0);
+        let sess_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_123",
+                "configOptions": [
+                    {"id": "model", "category": "model", "currentValue": "gpt-5.6-sol", "options": [{"value": "gpt-5.6-sol"}]},
+                    {"id": "thought_level", "category": "thought_level", "currentValue": "high", "options": []}
+                ]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &sess_resp]);
+
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        let model = ModelInfo {
+            id: "gpt-5.6-sol".into(),
+            provider: Some("SENTINEL-PROVIDER".into()),
+        };
+
+        client
+            .new_session("/project", &[], Some(&model))
+            .await
+            .unwrap();
+
+        let descriptor = cowboy_agent_client::Client::session_descriptor(&client).unwrap();
+        assert_eq!(descriptor.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
+        let rendered = format!("{descriptor:?}");
+        assert!(
+            !rendered.contains("SENTINEL-PROVIDER"),
+            "sentinel provider leaked into descriptor: {rendered}"
+        );
     }
 
     #[tokio::test]

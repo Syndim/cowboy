@@ -7,7 +7,8 @@ use std::time::Instant;
 use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_client::{
-    Client, Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason,
+    AgentSessionDescriptor, Client, Event, ModelInfo, PromptContent, PromptTurnCancellation,
+    StopReason,
 };
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow,
@@ -135,6 +136,7 @@ pub enum AgentProgressKind {
     SessionReady {
         role: String,
         session_id: String,
+        descriptor: Option<String>,
     },
     Prompt {
         role: String,
@@ -418,12 +420,17 @@ where
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
         let session_id = self.ensure_session(active, &key).await?;
+        let descriptor = active
+            .client
+            .session_descriptor()
+            .and_then(aggregate_session_descriptor);
         emit_progress_kind(
             self.config.progress.as_ref(),
             &context,
             AgentProgressKind::SessionReady {
                 role: action.role.clone(),
                 session_id: session_id.clone(),
+                descriptor,
             },
         );
 
@@ -1055,6 +1062,70 @@ fn unknown_tool_title() -> String {
     "<unknown tool>".to_string()
 }
 
+/// Sanitize a single agent-returned descriptor segment into a safe token.
+///
+/// Agent-returned values are untrusted and flow into a terminal title, so:
+/// - allow only ASCII alphanumeric plus `.`, `_`, and `-`;
+/// - drop control characters (newline, tab, ANSI escape bytes, etc.);
+/// - map any other disallowed run to a single `-`;
+/// - collapse consecutive separators and trim leading/trailing separators.
+///
+/// Returns `None` when nothing survives.
+fn sanitize_descriptor_token(raw: &str) -> Option<String> {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_separator = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            if pending_separator && !out.is_empty() {
+                out.push('-');
+            }
+
+            pending_separator = false;
+            out.push(ch);
+        } else {
+            // Any disallowed char (including control chars) becomes a pending
+            // separator; runs collapse into a single `-`.
+            pending_separator = true;
+        }
+    }
+
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Aggregate an agent-returned descriptor into one hyphen-joined token in the
+/// order model, context, reasoning.
+///
+/// The model provider prefix is stripped by keeping only the final
+/// `/`-separated segment before sanitization. Each present segment is sanitized;
+/// empty segments are skipped. Returns `None` when nothing survives.
+fn aggregate_session_descriptor(descriptor: &AgentSessionDescriptor) -> Option<String> {
+    let model = descriptor
+        .model
+        .as_deref()
+        .map(|value| value.rsplit('/').next().unwrap_or(value))
+        .and_then(sanitize_descriptor_token);
+    let context = descriptor
+        .context
+        .as_deref()
+        .and_then(sanitize_descriptor_token);
+    let reasoning = descriptor
+        .reasoning
+        .as_deref()
+        .and_then(sanitize_descriptor_token);
+
+    let token = [model, context, reasoning]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("-");
+    if token.is_empty() { None } else { Some(token) }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, VecDeque};
@@ -1089,6 +1160,7 @@ mod tests {
         new_session_models: Arc<SyncMutex<Vec<Option<ModelInfo>>>>,
         prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
         prompt_behavior: FakePromptBehavior,
+        session_descriptor: Option<AgentSessionDescriptor>,
     }
 
     impl FakeClient {
@@ -1102,6 +1174,7 @@ mod tests {
                 new_session_models: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_calls: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_behavior: FakePromptBehavior::Reply,
+                session_descriptor: None,
             }
         }
 
@@ -1125,6 +1198,13 @@ mod tests {
                 ..Self::new(Vec::new())
             }
         }
+
+        fn with_descriptor(events: Vec<Event>, descriptor: AgentSessionDescriptor) -> Self {
+            Self {
+                session_descriptor: Some(descriptor),
+                ..Self::new(events)
+            }
+        }
     }
 
     #[async_trait]
@@ -1135,6 +1215,10 @@ mod tests {
 
         fn agent_info(&self) -> Option<&AgentInfo> {
             None
+        }
+
+        fn session_descriptor(&self) -> Option<&AgentSessionDescriptor> {
+            self.session_descriptor.as_ref()
         }
 
         fn session_id(&self) -> Option<&str> {
@@ -1255,6 +1339,10 @@ mod tests {
         }
 
         fn agent_info(&self) -> Option<&AgentInfo> {
+            None
+        }
+
+        fn session_descriptor(&self) -> Option<&AgentSessionDescriptor> {
             None
         }
 
@@ -1931,7 +2019,7 @@ mod tests {
         assert_eq!(progress_events.len(), 8);
         assert!(matches!(
             &progress_events[0],
-            AgentProgressKind::SessionReady { role, session_id }
+            AgentProgressKind::SessionReady { role, session_id, .. }
                 if role == "developer" && session_id == "session-1"
         ));
         assert!(matches!(
@@ -2660,5 +2748,148 @@ mod tests {
         assert!(matches!(error, Error::MissingFrontmatter));
         let window = executor.store.window.lock();
         assert!(window.as_ref().is_some_and(|window| !window.is_open()));
+    }
+
+    #[test]
+    fn sanitize_descriptor_token_allows_safe_charset_and_strips_control() {
+        assert_eq!(
+            sanitize_descriptor_token("gpt-5.6-sol"),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            sanitize_descriptor_token("gpt_5.6"),
+            Some("gpt_5.6".to_string())
+        );
+        // Newline, tab, ANSI escape bytes, and other control chars become
+        // separators and never survive.
+        assert_eq!(
+            sanitize_descriptor_token("gpt\n5\t6"),
+            Some("gpt-5-6".to_string())
+        );
+        // The ESC byte and `[` are stripped as separators; printable residue of
+        // the sequence (`31m`) is harmless text that survives as ordinary chars.
+        assert_eq!(
+            sanitize_descriptor_token("gpt\x1b[31m5"),
+            Some("gpt-31m5".to_string())
+        );
+        assert!(
+            !sanitize_descriptor_token("gpt\x1b[31m5")
+                .unwrap()
+                .contains('\x1b'),
+            "ESC byte must never survive"
+        );
+        // Repeated disallowed runs collapse to a single separator; leading and
+        // trailing separators are trimmed.
+        assert_eq!(
+            sanitize_descriptor_token("  gpt   5  "),
+            Some("gpt-5".to_string())
+        );
+        assert_eq!(
+            sanitize_descriptor_token("gpt///5"),
+            Some("gpt-5".to_string())
+        );
+        // Empty after sanitization -> None.
+        assert_eq!(sanitize_descriptor_token(""), None);
+        assert_eq!(sanitize_descriptor_token("\n\t "), None);
+        assert_eq!(sanitize_descriptor_token("///"), None);
+    }
+
+    #[test]
+    fn aggregate_session_descriptor_joins_present_segments() {
+        let descriptor = AgentSessionDescriptor {
+            model: Some("github-copilot/gpt-5.6-sol".to_string()),
+            context: Some("1m".to_string()),
+            reasoning: Some("high".to_string()),
+        };
+        // Provider prefix stripped to final `/` segment; joined model-context-reasoning.
+        assert_eq!(
+            aggregate_session_descriptor(&descriptor),
+            Some("gpt-5.6-sol-1m-high".to_string())
+        );
+    }
+
+    #[test]
+    fn aggregate_session_descriptor_skips_missing_middle_segment() {
+        let descriptor = AgentSessionDescriptor {
+            model: Some("gpt-5.6-sol".to_string()),
+            context: None,
+            reasoning: Some("high".to_string()),
+        };
+        assert_eq!(
+            aggregate_session_descriptor(&descriptor),
+            Some("gpt-5.6-sol-high".to_string())
+        );
+    }
+
+    #[test]
+    fn aggregate_session_descriptor_none_when_all_empty() {
+        let descriptor = AgentSessionDescriptor {
+            model: Some("\n".to_string()),
+            context: Some("".to_string()),
+            reasoning: None,
+        };
+        assert_eq!(aggregate_session_descriptor(&descriptor), None);
+        assert_eq!(
+            aggregate_session_descriptor(&AgentSessionDescriptor::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn aggregate_session_descriptor_sanitizes_adversarial_values() {
+        let descriptor = AgentSessionDescriptor {
+            model: Some("evil/g\x1b[31mpt".to_string()),
+            context: Some("1\nm".to_string()),
+            reasoning: Some("hi\tgh".to_string()),
+        };
+        let token = aggregate_session_descriptor(&descriptor).unwrap();
+        assert_eq!(token, "g-31mpt-1-m-hi-gh");
+        assert!(
+            token
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-')),
+            "unsafe char survived: {token}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_ready_progress_carries_aggregated_descriptor() {
+        let client = FakeClient::with_descriptor(
+            vec![event()],
+            AgentSessionDescriptor {
+                model: Some("github-copilot/gpt-5.6-sol".to_string()),
+                context: Some("1m".to_string()),
+                reasoning: Some("high".to_string()),
+            },
+        );
+        let factory = FakeFactory::new(vec![client]);
+        let store = FakeStore::default();
+        let progress_events = Arc::new(SyncMutex::new(Vec::new()));
+        let progress_sink = {
+            let progress_events = progress_events.clone();
+            Arc::new(move |progress: AgentProgress| {
+                progress_events.lock().push(progress.kind);
+            })
+        };
+        let executor = AgentExecutor::new(
+            factory,
+            store,
+            AgentExecutionConfig {
+                progress: Some(progress_sink),
+                ..AgentExecutionConfig::default()
+            },
+        );
+
+        executor
+            .execute_agent(action("developer"), context("run", "record"))
+            .await
+            .unwrap();
+
+        let progress_events = progress_events.lock();
+        assert!(matches!(
+            &progress_events[0],
+            AgentProgressKind::SessionReady { descriptor, .. }
+                if descriptor.as_deref() == Some("gpt-5.6-sol-1m-high")
+        ));
     }
 }

@@ -573,6 +573,10 @@ mod tests {
             None
         }
 
+        fn session_descriptor(&self) -> Option<&cowboy_agent_client::AgentSessionDescriptor> {
+            None
+        }
+
         fn session_id(&self) -> Option<&str> {
             self.session_id.as_deref()
         }

@@ -24,6 +24,24 @@ impl ModelInfo {
     }
 }
 
+/// Agent-returned session descriptor built exclusively from values the agent
+/// reports back (never the configured `ModelInfo` Cowboy sends).
+///
+/// Each field holds the raw, agent-returned value for that facet; a facet the
+/// agent does not report is `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentSessionDescriptor {
+    /// Agent-returned model value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Agent-returned supported context size value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Agent-returned reasoning/thought-level value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+}
+
 /// Provider-reported agent metadata, when available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentInfo {

@@ -28,14 +28,23 @@ impl RenderedWorkflowEvent {
 }
 
 pub(super) fn render_workflow_event(event: &WorkflowEvent) -> RenderedWorkflowEvent {
-    render_workflow_event_width(event, DEFAULT_CARD_WIDTH)
+    render_workflow_event_width(event, None, DEFAULT_CARD_WIDTH)
 }
 
 pub(super) fn render_workflow_event_width(
     event: &WorkflowEvent,
+    agent_descriptor: Option<&str>,
     width: usize,
 ) -> RenderedWorkflowEvent {
-    let card = workflow_event_card(event);
+    let mut card = workflow_event_card(event);
+    // The descriptor is a compact model/context/reasoning token surfaced only on
+    // agent-run cards; non-agent cards ignore any snapshot.
+    if let Some(descriptor) = agent_descriptor
+        && agent_card_step_id(&event.kind).is_some()
+    {
+        card = card.title_suffix(descriptor);
+    }
+
     let lines = card.render(width);
     let text = lines
         .iter()
@@ -43,6 +52,24 @@ pub(super) fn render_workflow_event_width(
         .collect::<Vec<_>>()
         .join("\n");
     RenderedWorkflowEvent { lines, text }
+}
+
+/// Step id for the nine agent-run card variants that surface a model descriptor;
+/// `None` for every non-agent event. Single source of truth for "is this an
+/// agent card" used by both rendering and the TUI descriptor snapshot.
+pub(super) fn agent_card_step_id(kind: &WorkflowEventKind) -> Option<&str> {
+    match kind {
+        WorkflowEventKind::AgentSessionReady { step_id, .. }
+        | WorkflowEventKind::AgentPromptWindowOpened { step_id, .. }
+        | WorkflowEventKind::AgentPromptWindowClosed { step_id, .. }
+        | WorkflowEventKind::AgentPrompt { step_id, .. }
+        | WorkflowEventKind::AgentResponse { step_id, .. }
+        | WorkflowEventKind::AgentThought { step_id, .. }
+        | WorkflowEventKind::AgentToolCall { step_id, .. }
+        | WorkflowEventKind::AgentToolCallUpdate { step_id, .. }
+        | WorkflowEventKind::AgentPlan { step_id, .. } => Some(step_id),
+        _ => None,
+    }
 }
 
 fn workflow_event_card(event: &WorkflowEvent) -> Card {
@@ -688,8 +715,8 @@ mod tests {
         );
 
         let normal_title =
-            render_workflow_event_width(&event, DEFAULT_CARD_WIDTH).lines()[0].to_string();
-        let narrow_title = render_workflow_event_width(&event, 36).lines()[0].to_string();
+            render_workflow_event_width(&event, None, DEFAULT_CARD_WIDTH).lines()[0].to_string();
+        let narrow_title = render_workflow_event_width(&event, None, 36).lines()[0].to_string();
 
         assert!(
             normal_title.contains("(+00:04:56) · ◔ Waiting for input · ↳ review · ▶ 170dc431"),
@@ -721,6 +748,7 @@ mod tests {
                 step_id: "implement".to_string(),
                 role: "developer".to_string(),
                 session_id: "session-1".to_string(),
+                descriptor: None,
             },
             WorkflowEventKind::StepRetrying {
                 step_id: "implement".to_string(),
@@ -1398,5 +1426,90 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains(text) && span.style == style)
         })
+    }
+
+    #[test]
+    fn agent_card_variants_render_descriptor_suffix_when_present() {
+        let descriptor = "gpt-5.6-sol-1m-high";
+        let variants = vec![
+            WorkflowEventKind::AgentSessionReady {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-1".to_string(),
+                descriptor: Some(descriptor.to_string()),
+            },
+            WorkflowEventKind::AgentPromptWindowOpened {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                window_id: "window-1".to_string(),
+            },
+            WorkflowEventKind::AgentPromptWindowClosed {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                window_id: "window-1".to_string(),
+            },
+            WorkflowEventKind::AgentPrompt {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-1".to_string(),
+                prompt: "Do work".to_string(),
+            },
+            WorkflowEventKind::AgentResponse {
+                step_id: "implement".to_string(),
+                content: "answer".to_string(),
+            },
+            WorkflowEventKind::AgentThought {
+                step_id: "implement".to_string(),
+                content: "thinking".to_string(),
+            },
+            WorkflowEventKind::AgentToolCall {
+                step_id: "implement".to_string(),
+                tool_call_id: "call_1".to_string(),
+                title: "Read file".to_string(),
+                tool_kind: "read".to_string(),
+                status: "pending".to_string(),
+            },
+            WorkflowEventKind::AgentToolCallUpdate {
+                step_id: "implement".to_string(),
+                tool_call_id: "call_1".to_string(),
+                title: "Read file".to_string(),
+                status: "completed".to_string(),
+                content: None,
+            },
+            WorkflowEventKind::AgentPlan {
+                step_id: "implement".to_string(),
+                entries: vec![serde_json::json!({"content":"first"})],
+            },
+        ];
+        assert_eq!(variants.len(), 9);
+
+        for kind in variants {
+            let event = event(kind);
+            let title = render_workflow_event_width(&event, Some(descriptor), 200).lines()[0]
+                .to_string();
+            assert!(
+                title.contains(descriptor),
+                "expected descriptor suffix on agent card title: {title}"
+            );
+
+            // Absent snapshot -> no descriptor suffix rendered.
+            let bare = render_workflow_event_width(&event, None, 200).lines()[0].to_string();
+            assert!(
+                !bare.contains(descriptor),
+                "descriptor must not render without a snapshot: {bare}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_agent_card_ignores_descriptor_snapshot() {
+        let event = event(WorkflowEventKind::RunCompleted);
+        let title = render_workflow_event_width(&event, Some("gpt-5.6-sol-1m-high"), 200).lines()
+            [0]
+        .to_string();
+        assert!(
+            !title.contains("gpt-5.6-sol-1m-high"),
+            "non-agent card must ignore the descriptor: {title}"
+        );
     }
 }

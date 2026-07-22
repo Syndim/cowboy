@@ -1266,13 +1266,16 @@ impl WorkflowRuntime {
     fn workflow_event_kind_from_agent_progress(progress: AgentProgress) -> WorkflowEventKind {
         let step_id = progress.step_id;
         match progress.kind {
-            AgentProgressKind::SessionReady { role, session_id } => {
-                WorkflowEventKind::AgentSessionReady {
-                    step_id,
-                    role,
-                    session_id,
-                }
-            }
+            AgentProgressKind::SessionReady {
+                role,
+                session_id,
+                descriptor,
+            } => WorkflowEventKind::AgentSessionReady {
+                step_id,
+                role,
+                session_id,
+                descriptor,
+            },
             AgentProgressKind::PromptWindowOpened { role, window_id } => {
                 WorkflowEventKind::AgentPromptWindowOpened {
                     step_id,
@@ -1587,6 +1590,10 @@ mod tests {
         }
 
         fn agent_info(&self) -> Option<&AgentInfo> {
+            None
+        }
+
+        fn session_descriptor(&self) -> Option<&cowboy_agent_client::AgentSessionDescriptor> {
             None
         }
 
@@ -2076,6 +2083,83 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
             fs::read_to_string(&delivery_order).unwrap(),
             "before_replacement"
         );
+    }
+
+    fn write_descriptor_stub(path: &std::path::Path) {
+        // Line-oriented ACP stub: one JSON-RPC message per line in, exactly one
+        // JSON object per line out. Answers by method so any session (topic
+        // generation plus the workflow step) is served. `session/new` returns
+        // agent-owned configOptions for model, context_size, and thought_level.
+        fs::write(
+            path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"agentInfo":{"name":"descriptor-stub","version":"1"}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"s1","configOptions":[{"id":"model","category":"model","currentValue":"gpt-5.6-sol","options":[{"value":"gpt-5.6-sol"}]},{"id":"context_size","category":"model_config","currentValue":"1m","options":[{"value":"1m"}]},{"id":"thought_level","category":"thought_level","currentValue":"high","options":[{"value":"high"}]}]}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"---\nstatus: success\nsummary: ok\n---\ndone"}}}}'
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+    *'"method":"session/cancel"'*)
+      : ;;
+    *'"id":'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_session_ready_event_carries_returned_descriptor_case_a() {
+        // Case A: no model configured, so ACP model-selection enforcement never
+        // runs. The descriptor on the real emitted event must equal the
+        // aggregation of only the stub's returned currentValues.
+        let dir = tempfile::tempdir().unwrap();
+        let agent_script = dir.path().join("descriptor-stub.sh");
+        write_descriptor_stub(&agent_script);
+        let runtime = runtime_for_agent_workflow(
+            &dir,
+            None,
+            vec![AgentRuntimeConfig {
+                name: "default".to_string(),
+                command: agent_script.to_string_lossy().to_string(),
+                args: Vec::new(),
+                model: None,
+            }],
+        );
+
+        let mut events = runtime.events().subscribe();
+        let executing_runtime = runtime.clone();
+        let run_task =
+            tokio::spawn(async move { executing_runtime.start_run("smoke").await });
+
+        let descriptor = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
+                .await
+                .expect("session-ready event should be observed")
+                .expect("workflow event channel should remain open");
+            if let WorkflowEventKind::AgentSessionReady {
+                descriptor: token, ..
+            } = event.kind
+            {
+                break token;
+            }
+        };
+
+        run_task.await.unwrap().unwrap();
+        assert_eq!(descriptor, Some("gpt-5.6-sol-1m-high".to_string()));
     }
 
     #[cfg(feature = "test-support")]
@@ -6132,11 +6216,13 @@ Recovery implementation review"#
                 progress(AgentProgressKind::SessionReady {
                     role: "developer".to_string(),
                     session_id: "session-1".to_string(),
+                    descriptor: Some("gpt-5.6-sol-1m-high".to_string()),
                 }),
                 WorkflowEventKind::AgentSessionReady {
                     step_id: "implement".to_string(),
                     role: "developer".to_string(),
                     session_id: "session-1".to_string(),
+                    descriptor: Some("gpt-5.6-sol-1m-high".to_string()),
                 },
             ),
             (

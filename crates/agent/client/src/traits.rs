@@ -5,7 +5,7 @@ use std::task::{Context, Poll, Waker};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::{AgentInfo, Event, ModelInfo, PromptContent, StopReason};
+use crate::{AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, StopReason};
 
 /// Awaitable signal that cancels only the currently active prompt turn.
 ///
@@ -83,6 +83,11 @@ pub trait Client: Send + Sync + std::fmt::Debug {
 
     /// Current backend session id, when one exists.
     fn session_id(&self) -> Option<&str>;
+
+    /// Agent-returned session descriptor captured at session creation, when the
+    /// backend reports one. Built only from agent-returned config values, never
+    /// from the configured `ModelInfo`.
+    fn session_descriptor(&self) -> Option<&AgentSessionDescriptor>;
 
     /// Create a new agent session, optionally requesting a specific model.
     async fn new_session(

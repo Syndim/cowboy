@@ -420,7 +420,7 @@ fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
         .event_entries()
         .last()
         .is_some_and(|entry| match entry {
-            TranscriptEntry::Workflow(event) => matches!(
+            TranscriptEntry::Workflow { event, .. } => matches!(
                 &event.kind,
                 WorkflowEventKind::WaitingForInput { prompt_id: id, .. } if id == prompt_id
             ),
@@ -431,10 +431,14 @@ fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
 fn entry_is_waiting_prompt(entry: &TranscriptEntry, prompt_id: &str) -> bool {
     matches!(
         entry,
-        TranscriptEntry::Workflow(WorkflowEvent {
-            kind: WorkflowEventKind::WaitingForInput { prompt_id: id, .. },
+        TranscriptEntry::Workflow {
+            event:
+                WorkflowEvent {
+                    kind: WorkflowEventKind::WaitingForInput { prompt_id: id, .. },
+                    ..
+                },
             ..
-        }) if id == prompt_id
+        } if id == prompt_id
     )
 }
 
@@ -444,14 +448,19 @@ fn entry_tail_visual_rows(
     wrap_width: usize,
 ) -> EntryVisualRows {
     match entry {
-        TranscriptEntry::Workflow(event) => {
-            stream_event_tail_visual_rows(event, rows_needed, wrap_width).unwrap_or_else(|| {
-                EntryVisualRows {
-                    rows: entry.render_lines_for_width(wrap_width),
-                    older_unmeasured: false,
-                }
-            })
-        }
+        TranscriptEntry::Workflow {
+            event,
+            agent_descriptor,
+        } => stream_event_tail_visual_rows(
+            event,
+            agent_descriptor.clone(),
+            rows_needed,
+            wrap_width,
+        )
+        .unwrap_or_else(|| EntryVisualRows {
+            rows: entry.render_lines_for_width(wrap_width),
+            older_unmeasured: false,
+        }),
         TranscriptEntry::Card { .. } => EntryVisualRows {
             rows: entry.render_lines_for_width(wrap_width),
             older_unmeasured: false,
@@ -461,6 +470,7 @@ fn entry_tail_visual_rows(
 
 fn stream_event_tail_visual_rows(
     event: &WorkflowEvent,
+    agent_descriptor: Option<String>,
     rows_needed: usize,
     wrap_width: usize,
 ) -> Option<EntryVisualRows> {
@@ -485,7 +495,11 @@ fn stream_event_tail_visual_rows(
     }
 
     Some(EntryVisualRows {
-        rows: TranscriptEntry::Workflow(event).render_lines_for_width(wrap_width),
+        rows: TranscriptEntry::Workflow {
+            event,
+            agent_descriptor,
+        }
+        .render_lines_for_width(wrap_width),
         older_unmeasured: true,
     })
 }
@@ -972,6 +986,7 @@ mod tests {
                 step_id: "plan".to_string(),
                 role: "planner".to_string(),
                 session_id: "session-1".to_string(),
+                descriptor: None,
             },
         ));
         state.apply_workflow_event(WorkflowEvent::new(

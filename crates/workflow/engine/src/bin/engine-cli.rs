@@ -350,9 +350,14 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
             step_id,
             role,
             session_id,
+            descriptor,
         } => format!(
-            "{} step {step_id} agent session ready role={role} session={session_id}",
-            event.run_id
+            "{} step {step_id} agent session ready role={role} session={session_id}{}",
+            event.run_id,
+            descriptor
+                .as_deref()
+                .map(|descriptor| format!(" descriptor={descriptor}"))
+                .unwrap_or_default()
         ),
         WorkflowEventKind::AgentPromptWindowOpened {
             step_id,

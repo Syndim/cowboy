@@ -132,6 +132,8 @@ pub enum WorkflowEventKind {
         step_id: String,
         role: String,
         session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        descriptor: Option<String>,
     },
     AgentPromptWindowOpened {
         step_id: String,
@@ -492,6 +494,7 @@ mod tests {
                 step_id: "implement".to_string(),
                 role: "developer".to_string(),
                 session_id: "session-1".to_string(),
+                descriptor: Some("gpt-5.6-sol-1m-high".to_string()),
             },
             WorkflowEventKind::AgentPrompt {
                 step_id: "implement".to_string(),
@@ -532,5 +535,28 @@ mod tests {
             let reparsed: WorkflowEventKind = serde_json::from_str(&raw).unwrap();
             assert_eq!(reparsed, variant);
         }
+    }
+
+    #[test]
+    fn agent_session_ready_deserializes_descriptorless_json_as_none() {
+        // Back-compat: persisted events written before the descriptor field must
+        // still deserialize, with `descriptor` defaulting to `None`.
+        let raw = serde_json::json!({
+            "kind": "agent_session_ready",
+            "step_id": "implement",
+            "role": "developer",
+            "session_id": "session-1"
+        })
+        .to_string();
+        let parsed: WorkflowEventKind = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed,
+            WorkflowEventKind::AgentSessionReady {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-1".to_string(),
+                descriptor: None,
+            }
+        );
     }
 }

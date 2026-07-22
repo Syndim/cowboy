@@ -8,4 +8,4 @@ pub mod traits;
 pub mod types;
 
 pub use traits::{Client, PromptTurnCancellation};
-pub use types::{AgentInfo, Event, ModelInfo, PromptContent, StopReason};
+pub use types::{AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, StopReason};

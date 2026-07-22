@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use cowboy_tui_animation::FrameCycle;
@@ -9,7 +10,7 @@ use tui_input::{Input, InputRequest};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone};
 use super::controls::chrome::status_icon;
-use super::events::{render_workflow_event, render_workflow_event_width};
+use super::events::{agent_card_step_id, render_workflow_event, render_workflow_event_width};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
 use super::markup::render_content;
 use super::styles::{style_transcript_normal, style_warning};
@@ -49,7 +50,10 @@ impl PendingPrompt {
 
 #[derive(Debug, Clone)]
 pub(super) enum TranscriptEntry {
-    Workflow(WorkflowEvent),
+    Workflow {
+        event: WorkflowEvent,
+        agent_descriptor: Option<String>,
+    },
     Card {
         title: String,
         title_prefix: Vec<String>,
@@ -64,7 +68,12 @@ impl TranscriptEntry {
         width: usize,
     ) -> Vec<ratatui::text::Line<'static>> {
         match self {
-            Self::Workflow(event) => render_workflow_event_width(event, width).lines().to_vec(),
+            Self::Workflow {
+                event,
+                agent_descriptor,
+            } => render_workflow_event_width(event, agent_descriptor.as_deref(), width)
+                .lines()
+                .to_vec(),
             Self::Card {
                 title,
                 title_prefix,
@@ -77,7 +86,7 @@ impl TranscriptEntry {
     #[allow(dead_code)]
     pub(in crate::app) fn plain_text(&self) -> String {
         match self {
-            Self::Workflow(event) => render_workflow_event(event).text().to_string(),
+            Self::Workflow { event, .. } => render_workflow_event(event).text().to_string(),
             Self::Card {
                 title,
                 title_prefix,
@@ -417,6 +426,10 @@ pub(super) struct AppState {
     workflow_name: Option<String>,
     current_topic_run_id: Option<String>,
     current_run_topic: Option<String>,
+    /// Ingestion-only latest agent descriptor per `(run_id, step_id)`. Updated
+    /// for every `AgentSessionReady`; `Some` stores the token, `None` clears it.
+    /// Render code never reads this map — entries carry their own snapshot.
+    agent_descriptors: HashMap<(String, String), Option<String>>,
     pending_prompt: Option<PendingPrompt>,
     durable_run_status: Option<RunStatusState>,
     agent_prompt_window: Option<AgentPromptWindowState>,
@@ -451,6 +464,7 @@ impl AppState {
             workflow_name: None,
             current_topic_run_id: None,
             current_run_topic: None,
+            agent_descriptors: HashMap::new(),
             pending_prompt: None,
             durable_run_status: None,
             agent_prompt_window: None,
@@ -1149,7 +1163,11 @@ impl AppState {
         self.status = rendered.text().to_string();
         let is_active_event = is_active_event(&event.kind);
         self.apply_workflow_event_metadata(&event);
-        self.push_event(TranscriptEntry::Workflow(event.clone()));
+        let agent_descriptor = self.snapshot_agent_descriptor(&event);
+        self.push_event(TranscriptEntry::Workflow {
+            event: event.clone(),
+            agent_descriptor,
+        });
         if is_active_event {
             self.active_event = Some(ActiveEvent {
                 index: self.event_log.len().saturating_sub(1),
@@ -1174,13 +1192,35 @@ impl AppState {
         };
 
         self.status = status;
-        self.event_log[index] = TranscriptEntry::Workflow(active_event);
+        // Coalescing merges streaming chunks into the original entry; preserve
+        // that entry's descriptor snapshot rather than resampling ingestion state.
+        let agent_descriptor = match &self.event_log[index] {
+            TranscriptEntry::Workflow {
+                agent_descriptor, ..
+            } => agent_descriptor.clone(),
+            _ => None,
+        };
+        self.event_log[index] = TranscriptEntry::Workflow {
+            event: active_event,
+            agent_descriptor,
+        };
         self.clear_transcript_selection();
         self.apply_workflow_event_metadata(event);
         if self.follow_events {
             self.scroll_offset = 0;
         }
         true
+    }
+
+    /// Read the current ingestion descriptor snapshot for an agent-card event.
+    /// Non-agent events never carry a descriptor. Render code consults only the
+    /// per-entry snapshot this returns, never the live map.
+    fn snapshot_agent_descriptor(&self, event: &WorkflowEvent) -> Option<String> {
+        let step_id = agent_card_step_id(&event.kind)?;
+        self.agent_descriptors
+            .get(&(event.run_id.clone(), step_id.to_string()))
+            .cloned()
+            .flatten()
     }
 
     fn apply_workflow_event_metadata(&mut self, event: &WorkflowEvent) {
@@ -1237,11 +1277,27 @@ impl AppState {
                     self.agent_prompt_window = None;
                 }
             }
-            WorkflowEventKind::StepProgress {
-                step_id: current_step,
+            WorkflowEventKind::AgentSessionReady {
+                step_id,
+                descriptor,
                 ..
+            } => {
+                self.current_step = Some(step_id.clone());
+                self.run_state = "running".to_string();
+                // Ingestion-only: update the latest descriptor for this
+                // (run, step). `Some` stores it; `None` clears any stale entry so
+                // a later visit reporting nothing shows no descriptor.
+                let key = (event.run_id.clone(), step_id.clone());
+                match descriptor {
+                    Some(descriptor) => {
+                        self.agent_descriptors.insert(key, Some(descriptor.clone()));
+                    }
+                    None => {
+                        self.agent_descriptors.remove(&key);
+                    }
+                }
             }
-            | WorkflowEventKind::AgentSessionReady {
+            WorkflowEventKind::StepProgress {
                 step_id: current_step,
                 ..
             }
@@ -1882,7 +1938,7 @@ mod tests {
         assert!(!entry.contains("job-123"), "{}", entry.plain_text());
         assert!(!entry.contains("{"), "{}", entry.plain_text());
 
-        let TranscriptEntry::Workflow(event) = entry else {
+        let TranscriptEntry::Workflow { event, .. } = entry else {
             panic!("expected workflow entry");
         };
         let WorkflowEventKind::AgentToolCallUpdate { content, .. } = &event.kind else {
@@ -2432,5 +2488,105 @@ mod tests {
         FileExt::lock_exclusive(&lock_file).unwrap();
         fs::write(ready_path, "ready").unwrap();
         thread::sleep(Duration::from_secs(10));
+    }
+
+    fn entry_title(entry: &TranscriptEntry) -> String {
+        entry.render_lines_for_width(200)[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn later_none_descriptor_clears_snapshot_without_relabeling_earlier_cards() {
+        let mut state = test_state();
+        let descriptor = "gpt-5.6-sol-1m-high";
+
+        // Session A reports a descriptor; a following response on the same
+        // run/step inherits it.
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentSessionReady {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-a".to_string(),
+                descriptor: Some(descriptor.to_string()),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentResponse {
+                step_id: "implement".to_string(),
+                content: "response A".to_string(),
+            },
+        ));
+        // Session B (same run/step) reports nothing, clearing the descriptor.
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentSessionReady {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-b".to_string(),
+                descriptor: None,
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentResponse {
+                step_id: "implement".to_string(),
+                content: "response B".to_string(),
+            },
+        ));
+
+        let entries = state.event_entries();
+        assert_eq!(entries.len(), 4);
+        // Earlier cards keep their descriptor (never retroactively relabeled).
+        assert!(entry_title(&entries[0]).contains(descriptor), "session A");
+        assert!(entry_title(&entries[1]).contains(descriptor), "response A");
+        // Later cards after the `None` show no descriptor.
+        assert!(!entry_title(&entries[2]).contains(descriptor), "session B");
+        assert!(!entry_title(&entries[3]).contains(descriptor), "response B");
+    }
+
+    #[test]
+    fn coalesced_stream_chunks_retain_original_descriptor_snapshot() {
+        let mut state = test_state();
+        let descriptor = "gpt-5.6-sol-1m-high";
+
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentSessionReady {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                session_id: "session-a".to_string(),
+                descriptor: Some(descriptor.to_string()),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentResponse {
+                step_id: "implement".to_string(),
+                content: "Hel".to_string(),
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-1",
+            WorkflowEventKind::AgentResponse {
+                step_id: "implement".to_string(),
+                content: "lo".to_string(),
+            },
+        ));
+
+        // Session card + one coalesced response entry.
+        let entries = state.event_entries();
+        assert_eq!(entries.len(), 2);
+        let response = &entries[1];
+        assert!(response.contains("Hello"), "chunks merged");
+        assert!(
+            entry_title(response).contains(descriptor),
+            "merged streaming chunks keep their original descriptor snapshot: {}",
+            entry_title(response)
+        );
     }
 }
