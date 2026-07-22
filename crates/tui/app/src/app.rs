@@ -44,10 +44,46 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
         tracing::error!(error = ?err, "TUI loop exited with error");
     }
 
-    terminal_mode.restore()?;
+    finish_tui(result, &mut terminal_mode, &mut io::stdout())?;
     tracing::debug!("TUI terminal session restored");
 
-    result
+    Ok(())
+}
+
+/// Abstraction over restoring terminal modes on TUI teardown, so the
+/// print-after-restore ordering is unit-testable without a real terminal.
+trait TerminalRestore {
+    fn restore(&mut self) -> Result<()>;
+}
+
+impl TerminalRestore for TerminalModeGuard {
+    fn restore(&mut self) -> Result<()> {
+        TerminalModeGuard::restore(self)
+    }
+}
+
+/// Write the resume hint line, if any, to `out`. Writes `"{hint}\n"` for
+/// `Some` and nothing for `None`.
+fn print_resume_hint(out: &mut impl io::Write, hint: Option<&str>) -> io::Result<()> {
+    if let Some(hint) = hint {
+        writeln!(out, "{hint}")?;
+    }
+
+    Ok(())
+}
+
+/// Restore the terminal, then print the resume hint after restoration so it
+/// lands on the normal screen. A restore error propagates before any output;
+/// the hint prints only on `Ok(Some)`; the original loop error is returned
+/// unchanged when the loop failed.
+fn finish_tui(
+    loop_result: Result<Option<String>>,
+    guard: &mut impl TerminalRestore,
+    out: &mut impl io::Write,
+) -> Result<()> {
+    guard.restore()?;
+    print_resume_hint(out, loop_result.as_ref().ok().and_then(|hint| hint.as_deref()))?;
+    loop_result.map(|_| ())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +172,7 @@ async fn run_loop<B>(
     mut state: AppState,
     runtime: &WorkflowRuntime,
     workflow_events: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
-) -> Result<()>
+) -> Result<Option<String>>
 where
     B: ratatui::backend::Backend,
     B::Error: Send + Sync + 'static,
@@ -147,7 +183,7 @@ where
         draw_scheduler.mark_dirty_if(state.drain_workflow_events(workflow_events));
         draw_scheduler.mark_dirty_if(state.drain_background_tasks().await);
         if state.exit_requested() {
-            return Ok(());
+            return Ok(state.resume_hint());
         }
         if draw_scheduler.should_draw() {
             match draw_cursor_safe_production_frame(terminal, &mut state, current_layout) {
@@ -203,7 +239,7 @@ where
                         commands::submit_input(&mut state, runtime).await;
                         draw_scheduler.mark_dirty();
                     }
-                    KeyHandling::Exit => return Ok(()),
+                    KeyHandling::Exit => return Ok(state.resume_hint()),
                 }
             }
             Event::Mouse(mouse) => {

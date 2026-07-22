@@ -1189,3 +1189,114 @@ fn status_animation_tick_marks_dirty_only_while_running() {
     tick_status_animation(&mut state, &mut scheduler);
     assert!(!scheduler.should_draw());
 }
+
+#[test]
+fn print_resume_hint_writes_line_for_some_and_nothing_for_none() {
+    let line = "Run r1 is not complete. Resume with: cowboy resume r1";
+
+    let mut buf = Vec::new();
+    print_resume_hint(&mut buf, Some(line)).unwrap();
+    assert_eq!(buf, format!("{line}\n").into_bytes());
+
+    let mut empty = Vec::new();
+    print_resume_hint(&mut empty, None).unwrap();
+    assert!(empty.is_empty());
+}
+
+#[derive(Clone)]
+struct RecordingRestore {
+    log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    fail: bool,
+}
+
+impl TerminalRestore for RecordingRestore {
+    fn restore(&mut self) -> Result<()> {
+        self.log.borrow_mut().push("restore".to_string());
+        if self.fail {
+            return Err(anyhow::anyhow!("restore boom"));
+        }
+
+        Ok(())
+    }
+}
+
+struct RecordingWriter {
+    log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    bytes: Vec<u8>,
+}
+
+impl io::Write for RecordingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.bytes.is_empty() {
+            self.log.borrow_mut().push("write".to_string());
+        }
+
+        self.bytes.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn finish_tui_restores_before_writing_hint() {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut guard = RecordingRestore {
+        log: log.clone(),
+        fail: false,
+    };
+    let mut writer = RecordingWriter {
+        log: log.clone(),
+        bytes: Vec::new(),
+    };
+
+    let line = "Run r1 is not complete. Resume with: cowboy resume r1";
+    finish_tui(Ok(Some(line.to_string())), &mut guard, &mut writer).unwrap();
+
+    assert_eq!(*log.borrow(), vec!["restore".to_string(), "write".to_string()]);
+    assert_eq!(writer.bytes, format!("{line}\n").into_bytes());
+}
+
+#[test]
+fn finish_tui_suppresses_hint_on_none() {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut guard = RecordingRestore {
+        log: log.clone(),
+        fail: false,
+    };
+    let mut writer = RecordingWriter {
+        log: log.clone(),
+        bytes: Vec::new(),
+    };
+
+    finish_tui(Ok(None), &mut guard, &mut writer).unwrap();
+
+    assert_eq!(*log.borrow(), vec!["restore".to_string()]);
+    assert!(writer.bytes.is_empty());
+}
+
+#[test]
+fn finish_tui_returns_loop_error_and_suppresses_hint() {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let mut guard = RecordingRestore {
+        log: log.clone(),
+        fail: false,
+    };
+    let mut writer = RecordingWriter {
+        log: log.clone(),
+        bytes: Vec::new(),
+    };
+
+    let err = finish_tui(
+        Err(anyhow::anyhow!("loop boom")),
+        &mut guard,
+        &mut writer,
+    )
+    .unwrap_err();
+
+    assert_eq!(err.to_string(), "loop boom");
+    assert_eq!(*log.borrow(), vec!["restore".to_string()]);
+    assert!(writer.bytes.is_empty());
+}

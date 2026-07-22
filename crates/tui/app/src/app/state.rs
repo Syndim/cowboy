@@ -493,6 +493,28 @@ impl AppState {
         self.active_run_id.as_deref()
     }
 
+    /// User-facing hint printed on clean TUI exit when the active run is
+    /// resumable. Returns `None` when there is no active run or the run is in a
+    /// terminal state (`Completed`/`Cancelled`) or has no known durable status.
+    pub(in crate::app) fn resume_hint(&self) -> Option<String> {
+        let run_id = self.active_run_id.as_deref()?;
+        let command = match self.durable_run_status? {
+            RunStatusState::Running => format!("cowboy resume {run_id}"),
+            RunStatusState::Failed => format!("cowboy resolve {run_id}"),
+            RunStatusState::WaitingForInput => match &self.pending_prompt {
+                Some(prompt) if prompt.run_id() == run_id => {
+                    format!("cowboy answer {run_id} {} <answer>", prompt.prompt_id())
+                }
+                _ => format!("cowboy resume {run_id}"),
+            },
+            RunStatusState::Completed | RunStatusState::Cancelled => return None,
+        };
+
+        Some(format!(
+            "Run {run_id} is not complete. Resume with: {command}"
+        ))
+    }
+
     pub(in crate::app) fn current_step(&self) -> Option<&str> {
         self.current_step.as_deref()
     }
@@ -2588,5 +2610,123 @@ mod tests {
             "merged streaming chunks keep their original descriptor snapshot: {}",
             entry_title(response)
         );
+    }
+
+    fn waiting_for_input_event(run_id: &str, prompt_id: &str) -> WorkflowEvent {
+        WorkflowEvent::new(
+            run_id,
+            WorkflowEventKind::WaitingForInput {
+                step: "approve".to_string(),
+                prompt_id: prompt_id.to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["yes".to_string(), "no".to_string()],
+            },
+        )
+    }
+
+    #[test]
+    fn resume_hint_running_uses_resume_command() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-a",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-a is not complete. Resume with: cowboy resume run-a")
+        );
+    }
+
+    #[test]
+    fn resume_hint_waiting_matching_prompt_uses_answer_command() {
+        let mut state = test_state();
+        state.apply_workflow_event(waiting_for_input_event("run-a", "approval"));
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-a is not complete. Resume with: cowboy answer run-a approval <answer>")
+        );
+    }
+
+    #[test]
+    fn resume_hint_waiting_without_prompt_falls_back_to_resume() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-a",
+            WorkflowEventKind::RunStatusChanged {
+                status: "waiting_for_input".to_string(),
+            },
+        ));
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-a is not complete. Resume with: cowboy resume run-a")
+        );
+    }
+
+    #[test]
+    fn resume_hint_waiting_cross_run_prompt_falls_back_to_resume() {
+        let mut state = test_state();
+        state.apply_workflow_event(waiting_for_input_event("run-a", "approval"));
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-b",
+            WorkflowEventKind::StepStarted {
+                step_id: "start".to_string(),
+            },
+        ));
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-b is not complete. Resume with: cowboy resume run-b")
+        );
+    }
+
+    #[test]
+    fn resume_hint_failed_uses_resolve_command() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-a",
+            WorkflowEventKind::RunFailed {
+                reason: "boom".to_string(),
+            },
+        ));
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-a is not complete. Resume with: cowboy resolve run-a")
+        );
+    }
+
+    #[test]
+    fn resume_hint_cancelled_is_none() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new("run-a", WorkflowEventKind::RunCancelled));
+        assert_eq!(state.resume_hint(), None);
+    }
+
+    #[test]
+    fn resume_hint_completed_is_none() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new("run-a", WorkflowEventKind::RunCompleted));
+        assert_eq!(state.resume_hint(), None);
+    }
+
+    #[test]
+    fn resume_hint_unknown_status_is_none() {
+        let mut state = test_state();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-a",
+            WorkflowEventKind::RunStatusChanged {
+                status: "zzz_unmapped".to_string(),
+            },
+        ));
+        assert_eq!(state.active_run_id(), Some("run-a"));
+        assert_eq!(state.resume_hint(), None);
+    }
+
+    #[test]
+    fn resume_hint_no_active_run_is_none() {
+        let state = test_state();
+        assert_eq!(state.resume_hint(), None);
     }
 }
