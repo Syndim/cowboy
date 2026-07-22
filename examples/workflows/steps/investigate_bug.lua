@@ -15,10 +15,13 @@ Reproduce or otherwise ground the bug in the repository. Before returning "docum
 The RCA document must contain these sections exactly:
 - Bug behavior
 - Root cause
+- Root cause evidence
 - Reproduction steps
 - Regression test
 - Current failing result
 - Fix constraints
+
+The Root cause evidence section must prove the root cause is correct. Provide a concrete, step-by-step walkthrough of how the bug happens, tracing the flow from trigger to observed failure. Prefer an example flow reconstructed from real log output: quote the relevant log lines (redacted as needed) and, for each step, explain what the line shows and how it advances toward the defect. When logs are unavailable, ground the walkthrough in specific source locations (file, function, and line) that carry the flow instead. Do not assert the root cause without this traceable evidence.
 
 The RCA document must not include sensitive user data. Redact, generalize, or omit secrets, credentials, personal data, private paths, and proprietary customer content while preserving enough technical detail to reproduce the issue.
 

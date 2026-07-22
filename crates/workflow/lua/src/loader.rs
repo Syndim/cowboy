@@ -3869,4 +3869,142 @@ mod tests {
             "host"
         );
     }
+
+    #[test]
+    fn bugfix_investigation_requires_root_cause_evidence() {
+        let compiled = load_example_compiled_workflow("bugfix");
+
+        // Investigator role: ordered RCA section list plus the evidence wording.
+        let instructions = &compiled.definition.roles["investigator"].instructions;
+        assert!(
+            instructions.contains(
+                "Bug behavior, Root cause, Root cause evidence, Reproduction steps"
+            ),
+            "investigator role should list Root cause evidence in order\n{instructions}"
+        );
+        assert!(
+            instructions.contains("step-by-step walkthrough"),
+            "investigator role should require a step-by-step walkthrough\n{instructions}"
+        );
+        assert!(
+            instructions.contains("example flow"),
+            "investigator role should prefer an example flow from logs\n{instructions}"
+        );
+        assert!(
+            instructions.contains("specific source locations"),
+            "investigator role should offer the source-location fallback\n{instructions}"
+        );
+
+        // `investigate` step: RCA-section bullet plus the walkthrough language,
+        // and its unchanged status set and complete output-field schema.
+        let investigate = run_step(
+            &compiled.source_bundle,
+            "investigate",
+            serde_json::json!({ "request": "trace the failure" }),
+        )
+        .unwrap();
+        let StepAction::Agent(investigate) = investigate.action else {
+            panic!("investigate should request an agent action")
+        };
+        let prompt = &investigate.prompt;
+        assert!(
+            prompt.contains("- Root cause evidence"),
+            "investigate prompt should list the Root cause evidence bullet\n{prompt}"
+        );
+        assert!(
+            prompt.contains("step-by-step walkthrough"),
+            "investigate prompt should require a step-by-step walkthrough\n{prompt}"
+        );
+        assert!(
+            prompt.contains("quote the relevant log lines")
+                && prompt.contains("explain what the line shows and how it advances"),
+            "investigate prompt should require explained log-line evidence\n{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "When logs are unavailable, ground the walkthrough in specific source locations"
+            ),
+            "investigate prompt should offer the source-location fallback\n{prompt}"
+        );
+        assert!(
+            prompt.contains("Do not assert the root cause without this traceable evidence"),
+            "investigate prompt should forbid unsupported root causes\n{prompt}"
+        );
+        let investigate_output =
+            investigate.output.expect("investigate should declare output");
+        assert_eq!(
+            investigate_output.statuses,
+            ["documented", "unclear", "blocked"]
+        );
+        for (field, ty) in [
+            ("summary", "string"),
+            ("user_feedback", "array"),
+            ("work_dir", "string"),
+            ("rca_doc", "string"),
+            ("repro_test", "string"),
+            ("files", "array"),
+            ("command", "string"),
+            ("failure", "string"),
+        ] {
+            assert_eq!(
+                investigate_output.fields[field], ty,
+                "investigate output field {field} should be {ty}"
+            );
+        }
+        assert_eq!(
+            investigate_output.fields.as_object().unwrap().len(),
+            8,
+            "investigate output schema should be unchanged"
+        );
+
+        // `review_rca` step: evidence-validation requirement and rejection
+        // condition, plus its unchanged status set and preserved-field schema.
+        let review = run_step(
+            &compiled.source_bundle,
+            "review_rca",
+            serde_json::json!({ "request": "review the RCA" }),
+        )
+        .unwrap();
+        let StepAction::Agent(review) = review.action else {
+            panic!("review_rca should request an agent action")
+        };
+        let prompt = &review.prompt;
+        assert!(
+            prompt.contains(
+                "Validate that the Root cause evidence section proves the stated root cause"
+            ),
+            "review_rca prompt should validate the evidence section\n{prompt}"
+        );
+        assert!(
+            prompt.contains("step-by-step walkthrough"),
+            "review_rca prompt should require a step-by-step walkthrough\n{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "Return \"changes_requested\" when the root cause is asserted without this step-by-step evidence"
+            ),
+            "review_rca prompt should reject unsupported root causes\n{prompt}"
+        );
+        let review_output = review.output.expect("review_rca should declare output");
+        assert_eq!(review_output.statuses, ["approved", "changes_requested"]);
+        for (field, ty) in [
+            ("feedback", "string"),
+            ("user_feedback", "array"),
+            ("work_dir", "string"),
+            ("rca_doc", "string"),
+            ("repro_test", "string"),
+            ("commands", "array"),
+            ("failures", "array"),
+        ] {
+            assert_eq!(
+                review_output.fields[field], ty,
+                "review_rca output field {field} should be {ty}"
+            );
+        }
+        assert_eq!(
+            review_output.fields.as_object().unwrap().len(),
+            7,
+            "review_rca output schema should be unchanged"
+        );
+    }
 }

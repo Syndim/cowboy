@@ -11,7 +11,7 @@ return function(roles, opts)
 Request:
 ]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "RCA output:") .. context.preserve_user_feedback_guidance() .. context.review_user_feedback_guidance() .. [[
 
-Inspect the RCA document at the `RCA doc: ...` path and the regression test identified by `Repro test: ...`. Validate that the RCA explains the bug behavior, why it happens, and how to reproduce it. Validate that the regression test is focused on the reported issue and currently fails for the bug rather than for unrelated setup or assertion mistakes.
+Inspect the RCA document at the `RCA doc: ...` path and the regression test identified by `Repro test: ...`. Validate that the RCA explains the bug behavior, why it happens, and how to reproduce it. Validate that the Root cause evidence section proves the stated root cause with a traceable, step-by-step walkthrough of how the bug happens: an example flow from real log lines (each quoted line explained) or, when logs are unavailable, specific source locations that carry the flow. Return "changes_requested" when the root cause is asserted without this step-by-step evidence, or the evidence does not actually demonstrate the claimed flow. Validate that the regression test is focused on the reported issue and currently fails for the bug rather than for unrelated setup or assertion mistakes.
 
 Verify the RCA document does not include sensitive user data; require redaction or generalization of secrets, credentials, personal data, private paths, and proprietary customer content.
 
