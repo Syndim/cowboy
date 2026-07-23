@@ -10,16 +10,24 @@ pub fn build_agent_prompt(
     role: &RoleDefinition,
     action: &AgentAction,
     user_inputs: &[RunUserInput],
+    include_role: bool,
 ) -> String {
     let mut parts = Vec::new();
-    if !role.instructions.trim().is_empty() {
+    if include_role && !role.instructions.trim().is_empty() {
         parts.push(format!("## Role\n\n{}", role.instructions.trim()));
     }
     parts.push(format!("## Task\n\n{}", action.prompt.trim()));
-    parts.push(format!(
-        "## User Inputs\n\nAll entries below are cumulative user direction. Apply them in sequence.\n\n```json\n{}\n```",
-        serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
-    ));
+    if !user_inputs.is_empty() {
+        let header = if include_role {
+            "All entries below are cumulative user direction. Apply them in sequence."
+        } else {
+            "New user direction not yet sent in this session. Apply in sequence."
+        };
+        parts.push(format!(
+            "## User Inputs\n\n{header}\n\n```json\n{}\n```",
+            serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
+        ));
+    }
     if let Some(output) = &action.output {
         parts.push(build_output_instruction(output));
     }
@@ -167,6 +175,8 @@ fn field_description(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::DateTime;
+    use cowboy_workflow_core::RunUserInputKind;
 
     #[test]
     fn prompt_includes_role_task_and_frontmatter_instruction() {
@@ -190,7 +200,7 @@ mod tests {
                 required_fields: vec!["summary".into()],
             }),
         };
-        let prompt = build_agent_prompt(&role, &action, &[]);
+        let prompt = build_agent_prompt(&role, &action, &[], true);
         assert!(prompt.contains("Implement changes"));
         assert!(prompt.contains("Do work"));
         assert!(prompt.contains("valid YAML frontmatter"));
@@ -217,7 +227,7 @@ mod tests {
             }),
         };
 
-        let prompt = build_agent_prompt(&role, &action, &[]);
+        let prompt = build_agent_prompt(&role, &action, &[], true);
 
         assert!(prompt.contains("`blocked` is a last resort"));
         assert!(prompt.contains("exhaust reasonable, safe, in-scope actions"));
@@ -303,5 +313,106 @@ mod tests {
         let nudge = build_retry_nudge(&action, None);
         assert!(nudge.contains("Do not redo the work"));
         assert!(!nudge.contains("did not produce a parseable workflow result"));
+    }
+
+    fn user_input(sequence: u64, kind: RunUserInputKind, content: &str) -> RunUserInput {
+        RunUserInput {
+            sequence,
+            kind,
+            content: content.into(),
+            submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }
+    }
+
+    #[test]
+    fn follow_up_prompt_omits_role_but_keeps_task_and_deliverable() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "Implement changes".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: Some(OutputSpec {
+                statuses: vec!["success".into()],
+                fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec!["summary".into()],
+            }),
+        };
+        let prompt = build_agent_prompt(&role, &action, &[], false);
+        assert!(!prompt.contains("## Role"));
+        assert!(!prompt.contains("Implement changes"));
+        assert!(prompt.contains("## Task"));
+        assert!(prompt.contains("Do work"));
+        assert!(prompt.contains("valid YAML frontmatter"));
+    }
+
+    #[test]
+    fn empty_inputs_omit_user_inputs_and_delta_uses_follow_up_header() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "Implement changes".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        let empty = build_agent_prompt(&role, &action, &[], false);
+        assert!(!empty.contains("## User Inputs"));
+
+        let delta = vec![user_input(2, RunUserInputKind::FollowUp, "new direction")];
+        let prompt = build_agent_prompt(&role, &action, &delta, false);
+        assert!(prompt.contains("## User Inputs"));
+        assert!(prompt.contains("New user direction not yet sent in this session"));
+        assert!(!prompt.contains("cumulative user direction"));
+        assert!(prompt.contains("new direction"));
+        assert!(prompt.contains("\"sequence\": 2"));
+    }
+
+    #[test]
+    fn full_history_uses_cumulative_header() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "Implement changes".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        let inputs = vec![user_input(0, RunUserInputKind::Initial, "initial request")];
+        let prompt = build_agent_prompt(&role, &action, &inputs, true);
+        assert!(prompt.contains("cumulative user direction"));
+        assert!(!prompt.contains("New user direction not yet sent"));
+    }
+
+    #[test]
+    fn no_output_spec_omits_deliverable_format_for_both_role_flags() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "Implement changes".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        for include_role in [true, false] {
+            let prompt = build_agent_prompt(&role, &action, &[], include_role);
+            assert!(prompt.contains("## Task"));
+            assert!(prompt.contains("Do work"));
+            assert!(!prompt.contains("## Deliverable Format"));
+        }
     }
 }

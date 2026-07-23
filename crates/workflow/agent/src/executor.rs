@@ -13,8 +13,8 @@ use cowboy_agent_client::{
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow,
     CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
-    RoleDefinition, RoleId, RoleSession, RunId, RunStore, StepDetail, StepInput, StepRecord,
-    TurnRecord, WorkflowError, ordered_user_inputs_from_parts,
+    RoleDefinition, RoleId, RoleSession, RunId, RunStore, RunUserInput, StepDetail, StepInput,
+    StepRecord, TurnRecord, WorkflowError, ordered_user_inputs_from_parts,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -260,6 +260,16 @@ struct ActiveClient {
     backend: String,
 }
 
+/// Outcome of acquiring a backend session for a dispatch.
+struct AcquiredSession {
+    /// Backend session id to prompt against.
+    session_id: String,
+    /// True only when a brand-new backend session was created this dispatch
+    /// (initial create or load-failure fallback), meaning the session holds no
+    /// prior prompt history and the static role block must be resent.
+    fresh: bool,
+}
+
 /// Factory that creates backend clients for role sessions.
 #[async_trait]
 pub trait ClientFactory: Send + Sync {
@@ -406,7 +416,46 @@ where
             context.run_created_at,
             &context.user_prompts,
         );
-        let base_prompt = build_agent_prompt(role, &action, &user_inputs);
+        let mut clients = self.clients.lock().await;
+        let active = clients
+            .get_mut(&key)
+            .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
+        let acquired = self.ensure_session(active, &key).await?;
+        let session_id = acquired.session_id;
+        // Resolve the per-session prompt-delivery watermark. A brand-new backend
+        // session ignores any stale stored row and resends everything; a reused
+        // session omits the already-delivered role block and user inputs.
+        let prior_session = if acquired.fresh {
+            None
+        } else {
+            self.store
+                .load_role_session(&key.run_id, &key.role_id)
+                .map_err(Error::from)?
+        };
+        let (role_instructions_sent, last_sent_input_sequence) = prior_session
+            .as_ref()
+            .map(|session| {
+                (
+                    session.role_instructions_sent,
+                    session.last_sent_input_sequence,
+                )
+            })
+            .unwrap_or((false, None));
+        // Preserve the persisted backend for a reused session; fall back to the
+        // active backend for a fresh session with no prior row.
+        let session_backend = prior_session
+            .map(|session| session.backend)
+            .unwrap_or_else(|| active.backend.clone());
+        let include_role = !role_instructions_sent;
+        let delta_inputs: Vec<RunUserInput> = user_inputs
+            .iter()
+            .filter(|input| match last_sent_input_sequence {
+                Some(sent) => input.sequence > sent,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        let base_prompt = build_agent_prompt(role, &action, &delta_inputs, include_role);
         let prompt = if context.attempt > 1 {
             format!(
                 "{base_prompt}\n\n{}",
@@ -415,11 +464,6 @@ where
         } else {
             base_prompt
         };
-        let mut clients = self.clients.lock().await;
-        let active = clients
-            .get_mut(&key)
-            .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
-        let session_id = self.ensure_session(active, &key).await?;
         let descriptor = active
             .client
             .session_descriptor()
@@ -613,6 +657,27 @@ where
             }
         }
 
+        // Seal succeeded: every prompt turn for this window landed. Advance the
+        // per-session watermark before parsing/validation so a parse-failure
+        // retry on this same live session omits the already-sent role block and
+        // inputs. `applied_sequence` is the highest user-input sequence delivered
+        // to the session in this dispatch.
+        let advanced_sequence = match last_sent_input_sequence {
+            Some(prior) => applied_sequence.max(prior),
+            None => applied_sequence,
+        };
+        self.store
+            .save_role_session(RoleSession {
+                run_id: key.run_id.clone(),
+                role_id: key.role_id.clone(),
+                backend: session_backend,
+                session_id: session_id.clone(),
+                updated_at: Utc::now(),
+                role_instructions_sent: true,
+                last_sent_input_sequence: Some(advanced_sequence),
+            })
+            .map_err(Error::from)?;
+
         let parsed = parse_frontmatter_output(&visible)
             .map_err(|err| match err {
                 Error::MissingFrontmatter => Error::NoWorkflowResult,
@@ -660,11 +725,14 @@ where
         &self,
         active: &mut ActiveClient,
         key: &RoleSessionKey,
-    ) -> Result<String> {
+    ) -> Result<AcquiredSession> {
         let client = active.client.as_mut();
         if let Some(session_id) = client.session_id() {
             tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
-            return Ok(session_id.to_string());
+            return Ok(AcquiredSession {
+                session_id: session_id.to_string(),
+                fresh: false,
+            });
         }
 
         if let Some(saved) = self
@@ -695,7 +763,10 @@ where
                             history_events = history.len(),
                             "agent session loaded"
                         );
-                        return Ok(saved.session_id);
+                        return Ok(AcquiredSession {
+                            session_id: saved.session_id,
+                            fresh: false,
+                        });
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -734,6 +805,8 @@ where
                 backend: active.backend.clone(),
                 session_id: session_id.clone(),
                 updated_at: Utc::now(),
+                role_instructions_sent: false,
+                last_sent_input_sequence: None,
             })
             .map_err(Error::from)?;
         tracing::info!(
@@ -743,7 +816,10 @@ where
             backend = %active.backend,
             "agent session saved"
         );
-        Ok(session_id)
+        Ok(AcquiredSession {
+            session_id,
+            fresh: true,
+        })
     }
 }
 
@@ -1166,6 +1242,7 @@ mod tests {
         prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
         prompt_behavior: FakePromptBehavior,
         session_descriptor: Option<AgentSessionDescriptor>,
+        load_error: Option<String>,
     }
 
     impl FakeClient {
@@ -1180,6 +1257,7 @@ mod tests {
                 prompt_calls: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_behavior: FakePromptBehavior::Reply,
                 session_descriptor: None,
+                load_error: None,
             }
         }
 
@@ -1207,6 +1285,16 @@ mod tests {
         fn with_descriptor(events: Vec<Event>, descriptor: AgentSessionDescriptor) -> Self {
             Self {
                 session_descriptor: Some(descriptor),
+                ..Self::new(events)
+            }
+        }
+
+        /// A load-capable client whose `load_session` always fails, forcing the
+        /// load-failure fallback path in `ensure_session`.
+        fn with_load_error(events: Vec<Event>, message: impl Into<String>) -> Self {
+            Self {
+                supports_load: true,
+                load_error: Some(message.into()),
                 ..Self::new(events)
             }
         }
@@ -1256,6 +1344,9 @@ mod tests {
         ) -> anyhow::Result<Vec<Event>> {
             if !self.supports_load {
                 return Err(anyhow!("unsupported"));
+            }
+            if let Some(message) = &self.load_error {
+                return Err(anyhow!(message.clone()));
             }
             self.loaded_sessions.push(session_id.to_string());
             self.session_id = Some(session_id.to_string());
@@ -1469,6 +1560,121 @@ mod tests {
         accepted_prompts: SyncMutex<Vec<RunUserPrompt>>,
         window: SyncMutex<Option<AgentPromptWindow>>,
         pending_prompt_batches: SyncMutex<VecDeque<Vec<RunUserPrompt>>>,
+        /// Ordered record of every `save_role_session` call for assertions.
+        save_history: SyncMutex<Vec<RoleSession>>,
+    }
+
+    /// Cloneable `Arc`-backed store whose persisted state survives across two
+    /// `AgentExecutor::new` instances (which each consume their store).
+    #[derive(Clone, Default)]
+    struct SharedFakeStore {
+        inner: Arc<FakeStore>,
+    }
+
+    impl cowboy_workflow_core::RunStore for SharedFakeStore {
+        fn save_run(&self, run: &WorkflowRun) -> CoreResult<()> {
+            self.inner.save_run(run)
+        }
+
+        fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> CoreResult<WorkflowRun> {
+            self.inner.load_run(run_id)
+        }
+
+        fn list_runs(&self) -> CoreResult<Vec<RunHead>> {
+            self.inner.list_runs()
+        }
+
+        fn put_object<T: Serialize>(&self, kind: ObjectKind, value: &T) -> CoreResult<ObjectHash> {
+            self.inner.put_object(kind, value)
+        }
+
+        fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> CoreResult<T> {
+            self.inner.get_object(hash)
+        }
+
+        fn update_run_head(&self, run_id: &str, head: RunHead) -> CoreResult<()> {
+            self.inner.update_run_head(run_id, head)
+        }
+
+        fn load_run_head(&self, run_id: &str) -> CoreResult<RunHead> {
+            self.inner.load_run_head(run_id)
+        }
+
+        fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
+            self.inner.save_role_session(session)
+        }
+
+        fn load_role_session(
+            &self,
+            run_id: &str,
+            role_id: &str,
+        ) -> CoreResult<Option<RoleSession>> {
+            self.inner.load_role_session(run_id, role_id)
+        }
+
+        fn delete_role_sessions(&self, run_id: &str) -> CoreResult<()> {
+            self.inner.delete_role_sessions(run_id)
+        }
+
+        fn append_turn(
+            &self,
+            run_id: &str,
+            turn: cowboy_workflow_core::TurnRecord,
+        ) -> CoreResult<ObjectHash> {
+            self.inner.append_turn(run_id, turn)
+        }
+
+        fn load_user_prompts(&self, run_id: &str) -> CoreResult<Vec<RunUserPrompt>> {
+            self.inner.load_user_prompts(run_id)
+        }
+
+        fn append_user_prompt(
+            &self,
+            run_id: &str,
+            window_id: &str,
+            content: String,
+        ) -> CoreResult<AppendUserPromptOutcome> {
+            self.inner.append_user_prompt(run_id, window_id, content)
+        }
+
+        fn open_agent_prompt_window(
+            &self,
+            window: AgentPromptWindow,
+        ) -> CoreResult<OpenAgentPromptWindowOutcome> {
+            self.inner.open_agent_prompt_window(window)
+        }
+
+        fn compare_and_seal_agent_prompt_window(
+            &self,
+            run_id: &str,
+            window_id: &str,
+            applied_sequence: u64,
+            sealed_at: chrono::DateTime<Utc>,
+        ) -> CoreResult<CompareAndSealPromptWindowOutcome> {
+            self.inner.compare_and_seal_agent_prompt_window(
+                run_id,
+                window_id,
+                applied_sequence,
+                sealed_at,
+            )
+        }
+
+        fn abort_agent_prompt_window(
+            &self,
+            run_id: &str,
+            window_id: &str,
+            aborted_at: chrono::DateTime<Utc>,
+        ) -> CoreResult<AbortAgentPromptWindowOutcome> {
+            self.inner
+                .abort_agent_prompt_window(run_id, window_id, aborted_at)
+        }
+
+        fn clear_agent_prompt_window(
+            &self,
+            run_id: &str,
+        ) -> CoreResult<Option<AgentPromptWindow>> {
+            self.inner.clear_agent_prompt_window(run_id)
+        }
     }
 
     impl cowboy_workflow_core::RunStore for FakeStore {
@@ -1505,6 +1711,7 @@ mod tests {
         }
 
         fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
+            self.save_history.lock().push(session.clone());
             self.sessions
                 .lock()
                 .insert((session.run_id.clone(), session.role_id.clone()), session);
@@ -2344,6 +2551,8 @@ mod tests {
                 backend: "agent".into(),
                 session_id: "persisted-session".into(),
                 updated_at: Utc::now(),
+                role_instructions_sent: false,
+                last_sent_input_sequence: None,
             })
             .unwrap();
         let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
@@ -2994,5 +3203,343 @@ MissingFrontmatter, got: {error:?}"
             "a no-result reply must stay recoverable so retry/back-off policy \
 still applies, got non-recoverable: {error:?}"
         );
+    }
+
+    fn output_action(role: &str) -> AgentAction {
+        AgentAction {
+            role: role.to_string(),
+            prompt: "Do work".into(),
+            output: Some(cowboy_workflow_core::OutputSpec {
+                statuses: vec!["success".to_string()],
+                fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec!["summary".to_string()],
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_session_fresh_then_reused() {
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor =
+            AgentExecutor::new(FakeFactory::default(), store, AgentExecutionConfig::default());
+        let key = RoleSessionKey {
+            run_id: "run".into(),
+            role_id: "developer".into(),
+        };
+        let mut active = ActiveClient {
+            client: Box::new(FakeClient::new(vec![event()])),
+            model: None,
+            backend: "fake-agent".to_string(),
+        };
+
+        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
+        assert!(acquired.fresh);
+        let stored = store_handle
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert!(!stored.role_instructions_sent);
+        assert_eq!(stored.last_sent_input_sequence, None);
+
+        store_handle
+            .save_role_session(RoleSession {
+                run_id: "run".into(),
+                role_id: "developer".into(),
+                backend: stored.backend.clone(),
+                session_id: stored.session_id.clone(),
+                updated_at: Utc::now(),
+                role_instructions_sent: true,
+                last_sent_input_sequence: Some(3),
+            })
+            .unwrap();
+
+        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
+        assert!(!acquired.fresh);
+        let stored = store_handle
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert!(stored.role_instructions_sent);
+        assert_eq!(stored.last_sent_input_sequence, Some(3));
+    }
+
+    #[tokio::test]
+    async fn reused_session_omits_role_and_advances_watermark() {
+        let client = FakeClient::new(vec![event(), event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        let factory = FakeFactory::new(vec![client]);
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap();
+        executor
+            .execute_agent(output_action("developer"), context("run", "record-2"))
+            .await
+            .unwrap();
+
+        let calls = prompt_calls.lock();
+        assert_eq!(calls.len(), 2);
+        let first = &calls[0][0].text;
+        let second = &calls[1][0].text;
+        assert!(first.contains("Instructions for developer"));
+        assert!(!second.contains("Instructions for developer"));
+        assert!(first.contains("Do work"));
+        assert!(second.contains("Do work"));
+        assert!(first.contains("valid YAML frontmatter"));
+        assert!(second.contains("valid YAML frontmatter"));
+        drop(calls);
+
+        let stored = store_handle
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert!(stored.role_instructions_sent);
+        assert_eq!(stored.last_sent_input_sequence, Some(0));
+    }
+
+    #[tokio::test]
+    async fn follow_up_dispatch_sends_only_new_input_sequences() {
+        let client = FakeClient::new(vec![event(), event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        let factory = FakeFactory::new(vec![client]);
+        let store = FakeStore::default();
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap();
+        let mut second = context("run", "record-2");
+        second.user_prompts.push(RunUserPrompt {
+            sequence: 1,
+            content: "new follow-up direction".to_string(),
+            submitted_at: Utc::now(),
+        });
+        executor
+            .execute_agent(output_action("developer"), second)
+            .await
+            .unwrap();
+
+        let calls = prompt_calls.lock();
+        let second_prompt = &calls[1][0].text;
+        assert!(second_prompt.contains("## User Inputs"));
+        assert!(second_prompt.contains("new follow-up direction"));
+        assert!(second_prompt.contains("\"sequence\": 1"));
+        assert!(!second_prompt.contains("\"sequence\": 0"));
+        assert!(!second_prompt.contains("Original request"));
+        assert!(second_prompt.contains("New user direction not yet sent in this session"));
+    }
+
+    #[tokio::test]
+    async fn watermark_advance_preserves_backend_and_session_id() {
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let seeded_at = Utc::now() - chrono::Duration::hours(1);
+        store_handle
+            .save_role_session(RoleSession {
+                run_id: "run".into(),
+                role_id: "developer".into(),
+                backend: "seeded-backend".into(),
+                session_id: "seeded-session".into(),
+                updated_at: seeded_at,
+                role_instructions_sent: false,
+                last_sent_input_sequence: None,
+            })
+            .unwrap();
+        let factory = FakeFactory::new(vec![FakeClient::with_load(vec![event()])]);
+        let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
+
+        executor
+            .execute_agent(output_action("developer"), context("run", "record"))
+            .await
+            .unwrap();
+
+        let stored = store_handle
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert!(stored.role_instructions_sent);
+        assert_eq!(stored.last_sent_input_sequence, Some(0));
+        assert_eq!(stored.backend, "seeded-backend");
+        assert_eq!(stored.session_id, "seeded-session");
+        assert!(stored.updated_at > seeded_at);
+    }
+
+    #[tokio::test]
+    async fn shared_store_clone_observes_same_session() {
+        let store = SharedFakeStore::default();
+        let clone = store.clone();
+        let session = RoleSession {
+            run_id: "run".into(),
+            role_id: "developer".into(),
+            backend: "fake-agent".into(),
+            session_id: "session-x".into(),
+            updated_at: Utc::now(),
+            role_instructions_sent: true,
+            last_sent_input_sequence: Some(2),
+        };
+        store.save_role_session(session.clone()).unwrap();
+        let loaded = clone
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, session);
+    }
+
+    #[tokio::test]
+    async fn fake_client_load_error_is_returned() {
+        let mut client = FakeClient::with_load_error(vec![], "injected load failure");
+        let err = client.load_session("session", ".", &[]).await.unwrap_err();
+        assert!(err.to_string().contains("injected load failure"));
+    }
+
+    #[tokio::test]
+    async fn persisted_session_reload_omits_role() {
+        let store = SharedFakeStore::default();
+        let first = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            store.clone(),
+            AgentExecutionConfig::default(),
+        );
+        first
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap();
+
+        let reload_client = FakeClient::with_load(vec![event()]);
+        let prompt_calls = reload_client.prompt_calls.clone();
+        let second = AgentExecutor::new(
+            FakeFactory::new(vec![reload_client]),
+            store.clone(),
+            AgentExecutionConfig::default(),
+        );
+        let mut second_context = context("run", "record-2");
+        second_context.user_prompts.push(RunUserPrompt {
+            sequence: 1,
+            content: "reload follow-up".to_string(),
+            submitted_at: Utc::now(),
+        });
+        second
+            .execute_agent(output_action("developer"), second_context)
+            .await
+            .unwrap();
+
+        let calls = prompt_calls.lock();
+        let prompt = &calls[0][0].text;
+        assert!(!prompt.contains("Instructions for developer"));
+        assert!(prompt.contains("reload follow-up"));
+        assert!(prompt.contains("\"sequence\": 1"));
+        assert!(!prompt.contains("\"sequence\": 0"));
+    }
+
+    #[tokio::test]
+    async fn load_failure_resends_role() {
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        store_handle
+            .save_role_session(RoleSession {
+                run_id: "run".into(),
+                role_id: "developer".into(),
+                backend: "fake-agent".into(),
+                session_id: "old-session".into(),
+                updated_at: Utc::now(),
+                role_instructions_sent: true,
+                last_sent_input_sequence: Some(1),
+            })
+            .unwrap();
+        let seeded_saves = store_handle.inner.save_history.lock().len();
+
+        let reload_client = FakeClient::with_load_error(vec![event()], "load boom");
+        let prompt_calls = reload_client.prompt_calls.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![reload_client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+        let mut ctx = context("run", "record");
+        ctx.user_prompts.push(RunUserPrompt {
+            sequence: 1,
+            content: "seeded follow-up".to_string(),
+            submitted_at: Utc::now(),
+        });
+        executor
+            .execute_agent(output_action("developer"), ctx)
+            .await
+            .unwrap();
+
+        let calls = prompt_calls.lock();
+        let prompt = &calls[0][0].text;
+        assert!(prompt.contains("Instructions for developer"));
+        assert!(prompt.contains("\"sequence\": 0"));
+        assert!(prompt.contains("\"sequence\": 1"));
+        drop(calls);
+
+        let suffix: Vec<(bool, Option<u64>)> = store_handle
+            .inner
+            .save_history
+            .lock()
+            .iter()
+            .skip(seeded_saves)
+            .filter(|session| session.run_id == "run" && session.role_id == "developer")
+            .map(|session| {
+                (
+                    session.role_instructions_sent,
+                    session.last_sent_input_sequence,
+                )
+            })
+            .collect();
+        assert_eq!(suffix, vec![(false, None), (true, Some(1))]);
+    }
+
+    #[tokio::test]
+    async fn retry_reuses_session() {
+        let client = FakeClient::new(vec![
+            Event::MessageChunk {
+                content: serde_json::json!({"text": "no frontmatter at all"}),
+            },
+            event(),
+        ]);
+        let prompt_calls = client.prompt_calls.clone();
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NoWorkflowResult));
+
+        let after_first = store_handle
+            .load_role_session("run", "developer")
+            .unwrap()
+            .unwrap();
+        assert!(after_first.role_instructions_sent);
+
+        let mut retry = context("run", "record-1");
+        retry.attempt = 2;
+        retry.retry_reason = Some("missing YAML frontmatter".to_string());
+        executor
+            .execute_agent(output_action("developer"), retry)
+            .await
+            .unwrap();
+
+        let calls = prompt_calls.lock();
+        assert_eq!(calls.len(), 2);
+        let retry_prompt = &calls[1][0].text;
+        assert!(!retry_prompt.contains("Instructions for developer"));
+        assert!(!retry_prompt.contains("\"sequence\": 0"));
+        assert!(retry_prompt.contains("Do work"));
+        assert!(retry_prompt.contains("valid YAML frontmatter"));
+        assert!(retry_prompt.contains("Retry"));
     }
 }

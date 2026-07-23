@@ -922,6 +922,8 @@ mod tests {
             backend: "acp".into(),
             session_id: "session-1".into(),
             updated_at: now,
+            role_instructions_sent: true,
+            last_sent_input_sequence: Some(4),
         };
 
         store.save_role_session(session.clone()).unwrap();
@@ -943,6 +945,8 @@ mod tests {
             backend: "acp".into(),
             session_id: "session-1".into(),
             updated_at: now,
+            role_instructions_sent: false,
+            last_sent_input_sequence: None,
         };
         store.save_role_session(session).unwrap();
 

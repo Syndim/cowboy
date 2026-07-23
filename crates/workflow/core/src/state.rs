@@ -484,6 +484,12 @@ impl RunHead {
 }
 
 /// Persisted backend session for one role within one workflow run.
+///
+/// Also carries a per-session prompt-delivery watermark used to avoid resending
+/// static content to a reused backend session: once the `## Role` block has been
+/// delivered it is never resent, and only user inputs whose `sequence` exceeds
+/// `last_sent_input_sequence` are included on follow-up prompts. A brand-new
+/// backend session resets the watermark to `false`/`None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleSession {
     /// Run id this backend session belongs to.
@@ -496,6 +502,13 @@ pub struct RoleSession {
     pub session_id: String,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Whether the static `## Role` block was already delivered to this session.
+    #[serde(default)]
+    pub role_instructions_sent: bool,
+    /// Highest user-input `sequence` already delivered to this session
+    /// (`None` = nothing sent yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sent_input_sequence: Option<u64>,
 }
 
 /// Type tag for content-addressed stored objects.
@@ -737,5 +750,19 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn role_session_deserializes_legacy_rows_with_default_watermark() {
+        let value = serde_json::json!({
+            "run_id": "run-1",
+            "role_id": "dev",
+            "backend": "acp",
+            "session_id": "session-1",
+            "updated_at": "2026-01-02T03:04:05.000Z",
+        });
+        let session: RoleSession = serde_json::from_value(value).unwrap();
+        assert!(!session.role_instructions_sent);
+        assert_eq!(session.last_sent_input_sequence, None);
     }
 }
