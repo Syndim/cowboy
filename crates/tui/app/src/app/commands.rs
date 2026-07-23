@@ -6,6 +6,7 @@ use cowboy_command_parser::{
 };
 use cowboy_workflow_engine::{UserPromptSubmission, WorkflowRuntime};
 
+use super::events::current_wall_clock_prefix;
 use super::state::{AppState, ComposerSubmissionMode};
 
 pub(in crate::app) fn complete_slash_suggestion(state: &mut AppState) {
@@ -248,7 +249,7 @@ fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: Str
     let body = request.clone();
     state.spawn_card_report_task(
         "Run",
-        ["00:00:00".to_string()],
+        [current_wall_clock_prefix()],
         ["submitted run".to_string()],
         label,
         [body],
@@ -267,7 +268,7 @@ fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, req
     let body = request.clone();
     state.spawn_card_report_task(
         "Run",
-        ["00:00:00".to_string()],
+        [current_wall_clock_prefix()],
         ["submitted run --step".to_string()],
         label,
         [body],
@@ -292,7 +293,7 @@ fn spawn_start_run_with_workflow(
     let body = request.clone();
     state.spawn_card_report_task(
         "Run",
-        ["00:00:00".to_string()],
+        [current_wall_clock_prefix()],
         [title_suffix],
         label,
         [body],
@@ -317,7 +318,7 @@ fn spawn_start_run_with_workflow_stepwise(
     let body = request.clone();
     state.spawn_card_report_task(
         "Run",
-        ["00:00:00".to_string()],
+        [current_wall_clock_prefix()],
         [title_suffix],
         label,
         [body],
@@ -336,7 +337,7 @@ fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Strin
     let body = run_id.clone();
     state.spawn_card_report_task(
         "Step",
-        [],
+        [current_wall_clock_prefix()],
         ["submitted step".to_string()],
         label,
         [body],
@@ -355,7 +356,7 @@ fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Str
     let body = run_id.clone();
     state.spawn_card_report_task(
         "Resume",
-        [],
+        [current_wall_clock_prefix()],
         ["submitted resume".to_string()],
         label,
         [body],
@@ -381,7 +382,7 @@ fn spawn_answer_task(
     state.clear_pending_prompt();
     state.spawn_card_report_task(
         "Answer",
-        [],
+        [current_wall_clock_prefix()],
         ["submitted answer".to_string()],
         label,
         details,
@@ -462,7 +463,7 @@ async fn resolve_run(
             let details = [run_id.clone(), status.clone()];
             state.spawn_card_report_task(
                 "Resolve",
-                [],
+                [current_wall_clock_prefix()],
                 ["submitted resolve".to_string()],
                 label,
                 details,
@@ -569,9 +570,60 @@ mod tests {
             .join("\n")
     }
 
+    /// Strict card-title contract shared by every card test: the rendered title
+    /// MUST begin with a present `%H:%M` wall-clock prefix equal to the current
+    /// time captured around the action, followed by exactly `expected_remainder`.
+    /// Created in TODO-02; consumed by TODO-04.
+    fn check_card_title_current_time(
+        rendered: &str,
+        before: chrono::DateTime<chrono::Local>,
+        after: chrono::DateTime<chrono::Local>,
+        expected_remainder: &str,
+    ) -> Result<(), String> {
+        let title = rendered
+            .lines()
+            .next()
+            .ok_or_else(|| format!("card has no title line:\n{rendered}"))?;
+        let (prefix, remainder) = title.split_once(" · ").ok_or_else(|| {
+            format!("card title has no leading time prefix segment; title={title}")
+        })?;
+        let candidates = [
+            before.format("%H:%M").to_string(),
+            after.format("%H:%M").to_string(),
+        ];
+        if !candidates.iter().any(|candidate| candidate == prefix) {
+            return Err(format!(
+                "card title prefix {prefix:?} is not the current %H:%M wall clock \
+                 (expected one of {candidates:?}); title={title}"
+            ));
+        }
+
+        if remainder != expected_remainder {
+            return Err(format!(
+                "card title remainder {remainder:?} != expected {expected_remainder:?}; title={title}"
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn assert_card_title_current_time(
+        rendered: &str,
+        before: chrono::DateTime<chrono::Local>,
+        after: chrono::DateTime<chrono::Local>,
+        expected_remainder: &str,
+    ) {
+        if let Err(err) = check_card_title_current_time(rendered, before, after, expected_remainder)
+        {
+            panic!("{err}");
+        }
+    }
+
     fn assert_last_entry_is_card(
         state: &AppState,
-        expected_title: &str,
+        before: chrono::DateTime<chrono::Local>,
+        after: chrono::DateTime<chrono::Local>,
+        expected_remainder: &str,
         expected_body: &[&str],
     ) -> String {
         let rendered = state
@@ -579,13 +631,15 @@ mod tests {
             .last()
             .expect("submission should append a transcript entry")
             .plain_text();
-        assert_eq!(rendered.lines().next(), Some(expected_title), "{rendered}");
+        assert_card_title_current_time(&rendered, before, after, expected_remainder);
         for border in ['╭', '╮', '╰', '╯'] {
             assert!(rendered.contains(border), "{rendered}");
         }
+
         for detail in expected_body {
             assert!(rendered.contains(&format!("│{detail}")), "{rendered}");
         }
+
         assert!(
             !rendered.lines().any(|line| line.starts_with("submitted ")),
             "{rendered}"
@@ -653,11 +707,15 @@ mod tests {
         let (_dir, runtime, mut state) = test_runtime_state();
         state.push_input("build health route");
 
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
 
         let rendered = assert_last_entry_is_card(
             &state,
-            "00:00:00 · ● Run · submitted run",
+            before,
+            after,
+            "● Run · submitted run",
             &["build health route"],
         );
         assert!(!rendered.contains("│submitted run:"), "{rendered}");
@@ -667,36 +725,493 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn all_production_card_uis_show_current_wall_clock_time() {
+        // Acceptable current-time prefixes captured around an action. Both %H:%M
+        // and %H:%M:%S are accepted so the test does not over-constrain the
+        // fix's chosen wall-clock format.
+        fn clock_candidates(
+            before: chrono::DateTime<chrono::Local>,
+            after: chrono::DateTime<chrono::Local>,
+        ) -> Vec<String> {
+            let mut out = Vec::new();
+            for moment in [before, after] {
+                out.push(moment.format("%H:%M").to_string());
+                out.push(moment.format("%H:%M:%S").to_string());
+            }
+
+            out
+        }
+
+        fn title_line(rendered: &str) -> String {
+            rendered
+                .lines()
+                .next()
+                .expect("card should have a title line")
+                .to_string()
+        }
+
+        fn title_prefix(rendered: &str) -> String {
+            title_line(rendered)
+                .split(" · ")
+                .next()
+                .expect("card title should have a leading segment")
+                .to_string()
+        }
+
+        // Collect every category's outcome BEFORE asserting so one command
+        // independently exercises and reports all in-scope production card
+        // categories. A single failing category (e.g. the reported Run card)
+        // no longer short-circuits Categories 2–4.
+        fn check_current_time_prefix(
+            label: &str,
+            rendered: &str,
+            candidates: &[String],
+        ) -> Result<String, String> {
+            let title = title_line(rendered);
+            let prefix = title_prefix(rendered);
+            if prefix == "00:00:00" {
+                return Err(format!(
+                    "{label}: title prefix is the hardcoded `00:00:00` placeholder; title={title}"
+                ));
+            }
+
+            if !candidates.iter().any(|candidate| candidate == &prefix) {
+                return Err(format!(
+                    "{label}: title prefix {prefix:?} is not the current wall-clock time \
+                     (expected one of {candidates:?}); title={title}"
+                ));
+            }
+
+            Ok(format!("{label}: OK (prefix {prefix:?})"))
+        }
+
+        let mut outcomes: Vec<(&str, Result<String, String>)> = Vec::new();
+
+        // Category 0 (known-good control): workflow-event cards already stamp the
+        // current time via events.rs::workflow_title_prefix.
+        {
+            let (_dir, _runtime, mut state) = test_runtime_state();
+            let before = chrono::Local::now();
+            state.apply_workflow_event(WorkflowEvent::new(
+                "run-control",
+                WorkflowEventKind::RunStarted {
+                    workflow_name: "default".to_string(),
+                    current_step: "implement".to_string(),
+                    request_topic: None,
+                },
+            ));
+            let after = chrono::Local::now();
+            let rendered = state
+                .event_entries()
+                .last()
+                .expect("workflow event appends a transcript entry")
+                .plain_text();
+            outcomes.push((
+                "control",
+                check_current_time_prefix(
+                    "Category 0 workflow-event (control)",
+                    &rendered,
+                    &clock_candidates(before, after),
+                ),
+            ));
+        }
+
+        // Category 1: action-submission card (spawn_card_report_task) — plain Run.
+        {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            state.push_input("build health route");
+            let before = chrono::Local::now();
+            submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
+            let rendered = state
+                .event_entries()
+                .last()
+                .expect("run submission appends a transcript entry")
+                .plain_text();
+            outcomes.push((
+                "category1",
+                check_current_time_prefix(
+                    "Category 1 Run action-submission",
+                    &rendered,
+                    &clock_candidates(before, after),
+                ),
+            ));
+            state.cancel_background_tasks();
+        }
+
+        // Category 2: push_card path — /help card.
+        {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            state.push_input("/help");
+            let before = chrono::Local::now();
+            submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
+            let rendered = state
+                .event_entries()
+                .last()
+                .expect("/help appends a transcript entry")
+                .plain_text();
+            outcomes.push((
+                "category2",
+                check_current_time_prefix(
+                    "Category 2 Help push_card",
+                    &rendered,
+                    &clock_candidates(before, after),
+                ),
+            ));
+            state.cancel_background_tasks();
+        }
+
+        // Category 3: background-list card — /runs loading card.
+        {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            state.push_input("/runs");
+            let before = chrono::Local::now();
+            submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
+            let rendered = state
+                .event_entries()
+                .last()
+                .expect("/runs appends a transcript entry")
+                .plain_text();
+            outcomes.push((
+                "category3",
+                check_current_time_prefix(
+                    "Category 3 Runs background-list",
+                    &rendered,
+                    &clock_candidates(before, after),
+                ),
+            ));
+            state.cancel_background_tasks();
+        }
+
+        // Category 4: direct Card::new path — pending-prompt "Waiting for input".
+        {
+            let (_dir, _runtime, mut state) = test_runtime_state();
+            let before = chrono::Local::now();
+            state.apply_workflow_event(WorkflowEvent::new(
+                "pending-run",
+                WorkflowEventKind::WaitingForInput {
+                    step: "approve".to_string(),
+                    prompt_id: "prompt-1".to_string(),
+                    message: "Approve?".to_string(),
+                    choices: vec![],
+                },
+            ));
+            let after = chrono::Local::now();
+            let prompt = state
+                .pending_prompt()
+                .expect("waiting-for-input event sets a pending prompt");
+            let rendered = super::super::state::render_pending_prompt_lines(prompt, 80)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            outcomes.push((
+                "category4",
+                check_current_time_prefix(
+                    "Category 4 Waiting-for-input direct Card::new",
+                    &rendered,
+                    &clock_candidates(before, after),
+                ),
+            ));
+        }
+
+        // Report every category, then assert once so the command's output shows
+        // the state of all in-scope card UIs regardless of which ones fail.
+        let report = outcomes
+            .iter()
+            .map(|(_, outcome)| match outcome {
+                Ok(msg) => format!("PASS {msg}"),
+                Err(msg) => format!("FAIL {msg}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("card-timestamp category report:\n{report}");
+
+        // The workflow-event control must remain known-good.
+        assert!(
+            outcomes[0].1.is_ok(),
+            "workflow-event control card must be timestamped (known-good baseline); report:\n{report}"
+        );
+
+        let failures: Vec<&str> = outcomes
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "the following production card categories do not show the current time: {failures:?}\n{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn card_wall_clock_action_cards_show_current_time() {
+        // Every action-submission card (all eight spawn_card_report_task paths)
+        // must carry the current %H:%M wall clock, never `00:00:00`/absent.
+        struct Case {
+            input: &'static str,
+            seed_pending: bool,
+            remainder: &'static str,
+        }
+
+        let cases = [
+            Case {
+                input: "/run build health route",
+                seed_pending: false,
+                remainder: "● Run · submitted run",
+            },
+            Case {
+                input: "/run --step build health route",
+                seed_pending: false,
+                remainder: "● Run · submitted run --step",
+            },
+            Case {
+                input: "/run --workflow test-failure-fix build health route",
+                seed_pending: false,
+                remainder: "● Run · submitted run --workflow test-failure-fix",
+            },
+            Case {
+                input: "/run --step --workflow test-failure-fix build health route",
+                seed_pending: false,
+                remainder: "● Run · submitted run --step --workflow test-failure-fix",
+            },
+            Case {
+                input: "/step run-123",
+                seed_pending: false,
+                remainder: "● Step · submitted step",
+            },
+            Case {
+                input: "/resume run-123",
+                seed_pending: false,
+                remainder: "● Resume · submitted resume",
+            },
+            Case {
+                input: "approve please",
+                seed_pending: true,
+                remainder: "● Answer · submitted answer",
+            },
+            Case {
+                input: "/resolve run-123 accepted",
+                seed_pending: false,
+                remainder: "● Resolve · submitted resolve",
+            },
+        ];
+
+        for case in cases {
+            let (_dir, runtime, mut state) = test_runtime_state();
+            if case.seed_pending {
+                state.apply_workflow_event(WorkflowEvent::new(
+                    "pending-run",
+                    WorkflowEventKind::WaitingForInput {
+                        step: "approve".to_string(),
+                        prompt_id: "prompt-1".to_string(),
+                        message: "Approve?".to_string(),
+                        choices: vec![],
+                    },
+                ));
+            }
+
+            state.push_input(case.input);
+            let before = chrono::Local::now();
+            submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
+            let rendered = state
+                .event_entries()
+                .last()
+                .expect("action submission appends a transcript entry")
+                .plain_text();
+            assert_card_title_current_time(&rendered, before, after, case.remainder);
+            state.cancel_background_tasks();
+        }
+    }
+
+    #[tokio::test]
+    async fn card_wall_clock_push_card_shows_current_time() {
+        let (_dir, _runtime, mut state) = test_runtime_state();
+        let before = chrono::Local::now();
+        state.push_card("Notice", ["a note".to_string()]);
+        let after = chrono::Local::now();
+        let rendered = state
+            .event_entries()
+            .last()
+            .expect("push_card appends a transcript entry")
+            .plain_text();
+        // "Notice" maps to the waiting icon (◔) in app_card_status_and_tone.
+        assert_card_title_current_time(&rendered, before, after, "◔ Notice");
+    }
+
+    #[tokio::test]
+    async fn card_wall_clock_runs_loading_shows_current_time() {
+        let (_dir, runtime, mut state) = test_runtime_state();
+        state.push_input("/runs");
+        let before = chrono::Local::now();
+        submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
+        let rendered = state
+            .event_entries()
+            .last()
+            .expect("/runs appends a loading transcript entry")
+            .plain_text();
+        assert_card_title_current_time(&rendered, before, after, "● Runs · loading runs");
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn card_wall_clock_pending_prompt_shows_current_time() {
+        let (_dir, _runtime, mut state) = test_runtime_state();
+        let before = chrono::Local::now();
+        state.apply_workflow_event(WorkflowEvent::new(
+            "pending-run",
+            WorkflowEventKind::WaitingForInput {
+                step: "approve".to_string(),
+                prompt_id: "prompt-1".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec![],
+            },
+        ));
+        let after = chrono::Local::now();
+        let prompt = state
+            .pending_prompt()
+            .expect("waiting-for-input event sets a pending prompt");
+        let rendered = super::super::state::render_pending_prompt_lines(prompt, 80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Candidates captured around applying the event, because the prefix is now
+        // stored from the event timestamp rather than recomputed at render.
+        assert_card_title_current_time(
+            &rendered,
+            before,
+            after,
+            "◔ Waiting for input · ↳ approve · ▶ pending-run",
+        );
+    }
+
+    #[tokio::test]
+    async fn card_wall_clock_pending_prompt_prefix_is_stable_across_repeated_renders() {
+        // A fixed event timestamp makes the expected %H:%M deterministic and
+        // independent of when the test runs.
+        let fixed_utc = chrono::DateTime::<chrono::Utc>::from_timestamp(1_600_000_000, 0)
+            .expect("valid fixed UTC timestamp");
+        let (_dir, _runtime, mut state) = test_runtime_state();
+        state.apply_workflow_event(WorkflowEvent::with_timing(
+            "pending-run",
+            fixed_utc,
+            None,
+            None,
+            WorkflowEventKind::WaitingForInput {
+                step: "approve".to_string(),
+                prompt_id: "prompt-1".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec![],
+            },
+        ));
+        let prompt = state
+            .pending_prompt()
+            .expect("waiting-for-input event sets a pending prompt");
+
+        let render = |prompt: &_| {
+            super::super::state::render_pending_prompt_lines(prompt, 80)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let first = render(prompt);
+        let second = render(prompt);
+
+        // Oracle computed independently of the production helper: plain chrono
+        // from the fixed event timestamp.
+        let expected_prefix = fixed_utc
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        let first_title = first.lines().next().expect("card has a title line");
+        let (prefix, remainder) = first_title
+            .split_once(" · ")
+            .expect("pending-prompt title has a leading time prefix");
+        assert_eq!(
+            prefix, expected_prefix,
+            "stored prefix must equal the fixed event %H:%M; title={first_title}"
+        );
+        assert_eq!(
+            remainder, "◔ Waiting for input · ↳ approve · ▶ pending-run",
+            "title={first_title}"
+        );
+        assert_eq!(
+            first.lines().next(),
+            second.lines().next(),
+            "repeated renders must be byte-identical"
+        );
+    }
+
+    #[test]
+    fn card_wall_clock_helper_rejects_missing_and_nontime_prefix() {
+        let before = chrono::Local::now();
+        let after = chrono::Local::now();
+
+        // (a) No leading time prefix at all: the first (only) segment is the
+        // status+title, so there is no " · " split.
+        assert!(
+            check_card_title_current_time("◔ Notice", before, after, "◔ Notice").is_err(),
+            "helper must reject a title with no leading time prefix"
+        );
+
+        // (b) Non-%H:%M prefixes: the deterministic `00:00:00` placeholder can
+        // never equal a 5-char %H:%M candidate, and a status-icon prefix is not a
+        // clock value.
+        assert!(
+            check_card_title_current_time("00:00:00 · ● Run", before, after, "● Run").is_err(),
+            "helper must reject the 00:00:00 placeholder prefix"
+        );
+        assert!(
+            check_card_title_current_time("● Runs · loading runs", before, after, "loading runs")
+                .is_err(),
+            "helper must reject a status-icon (non-time) prefix"
+        );
+    }
+
+    #[tokio::test]
     async fn slash_run_variants_render_initial_input_as_cards() {
-        for (input, expected_title, expected_status) in [
+        for (input, expected_remainder, expected_status) in [
             (
                 "/run build health route",
-                "00:00:00 · ● Run · submitted run",
+                "● Run · submitted run",
                 "submitted run: build health route",
             ),
             (
                 "/run --step build health route",
-                "00:00:00 · ● Run · submitted run --step",
+                "● Run · submitted run --step",
                 "submitted run --step: build health route",
             ),
             (
                 "/run --workflow test-failure-fix build health route",
-                "00:00:00 · ● Run · submitted run --workflow test-failure-fix",
+                "● Run · submitted run --workflow test-failure-fix",
                 "submitted run --workflow test-failure-fix: build health route",
             ),
             (
                 "/run --step --workflow test-failure-fix build health route",
-                "00:00:00 · ● Run · submitted run --step --workflow test-failure-fix",
+                "● Run · submitted run --step --workflow test-failure-fix",
                 "submitted run --step --workflow test-failure-fix: build health route",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state();
             state.push_input(input);
 
+            let before = chrono::Local::now();
             submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
 
-            let rendered =
-                assert_last_entry_is_card(&state, expected_title, &["build health route"]);
+            let rendered = assert_last_entry_is_card(
+                &state,
+                before,
+                after,
+                expected_remainder,
+                &["build health route"],
+            );
             assert!(!rendered.contains("│submitted run"), "{rendered}");
             assert_eq!(state.status(), expected_status);
             assert_eq!(state.background_task_count(), 1);
@@ -706,7 +1221,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_control_submissions_render_action_cards() {
-        for (input, expected_title, expected_status, expected_body) in [
+        for (input, expected_remainder, expected_status, expected_body) in [
             (
                 "/step run-123",
                 "● Step · submitted step",
@@ -729,9 +1244,11 @@ mod tests {
             let (_dir, runtime, mut state) = test_runtime_state();
             state.push_input(input);
 
+            let before = chrono::Local::now();
             submit_input(&mut state, &runtime).await;
+            let after = chrono::Local::now();
 
-            assert_last_entry_is_card(&state, expected_title, &expected_body);
+            assert_last_entry_is_card(&state, before, after, expected_remainder, &expected_body);
             assert_eq!(state.status(), expected_status);
             assert_eq!(state.background_task_count(), 1);
             state.cancel_background_tasks();
@@ -1316,7 +1833,9 @@ mod tests {
 
         let options_input = format!("/resolve {run_id}");
         state.push_input(&options_input);
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
         let rendered = state
             .event_entries()
             .iter()
@@ -1324,7 +1843,7 @@ mod tests {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(rendered.lines().next(), Some("✓ Resolve"), "{rendered}");
+        assert_card_title_current_time(&rendered, before, after, "✓ Resolve");
         assert!(
             rendered.contains(&format!("/resolve '{run_id}'")),
             "{rendered}"
@@ -1348,7 +1867,9 @@ mod tests {
 
         assert!(!state.workflow_execution_running());
         state.push_input(&resolve_input);
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
         assert_eq!(state.background_task_count(), 1);
         assert_eq!(
             state.status(),
@@ -1356,6 +1877,8 @@ mod tests {
         );
         assert_last_entry_is_card(
             &state,
+            before,
+            after,
             "● Resolve · submitted resolve",
             &[&run_id, "planned"],
         );
@@ -1556,13 +2079,17 @@ mod tests {
         );
 
         state.push_input("answer with spaces");
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
 
         assert_eq!(state.status(), "submitted answer: pending-run prompt-42");
         assert_eq!(state.background_task_count(), 1);
         assert_eq!(state.pending_prompt_answer_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
+            before,
+            after,
             "● Answer · submitted answer",
             &["pending-run", "prompt-42"],
         );
@@ -1584,7 +2111,9 @@ mod tests {
         ));
 
         state.push_input("/answer explicit-run explicit-prompt \"answer with spaces\"");
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
 
         assert_eq!(
             state.status(),
@@ -1594,6 +2123,8 @@ mod tests {
         assert_eq!(state.pending_prompt_answer_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
+            before,
+            after,
             "● Answer · submitted answer",
             &["explicit-run", "explicit-prompt"],
         );
@@ -1931,14 +2462,16 @@ mod tests {
         let (dir, runtime, mut state) = test_runtime_state();
         state.push_input("  /resolve missing-run  ");
 
+        let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
+        let after = chrono::Local::now();
 
         assert_eq!(state.input(), "");
         assert_eq!(state.background_task_count(), 0);
         assert!(state.status().starts_with("error: "), "{}", state.status());
         assert!(state.status().contains("missing-run"), "{}", state.status());
         let error_card = state.event_entries().last().unwrap().plain_text();
-        assert_eq!(error_card.lines().next(), Some("✗ Error"), "{error_card}");
+        assert_card_title_current_time(&error_card, before, after, "✗ Error");
         assert!(error_card.contains(state.status()), "{error_card}");
 
         let history = std::fs::read_to_string(dir.path().join("state/input_history")).unwrap();

@@ -10,7 +10,10 @@ use tui_input::{Input, InputRequest};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone};
 use super::controls::chrome::status_icon;
-use super::events::{agent_card_step_id, render_workflow_event, render_workflow_event_width};
+use super::events::{
+    agent_card_step_id, current_wall_clock_prefix, event_wall_clock_prefix, render_workflow_event,
+    render_workflow_event_width,
+};
 use super::history::{HISTORY_LOAD_LIMIT, InputHistory};
 use super::markup::render_content;
 use super::styles::{style_transcript_normal, style_warning};
@@ -24,6 +27,7 @@ pub(super) struct PendingPrompt {
     prompt_id: String,
     message: String,
     choices: Vec<String>,
+    title_prefix: String,
 }
 
 impl PendingPrompt {
@@ -45,6 +49,10 @@ impl PendingPrompt {
 
     pub(in crate::app) fn choices(&self) -> &[String] {
         &self.choices
+    }
+
+    pub(in crate::app) fn title_prefix(&self) -> &str {
+        &self.title_prefix
     }
 }
 
@@ -116,6 +124,7 @@ pub(in crate::app) fn render_pending_prompt_lines(
         "Waiting for input",
         CardTone::Warning,
     )
+    .title_prefix(prompt.title_prefix().to_string())
     .metadata([
         CardMetadata::step(prompt.step()),
         CardMetadata::run(prompt.run_id()),
@@ -946,7 +955,7 @@ impl AppState {
     ) {
         self.push_event(TranscriptEntry::Card {
             title: title.to_string(),
-            title_prefix: Vec::new(),
+            title_prefix: vec![current_wall_clock_prefix()],
             title_suffix: Vec::new(),
             details: details.into_iter().collect(),
         });
@@ -1103,7 +1112,7 @@ impl AppState {
             status,
             TranscriptEntry::Card {
                 title: "Runs".to_string(),
-                title_prefix: Vec::new(),
+                title_prefix: vec![current_wall_clock_prefix()],
                 title_suffix: vec!["loading runs".to_string()],
                 details: vec!["Loading runs".to_string()],
             },
@@ -1369,6 +1378,7 @@ impl AppState {
                     prompt_id: prompt_id.clone(),
                     message: message.clone(),
                     choices: choices.clone(),
+                    title_prefix: event_wall_clock_prefix(event),
                 });
             }
             WorkflowEventKind::StepCompleted { step_id, .. } => {
@@ -1663,14 +1673,39 @@ mod tests {
             .last()
             .expect("feedback should append a transcript entry")
             .plain_text();
-        assert_eq!(rendered.lines().next(), Some(expected_title), "{rendered}");
+        assert_card_title_time_prefix(&rendered, expected_title);
         for border in ['╭', '╮', '╰', '╯'] {
             assert!(rendered.contains(border), "{rendered}");
         }
+
         assert!(
             rendered.contains(&format!("│{expected_body}")),
             "{rendered}"
         );
+    }
+
+    /// Assert the rendered card's first line begins with a present `%H:%M`
+    /// wall-clock prefix followed by exactly `expected_remainder`.
+    fn assert_card_title_time_prefix(rendered: &str, expected_remainder: &str) {
+        let title = rendered.lines().next().expect("card has a title line");
+        let (prefix, remainder) = title
+            .split_once(" · ")
+            .unwrap_or_else(|| panic!("card title has no leading time prefix; title={title}"));
+        assert!(
+            is_hh_mm(prefix),
+            "card title prefix {prefix:?} is not an %H:%M wall clock; title={title}"
+        );
+        assert_eq!(remainder, expected_remainder, "{rendered}");
+    }
+
+    fn is_hh_mm(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.len() == 5
+            && bytes[2] == b':'
+            && bytes[0].is_ascii_digit()
+            && bytes[1].is_ascii_digit()
+            && bytes[3].is_ascii_digit()
+            && bytes[4].is_ascii_digit()
     }
 
     fn spawn_pending_report_task(state: &mut AppState) {
@@ -1721,6 +1756,7 @@ mod tests {
             prompt_id: "approval".to_string(),
             message: "first line\nsecond **literal** `plan`?".to_string(),
             choices: vec!["approve".to_string()],
+            title_prefix: "12:00".to_string(),
         };
         let lines = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH);
         let rows = lines.iter().map(ToString::to_string).collect::<Vec<_>>();

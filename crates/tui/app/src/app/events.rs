@@ -410,6 +410,25 @@ fn workflow_card(
     Card::new(status, title, tone).title_prefix(workflow_title_prefix(event))
 }
 
+/// Single wall-clock format source shared by the workflow-event title prefix and
+/// every production card title prefix, so the two paths cannot drift.
+const CARD_WALL_CLOCK_FORMAT: &str = "%H:%M";
+
+fn format_wall_clock(ts: DateTime<FixedOffset>) -> String {
+    ts.format(CARD_WALL_CLOCK_FORMAT).to_string()
+}
+
+/// Current wall-clock time prefix stamped onto production card titles.
+pub(in crate::app) fn current_wall_clock_prefix() -> String {
+    format_wall_clock(Local::now().fixed_offset())
+}
+
+/// Wall-clock prefix derived once from an event's own timestamp (stable across
+/// repeated renders), used by the stored pending-prompt card prefix.
+pub(in crate::app) fn event_wall_clock_prefix(event: &WorkflowEvent) -> String {
+    format_wall_clock(event.timestamp.with_timezone(&Local).fixed_offset())
+}
+
 fn workflow_title_prefix(event: &WorkflowEvent) -> String {
     let local_timestamp = event.timestamp.with_timezone(&Local).fixed_offset();
 
@@ -420,11 +439,11 @@ fn format_workflow_title_prefix(
     local_timestamp: DateTime<FixedOffset>,
     elapsed_ms: Option<u64>,
 ) -> String {
-    let wall_clock = local_timestamp.format("%H:%M");
+    let wall_clock = format_wall_clock(local_timestamp);
 
     match elapsed_ms {
         Some(elapsed_ms) => format!("{wall_clock} (+{})", format_elapsed_ms(elapsed_ms)),
-        None => wall_clock.to_string(),
+        None => wall_clock,
     }
 }
 
