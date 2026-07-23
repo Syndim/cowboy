@@ -13,6 +13,10 @@ pub trait Transport: Send + Sync {
     async fn recv(&mut self) -> anyhow::Result<Option<String>>;
     /// Close the connection.
     async fn close(&mut self) -> anyhow::Result<()>;
+    /// Forcefully terminate the owned agent process or transport endpoint.
+    async fn force_terminate(&mut self) -> anyhow::Result<()> {
+        self.close().await
+    }
 }
 
 /// Stdio transport config
@@ -68,6 +72,7 @@ pub struct MockConfig {
 #[cfg(test)]
 pub struct MockTransport {
     incoming: std::collections::VecDeque<String>,
+    force_terminated: bool,
 }
 
 #[cfg(test)]
@@ -75,7 +80,12 @@ impl MockTransport {
     pub fn new(config: &MockConfig) -> Self {
         Self {
             incoming: config.responses.iter().cloned().collect(),
+            force_terminated: false,
         }
+    }
+
+    pub fn was_force_terminated(&self) -> bool {
+        self.force_terminated
     }
 }
 
@@ -92,5 +102,28 @@ impl Transport for MockTransport {
 
     async fn close(&mut self) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn force_terminate(&mut self) -> anyhow::Result<()> {
+        self.incoming.clear();
+        self.force_terminated = true;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn force_terminate_disposes_mock_transport() {
+        let mut transport = MockTransport::new(&MockConfig {
+            responses: vec!["response".to_string()],
+        });
+
+        transport.force_terminate().await.unwrap();
+
+        assert!(transport.was_force_terminated());
+        assert!(transport.recv().await.unwrap().is_none());
     }
 }

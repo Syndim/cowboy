@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cowboy_agent_client::ModelInfo;
-use cowboy_workflow_engine::{AgentRuntimeConfig, RunnerLimitsConfig, RuntimeConfig};
+use cowboy_workflow_engine::{
+    AgentRuntimeConfig, AgentWatchdogRuntimeConfig, RunnerLimitsConfig, RuntimeConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Configuration needed by the new workflow-first TUI shell.
@@ -96,6 +98,26 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub model: Option<ModelConfig>,
+    #[serde(default)]
+    pub watchdog: AgentWatchdogConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentWatchdogConfig {
+    pub response_timeout_seconds: u64,
+    pub cancel_timeout_seconds: u64,
+    pub recovery_operation_timeout_seconds: u64,
+}
+
+impl Default for AgentWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 30,
+        }
+    }
 }
 
 fn default_agent_command() -> String {
@@ -113,6 +135,7 @@ impl Default for AgentConfig {
             command: default_agent_command(),
             args: default_agent_args(),
             model: None,
+            watchdog: AgentWatchdogConfig::default(),
         }
     }
 }
@@ -233,6 +256,24 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
         if !names.insert(agent.name.as_str()) {
             anyhow::bail!("agent names must be unique: {:?}", agent.name);
         }
+        for (field, value) in [
+            (
+                "response_timeout_seconds",
+                agent.watchdog.response_timeout_seconds,
+            ),
+            (
+                "cancel_timeout_seconds",
+                agent.watchdog.cancel_timeout_seconds,
+            ),
+            (
+                "recovery_operation_timeout_seconds",
+                agent.watchdog.recovery_operation_timeout_seconds,
+            ),
+        ] {
+            if value == 0 {
+                anyhow::bail!("agent {:?} {field} must be greater than zero", agent.name);
+            }
+        }
     }
     Ok(())
 }
@@ -266,7 +307,7 @@ impl AppConfig {
             self.agents
                 .iter()
                 .map(|agent| {
-                    AgentRuntimeConfig::new(
+                    let mut runtime = AgentRuntimeConfig::new(
                         agent.name.clone(),
                         agent.command.clone(),
                         agent.args.clone(),
@@ -274,7 +315,15 @@ impl AppConfig {
                             id: model.id,
                             provider: model.provider,
                         }),
-                    )
+                    );
+                    runtime.watchdog = AgentWatchdogRuntimeConfig {
+                        response_timeout_seconds: agent.watchdog.response_timeout_seconds,
+                        cancel_timeout_seconds: agent.watchdog.cancel_timeout_seconds,
+                        recovery_operation_timeout_seconds: agent
+                            .watchdog
+                            .recovery_operation_timeout_seconds,
+                    };
+                    runtime
                 })
                 .collect(),
             config_sets,
@@ -326,6 +375,7 @@ mod tests {
         assert_eq!(config.agents.len(), 1);
         assert_eq!(config.agents[0].name, "default");
         assert_eq!(config.agents[0].command, "copilot");
+        assert_eq!(config.agents[0].watchdog, AgentWatchdogConfig::default());
         assert_eq!(config.mouse_scroll_lines, 3);
     }
 
@@ -593,6 +643,109 @@ max_retries_per_step = 4
         );
     }
 
+    const WATCHDOG_CONTRACT_START: &str = "<!-- cowboy-agent-watchdog-contract:start -->";
+    const WATCHDOG_CONTRACT_END: &str = "<!-- cowboy-agent-watchdog-contract:end -->";
+
+    fn expected_watchdog_contract() -> String {
+        let defaults = AgentWatchdogConfig::default();
+        format!(
+            "```toml\n[agents.watchdog]\nresponse_timeout_seconds = {}\ncancel_timeout_seconds = {}\nrecovery_operation_timeout_seconds = {}\n```\n\nParsed ACP activity resets the inactivity deadline. Recovery first sends exactly\none `session/cancel` and, when cancellation is confirmed, sends `\"Continue\"` on\nthe same session. If cancellation fails or times out, Cowboy kills the recorded\nPID, waits for exit, restarts the agent with `--resume=<session-id>`, initializes\nACP, and sends `\"Continue\"`. The recovery-operation timeout separately bounds\ntermination, restart, initialization, and continuation dispatch. This ACP\nrecovery does not consume workflow retry budgets. All values must be greater\nthan zero, and Cowboy must be restarted after watchdog configuration changes.",
+            defaults.response_timeout_seconds,
+            defaults.cancel_timeout_seconds,
+            defaults.recovery_operation_timeout_seconds,
+        )
+    }
+
+    fn extract_watchdog_contract(content: &str) -> std::result::Result<&str, String> {
+        let starts = content
+            .match_indices(WATCHDOG_CONTRACT_START)
+            .collect::<Vec<_>>();
+        let ends = content
+            .match_indices(WATCHDOG_CONTRACT_END)
+            .collect::<Vec<_>>();
+        if starts.len() != 1 || ends.len() != 1 {
+            return Err(format!(
+                "expected one watchdog contract block, found {} starts and {} ends",
+                starts.len(),
+                ends.len()
+            ));
+        }
+        let body_start = starts[0].0 + WATCHDOG_CONTRACT_START.len();
+        let body_end = ends[0].0;
+        if body_start > body_end {
+            return Err("watchdog contract end precedes start".to_string());
+        }
+        Ok(content[body_start..body_end].trim())
+    }
+
+    fn validate_watchdog_document(content: &str) -> std::result::Result<(), String> {
+        let contract = extract_watchdog_contract(content)?;
+        if contract != expected_watchdog_contract() {
+            return Err(
+                "watchdog contract differs from code defaults or recovery order".to_string(),
+            );
+        }
+        let outside = content.replacen(
+            &format!("{WATCHDOG_CONTRACT_START}\n{contract}\n{WATCHDOG_CONTRACT_END}"),
+            "",
+            1,
+        );
+        for field in [
+            "response_timeout_seconds",
+            "cancel_timeout_seconds",
+            "recovery_operation_timeout_seconds",
+        ] {
+            if outside.lines().any(|line| {
+                line.trim_start()
+                    .strip_prefix(field)
+                    .is_some_and(|rest| rest.trim_start().starts_with('='))
+            }) {
+                return Err(format!(
+                    "watchdog field assignment appears outside authoritative block: {field}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn documented_agent_watchdog_contract_is_unique_and_exact() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let demo = load_config(&root.join("demo-config.toml")).unwrap();
+        assert_eq!(
+            demo.agents
+                .iter()
+                .find(|agent| agent.name == "default")
+                .unwrap()
+                .watchdog,
+            AgentWatchdogConfig::default()
+        );
+
+        for relative in ["README.md", "docs/architecture.md", "docs/module-map.md"] {
+            let content = fs::read_to_string(root.join(relative)).unwrap();
+            validate_watchdog_document(&content)
+                .unwrap_or_else(|error| panic!("{relative}: {error}"));
+        }
+
+        let contract = expected_watchdog_contract();
+        let valid = format!("{WATCHDOG_CONTRACT_START}\n{contract}\n{WATCHDOG_CONTRACT_END}");
+        for invalid in [
+            valid.replace(
+                "response_timeout_seconds = 100",
+                "response_timeout_seconds = 99",
+            ),
+            valid.replace(
+                "Recovery first sends exactly\none `session/cancel`",
+                "Recovery first restarts the agent, then sends\none `session/cancel`",
+            ),
+            format!("{valid}\n{valid}"),
+            contract.clone(),
+            format!("{valid}\nresponse_timeout_seconds = 100"),
+        ] {
+            assert!(validate_watchdog_document(&invalid).is_err());
+        }
+    }
+
     #[test]
     fn parses_named_agents_and_runtime_conversion_preserves_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -607,6 +760,10 @@ args = ["--acp"]
 [agents.model]
 id = "opus-4.8-1m"
 provider = "github-copilot"
+[agents.watchdog]
+response_timeout_seconds = 7
+cancel_timeout_seconds = 8
+recovery_operation_timeout_seconds = 9
 
 [[agents]]
 name = "reviewer"
@@ -636,6 +793,14 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
         assert_eq!(runtime.agents.len(), 2);
         assert_eq!(runtime.agents[0].name, "default");
         assert_eq!(runtime.agents[0].model.as_ref().unwrap().id, "opus-4.8-1m");
+        assert_eq!(runtime.agents[0].watchdog.response_timeout_seconds, 7);
+        assert_eq!(runtime.agents[0].watchdog.cancel_timeout_seconds, 8);
+        assert_eq!(
+            runtime.agents[0]
+                .watchdog
+                .recovery_operation_timeout_seconds,
+            9
+        );
         assert_eq!(runtime.agents[1].name, "reviewer");
         assert_eq!(runtime.agents[1].command, "copilot");
         assert_eq!(runtime.agents[1].model.as_ref().unwrap().id, "gpt-5.5-1m");
@@ -701,6 +866,29 @@ command = "copilot"
 
         assert!(err.to_string().contains("invalid agent config"));
         assert!(format!("{err:#}").contains("agent name must not be empty"));
+    }
+
+    #[test]
+    fn rejects_zero_agent_watchdog_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        for field in [
+            "response_timeout_seconds",
+            "cancel_timeout_seconds",
+            "recovery_operation_timeout_seconds",
+        ] {
+            let path = dir.path().join(format!("{field}.toml"));
+            fs::write(
+                &path,
+                format!("[[agents]]\nname = \"default\"\n[agents.watchdog]\n{field} = 0\n"),
+            )
+            .unwrap();
+
+            let err = load_config(&path).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(&format!("{field} must be greater than zero")),
+                "{err:#}"
+            );
+        }
     }
 
     #[test]

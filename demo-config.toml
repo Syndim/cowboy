@@ -27,6 +27,14 @@ args = ["--thinking=auto", "acp"]
 id = "opus-4.8-1m"
 provider = "github-copilot"
 
+# Agent inactivity resets on every parsed ACP message. Recovery sends session/cancel,
+# then "Continue"; if cancellation stalls, Cowboy kills the recorded PID,
+# restarts with --resume=<session-id>, and sends "Continue" again.
+[agents.watchdog]
+response_timeout_seconds = 100
+cancel_timeout_seconds = 10
+recovery_operation_timeout_seconds = 30
+
 [[agents]]
 name = "planner"
 command = "omp"

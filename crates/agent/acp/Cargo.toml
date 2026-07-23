@@ -10,6 +10,10 @@ description = "ACP agent client implementation for Cowboy"
 name = "acp-chat"
 path = "src/bin/acp-chat.rs"
 
+[[bin]]
+name = "watchdog-fixture"
+path = "src/bin/watchdog-fixture.rs"
+
 [dependencies]
 cowboy-agent-client.workspace = true
 anyhow.workspace = true
@@ -18,8 +22,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }
 tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "test-util"] }

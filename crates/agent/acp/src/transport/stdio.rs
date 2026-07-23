@@ -171,6 +171,20 @@ impl Transport for StdioTransport {
         }
         Ok(())
     }
+
+    async fn force_terminate(&mut self) -> anyhow::Result<()> {
+        let status = self.child.try_wait()?;
+        if status.is_none() {
+            tracing::warn!(
+                command = %self.command,
+                pid = ?self.pid,
+                "Force terminating agent subprocess"
+            );
+            self.child.kill().await?;
+            let _ = self.child.wait().await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +271,21 @@ mod tests {
             env: vec![],
         });
         assert!(matches!(config, TransportConfig::Zellij(_)));
+    }
+
+    #[tokio::test]
+    async fn force_terminate_stops_stdio_child_by_pid() {
+        let config = StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            env: vec![],
+        };
+        let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
+        let pid = transport.pid.expect("child pid");
+
+        transport.force_terminate().await.unwrap();
+
+        assert!(transport.child.try_wait().unwrap().is_some());
+        assert_eq!(transport.pid, Some(pid));
     }
 }

@@ -93,6 +93,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::runtime::AgentWatchdogRuntimeConfig;
 
     fn agent(name: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
@@ -100,6 +101,7 @@ mod tests {
             command: format!("{name}-cmd"),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
 
@@ -132,6 +134,7 @@ mod tests {
                 "acp".to_string(),
             ],
             model: Some(ModelInfo::default()),
+            watchdog: AgentWatchdogRuntimeConfig::default(),
         };
         let resolver =
             AgentResolver::new(vec![agent("default"), agent("reviewer"), committer]).unwrap();

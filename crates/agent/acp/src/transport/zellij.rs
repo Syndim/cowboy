@@ -250,6 +250,38 @@ impl Transport for ZellijTransport {
         );
         Ok(())
     }
+
+    async fn force_terminate(&mut self) -> anyhow::Result<()> {
+        let mut attempts = 0;
+        let status = loop {
+            let result = tokio::process::Command::new(&self.zellij_command)
+                .args([
+                    "--session",
+                    &self.session,
+                    "action",
+                    "close-pane",
+                    "--pane-id",
+                    &self.pane_id,
+                ])
+                .status()
+                .await;
+            match result {
+                Err(err) if err.raw_os_error() == Some(26) && attempts == 0 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                result => break result?,
+            }
+        };
+        if !status.success() {
+            anyhow::bail!(
+                "Failed to force-close Zellij pane {} in session {}",
+                self.pane_id,
+                self.session
+            );
+        }
+        Ok(())
+    }
 }
 
 // ============================================================
@@ -364,5 +396,36 @@ exit 0
         assert!(
             commands.contains("--session test-zellij-session action close-pane --pane-id pane-1")
         );
+    }
+
+    #[tokio::test]
+    async fn force_terminate_closes_zellij_pane_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fake_zellij = dir.path().join("zellij");
+        let command_log = dir.path().join("commands.log");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+            command_log.display()
+        );
+        std::fs::write(&fake_zellij, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&fake_zellij).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&fake_zellij, permissions).unwrap();
+        }
+        let mut transport = ZellijTransport {
+            session: "watchdog-session".to_string(),
+            pane_id: "pane-1".to_string(),
+            zellij_command: fake_zellij.to_string_lossy().to_string(),
+            message_buffer: VecDeque::new(),
+            last_seen_line: 0,
+        };
+
+        transport.force_terminate().await.unwrap();
+
+        let commands = std::fs::read_to_string(command_log).unwrap();
+        assert_eq!(commands.matches("action close-pane").count(), 1);
     }
 }

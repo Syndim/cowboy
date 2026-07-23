@@ -35,7 +35,7 @@ This crate owns config loading, logging setup, runtime dispatch, and terminal re
 | --- | --- |
 | `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. |
 | `lib.rs` | Public exports for the TUI app crate: config and `run_tui`. |
-| `config.rs` | Load and validate TOML, materialize named config sets (including built-in `default`), and convert them into engine `RuntimeConfig`. |
+| `config.rs` | Load and validate TOML, including per-agent watchdog policy, materialize named config sets, and convert them into engine `RuntimeConfig`. |
 | `app.rs` | Terminal startup, event loop, and top-level vertical layout only. |
 | `app/commands.rs` | Slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
@@ -188,10 +188,29 @@ ACP backend implementation.
 
 | Module | Responsibility |
 | --- | --- |
-| `client.rs` | ACP client implementing `cowboy-agent-client::Client`. |
+| `client.rs` | ACP client implementing `cowboy-agent-client::Client`, including inactivity reset, `session/cancel`, same-session `"Continue"`, and bounded restart/resume recovery. |
 | `messages.rs` | ACP JSON-RPC message types and parser. |
-| `transport/` | stdio and Zellij line transports. |
+| `transport/` | stdio and Zellij line transports, including recorded-PID force termination before replacement startup with `--resume=<session-id>`. |
 | `bin/acp-chat.rs` | Test app for chatting with an ACP agent. |
+| `bin/watchdog-fixture.rs` | Deterministic soft/hard watchdog smoke fixture and authenticated cleanup verifier. |
+
+<!-- cowboy-agent-watchdog-contract:start -->
+```toml
+[agents.watchdog]
+response_timeout_seconds = 100
+cancel_timeout_seconds = 10
+recovery_operation_timeout_seconds = 30
+```
+
+Parsed ACP activity resets the inactivity deadline. Recovery first sends exactly
+one `session/cancel` and, when cancellation is confirmed, sends `"Continue"` on
+the same session. If cancellation fails or times out, Cowboy kills the recorded
+PID, waits for exit, restarts the agent with `--resume=<session-id>`, initializes
+ACP, and sends `"Continue"`. The recovery-operation timeout separately bounds
+termination, restart, initialization, and continuation dispatch. This ACP
+recovery does not consume workflow retry budgets. All values must be greater
+than zero, and Cowboy must be restarted after watchdog configuration changes.
+<!-- cowboy-agent-watchdog-contract:end -->
 
 ## Current flow
 

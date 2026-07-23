@@ -7,7 +7,6 @@ use std::sync::{
 };
 
 use chrono::Utc;
-use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
 use cowboy_agent_client::PromptTurnCancellation;
@@ -22,8 +21,8 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
-    ObjectKind, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction,
-    StepAction, StepActionProvider, StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError,
+    ObjectKind, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction,
+    StepActionProvider, StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError,
     WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
 };
@@ -37,7 +36,8 @@ use crate::agent_resolver::AgentResolver;
 use crate::events::WORKFLOW_STORE_WAITING_MESSAGE;
 use crate::run_lock::RunExecutionLocks;
 use crate::runtime_dependencies::{
-    ProductionRuntimeDependencies, RuntimeDependencies, transport_for,
+    AcpConnector, ProductionAcpConnector, ProductionRuntimeDependencies, RuntimeDependencies,
+    transport_for, watchdog_options_for,
 };
 use crate::workflow::DeterministicSelector;
 use crate::{
@@ -63,6 +63,26 @@ pub struct AgentRuntimeConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub model: Option<ModelInfo>,
+    #[serde(default)]
+    pub watchdog: AgentWatchdogRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentWatchdogRuntimeConfig {
+    pub response_timeout_seconds: u64,
+    pub cancel_timeout_seconds: u64,
+    pub recovery_operation_timeout_seconds: u64,
+}
+
+impl Default for AgentWatchdogRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +117,7 @@ impl AgentRuntimeConfig {
             command: command.into(),
             args,
             model,
+            watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
 }
@@ -304,6 +325,7 @@ pub struct WorkflowRuntime {
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
     dependencies: Arc<dyn RuntimeDependencies>,
+    acp_connector: Arc<dyn AcpConnector>,
     prompt_turn_controls: PromptTurnControlRegistry,
     #[cfg(feature = "test-support")]
     handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
@@ -379,12 +401,30 @@ pub(crate) enum SelectorMode {
 
 impl WorkflowRuntime {
     pub fn new(config: RuntimeConfig) -> Self {
-        Self::with_dependencies(config, Arc::new(ProductionRuntimeDependencies))
+        let acp_connector = Arc::new(ProductionAcpConnector);
+        Self::with_dependencies_and_connector(
+            config,
+            Arc::new(ProductionRuntimeDependencies::new(acp_connector.clone())),
+            acp_connector,
+        )
     }
 
+    #[cfg(test)]
     fn with_dependencies(
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
+    ) -> Self {
+        Self::with_dependencies_and_connector(
+            config,
+            dependencies,
+            Arc::new(ProductionAcpConnector),
+        )
+    }
+
+    fn with_dependencies_and_connector(
+        config: RuntimeConfig,
+        dependencies: Arc<dyn RuntimeDependencies>,
+        acp_connector: Arc<dyn AcpConnector>,
     ) -> Self {
         let store = RedbRunStore::lazy(&config.workflow_store);
 
@@ -396,6 +436,7 @@ impl WorkflowRuntime {
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
+            acp_connector,
             prompt_turn_controls: PromptTurnControlRegistry::default(),
             #[cfg(feature = "test-support")]
             handoff_observer: None,
@@ -722,7 +763,12 @@ impl WorkflowRuntime {
             };
         }
 
-        if let Some(config_set) = self.config.config_sets.get(DEFAULT_CONFIG_SET_NAME).copied() {
+        if let Some(config_set) = self
+            .config
+            .config_sets
+            .get(DEFAULT_CONFIG_SET_NAME)
+            .copied()
+        {
             tracing::warn!(
                 requested = %name,
                 "config set missing from current config; falling back to default config set"
@@ -756,7 +802,9 @@ impl WorkflowRuntime {
             SelectorMode::Agent => {
                 let resolver = AgentResolver::new(self.config.agents.clone())?;
                 let agent = resolver.resolve_default()?;
-                let client = AcpClient::connect(transport_for(agent))
+                let client = self
+                    .acp_connector
+                    .connect(transport_for(agent), watchdog_options_for(agent))
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
                 let selector = crate::AgentWorkflowSelector::new(
@@ -1099,7 +1147,9 @@ impl WorkflowRuntime {
         let run = self.load_run(run_id)?;
         let resolver = AgentResolver::new(self.config.agents.clone())?;
         let agent = resolver.resolve_default()?;
-        let client = AcpClient::connect(transport_for(agent))
+        let client = self
+            .acp_connector
+            .connect(transport_for(agent), watchdog_options_for(agent))
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         let summarizer = crate::AgentWorkflowSummarizer::new(
@@ -1551,6 +1601,8 @@ mod tests {
     use super::*;
     use crate::runtime_dependencies::{MockRuntimeDependencies, SharedClientFactory};
     use async_trait::async_trait;
+    use cowboy_agent_acp::transport::TransportConfig;
+    use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient};
     use cowboy_agent_client::{AgentInfo, Client, Event, PromptContent, StopReason};
     #[cfg(feature = "test-support")]
     use cowboy_workflow_agent::PromptWindowHandoffPoint;
@@ -1564,12 +1616,48 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct RecordedRuntimeAcpConnection {
+        command: String,
+        watchdog: AgentWatchdogOptions,
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingRuntimeAcpConnector {
+        connections: Arc<SyncMutex<Vec<RecordedRuntimeAcpConnection>>>,
+    }
+
+    impl RecordingRuntimeAcpConnector {
+        fn connections(&self) -> Vec<RecordedRuntimeAcpConnection> {
+            self.connections.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AcpConnector for RecordingRuntimeAcpConnector {
+        async fn connect(
+            &self,
+            transport: TransportConfig,
+            watchdog: AgentWatchdogOptions,
+        ) -> anyhow::Result<AcpClient> {
+            let TransportConfig::Stdio(transport) = transport else {
+                panic!("workflow runtime agents must use stdio")
+            };
+            self.connections.lock().push(RecordedRuntimeAcpConnection {
+                command: transport.command,
+                watchdog,
+            });
+            Err(anyhow::anyhow!("recording runtime connector"))
+        }
+    }
+
     fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             name: name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
 
@@ -1806,9 +1894,9 @@ mod tests {
                     .returning(move |_| Ok(factory.clone()));
             }
             None => {
-                dependencies
-                    .expect_agent_factory()
-                    .returning(|config| ProductionRuntimeDependencies.agent_factory(config));
+                dependencies.expect_agent_factory().returning(|config| {
+                    ProductionRuntimeDependencies::default().agent_factory(config)
+                });
             }
         }
 
@@ -1844,11 +1932,96 @@ mod tests {
             config_sets: BTreeMap::new(),
         };
 
-        let topic = ProductionRuntimeDependencies
+        let topic = ProductionRuntimeDependencies::default()
             .generate_request_topic(&config, SelectorMode::Agent, "summarize this request")
             .await;
 
         assert_eq!(topic, None);
+    }
+
+    fn production_connector_test_config(dir: &tempfile::TempDir) -> RuntimeConfig {
+        RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            agents: vec![AgentRuntimeConfig {
+                name: "default".to_string(),
+                command: "default-runtime-agent".to_string(),
+                args: Vec::new(),
+                model: None,
+                watchdog: AgentWatchdogRuntimeConfig {
+                    response_timeout_seconds: 31,
+                    cancel_timeout_seconds: 32,
+                    recovery_operation_timeout_seconds: 33,
+                },
+            }],
+            config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        }
+    }
+
+    fn runtime_with_recording_connector(
+        config: RuntimeConfig,
+        connector: Arc<RecordingRuntimeAcpConnector>,
+    ) -> WorkflowRuntime {
+        WorkflowRuntime::with_dependencies_and_connector(
+            config,
+            Arc::new(MockRuntimeDependencies::new()),
+            connector,
+        )
+    }
+
+    fn expected_default_runtime_connection() -> RecordedRuntimeAcpConnection {
+        RecordedRuntimeAcpConnection {
+            command: "default-runtime-agent".to_string(),
+            watchdog: AgentWatchdogOptions {
+                response_timeout_seconds: 31,
+                cancel_timeout_seconds: 32,
+                recovery_operation_timeout_seconds: 33,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_selector_client_construction_uses_default_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let runtime = runtime_with_recording_connector(
+            production_connector_test_config(&dir),
+            connector.clone(),
+        );
+        let catalog = runtime.catalog().unwrap();
+
+        let error = runtime
+            .select_workflow("select a workflow", &catalog)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("recording runtime connector"));
+        assert_eq!(
+            connector.connections(),
+            [expected_default_runtime_connection()]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_improvement_client_construction_uses_default_watchdog() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let runtime = runtime_with_recording_connector(
+            production_connector_test_config(&dir),
+            connector.clone(),
+        );
+        let run = summary_test_run("improve-connector", RunStatus::Completed, None);
+        runtime.store().unwrap().save_run(&run).unwrap();
+
+        let error = runtime.improve_run(&run.id).await.unwrap_err();
+
+        assert!(error.to_string().contains("recording runtime connector"));
+        assert_eq!(
+            connector.connections(),
+            [expected_default_runtime_connection()]
+        );
     }
 
     #[tokio::test]
@@ -2062,6 +2235,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     handoff_gate.to_string_lossy().to_string(),
                 ],
                 model: Some(ModelInfo::default()),
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
         );
         let submit_runtime = runtime.clone();
@@ -2174,13 +2348,13 @@ done
                 command: agent_script.to_string_lossy().to_string(),
                 args: Vec::new(),
                 model: None,
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
         );
 
         let mut events = runtime.events().subscribe();
         let executing_runtime = runtime.clone();
-        let run_task =
-            tokio::spawn(async move { executing_runtime.start_run("smoke").await });
+        let run_task = tokio::spawn(async move { executing_runtime.start_run("smoke").await });
 
         let descriptor = loop {
             let event = tokio::time::timeout(std::time::Duration::from_secs(10), events.recv())
@@ -3047,10 +3221,7 @@ exit 0
         );
 
         // Run A: `step_run` applies the lowered live limit and is blocked.
-        let stepped_err = resumed_runtime
-            .step_run(&run_a.run.id)
-            .await
-            .unwrap_err();
+        let stepped_err = resumed_runtime.step_run(&run_a.run.id).await.unwrap_err();
         assert!(
             stepped_err
                 .to_string()
@@ -3063,10 +3234,7 @@ exit 0
         assert_eq!(loaded_a.steps_executed, 1);
 
         // Run B: `resume_run` applies the same lowered live limit and is blocked.
-        let resumed_err = resumed_runtime
-            .resume_run(&run_b.run.id)
-            .await
-            .unwrap_err();
+        let resumed_err = resumed_runtime.resume_run(&run_b.run.id).await.unwrap_err();
         assert!(
             resumed_err
                 .to_string()
@@ -3901,6 +4069,7 @@ exit 0
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -4175,6 +4344,7 @@ exit 0
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6649,6 +6819,7 @@ Recovery implementation review"#
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6728,6 +6899,7 @@ Recovery implementation review"#
                 command: "agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),

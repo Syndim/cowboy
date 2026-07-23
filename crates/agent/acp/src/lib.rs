@@ -8,5 +8,5 @@ mod test_util;
 pub mod transport;
 
 pub use backend::BackendPreset;
-pub use client::Client;
+pub use client::{AgentWatchdogOptions, Client};
 pub use transport::TransportConfig;

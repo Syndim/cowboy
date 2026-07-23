@@ -174,6 +174,24 @@ applied sequence.
 `WorkflowRuntime` wires agent clients to ACP via `cowboy-agent-acp` using the
 configured command, args, and model.
 
+<!-- cowboy-agent-watchdog-contract:start -->
+```toml
+[agents.watchdog]
+response_timeout_seconds = 100
+cancel_timeout_seconds = 10
+recovery_operation_timeout_seconds = 30
+```
+
+Parsed ACP activity resets the inactivity deadline. Recovery first sends exactly
+one `session/cancel` and, when cancellation is confirmed, sends `"Continue"` on
+the same session. If cancellation fails or times out, Cowboy kills the recorded
+PID, waits for exit, restarts the agent with `--resume=<session-id>`, initializes
+ACP, and sends `"Continue"`. The recovery-operation timeout separately bounds
+termination, restart, initialization, and continuation dispatch. This ACP
+recovery does not consume workflow retry budgets. All values must be greater
+than zero, and Cowboy must be restarted after watchdog configuration changes.
+<!-- cowboy-agent-watchdog-contract:end -->
+
 ### User input
 
 On-the-fly prompts are accepted only through a matching open agent window while

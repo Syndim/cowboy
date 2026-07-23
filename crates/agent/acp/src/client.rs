@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 
 use cowboy_agent_client::{
     AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, PromptTurnCancellation,
@@ -9,6 +10,26 @@ use cowboy_agent_client::{
 use super::messages::*;
 use super::transport::{Transport, TransportConfig};
 use async_trait::async_trait;
+
+const CONTINUE_PROMPT: &str = "Continue";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentWatchdogOptions {
+    pub response_timeout_seconds: u64,
+    pub cancel_timeout_seconds: u64,
+    pub recovery_operation_timeout_seconds: u64,
+}
+
+impl Default for AgentWatchdogOptions {
+    fn default() -> Self {
+        Self {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 30,
+        }
+    }
+}
 
 /// ACP client — manages JSON-RPC communication with a single agent through the Transport abstraction.
 ///
@@ -37,6 +58,11 @@ pub struct Client {
     /// configured `ModelInfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_descriptor: Option<AgentSessionDescriptor>,
+    #[serde(default)]
+    watchdog: AgentWatchdogOptions,
+    #[cfg(test)]
+    #[serde(skip)]
+    replacement_factory: ReplacementTransportFactory,
 }
 
 impl Clone for Client {
@@ -50,6 +76,9 @@ impl Clone for Client {
             session_id: self.session_id.clone(),
             pushback: Vec::new(),
             session_descriptor: self.session_descriptor.clone(),
+            watchdog: self.watchdog,
+            #[cfg(test)]
+            replacement_factory: ReplacementTransportFactory::default(),
         }
     }
 }
@@ -63,6 +92,7 @@ impl std::fmt::Debug for Client {
             .field("session_id", &self.session_id)
             .field("agent_info", &self.agent_info)
             .field("session_descriptor", &self.session_descriptor)
+            .field("watchdog", &self.watchdog)
             .finish()
     }
 }
@@ -183,6 +213,49 @@ fn log_acp_message(direction: &'static str, msg: &Message) {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ReplacementTransportFactory {
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    outcomes: std::sync::Arc<
+        parking_lot::Mutex<std::collections::VecDeque<ReplacementTransportFactoryOutcome>>,
+    >,
+}
+
+#[cfg(test)]
+enum ReplacementTransportFactoryOutcome {
+    Ready(Box<dyn Transport>),
+    Error(&'static str),
+    Pending,
+}
+
+#[cfg(test)]
+impl ReplacementTransportFactory {
+    fn push(&self, outcome: ReplacementTransportFactoryOutcome) {
+        self.outcomes.lock().push_back(outcome);
+    }
+
+    fn next(&self) -> Option<ReplacementTransportFactoryOutcome> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.outcomes.lock().pop_front()
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+impl ReplacementTransportFactoryOutcome {
+    async fn into_transport(self) -> anyhow::Result<Box<dyn Transport>> {
+        match self {
+            Self::Ready(transport) => Ok(transport),
+            Self::Error(error) => anyhow::bail!("{error}"),
+            Self::Pending => std::future::pending().await,
+        }
+    }
+}
+
 impl Client {
     /// Get a mutable reference to the existing transport (no reconnect).
     fn transport_mut(&mut self) -> anyhow::Result<&mut Box<dyn Transport>> {
@@ -227,6 +300,7 @@ impl Client {
                 let transport = StdioTransport::connect(cfg, &additional_args).await?;
                 Ok(Box::new(transport) as Box<dyn Transport>)
             }
+
             TransportConfig::Zellij(cfg) => {
                 use super::transport::zellij::ZellijTransport;
                 let transport = ZellijTransport::connect(cfg, resume_session_id).await?;
@@ -237,6 +311,17 @@ impl Client {
                 Ok(Box::new(super::transport::MockTransport::new(cfg)) as Box<dyn Transport>)
             }
         }
+    }
+
+    async fn create_replacement_transport(
+        &mut self,
+        session_id: &str,
+    ) -> anyhow::Result<Box<dyn Transport>> {
+        #[cfg(test)]
+        if let Some(outcome) = self.replacement_factory.next() {
+            return outcome.into_transport().await;
+        }
+        Self::create_transport(&self.transport_config, Some(session_id)).await
     }
 
     /// Run the ACP initialize handshake on the current transport.
@@ -298,14 +383,34 @@ impl Client {
 
     /// Connect to the agent with TransportConfig and complete the ACP initialize handshake.
     pub async fn connect(transport_config: TransportConfig) -> anyhow::Result<Self> {
+        Self::connect_with_options(transport_config, AgentWatchdogOptions::default()).await
+    }
+
+    pub async fn connect_with_options(
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+    ) -> anyhow::Result<Self> {
         let transport = Self::create_transport(&transport_config, None).await?;
-        Self::connect_with_transport(transport, transport_config).await
+        Self::connect_with_transport_and_options(transport, transport_config, watchdog).await
     }
 
     /// Connect using a pre-built transport (for tests or custom transports).
     pub async fn connect_with_transport(
         transport: Box<dyn Transport>,
         transport_config: TransportConfig,
+    ) -> anyhow::Result<Self> {
+        Self::connect_with_transport_and_options(
+            transport,
+            transport_config,
+            AgentWatchdogOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn connect_with_transport_and_options(
+        transport: Box<dyn Transport>,
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
     ) -> anyhow::Result<Self> {
         let mut client = Self {
             transport: Some(transport),
@@ -316,15 +421,45 @@ impl Client {
             session_id: None,
             pushback: Vec::new(),
             session_descriptor: None,
+            watchdog,
+            #[cfg(test)]
+            replacement_factory: ReplacementTransportFactory::default(),
         };
 
         client.initialize().await?;
         Ok(client)
     }
 
+    #[cfg(test)]
+    fn push_replacement_transport(&mut self, transport: Box<dyn Transport>) {
+        self.replacement_factory
+            .push(ReplacementTransportFactoryOutcome::Ready(transport));
+    }
+
+    #[cfg(test)]
+    fn replacement_factory_calls(&self) -> usize {
+        self.replacement_factory.calls()
+    }
+
+    #[cfg(test)]
+    fn push_replacement_creation_error(&mut self, error: &'static str) {
+        self.replacement_factory
+            .push(ReplacementTransportFactoryOutcome::Error(error));
+    }
+
+    #[cfg(test)]
+    fn push_replacement_creation_pending(&mut self) {
+        self.replacement_factory
+            .push(ReplacementTransportFactoryOutcome::Pending);
+    }
+
     /// Whether the transport is connected.
     pub fn is_connected(&self) -> bool {
         self.transport.is_some()
+    }
+
+    pub fn watchdog_options(&self) -> AgentWatchdogOptions {
+        self.watchdog
     }
 
     /// Create a new ACP session.
@@ -495,10 +630,7 @@ impl Client {
         config_options: &[SessionConfigOption],
     ) -> Option<AgentSessionDescriptor> {
         fn current_string(option: &SessionConfigOption) -> Option<String> {
-            option
-                .current_value
-                .as_str()
-                .map(|value| value.to_string())
+            option.current_value.as_str().map(|value| value.to_string())
         }
 
         let model = config_options
@@ -603,7 +735,7 @@ impl Client {
                 activity = ?outcome.activity,
                 "Agent ended turn without text output, continuing"
             );
-            content = vec![PromptContent::text("Continue")];
+            content = vec![PromptContent::text(CONTINUE_PROMPT)];
         }
 
         unreachable!("prompt continuation loop always returns or errors")
@@ -617,6 +749,98 @@ impl Client {
             },
         )
         .await
+    }
+
+    async fn dispatch_watchdog_continuation(&mut self, session_id: &str) -> anyhow::Result<u64> {
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let params = SessionPromptParams {
+            session_id: session_id.to_string(),
+            prompt: vec![PromptContent::text(CONTINUE_PROMPT)],
+        };
+        tokio::time::timeout(timeout, self.send_request_no_wait("session/prompt", params))
+            .await
+            .map_err(|_| anyhow::anyhow!("agent watchdog continuation dispatch timed out"))?
+            .map_err(|err| anyhow::anyhow!("agent watchdog continuation dispatch failed: {err}"))
+    }
+
+    async fn cleanup_replacement(&mut self) {
+        let Some(mut transport) = self.transport.take() else {
+            return;
+        };
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let _ = tokio::time::timeout(timeout, transport.force_terminate()).await;
+    }
+
+    async fn hard_recover_and_continue(&mut self, session_id: &str) -> anyhow::Result<u64> {
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let Some(mut old_transport) = self.transport.take() else {
+            anyhow::bail!("agent watchdog recovery found no active transport");
+        };
+
+        match tokio::time::timeout(timeout, old_transport.force_terminate()).await {
+            Ok(Ok(())) => {
+                tracing::warn!(
+                    event = "agent_watchdog_force_terminated",
+                    session_id,
+                    "Agent watchdog force-terminated the unresponsive transport"
+                );
+            }
+            Ok(Err(err)) => {
+                tracing::error!(
+                    event = "agent_watchdog_recovery_failed",
+                    session_id,
+                    error = %err,
+                    "Agent watchdog force termination failed"
+                );
+                anyhow::bail!("agent watchdog force termination failed: {err}");
+            }
+            Err(_) => {
+                tracing::error!(
+                    event = "agent_watchdog_recovery_failed",
+                    session_id,
+                    "Agent watchdog force termination timed out"
+                );
+                anyhow::bail!("agent watchdog force termination timed out");
+            }
+        }
+        drop(old_transport);
+
+        let replacement =
+            tokio::time::timeout(timeout, self.create_replacement_transport(session_id))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("agent watchdog replacement transport creation timed out")
+                })?
+                .map_err(|err| {
+                    anyhow::anyhow!("agent watchdog replacement transport creation failed: {err}")
+                })?;
+        self.transport = Some(replacement);
+        self.pushback.clear();
+
+        match tokio::time::timeout(timeout, self.initialize()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                self.cleanup_replacement().await;
+                anyhow::bail!("agent watchdog replacement initialization failed: {err}");
+            }
+            Err(_) => {
+                self.cleanup_replacement().await;
+                anyhow::bail!("agent watchdog replacement initialization timed out");
+            }
+        }
+
+        tracing::warn!(
+            event = "agent_watchdog_transport_resumed",
+            session_id,
+            "Agent watchdog resumed the session on a replacement transport"
+        );
+        match self.dispatch_watchdog_continuation(session_id).await {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                self.cleanup_replacement().await;
+                Err(err)
+            }
+        }
     }
 
     /// Execute a single prompt turn and report why it stopped plus which
@@ -639,7 +863,7 @@ impl Client {
             session_id: session_id.to_string(),
             prompt: prompt_content,
         };
-        let id = self.send_request_no_wait("session/prompt", params).await?;
+        let mut id = self.send_request_no_wait("session/prompt", params).await?;
         tracing::debug!(
             session_id,
             id,
@@ -648,44 +872,209 @@ impl Client {
             "ACP prompt sent"
         );
 
-        const MAX_DEFERRED_UPDATES_AFTER_CANCELLATION: usize = 1;
         let mut activity = PromptTurnActivity::Empty;
-        let mut cancellation_sent = false;
-        let mut deferred_updates_after_cancellation = 0;
-
-        let stop_reason = loop {
-            let msg = if cancellation_sent {
-                self.recv_message().await?
+        let mut external_cancellation_sent = false;
+        let mut deferred_updates_after_external_cancellation = 0usize;
+        let mut replacement_continuation_active = false;
+        let stop_reason = 'monitor: loop {
+            let response_deadline =
+                tokio::time::sleep(Duration::from_secs(self.watchdog.response_timeout_seconds));
+            tokio::pin!(response_deadline);
+            enum WaitOutcome {
+                Message(anyhow::Result<Message>),
+                ExternalCancellation,
+                WatchdogTimeout,
+            }
+            let outcome = if external_cancellation_sent {
+                WaitOutcome::Message(self.recv_message().await)
             } else {
-                let message = tokio::select! {
+                tokio::select! {
                     biased;
-                    message = self.recv_message() => Some(message?),
-                    () = cancellation.cancelled() => None,
-                };
-                let Some(message) = message else {
+                    message = self.recv_message() => WaitOutcome::Message(message),
+                    () = cancellation.cancelled() => WaitOutcome::ExternalCancellation,
+                    () = &mut response_deadline => WaitOutcome::WatchdogTimeout,
+                }
+            };
+
+            let msg = match outcome {
+                WaitOutcome::Message(message) => match message {
+                    Ok(message) => message,
+                    Err(err) => {
+                        if external_cancellation_sent {
+                            return Err(err);
+                        }
+                        if replacement_continuation_active {
+                            self.cleanup_replacement().await;
+                            return Err(anyhow::anyhow!(
+                                "agent watchdog replacement continuation failed: {err}"
+                            ));
+                        }
+                        tracing::warn!(
+                            event = "agent_watchdog_recovery_failed",
+                            session_id,
+                            error = %err,
+                            "Agent watchdog observed an unusable ACP stream"
+                        );
+                        id = self.hard_recover_and_continue(session_id).await.map_err(
+                            |recovery| {
+                                anyhow::anyhow!("{err}; agent watchdog recovery failed: {recovery}")
+                            },
+                        )?;
+                        replacement_continuation_active = true;
+                        continue;
+                    }
+                },
+                WaitOutcome::ExternalCancellation => {
                     self.send_prompt_turn_cancellation(session_id).await?;
-                    cancellation_sent = true;
                     tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
+                    external_cancellation_sent = true;
                     continue;
-                };
-                message
+                }
+                WaitOutcome::WatchdogTimeout => {
+                    replacement_continuation_active = false;
+                    tracing::warn!(
+                        event = "agent_watchdog_timeout",
+                        session_id,
+                        id,
+                        timeout_seconds = self.watchdog.response_timeout_seconds,
+                        "Agent watchdog detected response inactivity"
+                    );
+                    if let Err(err) = self.send_prompt_turn_cancellation(session_id).await {
+                        tracing::warn!(
+                            event = "agent_watchdog_recovery_failed",
+                            session_id,
+                            error = %err,
+                            "Agent watchdog cancel notification failed"
+                        );
+                        id = self.hard_recover_and_continue(session_id).await?;
+                        replacement_continuation_active = true;
+                        continue;
+                    }
+                    tracing::warn!(
+                        event = "agent_watchdog_cancel_sent",
+                        session_id,
+                        id,
+                        "Agent watchdog sent session/cancel"
+                    );
+
+                    let cancel_deadline = tokio::time::sleep(Duration::from_secs(
+                        self.watchdog.cancel_timeout_seconds,
+                    ));
+                    tokio::pin!(cancel_deadline);
+                    loop {
+                        enum CancelGraceOutcome {
+                            Message(anyhow::Result<Message>),
+                            ExternalCancellation,
+                            Timeout,
+                        }
+                        let outcome = if external_cancellation_sent {
+                            CancelGraceOutcome::Message(self.recv_message().await)
+                        } else {
+                            tokio::select! {
+                                biased;
+                                message = self.recv_message() => CancelGraceOutcome::Message(message),
+                                () = cancellation.cancelled() => CancelGraceOutcome::ExternalCancellation,
+                                () = &mut cancel_deadline => CancelGraceOutcome::Timeout,
+                            }
+                        };
+                        let message = match outcome {
+                            CancelGraceOutcome::Message(message) => message,
+                            CancelGraceOutcome::ExternalCancellation => {
+                                external_cancellation_sent = true;
+                                continue;
+                            }
+                            CancelGraceOutcome::Timeout => {
+                                if external_cancellation_sent {
+                                    continue 'monitor;
+                                }
+                                id = self.hard_recover_and_continue(session_id).await?;
+                                replacement_continuation_active = true;
+                                continue 'monitor;
+                            }
+                        };
+                        let message = match message {
+                            Ok(message) => message,
+                            Err(err) => {
+                                if external_cancellation_sent {
+                                    return Err(err);
+                                }
+                                id = self.hard_recover_and_continue(session_id).await?;
+                                replacement_continuation_active = true;
+                                continue 'monitor;
+                            }
+                        };
+                        match message {
+                            Message::SessionUpdate { update, .. } => {
+                                activity.observe_event(&update);
+                                event_handler(update);
+                            }
+                            Message::PermissionRequest {
+                                id: req_id,
+                                session_id: permission_session_id,
+                                tool_call,
+                                options: _,
+                            } => {
+                                tracing::debug!(
+                                    session_id = %permission_session_id,
+                                    request_id = req_id,
+                                    tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
+                                    "ACP permission request cancelled during watchdog grace"
+                                );
+                                self.send_rpc_response(req_id, PermissionOutcome::cancelled())
+                                    .await?;
+                            }
+                            Message::Response {
+                                id: resp_id,
+                                result,
+                                error,
+                            } if resp_id == id => {
+                                if let Some(err) = error {
+                                    if external_cancellation_sent {
+                                        anyhow::bail!("Agent error: {err}");
+                                    }
+                                    id = self.hard_recover_and_continue(session_id).await?;
+                                    replacement_continuation_active = true;
+                                    continue 'monitor;
+                                }
+                                let result: SessionPromptResult =
+                                    serde_json::from_value(result.unwrap_or(Value::Null))
+                                        .unwrap_or(SessionPromptResult { stop_reason: None });
+                                let stop_reason = result.stop_reason.unwrap_or(StopReason::EndTurn);
+                                if matches!(stop_reason, StopReason::Cancelled) {
+                                    if external_cancellation_sent {
+                                        break 'monitor StopReason::Cancelled;
+                                    }
+                                    tracing::warn!(
+                                        event = "agent_watchdog_soft_recovered",
+                                        session_id,
+                                        "Agent watchdog cancellation completed; continuing session"
+                                    );
+                                    id = self.dispatch_watchdog_continuation(session_id).await?;
+                                    continue 'monitor;
+                                }
+                                break 'monitor stop_reason;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             };
 
             let matching_prompt_response = matches!(
                 &msg,
                 Message::Response { id: response_id, .. } if *response_id == id
             );
-            let cancellation_ready =
-                !cancellation_sent && !matching_prompt_response && cancellation.try_cancelled();
-            if cancellation_ready {
+            if !external_cancellation_sent
+                && !matching_prompt_response
+                && cancellation.try_cancelled()
+            {
                 let defer_for_buffered_completion = matches!(&msg, Message::SessionUpdate { .. })
-                    && deferred_updates_after_cancellation
-                        < MAX_DEFERRED_UPDATES_AFTER_CANCELLATION;
+                    && deferred_updates_after_external_cancellation < 1;
                 if defer_for_buffered_completion {
-                    deferred_updates_after_cancellation += 1;
+                    deferred_updates_after_external_cancellation += 1;
                 } else {
                     self.send_prompt_turn_cancellation(session_id).await?;
-                    cancellation_sent = true;
+                    external_cancellation_sent = true;
                     tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
                 }
             }
@@ -702,7 +1091,7 @@ impl Client {
                     options,
                 } => {
                     activity.observe_permission_request();
-                    let outcome = if cancellation_sent {
+                    let outcome = if external_cancellation_sent {
                         PermissionOutcome::cancelled()
                     } else {
                         PermissionOutcome::allow_from_options(&options)
@@ -714,7 +1103,6 @@ impl Client {
                         tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
                         options = options.len(),
                         outcome = ?outcome,
-                        cancellation_sent,
                         "ACP permission request answered"
                     );
                     self.send_rpc_response(req_id, outcome).await?;
@@ -725,6 +1113,12 @@ impl Client {
                     error,
                 } if resp_id == id => {
                     if let Some(err) = error {
+                        if replacement_continuation_active {
+                            self.cleanup_replacement().await;
+                            anyhow::bail!(
+                                "agent watchdog replacement continuation RPC error: {err}"
+                            );
+                        }
                         tracing::warn!(session_id, id = resp_id, error = %err, "ACP prompt response error");
                         anyhow::bail!("Agent error: {err}");
                     }
@@ -732,14 +1126,6 @@ impl Client {
                         serde_json::from_value(result.unwrap_or(Value::Null))
                             .unwrap_or(SessionPromptResult { stop_reason: None });
                     let stop_reason = prompt_result.stop_reason.unwrap_or(StopReason::EndTurn);
-                    if cancellation_sent && !matches!(stop_reason, StopReason::Cancelled) {
-                        tracing::debug!(
-                            session_id,
-                            id = resp_id,
-                            stop_reason = ?stop_reason,
-                            "ACP prompt completed before cancellation took effect"
-                        );
-                    }
                     break stop_reason;
                 }
                 _ => {}
@@ -1164,6 +1550,104 @@ mod tests {
     struct ControlledTransportCounters {
         received: AtomicUsize,
         received_at_cancel: AtomicUsize,
+        force_terminated: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct ScriptedTransportCounters {
+        sends: AtomicUsize,
+        force_terminated: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    enum ScriptedReceive {
+        Message(String),
+        Eof,
+        Pending,
+    }
+
+    enum ScriptedOperation {
+        Ready,
+        Error(&'static str),
+        Pending,
+    }
+
+    struct ScriptedTransport {
+        incoming: std::collections::VecDeque<ScriptedReceive>,
+        fail_send_at: Option<(usize, ScriptedOperation)>,
+        force: ScriptedOperation,
+        counters: Arc<ScriptedTransportCounters>,
+    }
+
+    impl ScriptedTransport {
+        fn new(incoming: Vec<ScriptedReceive>, counters: Arc<ScriptedTransportCounters>) -> Self {
+            Self {
+                incoming: incoming.into(),
+                fail_send_at: None,
+                force: ScriptedOperation::Ready,
+                counters,
+            }
+        }
+
+        fn send_action(mut self, index: usize, action: ScriptedOperation) -> Self {
+            self.fail_send_at = Some((index, action));
+            self
+        }
+
+        fn force_action(mut self, action: ScriptedOperation) -> Self {
+            self.force = action;
+            self
+        }
+    }
+
+    impl Drop for ScriptedTransport {
+        fn drop(&mut self) {
+            self.counters.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedTransport {
+        async fn send(&mut self, _message: &str) -> anyhow::Result<()> {
+            let index = self.counters.sends.fetch_add(1, Ordering::SeqCst);
+            if let Some((failure_index, action)) = &self.fail_send_at
+                && index == *failure_index
+            {
+                return match action {
+                    ScriptedOperation::Ready => Ok(()),
+                    ScriptedOperation::Error(error) => anyhow::bail!("{error}"),
+                    ScriptedOperation::Pending => std::future::pending().await,
+                };
+            }
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+            match self
+                .incoming
+                .pop_front()
+                .unwrap_or(ScriptedReceive::Pending)
+            {
+                ScriptedReceive::Message(message) => Ok(Some(message)),
+                ScriptedReceive::Eof => Ok(None),
+                ScriptedReceive::Pending => std::future::pending().await,
+            }
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn force_terminate(&mut self) -> anyhow::Result<()> {
+            self.counters
+                .force_terminated
+                .fetch_add(1, Ordering::SeqCst);
+            match &self.force {
+                ScriptedOperation::Ready => Ok(()),
+                ScriptedOperation::Error(error) => anyhow::bail!("{error}"),
+                ScriptedOperation::Pending => std::future::pending().await,
+            }
+        }
     }
 
     struct ControlledTransport {
@@ -1203,6 +1687,13 @@ mod tests {
         async fn close(&mut self) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn force_terminate(&mut self) -> anyhow::Result<()> {
+            if let Some(counters) = &self.counters {
+                counters.force_terminated.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
     }
 
     async fn next_outgoing(receiver: &mut mpsc::UnboundedReceiver<String>) -> Value {
@@ -1211,6 +1702,28 @@ mod tests {
             .expect("client should send the next ACP message")
             .expect("controlled outgoing channel should remain open");
         serde_json::from_str(&message).unwrap()
+    }
+
+    fn test_watchdog() -> AgentWatchdogOptions {
+        AgentWatchdogOptions {
+            response_timeout_seconds: 1,
+            cancel_timeout_seconds: 2,
+            recovery_operation_timeout_seconds: 3,
+        }
+    }
+
+    async fn scripted_client(
+        initial: ScriptedTransport,
+    ) -> (Client, Arc<ScriptedTransportCounters>) {
+        let counters = initial.counters.clone();
+        let client = Client::connect_with_transport_and_options(
+            Box::new(initial),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        (client, counters)
     }
 
     #[tokio::test]
@@ -1491,7 +2004,10 @@ mod tests {
         .unwrap();
 
         let descriptor = Client::descriptor_from_config_options(&options).unwrap();
-        assert_eq!(descriptor.model.as_deref(), Some("github-copilot/gpt-5.6-sol"));
+        assert_eq!(
+            descriptor.model.as_deref(),
+            Some("github-copilot/gpt-5.6-sol")
+        );
         assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
         assert_eq!(descriptor.context.as_deref(), Some("1m"));
     }
@@ -2434,5 +2950,1140 @@ mod tests {
         assert_eq!(req0["id"], 0);
         assert_eq!(req1["id"], 1);
         assert_eq!(req2["id"], 2);
+    }
+
+    #[test]
+    fn watchdog_options_retain_defaults_and_explicit_values() {
+        assert_eq!(
+            AgentWatchdogOptions::default(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 100,
+                cancel_timeout_seconds: 10,
+                recovery_operation_timeout_seconds: 30,
+            }
+        );
+        let explicit = AgentWatchdogOptions {
+            response_timeout_seconds: 1,
+            cancel_timeout_seconds: 2,
+            recovery_operation_timeout_seconds: 3,
+        };
+        assert_eq!(explicit.response_timeout_seconds, 1);
+        assert_eq!(explicit.cancel_timeout_seconds, 2);
+        assert_eq!(explicit.recovery_operation_timeout_seconds, 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replacement_transport_is_consumed_only_after_forced_reconnect() {
+        let initial_counters = Arc::new(ScriptedTransportCounters::default());
+        let initial = ScriptedTransport::new(
+            vec![ScriptedReceive::Message(init_response(0))],
+            initial_counters,
+        );
+        let (mut client, _) = scripted_client(initial).await;
+        assert_eq!(client.replacement_factory_calls(), 0);
+
+        let replacement_counters = Arc::new(ScriptedTransportCounters::default());
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![ScriptedReceive::Message(init_response(1))],
+            replacement_counters,
+        )));
+        assert_eq!(client.replacement_factory_calls(), 0);
+
+        let continuation_id = client.hard_recover_and_continue("sess_1").await.unwrap();
+
+        assert_eq!(continuation_id, 2);
+        assert_eq!(client.replacement_factory_calls(), 1);
+        assert!(client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_cancel_continues_same_session() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(transport),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let initial = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initial["id"], 1);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["method"], "session/prompt");
+        assert_eq!(continuation["params"]["sessionId"], "sess_1");
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_restart_resumes_same_session() {
+        let initial_counters = Arc::new(ControlledTransportCounters::default());
+        let replacement_counters = Arc::new(ControlledTransportCounters::default());
+        let (initial_in_tx, initial_in_rx) = mpsc::unbounded_channel();
+        let (initial_out_tx, mut initial_out_rx) = mpsc::unbounded_channel();
+        initial_in_tx.send(init_response(0)).unwrap();
+        let initial = ControlledTransport {
+            incoming: initial_in_rx,
+            outgoing: initial_out_tx,
+            counters: Some(initial_counters.clone()),
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(initial),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut initial_out_rx).await;
+
+        let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
+        let (replacement_out_tx, mut replacement_out_rx) = mpsc::unbounded_channel();
+        replacement_in_tx.send(init_response(2)).unwrap();
+        client.push_replacement_transport(Box::new(ControlledTransport {
+            incoming: replacement_in_rx,
+            outgoing: replacement_out_tx,
+            counters: Some(replacement_counters),
+        }));
+
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial_prompt = next_outgoing(&mut initial_out_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut initial_out_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        initial_in_tx
+            .send(text_chunk_update("sess_1", "late activity"))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let replacement_initialize = next_outgoing(&mut replacement_out_rx).await;
+        assert_eq!(replacement_initialize["method"], "initialize");
+        let continuation = next_outgoing(&mut replacement_out_rx).await;
+        assert_eq!(continuation["id"], 3);
+        assert_eq!(continuation["params"]["sessionId"], "sess_1");
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        replacement_in_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        replacement_in_tx
+            .send(prompt_response(3, "end_turn"))
+            .unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(initial_counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(client.replacement_factory_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_replacement_rpc_error_disposes_transport() {
+        let replacement_counters = Arc::new(ControlledTransportCounters::default());
+        let (initial_in_tx, initial_in_rx) = mpsc::unbounded_channel();
+        let (initial_out_tx, mut initial_out_rx) = mpsc::unbounded_channel();
+        initial_in_tx.send(init_response(0)).unwrap();
+        let initial = ControlledTransport {
+            incoming: initial_in_rx,
+            outgoing: initial_out_tx,
+            counters: None,
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(initial),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut initial_out_rx).await;
+        let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
+        let (replacement_out_tx, mut replacement_out_rx) = mpsc::unbounded_channel();
+        replacement_in_tx.send(init_response(2)).unwrap();
+        client.push_replacement_transport(Box::new(ControlledTransport {
+            incoming: replacement_in_rx,
+            outgoing: replacement_out_tx,
+            counters: Some(replacement_counters.clone()),
+        }));
+
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial_prompt = next_outgoing(&mut initial_out_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let _cancel = next_outgoing(&mut initial_out_rx).await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _replacement_initialize = next_outgoing(&mut replacement_out_rx).await;
+        let continuation = next_outgoing(&mut replacement_out_rx).await;
+        replacement_in_tx
+            .send(rpc_error(
+                continuation["id"].as_u64().unwrap(),
+                -32000,
+                "replacement failed",
+            ))
+            .unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replacement continuation RPC error")
+        );
+        assert_eq!(
+            replacement_counters.force_terminated.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(client.replacement_factory_calls(), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_cancellation_wins_simultaneous_watchdog_deadline() {
+        let counters = Arc::new(ControlledTransportCounters::default());
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: Some(counters.clone()),
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(transport),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(tokio::time::sleep(Duration::from_secs(1))),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _initial_prompt = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+
+        assert!(matches!(
+            prompt.await.unwrap().unwrap(),
+            StopReason::Cancelled
+        ));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_cancellation_during_watchdog_grace_suppresses_continuation() {
+        let counters = Arc::new(ControlledTransportCounters::default());
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: Some(counters.clone()),
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(transport),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(async move {
+                        let _ = cancel_rx.await;
+                    }),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _initial_prompt = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+
+        cancel_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+
+        assert!(matches!(
+            prompt.await.unwrap().unwrap(),
+            StopReason::Cancelled
+        ));
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn force_terminate_disposes_controlled_transport() {
+        let counters = Arc::new(ControlledTransportCounters::default());
+        let (_incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, _outgoing_rx) = mpsc::unbounded_channel();
+        let mut transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: Some(counters.clone()),
+        };
+
+        transport.force_terminate().await.unwrap();
+
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_parsed_activity_resets_inactivity_deadline() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(transport),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        tokio::time::advance(Duration::from_millis(900)).await;
+        incoming_tx
+            .send(text_chunk_update("sess_1", "activity"))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        assert!(outgoing_rx.try_recv().is_err());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+
+        assert!(matches!(
+            prompt.await.unwrap().unwrap(),
+            StopReason::EndTurn
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_normal_completion_wins_ready_timeout_without_cancel() {
+        let counters = Arc::new(ControlledTransportCounters::default());
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: Some(counters.clone()),
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        incoming_tx
+            .send(text_chunk_update("sess_1", "completed"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    async fn run_cancel_grace_escalation(message: String) -> (Client, anyhow::Result<StopReason>) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(2)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "recovered")),
+                ScriptedReceive::Message(prompt_response(3, "end_turn")),
+            ],
+            Arc::new(ScriptedTransportCounters::default()),
+        )));
+        let task = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        incoming_tx.send(message).unwrap();
+        task.await.unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_prompt_rpc_error_during_cancel_grace_escalates() {
+        let (client, result) =
+            run_cancel_grace_escalation(rpc_error(1, -32000, "prompt failed")).await;
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_malformed_json_during_cancel_grace_escalates() {
+        let (client, result) = run_cancel_grace_escalation("{malformed".to_string()).await;
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_external_cancellation_before_timeout_sends_no_continuation() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        let task = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(tokio::time::sleep(Duration::from_millis(
+                        500,
+                    ))),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+
+        let (client, result) = task.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::Cancelled));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    async fn direct_hard_client(
+        force: ScriptedOperation,
+    ) -> (Client, Arc<ScriptedTransportCounters>) {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport = ScriptedTransport::new(
+            vec![ScriptedReceive::Message(init_response(0))],
+            counters.clone(),
+        )
+        .force_action(force);
+        scripted_client(transport).await
+    }
+
+    fn replacement_with(
+        incoming: Vec<ScriptedReceive>,
+        counters: Arc<ScriptedTransportCounters>,
+    ) -> ScriptedTransport {
+        ScriptedTransport::new(incoming, counters)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_force_termination_error_prevents_replacement() {
+        let (mut client, counters) =
+            direct_hard_client(ScriptedOperation::Error("terminate failed")).await;
+        client.push_replacement_creation_error("must not be consumed");
+
+        let error = client
+            .hard_recover_and_continue("sess_1")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("force termination failed"));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_force_termination_timeout_prevents_replacement() {
+        let (mut client, counters) = direct_hard_client(ScriptedOperation::Pending).await;
+        client.push_replacement_creation_error("must not be consumed");
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            future.await.unwrap_err()
+        };
+
+        assert!(error.to_string().contains("force termination timed out"));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_replacement_creation_error_leaves_no_transport() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        client.push_replacement_creation_error("creation failed");
+
+        let error = client
+            .hard_recover_and_continue("sess_1")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("transport creation failed"));
+        assert_eq!(client.replacement_factory_calls(), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_replacement_creation_timeout_leaves_no_transport() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        client.push_replacement_creation_pending();
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            future.await.unwrap_err()
+        };
+
+        assert!(error.to_string().contains("transport creation timed out"));
+        assert_eq!(client.replacement_factory_calls(), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_initialization_rpc_error_disposes_replacement() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        client.push_replacement_transport(Box::new(replacement_with(
+            vec![ScriptedReceive::Message(rpc_error(
+                1,
+                -32000,
+                "initialize failed",
+            ))],
+            counters.clone(),
+        )));
+
+        let error = client
+            .hard_recover_and_continue("sess_1")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("initialization failed"));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_initialization_timeout_disposes_replacement() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        client.push_replacement_transport(Box::new(replacement_with(
+            vec![ScriptedReceive::Pending],
+            counters.clone(),
+        )));
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            future.await.unwrap_err()
+        };
+
+        assert!(error.to_string().contains("initialization timed out"));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_continuation_send_error_disposes_replacement() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let replacement = replacement_with(
+            vec![ScriptedReceive::Message(init_response(1))],
+            counters.clone(),
+        )
+        .send_action(1, ScriptedOperation::Error("continuation send failed"));
+        client.push_replacement_transport(Box::new(replacement));
+
+        let error = client
+            .hard_recover_and_continue("sess_1")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("continuation dispatch failed"));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_continuation_dispatch_timeout_disposes_replacement() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let replacement = replacement_with(
+            vec![ScriptedReceive::Message(init_response(1))],
+            counters.clone(),
+        )
+        .send_action(1, ScriptedOperation::Pending);
+        client.push_replacement_transport(Box::new(replacement));
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            future.await.unwrap_err()
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("continuation dispatch timed out")
+        );
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    async fn run_replacement_stream_failure(
+        failure: ScriptedReceive,
+    ) -> (Client, anyhow::Error, Arc<ScriptedTransportCounters>) {
+        let initial_counters = Arc::new(ScriptedTransportCounters::default());
+        let initial = ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(0)),
+                ScriptedReceive::Pending,
+            ],
+            initial_counters,
+        );
+        let (mut client, _) = scripted_client(initial).await;
+        let replacement_counters = Arc::new(ScriptedTransportCounters::default());
+        client.push_replacement_transport(Box::new(replacement_with(
+            vec![ScriptedReceive::Message(init_response(2)), failure],
+            replacement_counters.clone(),
+        )));
+        let task = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let (client, result) = task.await.unwrap();
+        (client, result.unwrap_err(), replacement_counters)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_replacement_malformed_json_disposes_transport() {
+        let (client, error, counters) =
+            run_replacement_stream_failure(ScriptedReceive::Message("{malformed".to_string()))
+                .await;
+        assert!(
+            error
+                .to_string()
+                .contains("replacement continuation failed")
+        );
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_replacement_eof_disposes_transport() {
+        let (client, error, counters) = run_replacement_stream_failure(ScriptedReceive::Eof).await;
+        assert!(
+            error
+                .to_string()
+                .contains("replacement continuation failed")
+        );
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_hard_cleanup_timeout_drops_replacement_transport() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let replacement = replacement_with(
+            vec![ScriptedReceive::Message(rpc_error(
+                1,
+                -32000,
+                "initialize failed",
+            ))],
+            counters.clone(),
+        )
+        .force_action(ScriptedOperation::Pending);
+        client.push_replacement_transport(Box::new(replacement));
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            tokio::time::advance(Duration::from_secs(3)).await;
+            future.await.unwrap_err()
+        };
+
+        assert!(error.to_string().contains("initialization failed"));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_fixed_cancel_grace_ignores_activity() {
+        let initial_counters = Arc::new(ControlledTransportCounters::default());
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: Some(initial_counters.clone()),
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(2)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "recovered")),
+                ScriptedReceive::Message(prompt_response(3, "end_turn")),
+            ],
+            Arc::new(ScriptedTransportCounters::default()),
+        )));
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        incoming_tx
+            .send(text_chunk_update("sess_1", "late activity"))
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+        assert_eq!(initial_counters.force_terminated.load(Ordering::SeqCst), 1);
+    }
+
+    async fn run_original_stream_failure(failure: ScriptedReceive) -> StopReason {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let initial = ScriptedTransport::new(
+            vec![ScriptedReceive::Message(init_response(0)), failure],
+            counters,
+        );
+        let (mut client, _) = scripted_client(initial).await;
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(2)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "recovered")),
+                ScriptedReceive::Message(prompt_response(3, "end_turn")),
+            ],
+            Arc::new(ScriptedTransportCounters::default()),
+        )));
+        client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("work")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_notification_write_failure_uses_hard_recovery() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let initial = ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(0)),
+                ScriptedReceive::Pending,
+            ],
+            counters.clone(),
+        )
+        .send_action(2, ScriptedOperation::Error("cancel write failed"));
+        let (mut client, _) = scripted_client(initial).await;
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(2)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "recovered")),
+                ScriptedReceive::Message(prompt_response(3, "end_turn")),
+            ],
+            Arc::new(ScriptedTransportCounters::default()),
+        )));
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_eof_during_prompt_uses_hard_recovery() {
+        assert!(matches!(
+            run_original_stream_failure(ScriptedReceive::Eof).await,
+            StopReason::EndTurn
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_eof_during_cancel_grace_uses_hard_recovery() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        client.push_replacement_transport(Box::new(ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(2)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "recovered")),
+                ScriptedReceive::Message(prompt_response(3, "end_turn")),
+            ],
+            Arc::new(ScriptedTransportCounters::default()),
+        )));
+        let task = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        drop(incoming_tx);
+        let (client, result) = task.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_valid_unrecognized_json_does_not_reset_deadline() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_millis(900)).await;
+        incoming_tx
+            .send(r#"{"jsonrpc":"2.0","method":"unknown"}"#.to_string())
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx
+            .send(text_chunk_update("sess_1", "completed"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_malformed_json_during_prompt_uses_hard_recovery() {
+        assert!(matches!(
+            run_original_stream_failure(ScriptedReceive::Message("{malformed".to_string())).await,
+            StopReason::EndTurn
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_second_stall_after_soft_recovery_is_monitored() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _ = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first_cancel = next_outgoing(&mut outgoing_rx).await;
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+        let _first_continue = next_outgoing(&mut outgoing_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second_cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(first_cancel["method"], "session/cancel");
+        assert_eq!(second_cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(2, "cancelled")).unwrap();
+        let _second_continue = next_outgoing(&mut outgoing_rx).await;
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(3, "end_turn")).unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_second_stall_after_hard_recovery_is_monitored() {
+        let initial_counters = Arc::new(ScriptedTransportCounters::default());
+        let initial = ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(0)),
+                ScriptedReceive::Pending,
+            ],
+            initial_counters,
+        );
+        let (mut client, _) = scripted_client(initial).await;
+        let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
+        let (replacement_out_tx, mut replacement_out_rx) = mpsc::unbounded_channel();
+        replacement_in_tx.send(init_response(2)).unwrap();
+        client.push_replacement_transport(Box::new(ControlledTransport {
+            incoming: replacement_in_rx,
+            outgoing: replacement_out_tx,
+            counters: None,
+        }));
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let _initialize = next_outgoing(&mut replacement_out_rx).await;
+        let _first_continue = next_outgoing(&mut replacement_out_rx).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second_cancel = next_outgoing(&mut replacement_out_rx).await;
+        assert_eq!(second_cancel["method"], "session/cancel");
+        replacement_in_tx
+            .send(prompt_response(3, "cancelled"))
+            .unwrap();
+        let _second_continue = next_outgoing(&mut replacement_out_rx).await;
+        replacement_in_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        replacement_in_tx
+            .send(prompt_response(4, "end_turn"))
+            .unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
     }
 }
