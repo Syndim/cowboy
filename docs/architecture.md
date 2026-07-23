@@ -72,7 +72,7 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - run id
 - workflow id/hash/source snapshot
 - original request
-- resolved config-set name and all four effective runner limits
+- resolved config-set name (a name-only pointer; effective runner limits are resolved live from current config per operation)
 - current step
 - latest step-record hash
 - run status, including pending ask-user metadata when blocked for input
@@ -119,10 +119,14 @@ set is always present. Retry limits may be zero, while step and visit limits
 must be nonzero. The old top-level runner-limit keys are rejected.
 
 After Lua compilation, `WorkflowRuntime` resolves the workflow's optional
-`config_set` (or `default`) before persisting a new `WorkflowRun`. Unknown sets
-fail before run persistence. The resolved name and limits are durable run
-state, so every later resume, step, answer, resolve, and resolution-options
-path is independent of current process configuration.
+`config_set` name (or `default`) before persisting a new `WorkflowRun`. Unknown
+sets fail before run persistence. Only the name is durable run state; effective
+`RunnerLimits` are resolved live from current config on every resume, step,
+answer, resolve, and resolution-options path. A config edit (for example a
+raised retry budget) therefore applies to an existing run, and a deleted set
+falls back to `default` limits with a warning (or the built-in defaults when
+`default` is also absent). This is a breaking persisted-shape change with no
+migration; pre-existing runs may be discarded by resetting the store.
 
 `WorkflowRunner` reserves each recoverable retry by incrementing the run-wide
 and per-step-id counters and saving the run before emitting `StepRetrying` or
@@ -230,7 +234,7 @@ include spaces, `=`, or a leading `-`; quote them when needed. Plain values
 remain strings while valid JSON literals preserve structured types, for example
 `--field summary "manual resolution" --field retry false --field files '["src/a.rs"]'`.
 
-Recoverable step failures consume the snapshotted cumulative run-wide and
+Recoverable step failures consume the live-resolved cumulative run-wide and
 per-step-id retry budgets described above. Exhaustion persists `Failed` while
 keeping the current step available. More generally, `cowboy resume`/`cowboy
 step` re-execute the retained current step for every non-terminal run status —

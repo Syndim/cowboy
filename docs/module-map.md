@@ -81,7 +81,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config sets before new-run persistence; run existing workflows from their durable policy snapshot; wire store/catalog/Lua/action dispatch/agent execution; persist event logs. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, and persists `Failed` on give-up. Also `LuaStepActionProvider`. |
@@ -101,9 +101,9 @@ Runner-policy contract: TOML uses `[config_sets.<name>]` with
 `max_retries_per_step`, independently defaulting to `100`, `20`, `200`, and
 `2`. `default` always exists; retry limits may be zero; step/visit limits may
 not. Lua selects a nonblank name through `workflow(..., { config_set = ... })`.
-Resolution happens before new-run persistence, then the name, effective limits,
-and cumulative retry counters remain durable for all lifecycle paths. Old
-top-level runner-limit keys are rejected.
+Only the resolved set **name** is durable; effective limits are resolved live
+from current config on every lifecycle path, while cumulative retry counters
+remain durable. Old top-level runner-limit keys are rejected.
 
 ## Crate: `cowboy-workflow-catalog`
 
@@ -126,7 +126,7 @@ Owns workflow domain data and pure execution rules.
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
 | `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `fail`. |
-| `state.rs` | Durable `WorkflowRun`, resolved config-set snapshot, retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
+| `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates: loader, selector, executor, summarizer, run store. |
 | `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, and step/visit budget enforcement. |
@@ -200,7 +200,7 @@ CLI/TUI command
   -> cowboy-workflow-engine WorkflowRuntime
   -> catalog chooses/loads workflow source
   -> workflow-lua compiles/snapshots workflow source
-  -> engine resolves workflow config_set (or default) and snapshots effective limits
+  -> engine resolves workflow config_set name (or default); limits resolved live per operation
   -> WorkflowRun persisted through RunStore
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction

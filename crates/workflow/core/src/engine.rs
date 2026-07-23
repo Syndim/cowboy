@@ -579,7 +579,7 @@ mod tests {
             current_step: "start".to_string(),
             head: None,
             resume: Value::Null,
-            config_set: crate::ResolvedConfigSet::default(),
+            config_set: crate::ConfigSetRef::default(),
             retries_used: 0,
             step_retries_used: BTreeMap::new(),
             steps_executed: 0,

@@ -21,8 +21,8 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ActionResult, AppendUserPromptOutcome, DEFAULT_CONFIG_SET_NAME, ExecutionContext, ObjectKind,
-    ResolvedConfigSet, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction,
+    ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
+    ObjectKind, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction,
     StepAction, StepActionProvider, StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError,
     WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
@@ -41,8 +41,8 @@ use crate::runtime_dependencies::{
 };
 use crate::workflow::DeterministicSelector;
 use crate::{
-    EngineActionDispatcher, EventBus, LuaStepActionProvider, ResumeRouter, WorkflowEvent,
-    WorkflowEventKind, WorkflowRunner,
+    EngineActionDispatcher, EventBus, LuaStepActionProvider, ResolvedRuntimePolicy, ResumeRouter,
+    WorkflowEvent, WorkflowEventKind, WorkflowRunner,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -682,12 +682,16 @@ impl WorkflowRuntime {
             .await
     }
 
-    fn resolve_config_set(&self, definition: &WorkflowDefinition) -> Result<ResolvedConfigSet> {
+    /// Resolve the config-set **name** a workflow selects, validating it against
+    /// live config before a run is persisted. An unknown/misspelled name is a
+    /// hard error at start (only the durable pointer is stored; limits are
+    /// resolved live afterward).
+    fn resolve_config_set(&self, definition: &WorkflowDefinition) -> Result<ConfigSetRef> {
         let name = definition
             .config_set
             .as_deref()
             .unwrap_or(DEFAULT_CONFIG_SET_NAME);
-        let Some(config_set) = self.config.config_sets.get(name).copied() else {
+        if !self.config.config_sets.contains_key(name) {
             let available = self
                 .config
                 .config_sets
@@ -699,12 +703,44 @@ impl WorkflowRuntime {
                 "workflow {:?} requested unknown config set {name:?}; available config sets: {available}",
                 definition.name
             )));
-        };
+        }
 
-        Ok(ResolvedConfigSet {
+        Ok(ConfigSetRef {
             name: name.to_string(),
-            limits: config_set.into(),
         })
+    }
+
+    /// Resolve effective runner limits for an existing run from current process
+    /// configuration. Infallible by construction so it can run at any point in a
+    /// lifecycle path without stranding a durable mutation: three exhaustive
+    /// branches cover every case and none index `config_sets`.
+    fn resolve_limits(&self, name: &str) -> ResolvedRuntimePolicy {
+        if let Some(config_set) = self.config.config_sets.get(name).copied() {
+            return ResolvedRuntimePolicy {
+                name: name.to_string(),
+                limits: config_set.into(),
+            };
+        }
+
+        if let Some(config_set) = self.config.config_sets.get(DEFAULT_CONFIG_SET_NAME).copied() {
+            tracing::warn!(
+                requested = %name,
+                "config set missing from current config; falling back to default config set"
+            );
+            return ResolvedRuntimePolicy {
+                name: DEFAULT_CONFIG_SET_NAME.to_string(),
+                limits: config_set.into(),
+            };
+        }
+
+        tracing::warn!(
+            requested = %name,
+            "config set and default config set both missing from current config; falling back to built-in default limits"
+        );
+        ResolvedRuntimePolicy {
+            name: DEFAULT_CONFIG_SET_NAME.to_string(),
+            limits: RunnerLimits::default(),
+        }
     }
 
     async fn select_workflow(
@@ -1209,7 +1245,8 @@ impl WorkflowRuntime {
             .with_prompt_turn_controls(self.prompt_turn_controls.clone());
         let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
         let provider = LuaStepActionProvider::new(snapshot);
-        let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone())
+        let policy = self.resolve_limits(&run.config_set.name);
+        let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone(), policy)
             .with_request_topic(request_topic)
             .with_active_clock(active_clock);
         let run_future = async {
@@ -2854,14 +2891,73 @@ exit 0
             .await
             .unwrap();
         assert_eq!(explicit.run.config_set.name, "careful");
-        assert_eq!(explicit.run.config_set.limits, careful.into());
 
         let implicit = runtime
             .start_run_with_workflow("implicit", "do it")
             .await
             .unwrap();
         assert_eq!(implicit.run.config_set.name, "default");
-        assert_eq!(implicit.run.config_set.limits, RunnerLimits::default());
+    }
+
+    fn runtime_with_config_sets(
+        dir: &tempfile::TempDir,
+        config_sets: BTreeMap<String, RunnerLimitsConfig>,
+    ) -> WorkflowRuntime {
+        WorkflowRuntime::new(RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: Vec::new(),
+            agents: vec![agent("default", "unused-agent")],
+            config_sets,
+        })
+    }
+
+    #[test]
+    fn resolve_limits_uses_requested_set_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let careful = RunnerLimitsConfig {
+            max_steps_per_run: 9,
+            max_visits_per_step: 8,
+            max_retries_per_run: 7,
+            max_retries_per_step: 6,
+        };
+        let runtime = runtime_with_config_sets(
+            &dir,
+            BTreeMap::from([
+                ("default".to_string(), RunnerLimitsConfig::default()),
+                ("careful".to_string(), careful),
+            ]),
+        );
+
+        let policy = runtime.resolve_limits("careful");
+        assert_eq!(policy.name, "careful");
+        assert_eq!(policy.limits, careful.into());
+    }
+
+    #[test]
+    fn resolve_limits_falls_back_to_default_when_requested_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let default = RunnerLimitsConfig {
+            max_steps_per_run: 3,
+            ..RunnerLimitsConfig::default()
+        };
+        let runtime =
+            runtime_with_config_sets(&dir, BTreeMap::from([("default".to_string(), default)]));
+
+        let policy = runtime.resolve_limits("careful");
+        assert_eq!(policy.name, "default");
+        assert_eq!(policy.limits, default.into());
+    }
+
+    #[test]
+    fn resolve_limits_falls_back_to_builtin_default_when_all_sets_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_with_config_sets(&dir, BTreeMap::new());
+
+        let policy = runtime.resolve_limits("careful");
+        assert_eq!(policy.name, "default");
+        assert_eq!(policy.limits, RunnerLimits::default());
     }
 
     #[tokio::test]
@@ -2896,7 +2992,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn step_and_resume_use_snapshot_after_config_set_changes() {
+    async fn changed_config_set_limits_apply_live_on_resume_and_step() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -2926,12 +3022,20 @@ exit 0
             workflow_dir.clone(),
             config_sets_with_careful(Some(original)),
         );
-        let started = creator
+        let run_a = creator
             .start_run_with_workflow_stepwise("multi", "do it")
             .await
             .unwrap();
-        assert_eq!(started.run.steps_executed, 1);
+        assert_eq!(run_a.run.steps_executed, 1);
+        assert_eq!(run_a.run.current_step, "second");
+        let run_b = creator
+            .start_run_with_workflow_stepwise("multi", "do it")
+            .await
+            .unwrap();
+        assert_eq!(run_b.run.steps_executed, 1);
+        assert_eq!(run_b.run.current_step, "second");
 
+        // A second runtime whose `careful` set lowers the step ceiling to 1.
         let changed = RunnerLimitsConfig {
             max_steps_per_run: 1,
             ..original
@@ -2941,19 +3045,42 @@ exit 0
             workflow_dir,
             config_sets_with_careful(Some(changed)),
         );
-        let stepped = resumed_runtime.step_run(&started.run.id).await.unwrap();
-        assert_eq!(stepped.run.steps_executed, 2);
-        assert_eq!(stepped.run.status, RunStatus::Running);
-        assert_eq!(stepped.run.config_set.limits, original.into());
 
-        let resumed = resumed_runtime.resume_run(&started.run.id).await.unwrap();
-        assert_eq!(resumed.run.status, RunStatus::Completed);
-        assert_eq!(resumed.run.steps_executed, 3);
-        assert_eq!(resumed.run.config_set.limits, original.into());
+        // Run A: `step_run` applies the lowered live limit and is blocked.
+        let stepped_err = resumed_runtime
+            .step_run(&run_a.run.id)
+            .await
+            .unwrap_err();
+        assert!(
+            stepped_err
+                .to_string()
+                .contains("run exceeded max step count (1)"),
+            "{stepped_err}"
+        );
+        let loaded_a = resumed_runtime.load_run(&run_a.run.id).unwrap();
+        assert!(matches!(loaded_a.status, RunStatus::Failed { .. }));
+        assert_eq!(loaded_a.current_step, "second");
+        assert_eq!(loaded_a.steps_executed, 1);
+
+        // Run B: `resume_run` applies the same lowered live limit and is blocked.
+        let resumed_err = resumed_runtime
+            .resume_run(&run_b.run.id)
+            .await
+            .unwrap_err();
+        assert!(
+            resumed_err
+                .to_string()
+                .contains("run exceeded max step count (1)"),
+            "{resumed_err}"
+        );
+        let loaded_b = resumed_runtime.load_run(&run_b.run.id).unwrap();
+        assert!(matches!(loaded_b.status, RunStatus::Failed { .. }));
+        assert_eq!(loaded_b.current_step, "second");
+        assert_eq!(loaded_b.steps_executed, 1);
     }
 
     #[tokio::test]
-    async fn answer_resolve_and_options_use_snapshot_after_set_deletion() {
+    async fn deleted_set_answer_and_resolve_fall_back_to_default_limits() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -2984,7 +3111,7 @@ exit 0
         )
         .unwrap();
         let current_default = RunnerLimitsConfig {
-            max_steps_per_run: 1,
+            max_steps_per_run: 2,
             ..RunnerLimitsConfig::default()
         };
         let careful = RunnerLimitsConfig {
@@ -3008,28 +3135,51 @@ exit 0
             RunStatus::WaitingForInput { .. }
         ));
         assert_eq!(waiting.run.steps_executed, 1);
-        assert_eq!(waiting.run.config_set.limits.max_steps_per_run, 2);
+        let waiting_head = waiting.run.head.clone();
         let failed = creator
             .start_run_with_workflow("resolve", "do it")
             .await
             .unwrap();
         assert!(matches!(failed.run.status, RunStatus::Failed { .. }));
         assert_eq!(failed.run.steps_executed, 1);
-        assert_eq!(failed.run.config_set.limits.max_steps_per_run, 2);
+        let failed_head = failed.run.head.clone();
 
+        // A second runtime that DELETES `careful` and lowers `default` to a
+        // one-step ceiling. Live resolution falls back to `default` limit 1,
+        // which blocks executing the next `done` step (careful's 2 would have
+        // completed both).
+        let lowered_default = RunnerLimitsConfig {
+            max_steps_per_run: 1,
+            ..RunnerLimitsConfig::default()
+        };
         let without_careful = runtime_for_workflow_dir_with_config_sets(
             &dir,
             workflow_dir,
-            BTreeMap::from([("default".to_string(), current_default)]),
+            BTreeMap::from([("default".to_string(), lowered_default)]),
         );
-        let answered = without_careful
+        let store = without_careful.store().unwrap();
+
+        let answered_err = without_careful
             .answer_run(&waiting.run.id, "approval", "yes")
             .await
+            .unwrap_err();
+        assert!(
+            answered_err
+                .to_string()
+                .contains("run exceeded max step count (1)"),
+            "{answered_err}"
+        );
+        let loaded_answer = without_careful.load_run(&waiting.run.id).unwrap();
+        assert!(matches!(loaded_answer.status, RunStatus::Failed { .. }));
+        assert_ne!(loaded_answer.status, RunStatus::Completed);
+        assert_eq!(loaded_answer.current_step, "done");
+        assert_eq!(loaded_answer.steps_executed, 1);
+        assert_ne!(loaded_answer.head, waiting_head);
+        let answer_record = store
+            .get_object::<StepRecord>(loaded_answer.head.as_ref().unwrap())
             .unwrap();
-        assert_eq!(answered.run.status, RunStatus::Completed);
-        assert_eq!(answered.run.config_set.name, "careful");
-        assert_eq!(answered.run.steps_executed, 2);
-        assert_eq!(answered.run.config_set.limits.max_steps_per_run, 2);
+        assert_eq!(answer_record.step, "ask");
+        assert_eq!(answer_record.output.unwrap().fields["answer"], "yes");
 
         let options = without_careful.resolution_options(&failed.run.id).unwrap();
         assert!(
@@ -3038,14 +3188,26 @@ exit 0
                 .iter()
                 .any(|status| status.status == "fixed")
         );
-        let resolved = without_careful
+        let resolved_err = without_careful
             .resolve_run(&failed.run.id, "fixed", None, None)
             .await
+            .unwrap_err();
+        assert!(
+            resolved_err
+                .to_string()
+                .contains("run exceeded max step count (1)"),
+            "{resolved_err}"
+        );
+        let loaded_resolve = without_careful.load_run(&failed.run.id).unwrap();
+        assert!(matches!(loaded_resolve.status, RunStatus::Failed { .. }));
+        assert_ne!(loaded_resolve.status, RunStatus::Completed);
+        assert_eq!(loaded_resolve.current_step, "done");
+        assert_eq!(loaded_resolve.steps_executed, 1);
+        assert_ne!(loaded_resolve.head, failed_head);
+        let resolve_record = store
+            .get_object::<StepRecord>(loaded_resolve.head.as_ref().unwrap())
             .unwrap();
-        assert_eq!(resolved.run.status, RunStatus::Completed);
-        assert_eq!(resolved.run.config_set.name, "careful");
-        assert_eq!(resolved.run.steps_executed, 2);
-        assert_eq!(resolved.run.config_set.limits.max_steps_per_run, 2);
+        assert_eq!(resolve_record.action, "manual_resolution");
     }
 
     fn prompt_workflow_source() -> &'static str {
@@ -4696,6 +4858,385 @@ exit 0
         assert_eq!(loaded.retries_used, 2);
         assert_eq!(loaded.step_retries_used.get("start").copied(), Some(2));
         factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn resume_applies_increased_step_retry_budget_to_existing_failed_run() {
+        // Regression: a run that failed with the per-step retry budget exhausted
+        // (the "2/2 retries used" the user saw) must be able to benefit from a
+        // raised `max_retries_per_step` after the user edits their config and
+        // resumes. Today resume reuses the durable per-run config snapshot, so
+        // the raised limit never reaches an already-started run and it re-fails
+        // immediately at the stale 2/2 boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            r#"
+            local developer = role("developer", { instructions = "Implement" })
+            local start = step("start", { role = developer })
+            start.run = function(ctx)
+              return action.agent {
+                role = developer,
+                prompt = "Do work",
+                output = { status = { "success" }, fields = { summary = "string" } }
+              }
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status { status = "success", body = "finished" }
+            end
+            start:on("success", finish)
+            return workflow("aaa", start)
+            "#,
+        )
+        .unwrap();
+
+        let config_for = |limit: u32| RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir.clone()],
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: limit,
+                },
+            )]),
+        };
+
+        // First runtime: default `max_retries_per_step = 2`. The initial attempt
+        // plus both recoverable retries return frontmatter-less bodies, so the
+        // run gives up as Failed at the 2/2 per-step boundary.
+        let low_factory = ScriptedAgentFactory::new(vec![
+            "no frontmatter here".to_string(),
+            "still no frontmatter".to_string(),
+            "again no frontmatter".to_string(),
+        ]);
+        let low = WorkflowRuntime::with_dependencies(
+            config_for(2),
+            mock_runtime_dependencies(None, Some(low_factory.clone())),
+        )
+        .with_deterministic_selector();
+
+        let start_err = low.start_run("do work").await.unwrap_err();
+        assert!(
+            start_err.to_string().contains("2/2 retries used"),
+            "unexpected start error: {start_err}"
+        );
+        low_factory.assert_exhausted();
+
+        let runs = low.list_runs(None).unwrap();
+        assert_eq!(runs.len(), 1);
+        let run_id = runs[0].run_id.clone();
+        let failed = low.load_run(&run_id).unwrap();
+        assert!(
+            matches!(failed.status, RunStatus::Failed { .. }),
+            "expected Failed run, got {:?}",
+            failed.status
+        );
+        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+
+        // The user raises `max_retries_per_step` to 20 and resumes the same run.
+        // The fresh attempt fails once more, but with the raised budget a single
+        // retry reaches the scripted success and completes the run.
+        let high_factory = ScriptedAgentFactory::new(vec![
+            "no frontmatter yet".to_string(),
+            "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+        ]);
+        let mut high_deps = MockRuntimeDependencies::new();
+        let high_shared = SharedClientFactory::new(high_factory.clone());
+        high_deps
+            .expect_agent_factory()
+            .returning(move |_| Ok(high_shared.clone()));
+        let high = WorkflowRuntime::with_dependencies(config_for(20), Arc::new(high_deps))
+            .with_deterministic_selector();
+
+        let report = high.resume_run(&run_id).await.expect(
+            "raising max_retries_per_step should let the resumed run retry instead of re-failing at the stale 2/2",
+        );
+
+        assert_eq!(
+            report.run.status,
+            RunStatus::Completed,
+            "resumed run should apply the raised max_retries_per_step and complete"
+        );
+    }
+
+    fn agent_retry_workflow(config_set_suffix: &str) -> String {
+        format!(
+            r#"
+            local developer = role("developer", {{ instructions = "Implement" }})
+            local start = step("start", {{ role = developer }})
+            start.run = function(ctx)
+              return action.agent {{
+                role = developer,
+                prompt = "Do work",
+                output = {{ status = {{ "success" }}, fields = {{ summary = "string" }} }}
+              }}
+            end
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status {{ status = "success", body = "finished" }}
+            end
+            start:on("success", finish)
+            return workflow("aaa", start{config_set_suffix})
+            "#
+        )
+    }
+
+    fn single_default_set(max_retries_per_step: u32) -> BTreeMap<String, RunnerLimitsConfig> {
+        BTreeMap::from([(
+            "default".to_string(),
+            RunnerLimitsConfig {
+                max_steps_per_run: 5,
+                max_visits_per_step: 5,
+                max_retries_per_run: 200,
+                max_retries_per_step,
+            },
+        )])
+    }
+
+    fn agent_retry_config(
+        dir: &tempfile::TempDir,
+        workflow_dir: PathBuf,
+        config_sets: BTreeMap<String, RunnerLimitsConfig>,
+    ) -> RuntimeConfig {
+        RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_dirs: vec![workflow_dir],
+            agents: Vec::new(),
+            config_sets,
+        }
+    }
+
+    /// Runtime dependencies for a resume/step path that never generates a
+    /// request topic (only the agent factory is exercised).
+    fn agent_factory_deps(factory: ScriptedAgentFactory) -> Arc<dyn RuntimeDependencies> {
+        let mut deps = MockRuntimeDependencies::new();
+        let shared = SharedClientFactory::new(factory);
+        deps.expect_agent_factory()
+            .returning(move |_| Ok(shared.clone()));
+        Arc::new(deps)
+    }
+
+    #[tokio::test]
+    async fn resume_of_failed_run_advances_cumulative_retry_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(workflow_dir.join("aaa.lua"), agent_retry_workflow("")).unwrap();
+
+        let low = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir.clone(), single_default_set(2)),
+            mock_runtime_dependencies(
+                None,
+                Some(ScriptedAgentFactory::new(vec![
+                    "no frontmatter here".to_string(),
+                    "still no frontmatter".to_string(),
+                    "again no frontmatter".to_string(),
+                ])),
+            ),
+        )
+        .with_deterministic_selector();
+
+        let start_err = low.start_run("do work").await.unwrap_err();
+        assert!(
+            start_err.to_string().contains("2/2 retries used"),
+            "{start_err}"
+        );
+        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
+        let failed = low.load_run(&run_id).unwrap();
+        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(failed.retries_used, 2);
+
+        let high = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir, single_default_set(20)),
+            agent_factory_deps(ScriptedAgentFactory::new(vec![
+                "no frontmatter yet".to_string(),
+                "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+            ])),
+        )
+        .with_deterministic_selector();
+
+        let report = high.resume_run(&run_id).await.unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(report.run.retries_used, 3);
+        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn step_run_applies_increased_step_retry_budget_to_existing_failed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(workflow_dir.join("aaa.lua"), agent_retry_workflow("")).unwrap();
+
+        let low = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir.clone(), single_default_set(2)),
+            mock_runtime_dependencies(
+                None,
+                Some(ScriptedAgentFactory::new(vec![
+                    "no frontmatter here".to_string(),
+                    "still no frontmatter".to_string(),
+                    "again no frontmatter".to_string(),
+                ])),
+            ),
+        )
+        .with_deterministic_selector();
+
+        low.start_run("do work").await.unwrap_err();
+        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
+        assert_eq!(
+            low.load_run(&run_id)
+                .unwrap()
+                .step_retries_used
+                .get("start")
+                .copied(),
+            Some(2)
+        );
+
+        let high = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir, single_default_set(20)),
+            agent_factory_deps(ScriptedAgentFactory::new(vec![
+                "no frontmatter yet".to_string(),
+                "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+            ])),
+        )
+        .with_deterministic_selector();
+
+        let report = high.step_run(&run_id).await.unwrap();
+        assert_eq!(report.run.status, RunStatus::Running);
+        assert_eq!(report.run.current_step, "finish");
+        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn resume_of_failed_run_applies_lowered_whole_set_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(workflow_dir.join("aaa.lua"), agent_retry_workflow("")).unwrap();
+
+        // Fail at the per-step ceiling under `max_retries_per_step = 5`: initial
+        // attempt plus five recoverable retries all return frontmatter-less bodies.
+        let high = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir.clone(), single_default_set(5)),
+            mock_runtime_dependencies(
+                None,
+                Some(ScriptedAgentFactory::new(vec![
+                    "no frontmatter 1".to_string(),
+                    "no frontmatter 2".to_string(),
+                    "no frontmatter 3".to_string(),
+                    "no frontmatter 4".to_string(),
+                    "no frontmatter 5".to_string(),
+                    "no frontmatter 6".to_string(),
+                ])),
+            ),
+        )
+        .with_deterministic_selector();
+
+        high.start_run("do work").await.unwrap_err();
+        let run_id = high.list_runs(None).unwrap()[0].run_id.clone();
+        assert_eq!(
+            high.load_run(&run_id)
+                .unwrap()
+                .step_retries_used
+                .get("start")
+                .copied(),
+            Some(5)
+        );
+
+        // Resume through a runtime whose set lowers `max_retries_per_step` to 3.
+        let low = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir, single_default_set(3)),
+            agent_factory_deps(ScriptedAgentFactory::new(vec![
+                "still no frontmatter".to_string(),
+            ])),
+        )
+        .with_deterministic_selector();
+
+        let err = low.resume_run(&run_id).await.unwrap_err();
+        assert!(err.to_string().contains("5/3 retries used"), "{err}");
+        let reloaded = low.load_run(&run_id).unwrap();
+        assert_eq!(reloaded.retries_used, 5);
+        assert_eq!(reloaded.step_retries_used.get("start").copied(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn resume_of_failed_run_uses_default_limits_when_selected_set_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("aaa.lua"),
+            agent_retry_workflow(", { config_set = \"careful\" }"),
+        )
+        .unwrap();
+
+        let with_careful = BTreeMap::from([
+            ("default".to_string(), RunnerLimitsConfig::default()),
+            (
+                "careful".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 2,
+                },
+            ),
+        ]);
+        let low = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir.clone(), with_careful),
+            mock_runtime_dependencies(
+                None,
+                Some(ScriptedAgentFactory::new(vec![
+                    "no frontmatter here".to_string(),
+                    "still no frontmatter".to_string(),
+                    "again no frontmatter".to_string(),
+                ])),
+            ),
+        )
+        .with_deterministic_selector();
+
+        let start_err = low.start_run("do work").await.unwrap_err();
+        assert!(
+            start_err.to_string().contains("2/2 retries used"),
+            "{start_err}"
+        );
+        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
+        assert_eq!(
+            low.load_run(&run_id)
+                .unwrap()
+                .step_retries_used
+                .get("start")
+                .copied(),
+            Some(2)
+        );
+
+        // Resume through a runtime that DELETES `careful` but keeps a widened
+        // `default`. Live resolution falls back to `default` limit 20.
+        let high = WorkflowRuntime::with_dependencies(
+            agent_retry_config(&dir, workflow_dir, single_default_set(20)),
+            agent_factory_deps(ScriptedAgentFactory::new(vec![
+                "no frontmatter yet".to_string(),
+                "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
+            ])),
+        )
+        .with_deterministic_selector();
+
+        let report = high.resume_run(&run_id).await.unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        // The durable pointer is unchanged even though `careful` no longer exists.
+        assert_eq!(report.run.config_set.name, "careful");
+        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
     }
 
     #[tokio::test]

@@ -871,6 +871,19 @@ mod tests {
     }
 
     #[test]
+    fn stores_and_loads_run_with_named_config_set_ref() {
+        let (_file, store) = store();
+        let mut run = run();
+        run.config_set = cowboy_workflow_core::ConfigSetRef {
+            name: "careful".into(),
+        };
+        store.save_run(&run).unwrap();
+        let loaded = store.load_run(&run.id).unwrap();
+        assert_eq!(loaded, run);
+        assert_eq!(loaded.config_set.name, "careful");
+    }
+
+    #[test]
     fn stores_and_loads_objects_by_hash() {
         let (_file, store) = store();
         let record = step_record();

@@ -5,27 +5,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ObjectHash, RecordId, Result, RoleId, RunId, RunnerLimits, Status, StepId, TurnId,
+    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId,
     WorkflowError, WorkflowId,
 };
 
 /// Name used when a workflow does not explicitly select a config set.
 pub const DEFAULT_CONFIG_SET_NAME: &str = "default";
 
-/// Runner policy resolved when a run is created and retained for its lifetime.
+/// Name-only pointer to the config set a run selected at start.
+///
+/// Only the selected set name is durable. Effective `RunnerLimits` are
+/// resolved live from current process configuration on every operation, so a
+/// later `config.toml` edit (for example a raised retry budget) applies to an
+/// existing run without resetting its cumulative retry accounting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResolvedConfigSet {
+pub struct ConfigSetRef {
     /// Name selected by the workflow, or `default` when none was declared.
     pub name: String,
-    /// Effective limits copied from the selected runtime config set.
-    pub limits: RunnerLimits,
 }
 
-impl Default for ResolvedConfigSet {
+impl Default for ConfigSetRef {
     fn default() -> Self {
         Self {
             name: DEFAULT_CONFIG_SET_NAME.to_string(),
-            limits: RunnerLimits::default(),
         }
     }
 }
@@ -48,9 +50,10 @@ pub struct WorkflowRun {
     /// Short generated topic shown in run listings when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_topic: Option<String>,
-    /// Config set and effective limits resolved before this run was persisted.
+    /// Config set the run selected at start. Only the name is durable; limits
+    /// are resolved live from current config on every operation.
     #[serde(default)]
-    pub config_set: ResolvedConfigSet,
+    pub config_set: ConfigSetRef,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
     /// Step id that should run next when the run resumes.
@@ -510,6 +513,7 @@ pub enum ObjectKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RunnerLimits;
 
     #[test]
     fn resume_callback_rejects_empty_kind() {
@@ -595,7 +599,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(run.config_set, ResolvedConfigSet::default());
+        assert_eq!(run.config_set, ConfigSetRef::default());
         assert_eq!(run.retries_used, 0);
         assert!(run.step_retries_used.is_empty());
     }
@@ -654,14 +658,8 @@ mod tests {
             "updated_at": "2026-01-01T00:00:00Z"
         }))
         .unwrap();
-        run.config_set = ResolvedConfigSet {
+        run.config_set = ConfigSetRef {
             name: "careful".to_string(),
-            limits: RunnerLimits {
-                max_steps_per_run: 9,
-                max_visits_per_step: 8,
-                max_retries_per_run: 7,
-                max_retries_per_step: 6,
-            },
         };
         run.retries_used = 3;
         run.step_retries_used.insert("start".to_string(), 2);
@@ -669,7 +667,6 @@ mod tests {
         let round_trip: WorkflowRun =
             serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
         assert_eq!(round_trip.config_set.name, "careful");
-        assert_eq!(round_trip.config_set.limits.max_retries_per_run, 7);
         assert_eq!(round_trip.retries_used, 3);
         assert_eq!(round_trip.step_retries_used["start"], 2);
     }

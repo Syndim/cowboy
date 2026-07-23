@@ -23,7 +23,7 @@ pub use cowboy_workflow_actions::{
 };
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::ResumeRouter;
-pub use runner::{LuaStepActionProvider, WorkflowRunner};
+pub use runner::{LuaStepActionProvider, ResolvedRuntimePolicy, WorkflowRunner};
 pub use runtime::{
     AgentRuntimeConfig, ResolutionOptions, ResolutionStatus, RunReport, RunStatusDetail,
     RunStatusState, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig, UserPromptRejection,

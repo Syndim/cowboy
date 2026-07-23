@@ -243,12 +243,26 @@ detent scrolls in the TUI. It defaults to `3` and must be greater than zero.
 
 Workflows select a set with
 `workflow(name, head, { config_set = "careful" })`; omission selects `default`.
-An unknown selection fails before the new run is persisted. Cowboy snapshots
-the selected name and all four effective limits into the run, so resume, step,
-answer, resolve, and resolution-option operations keep working after runtime
-configuration changes or removal. Retry counters are durable and cumulative
-across visits to the same step id. Retry events retain visit-local attempt
-numbers (`2..=max_attempts`) and use one fixed `max_attempts` for that visit.
+An unknown selection fails before the new run is persisted. A run persists only
+its selected config-set **name**; effective limits are resolved from current
+config on every operation. So resuming or stepping an existing run after a
+config edit — including a raised retry budget — applies the current limits, and
+a config-set that was deleted falls back to `default` limits (a warning is
+logged, and if `default` is also gone the built-in defaults apply). Retry
+counters are durable and cumulative across visits to the same step id, so a
+raised limit adds budget without resetting accounting. Retry events retain
+visit-local attempt numbers (`2..=max_attempts`) and use one fixed
+`max_attempts` for that visit.
+
+A long-lived TUI still loads config once per process, so **new** runs pick up
+config edits only after a restart.
+
+This persisted-shape change is a breaking change with no migration: pre-existing
+runs may be discarded. To reset the store, in order: (1) stop all Cowboy
+processes; (2) delete the configured `workflow_store` file (default
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`, which may be
+configured outside `state_dir`); (3) delete the `<state_dir>/events` directory
+(default `${XDG_STATE_HOME:-~/.local/state}/cowboy/events`).
 
 This is a clean cutover: old top-level `max_steps_per_run`,
 `max_visits_per_step`, and `max_retries_per_step` keys are rejected. Move them
@@ -321,7 +335,7 @@ COWBOY_LOG="info,cowboy_agent_acp=debug" cowboy
 CLI/TUI request
   -> workflow catalog selects a Lua workflow
   -> Lua source is snapshotted and compiled into a WorkflowDefinition
-  -> engine resolves config_set (or default) and snapshots effective limits
+  -> engine records the selected config_set name (limits resolved live per operation)
   -> WorkflowRun is persisted through redb
   -> WorkflowRunner executes steps until completed/failed/waiting
   -> agent steps go through ACP and parse YAML-frontmatter output

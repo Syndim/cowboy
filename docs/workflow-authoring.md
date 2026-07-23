@@ -224,13 +224,24 @@ built-in value. Retry limits may be `0`; step and visit limits must be greater
 than zero. Blank names and unknown fields are rejected. An unknown workflow
 selection fails before a new run is persisted and reports the available sets.
 
-Cowboy snapshots the selected set name and all four effective limits into a
-new run. Later resume, step, answer, resolve, and resolution-option operations
-use that snapshot even if the host config changes or removes the set. Retry
-dispatches are durable and cumulative across the run and across every visit to
-the same step id; initial attempts do not count, and retries consume neither
-step nor visit budgets. `StepRetrying` events keep visit-local attempts and a
-fixed `max_attempts` computed from both remaining retry ceilings.
+Cowboy persists only the selected set **name** into a new run; effective limits
+are resolved from current config on every operation. Resuming or stepping an
+existing run after a config edit — including a raised retry budget — applies the
+current limits, and a set that was deleted falls back to `default` limits (a
+warning is logged; if `default` is also gone, the built-in defaults apply). A
+long-lived TUI still needs a restart for **new** runs to pick up config edits.
+Retry dispatches are durable and cumulative across the run and across every
+visit to the same step id, so a raised limit adds budget without resetting
+accounting; initial attempts do not count, and retries consume neither step nor
+visit budgets. `StepRetrying` events keep visit-local attempts and a fixed
+`max_attempts` computed from both remaining retry ceilings.
+
+This name-only persisted shape is a breaking change with no migration;
+pre-existing runs may be discarded. To reset the store, in order: (1) stop all
+Cowboy processes; (2) delete the configured `workflow_store` file (default
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`, which may be
+configured to a path outside `state_dir`); (3) delete the `<state_dir>/events`
+directory (default `${XDG_STATE_HOME:-~/.local/state}/cowboy/events`).
 
 Top-level runner-limit keys from older configs are no longer accepted. Move
 them under `[config_sets.default]`.

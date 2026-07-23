@@ -194,7 +194,7 @@ Owns:
 
 Important modules:
 
-- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default resolution, durable policy snapshots, start/resume/step/answer/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
+- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default name resolution, live per-operation limit resolution (`resolve_limits`), start/resume/step/answer/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
 - `runner.rs` — `WorkflowRunner<S, D, P>` over `cowboy-workflow-core::execute_step`; owns event emission and cumulative run/per-step retry enforcement, reserves retry counters before dispatch, and persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`.
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `ResumeRouter` for `RunStatus::WaitingForInput` answers and persisted resume callbacks.
@@ -245,7 +245,7 @@ Owns:
 - `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
 - `StepAction`: `agent`, `command`, `status`, `ask_user`, `fail`
-- `WorkflowRun`, durable resolved config-set snapshots and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
+- `WorkflowRun`, durable name-only config-set pointer (`ConfigSetRef`) and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
 - `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, `RunStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
 - `execute_step`, step/visit budget enforcement, and step-record/status application helpers
 
@@ -373,7 +373,7 @@ CLI argv or TUI composer input
   -> cowboy app dispatches to cowboy-workflow-engine::WorkflowRuntime
   -> catalog loads/selects WorkflowSourceRef
   -> workflow-lua compiles/snapshots Lua source
-  -> engine resolves workflow config_set (or default) and snapshots effective limits
+  -> engine resolves the workflow config_set name (or default); limits are resolved live per operation
   -> WorkflowRun is saved through RunStore
   -> WorkflowRunner loops execute_step until terminal/waiting/failed
   -> ActionDispatcher maps StepAction to ActionResult
@@ -470,11 +470,24 @@ Blank names and unknown fields are rejected. Workflows select a set with
 `workflow(name, head, { config_set = "careful" })`; omission selects `default`,
 and unknown names fail before a run is persisted.
 
-New runs snapshot the resolved set name and all four effective limits. Resume,
-step, answer, resolve, and resolution-option paths use the snapshot even after
-the process config changes or removes the named set. Retry counters are durable
-and cumulative across a run and across repeated visits to one step id; events
-keep visit-local attempt numbering with a fixed per-visit `max_attempts`.
+A run persists only the resolved set **name**; effective limits are resolved
+from current config on every operation (resume, step, answer, resolve, and
+resolution-options). Resuming or stepping an existing run after a config edit —
+including a raised retry budget — applies the current limits, and a deleted set
+falls back to `default` limits (a warning is logged; if `default` is also
+missing, the built-in defaults apply). New runs in a long-lived TUI still need a
+process restart to pick up config edits. Retry counters are durable and
+cumulative across a run and across repeated visits to one step id, so a raised
+limit adds budget without resetting accounting; events keep visit-local attempt
+numbering with a fixed per-visit `max_attempts`.
+
+This name-only persisted shape is a breaking change with no migration;
+pre-existing runs may be discarded. To reset the store, in order: (1) stop all
+Cowboy processes; (2) delete the configured `workflow_store` file (default
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`, which MAY be
+configured to a path outside `state_dir`); (3) delete the `<state_dir>/events`
+directory (always under `state_dir`, default
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/events`).
 
 The config migration is a clean cutover: top-level `max_steps_per_run`,
 `max_visits_per_step`, and `max_retries_per_step` are rejected. Move them under

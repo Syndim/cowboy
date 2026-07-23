@@ -2,8 +2,8 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    ActionDispatcher, Result, RunStatus, RunStore, RunUserPrompt, StepAction, StepActionProvider,
-    StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
+    ActionDispatcher, Result, RunStatus, RunStore, RunUserPrompt, RunnerLimits, StepAction,
+    StepActionProvider, StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
     WorkflowSourceSnapshot, apply_run_status, execute_step, ordered_user_inputs,
     retry_current_step,
 };
@@ -13,6 +13,17 @@ use crate::{
     active_clock::ActiveRunClock,
     events::{EventBus, WorkflowEvent, WorkflowEventKind},
 };
+
+/// Runner policy resolved live from current process configuration.
+///
+/// `name` is the **effective** config-set name (`"default"` when a persisted
+/// set name was missing and fell back), so exhaustion diagnostics attribute the
+/// enforced budget to the set actually applied, never a stale persisted pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimePolicy {
+    pub name: String,
+    pub limits: RunnerLimits,
+}
 
 /// Runs one workflow until it completes, fails, waits for input, or hits a budget.
 ///
@@ -24,17 +35,25 @@ pub struct WorkflowRunner<S, E, P> {
     executor: E,
     provider: P,
     events: Arc<EventBus>,
+    policy: ResolvedRuntimePolicy,
     request_topic: Option<String>,
     active_clock: Option<ActiveRunClock>,
 }
 
 impl<S, E, P> WorkflowRunner<S, E, P> {
-    pub fn new(store: S, executor: E, provider: P, events: Arc<EventBus>) -> Self {
+    pub fn new(
+        store: S,
+        executor: E,
+        provider: P,
+        events: Arc<EventBus>,
+        policy: ResolvedRuntimePolicy,
+    ) -> Self {
         Self {
             store,
             executor,
             provider,
             events,
+            policy,
             request_topic: None,
             active_clock: None,
         }
@@ -154,7 +173,7 @@ where
             },
         ));
 
-        let limits = run.config_set.limits;
+        let limits = self.policy.limits;
         let status = match execute_step(
             &self.store,
             &self.executor,
@@ -210,7 +229,7 @@ where
             return Err(first_error);
         }
 
-        let limits = run.config_set.limits;
+        let limits = self.policy.limits;
         let run_remaining = limits.max_retries_per_run.saturating_sub(run.retries_used);
         let step_remaining = limits
             .max_retries_per_step
@@ -268,11 +287,11 @@ where
         step_id: &str,
         last_error: &WorkflowError,
     ) -> Option<WorkflowError> {
-        let limits = run.config_set.limits;
+        let limits = self.policy.limits;
         if run.retries_used >= limits.max_retries_per_run {
             return Some(WorkflowError::InvalidAction(format!(
                 "config set {:?} exhausted run retry budget: {}/{} retries used; last recoverable error: {last_error}",
-                run.config_set.name, run.retries_used, limits.max_retries_per_run
+                self.policy.name, run.retries_used, limits.max_retries_per_run
             )));
         }
 
@@ -280,7 +299,7 @@ where
         if step_retries_used >= limits.max_retries_per_step {
             return Some(WorkflowError::InvalidAction(format!(
                 "config set {:?} exhausted retry budget for step {step_id:?}: {step_retries_used}/{} retries used; last recoverable error: {last_error}",
-                run.config_set.name, limits.max_retries_per_step
+                self.policy.name, limits.max_retries_per_step
             )));
         }
 
@@ -765,6 +784,7 @@ mod tests {
                 }),
             ]),
             bus,
+            default_policy(),
         )
         .with_request_topic(Some("Add health route".to_string()))
         .with_active_clock(ActiveRunClock::open_at(&initial_run, Utc::now()));
@@ -838,6 +858,7 @@ mod tests {
                 }),
             ]),
             bus.clone(),
+            default_policy(),
         )
         .with_request_topic(Some("Single step topic".to_string()));
         let definition = definition();
@@ -913,6 +934,7 @@ mod tests {
             NoopDispatcher,
             LuaStepActionProvider::new(source_bundle),
             Arc::new(EventBus::new(16)),
+            default_policy(),
         );
 
         let run = runner.run_until_blocked(&definition, run()).await.unwrap();
@@ -1061,6 +1083,7 @@ mod tests {
             NoopDispatcher,
             LuaStepActionProvider::new(source_bundle),
             Arc::new(EventBus::new(16)),
+            default_policy(),
         );
 
         let run = runner.run_until_blocked(&definition, run()).await.unwrap();
@@ -1078,18 +1101,23 @@ mod tests {
         run
     }
 
-    fn agent_run_with_retry_limits(
-        max_retries_per_run: u32,
-        max_retries_per_step: u32,
-    ) -> WorkflowRun {
-        let mut run = agent_run();
-        run.config_set.limits = RunnerLimits {
-            max_steps_per_run: 5,
-            max_visits_per_step: 3,
-            max_retries_per_run,
-            max_retries_per_step,
-        };
-        run
+    fn default_policy() -> ResolvedRuntimePolicy {
+        ResolvedRuntimePolicy {
+            name: "default".to_string(),
+            limits: RunnerLimits::default(),
+        }
+    }
+
+    fn retry_policy(max_retries_per_run: u32, max_retries_per_step: u32) -> ResolvedRuntimePolicy {
+        ResolvedRuntimePolicy {
+            name: "default".to_string(),
+            limits: RunnerLimits {
+                max_steps_per_run: 5,
+                max_visits_per_step: 3,
+                max_retries_per_run,
+                max_retries_per_step,
+            },
+        }
     }
 
     fn agent_action() -> StepAction {
@@ -1106,7 +1134,7 @@ mod tests {
         let seen_attempts = Arc::new(Mutex::new(Vec::new()));
         let bus = Arc::new(EventBus::new(32));
         let mut events = bus.subscribe();
-        let initial_run = agent_run_with_retry_limits(200, 2);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1117,6 +1145,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             bus,
+            retry_policy(200, 2),
         )
         .with_active_clock(ActiveRunClock::open_at(&initial_run, Utc::now()));
 
@@ -1174,7 +1203,7 @@ mod tests {
         let seen_attempts = Arc::new(Mutex::new(Vec::new()));
         let bus = Arc::new(EventBus::new(32));
         let mut events = bus.subscribe();
-        let initial_run = agent_run_with_retry_limits(200, 2);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1185,6 +1214,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             bus,
+            retry_policy(200, 2),
         )
         .with_active_clock(ActiveRunClock::open_at(&initial_run, Utc::now()));
 
@@ -1239,7 +1269,7 @@ mod tests {
         let seen_attempts = Arc::new(Mutex::new(Vec::new()));
         let bus = Arc::new(EventBus::new(32));
         let mut events = bus.subscribe();
-        let initial_run = agent_run_with_retry_limits(200, 2);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1250,6 +1280,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             bus,
+            retry_policy(200, 2),
         );
 
         let result = runner.run_until_blocked(&definition(), initial_run).await;
@@ -1276,7 +1307,7 @@ mod tests {
     #[tokio::test]
     async fn zero_retry_limits_use_run_first_exhaustion_precedence() {
         let dispatches = Arc::new(Mutex::new(0));
-        let initial_run = agent_run_with_retry_limits(0, 0);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1287,6 +1318,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             Arc::new(EventBus::new(8)),
+            retry_policy(0, 0),
         );
 
         let err = runner
@@ -1306,7 +1338,7 @@ mod tests {
     async fn run_ceiling_fixes_visit_local_max_attempts() {
         let bus = Arc::new(EventBus::new(16));
         let mut events = bus.subscribe();
-        let initial_run = agent_run_with_retry_limits(1, 4);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1317,6 +1349,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             bus,
+            retry_policy(1, 4),
         );
 
         let err = runner
@@ -1340,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_visits_share_the_per_step_retry_budget() {
-        let first_visit = agent_run_with_retry_limits(10, 2);
+        let first_visit = agent_run();
         let first_runner = WorkflowRunner::new(
             MemoryStore::default(),
             FlakyDispatcher {
@@ -1351,6 +1384,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             Arc::new(EventBus::new(8)),
+            retry_policy(10, 2),
         );
         let mut second_visit = first_runner
             .step_once(&definition(), first_visit)
@@ -1373,6 +1407,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action(), agent_action()]),
             Arc::new(EventBus::new(8)),
+            retry_policy(10, 2),
         );
 
         let err = second_runner
@@ -1393,7 +1428,7 @@ mod tests {
     async fn retry_reservation_is_saved_before_dispatch() {
         let store = MemoryStore::default();
         let first_dispatches = Arc::new(Mutex::new(0));
-        let initial_run = agent_run_with_retry_limits(1, 1);
+        let initial_run = agent_run();
         let runner = WorkflowRunner::new(
             store.clone(),
             PersistedRetryDispatcher {
@@ -1402,6 +1437,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             Arc::new(EventBus::new(8)),
+            retry_policy(1, 1),
         );
 
         runner
@@ -1422,7 +1458,10 @@ mod tests {
     ) -> (WorkflowError, u32) {
         let store = MemoryStore::default();
         let mut persisted = agent_run();
-        persisted.config_set.limits = limits;
+        let policy = ResolvedRuntimePolicy {
+            name: "default".to_string(),
+            limits,
+        };
         persisted.retries_used = retries_used;
         persisted
             .step_retries_used
@@ -1441,6 +1480,7 @@ mod tests {
             },
             StaticProvider(vec![agent_action()]),
             Arc::new(EventBus::new(8)),
+            policy,
         );
 
         let error = reconstructed
@@ -1489,6 +1529,45 @@ mod tests {
                 .contains("exhausted retry budget for step \"agent\"")
         );
         assert_eq!(dispatches, 1);
+    }
+
+    #[tokio::test]
+    async fn exhaustion_error_names_effective_default_policy_not_persisted_pointer() {
+        // The run persists a `careful` pointer, but the effective resolved policy
+        // fell back to `default`. Exhaustion diagnostics must name the effective
+        // policy that was actually enforced, never the stale persisted pointer.
+        let mut run = agent_run();
+        run.config_set = cowboy_workflow_core::ConfigSetRef {
+            name: "careful".to_string(),
+        };
+        let runner = WorkflowRunner::new(
+            MemoryStore::default(),
+            FlakyDispatcher {
+                remaining_failures: Mutex::new(u32::MAX),
+                recoverable: true,
+                dispatches: Arc::new(Mutex::new(0)),
+                seen_attempts: Arc::new(Mutex::new(Vec::new())),
+            },
+            StaticProvider(vec![agent_action()]),
+            Arc::new(EventBus::new(8)),
+            ResolvedRuntimePolicy {
+                name: "default".to_string(),
+                limits: RunnerLimits {
+                    max_steps_per_run: 5,
+                    max_visits_per_step: 3,
+                    max_retries_per_run: 200,
+                    max_retries_per_step: 1,
+                },
+            },
+        );
+
+        let err = runner
+            .step_once(&definition(), run)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("config set \"default\""), "{err}");
+        assert!(!err.contains("careful"), "{err}");
     }
     #[test]
     fn maximum_u32_retry_allowance_has_representable_attempt_bounds() {
