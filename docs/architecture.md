@@ -305,7 +305,7 @@ forces a manual status on a failed run.
 
 The TUI accepts plain requests and slash commands in its composer. Slash command parsing and completion metadata come from `cowboy-command-parser`; the app crate owns dispatch, pending-prompt fallback, and rendering. Runtime behavior is delegated to `cowboy-workflow-engine`, and the TUI renders the workflow event stream from the runtime event bus.
 
-Agent cards show the agent-reported model descriptor (model/context/reasoning) captured at session creation, built only from agent-returned ACP config option values and never from the configured `ModelInfo`.
+Agent cards show the agent-reported model descriptor (model/context/reasoning) captured when a session is created or loaded, built only from agent-returned ACP config option values and never from the configured `ModelInfo`.
 
 Composer behavior derives from three independent facts: whether a typed
 workflow-execution background task is running, whether that execution has an

@@ -53,9 +53,9 @@ pub struct Client {
     /// Push-back buffer for messages consumed during trailing event drain
     #[serde(skip)]
     pushback: Vec<String>,
-    /// Agent-returned session descriptor captured from `session/new` (or the
-    /// post-`set_config_option`) config options; never derived from the
-    /// configured `ModelInfo`.
+    /// Agent-returned session descriptor captured from `session/new`,
+    /// `session/load`, or post-`set_config_option` config options; never
+    /// derived from the configured `ModelInfo`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_descriptor: Option<AgentSessionDescriptor>,
     #[serde(default)]
@@ -1282,12 +1282,20 @@ impl Client {
                     history.push(update);
                 }
                 Message::Response {
-                    id: resp_id, error, ..
+                    id: resp_id,
+                    result,
+                    error,
                 } if resp_id == id => {
                     if let Some(err) = error {
                         tracing::warn!(session_id, id = resp_id, error = %err, "ACP session/load response error");
                         anyhow::bail!("session/load error: {err}");
                     }
+                    let result = match result {
+                        Some(Value::Null) | None => SessionLoadResult::default(),
+                        Some(result) => serde_json::from_value(result)?,
+                    };
+                    self.session_descriptor =
+                        Self::descriptor_from_config_options(&result.config_options);
                     self.session_id = Some(session_id.to_string());
                     tracing::info!(
                         session_id,
@@ -2860,6 +2868,113 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(matches!(&history[0], Event::UserMessageChunk { .. }));
         assert!(matches!(&history[1], Event::MessageChunk { .. }));
+    }
+
+    #[tokio::test]
+    async fn load_session_captures_descriptor_from_returned_config_options() {
+        let init_resp = init_response(0);
+        let load_resp = rpc_response(
+            1,
+            serde_json::json!({
+                "configOptions": [
+                    {
+                        "id": "model",
+                        "category": "model",
+                        "currentValue": "github-copilot/gpt-5.6-sol",
+                        "options": [{"value": "github-copilot/gpt-5.6-sol"}]
+                    },
+                    {
+                        "id": "thought_level",
+                        "category": "thought_level",
+                        "currentValue": "high",
+                        "options": [{"value": "high"}]
+                    }
+                ]
+            }),
+        );
+        let transport = MockTransport::new(vec![&init_resp, &load_resp]);
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        client
+            .load_session("sess_old", "/project", &[])
+            .await
+            .unwrap();
+
+        let descriptor = cowboy_agent_client::Client::session_descriptor(&client)
+            .expect("session/load config options should restore the model descriptor");
+        assert_eq!(
+            descriptor.model.as_deref(),
+            Some("github-copilot/gpt-5.6-sol")
+        );
+        assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn load_session_clears_descriptor_for_descriptorless_results() {
+        let responses = [
+            serde_json::json!({"jsonrpc": "2.0", "id": 1}).to_string(),
+            rpc_response(1, Value::Null),
+            rpc_response(1, serde_json::json!({})),
+            rpc_response(1, serde_json::json!({"configOptions": []})),
+            rpc_response(
+                1,
+                serde_json::json!({
+                    "configOptions": [{
+                        "id": "theme",
+                        "category": "display",
+                        "currentValue": "dark",
+                        "options": [{"value": "dark"}]
+                    }]
+                }),
+            ),
+        ];
+
+        for load_resp in responses {
+            let init_resp = init_response(0);
+            let transport = MockTransport::new(vec![&init_resp, &load_resp]);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.session_descriptor = Some(AgentSessionDescriptor {
+                model: Some("stale-model".into()),
+                context: None,
+                reasoning: None,
+            });
+
+            client
+                .load_session("sess_old", "/project", &[])
+                .await
+                .unwrap();
+
+            assert!(
+                cowboy_agent_client::Client::session_descriptor(&client).is_none(),
+                "descriptorless session/load result should clear stale descriptor: {load_resp}"
+            );
+            assert_eq!(client.session_id(), Some("sess_old"));
+        }
+    }
+
+    #[tokio::test]
+    async fn load_session_rejects_malformed_non_null_result() {
+        let init_resp = init_response(0);
+        let load_resp = rpc_response(1, serde_json::json!("malformed"));
+        let transport = MockTransport::new(vec![&init_resp, &load_resp]);
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        let error = client
+            .load_session("sess_old", "/project", &[])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid type"));
+        assert_eq!(client.session_id(), None);
     }
 
     #[tokio::test]

@@ -225,6 +225,14 @@ pub struct SessionNewResult {
     pub config_options: Vec<SessionConfigOption>,
 }
 
+/// session/load response result
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLoadResult {
+    #[serde(default)]
+    pub config_options: Vec<SessionConfigOption>,
+}
+
 /// A session-level configuration option exposed by the ACP agent.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -409,6 +417,13 @@ pub fn parse_acp_message(msg: &Value) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_load_result_defaults_missing_config_options() {
+        let result: SessionLoadResult = serde_json::from_value(serde_json::json!({})).unwrap();
+
+        assert!(result.config_options.is_empty());
+    }
 
     #[test]
     fn test_parse_response() {
