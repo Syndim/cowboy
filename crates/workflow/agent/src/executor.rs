@@ -11,10 +11,10 @@ use cowboy_agent_client::{
     StopReason,
 };
 use cowboy_workflow_core::{
-    AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow,
+    AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow, AgentSessionStore,
     CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
-    RoleDefinition, RoleId, RoleSession, RunId, RunStore, RunUserInput, StepDetail, StepInput,
-    StepRecord, TurnRecord, WorkflowError, ordered_user_inputs_from_parts,
+    PromptWindowStore, RoleDefinition, RoleId, RoleSession, RunId, RunUserInput, StepDetail,
+    StepInput, StepRecord, TurnRecord, TurnStore, WorkflowError, ordered_user_inputs_from_parts,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -292,7 +292,11 @@ pub struct AgentExecutor<F, S> {
     prompt_turn_controls: PromptTurnControlRegistry,
 }
 
-struct PromptWindowGuard<S: RunStore> {
+pub trait AgentStore: AgentSessionStore + TurnStore + PromptWindowStore {}
+
+impl<T> AgentStore for T where T: AgentSessionStore + TurnStore + PromptWindowStore + ?Sized {}
+
+struct PromptWindowGuard<S: AgentStore + 'static> {
     store: Arc<S>,
     context: ExecutionContext,
     role: String,
@@ -302,7 +306,7 @@ struct PromptWindowGuard<S: RunStore> {
     closed: bool,
 }
 
-impl<S: RunStore> PromptWindowGuard<S> {
+impl<S: AgentStore + 'static> PromptWindowGuard<S> {
     fn close(&mut self) {
         if self.closed {
             return;
@@ -319,18 +323,16 @@ impl<S: RunStore> PromptWindowGuard<S> {
             },
         );
     }
-}
 
-impl<S: RunStore> Drop for PromptWindowGuard<S> {
-    fn drop(&mut self) {
+    async fn abort(&mut self) {
         if self.closed {
             return;
         }
-        match self.store.abort_agent_prompt_window(
-            &self.context.run_id,
-            &self.window_id,
-            Utc::now(),
-        ) {
+        match self
+            .store
+            .abort_agent_prompt_window(&self.context.run_id, &self.window_id, Utc::now())
+            .await
+        {
             Ok(
                 AbortAgentPromptWindowOutcome::Aborted(_)
                 | AbortAgentPromptWindowOutcome::NoWindow
@@ -345,6 +347,45 @@ impl<S: RunStore> Drop for PromptWindowGuard<S> {
             ),
         }
         self.close();
+    }
+}
+
+impl<S: AgentStore + 'static> Drop for PromptWindowGuard<S> {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let store = self.store.clone();
+        let context = self.context.clone();
+        let role = self.role.clone();
+        let window_id = self.window_id.clone();
+        let progress = self.progress.clone();
+        let prompt_turn_controls = self.prompt_turn_controls.clone();
+        self.closed = true;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(err) = store
+                    .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now())
+                    .await
+                {
+                    tracing::warn!(
+                        run_id = %context.run_id,
+                        window_id,
+                        error = %err,
+                        "failed to abort agent prompt window"
+                    );
+                }
+                prompt_turn_controls.unregister(&context.run_id, &window_id);
+                emit_progress_kind(
+                    progress.as_ref(),
+                    &context,
+                    AgentProgressKind::PromptWindowClosed { role, window_id },
+                );
+            });
+        } else {
+            self.prompt_turn_controls
+                .unregister(&self.context.run_id, &self.window_id);
+        }
     }
 }
 
@@ -370,7 +411,7 @@ impl<F, S> AgentExecutor<F, S> {
 impl<F, S> AgentExecutor<F, S>
 where
     F: ClientFactory,
-    S: RunStore + 'static,
+    S: AgentStore + 'static,
 {
     /// Execute an agent action using the session keyed by `(run_id, role_id)`.
     pub async fn execute_agent(
@@ -430,6 +471,7 @@ where
         } else {
             self.store
                 .load_role_session(&key.run_id, &key.role_id)
+                .await
                 .map_err(Error::from)?
         };
         let (role_instructions_sent, last_sent_input_sequence) = prior_session
@@ -497,6 +539,7 @@ where
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .map_err(Error::from)?;
         let OpenAgentPromptWindowOutcome::Opened(window) = opened else {
             return Err(WorkflowError::InvalidAction(format!(
@@ -508,7 +551,8 @@ where
         if window.baseline_sequence != expected_baseline {
             let _ = self
                 .store
-                .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now());
+                .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now())
+                .await;
             return Err(WorkflowError::InvalidAction(format!(
                 "agent prompt baseline changed from {expected_baseline} to {} before opening",
                 window.baseline_sequence
@@ -545,7 +589,7 @@ where
             },
         );
         let mut turn_cursor = TurnCursor::default();
-        let (mut visible, mut turns, stop_reason) = run_prompt_turn(
+        let initial_turn = run_prompt_turn(
             active.client.as_mut(),
             &session_id,
             vec![PromptContent::text(prompt.clone())],
@@ -555,7 +599,14 @@ where
             self.config.progress.clone(),
             &mut turn_cursor,
         )
-        .await?;
+        .await;
+        let (mut visible, mut turns, stop_reason) = match initial_turn {
+            Ok(turn) => turn,
+            Err(error) => {
+                window_guard.abort().await;
+                return Err(error);
+            }
+        };
         tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
 
         let mut applied_sequence = expected_baseline;
@@ -579,6 +630,7 @@ where
                     applied_sequence,
                     Utc::now(),
                 )
+                .await
                 .map_err(Error::from)?;
             #[cfg(any(test, feature = "test-support"))]
             if let Some(observer) = &self.config.handoff_observer {
@@ -625,7 +677,7 @@ where
                             prompt: rendered,
                         },
                     );
-                    let (replacement, correction_records, stop_reason) = run_prompt_turn(
+                    let correction_turn = run_prompt_turn(
                         active.client.as_mut(),
                         &session_id,
                         blocks,
@@ -638,7 +690,14 @@ where
                         self.config.progress.clone(),
                         &mut turn_cursor,
                     )
-                    .await?;
+                    .await;
+                    let (replacement, correction_records, stop_reason) = match correction_turn {
+                        Ok(turn) => turn,
+                        Err(error) => {
+                            window_guard.abort().await;
+                            return Err(error);
+                        }
+                    };
                     visible = replacement;
                     turns.extend(correction_records);
                     tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
@@ -648,6 +707,7 @@ where
                     break;
                 }
                 outcome => {
+                    window_guard.abort().await;
                     return Err(WorkflowError::InvalidAction(format!(
                         "agent prompt window handoff failed for run {:?}: {outcome:?}",
                         context.run_id
@@ -676,6 +736,7 @@ where
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(advanced_sequence),
             })
+            .await
             .map_err(Error::from)?;
 
         let parsed = parse_frontmatter_output(&visible)
@@ -738,6 +799,7 @@ where
         if let Some(saved) = self
             .store
             .load_role_session(&key.run_id, &key.role_id)
+            .await
             .map_err(Error::from)?
         {
             if client.supports_load_session() {
@@ -808,6 +870,7 @@ where
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
             })
+            .await
             .map_err(Error::from)?;
         tracing::info!(
             run_id = %key.run_id,
@@ -1215,11 +1278,9 @@ mod tests {
     use anyhow::anyhow;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        AppendUserPromptOutcome, ObjectHash, ObjectKind, Result as CoreResult, RunHead,
-        RunUserPrompt, WorkflowRun,
+        AppendUserPromptOutcome, ObjectHash, Result as CoreResult, RunUserPrompt,
     };
     use parking_lot::Mutex as SyncMutex;
-    use serde::{Serialize, de::DeserializeOwned};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -1571,95 +1632,86 @@ mod tests {
         inner: Arc<FakeStore>,
     }
 
-    impl cowboy_workflow_core::RunStore for SharedFakeStore {
-        fn save_run(&self, run: &WorkflowRun) -> CoreResult<()> {
-            self.inner.save_run(run)
+    #[async_trait]
+    impl AgentSessionStore for SharedFakeStore {
+        async fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
+            self.inner.save_role_session(session).await
         }
 
-        fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> CoreResult<WorkflowRun> {
-            self.inner.load_run(run_id)
-        }
-
-        fn list_runs(&self) -> CoreResult<Vec<RunHead>> {
-            self.inner.list_runs()
-        }
-
-        fn put_object<T: Serialize>(&self, kind: ObjectKind, value: &T) -> CoreResult<ObjectHash> {
-            self.inner.put_object(kind, value)
-        }
-
-        fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> CoreResult<T> {
-            self.inner.get_object(hash)
-        }
-
-        fn update_run_head(&self, run_id: &str, head: RunHead) -> CoreResult<()> {
-            self.inner.update_run_head(run_id, head)
-        }
-
-        fn load_run_head(&self, run_id: &str) -> CoreResult<RunHead> {
-            self.inner.load_run_head(run_id)
-        }
-
-        fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
-            self.inner.save_role_session(session)
-        }
-
-        fn load_role_session(
+        async fn load_role_session(
             &self,
             run_id: &str,
             role_id: &str,
         ) -> CoreResult<Option<RoleSession>> {
-            self.inner.load_role_session(run_id, role_id)
+            self.inner.load_role_session(run_id, role_id).await
         }
 
-        fn delete_role_sessions(&self, run_id: &str) -> CoreResult<()> {
-            self.inner.delete_role_sessions(run_id)
+        async fn delete_role_sessions(&self, run_id: &str) -> CoreResult<()> {
+            self.inner.delete_role_sessions(run_id).await
         }
+    }
 
-        fn append_turn(
+    #[async_trait]
+    impl TurnStore for SharedFakeStore {
+        async fn append_turn(
             &self,
             run_id: &str,
             turn: cowboy_workflow_core::TurnRecord,
         ) -> CoreResult<ObjectHash> {
-            self.inner.append_turn(run_id, turn)
+            self.inner.append_turn(run_id, turn).await
         }
 
-        fn load_user_prompts(&self, run_id: &str) -> CoreResult<Vec<RunUserPrompt>> {
-            self.inner.load_user_prompts(run_id)
+        async fn load_turn(&self, hash: &ObjectHash) -> CoreResult<TurnRecord> {
+            self.inner.load_turn(hash).await
         }
 
-        fn append_user_prompt(
+        async fn load_turns(
+            &self,
+            run_id: &str,
+            step_record_id: &str,
+        ) -> CoreResult<Vec<TurnRecord>> {
+            self.inner.load_turns(run_id, step_record_id).await
+        }
+    }
+
+    #[async_trait]
+    impl PromptWindowStore for SharedFakeStore {
+        async fn append_user_prompt(
             &self,
             run_id: &str,
             window_id: &str,
             content: String,
         ) -> CoreResult<AppendUserPromptOutcome> {
-            self.inner.append_user_prompt(run_id, window_id, content)
+            self.inner
+                .append_user_prompt(run_id, window_id, content)
+                .await
         }
 
-        fn open_agent_prompt_window(
+        async fn open_agent_prompt_window(
             &self,
             window: AgentPromptWindow,
         ) -> CoreResult<OpenAgentPromptWindowOutcome> {
-            self.inner.open_agent_prompt_window(window)
+            self.inner.open_agent_prompt_window(window).await
         }
 
-        fn compare_and_seal_agent_prompt_window(
+        async fn compare_and_seal_agent_prompt_window(
             &self,
             run_id: &str,
             window_id: &str,
             applied_sequence: u64,
             sealed_at: chrono::DateTime<Utc>,
         ) -> CoreResult<CompareAndSealPromptWindowOutcome> {
-            self.inner.compare_and_seal_agent_prompt_window(
-                run_id,
-                window_id,
-                applied_sequence,
-                sealed_at,
-            )
+            self.inner
+                .compare_and_seal_agent_prompt_window(
+                    run_id,
+                    window_id,
+                    applied_sequence,
+                    sealed_at,
+                )
+                .await
         }
 
-        fn abort_agent_prompt_window(
+        async fn abort_agent_prompt_window(
             &self,
             run_id: &str,
             window_id: &str,
@@ -1667,50 +1719,20 @@ mod tests {
         ) -> CoreResult<AbortAgentPromptWindowOutcome> {
             self.inner
                 .abort_agent_prompt_window(run_id, window_id, aborted_at)
+                .await
         }
 
-        fn clear_agent_prompt_window(
+        async fn clear_agent_prompt_window(
             &self,
             run_id: &str,
         ) -> CoreResult<Option<AgentPromptWindow>> {
-            self.inner.clear_agent_prompt_window(run_id)
+            self.inner.clear_agent_prompt_window(run_id).await
         }
     }
 
-    impl cowboy_workflow_core::RunStore for FakeStore {
-        fn save_run(&self, _run: &WorkflowRun) -> CoreResult<()> {
-            Ok(())
-        }
-
-        fn load_run(&self, _run_id: &cowboy_workflow_core::RunId) -> CoreResult<WorkflowRun> {
-            Err(WorkflowError::InvalidAction("unused".to_string()))
-        }
-
-        fn list_runs(&self) -> CoreResult<Vec<RunHead>> {
-            Ok(Vec::new())
-        }
-
-        fn put_object<T: Serialize>(
-            &self,
-            _kind: ObjectKind,
-            _value: &T,
-        ) -> CoreResult<ObjectHash> {
-            Ok("hash".to_string())
-        }
-
-        fn get_object<T: DeserializeOwned>(&self, _hash: &ObjectHash) -> CoreResult<T> {
-            Err(WorkflowError::InvalidAction("unused".to_string()))
-        }
-
-        fn update_run_head(&self, _run_id: &str, _head: RunHead) -> CoreResult<()> {
-            Ok(())
-        }
-
-        fn load_run_head(&self, _run_id: &str) -> CoreResult<RunHead> {
-            Err(WorkflowError::InvalidAction("unused".to_string()))
-        }
-
-        fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
+    #[async_trait]
+    impl AgentSessionStore for FakeStore {
+        async fn save_role_session(&self, session: RoleSession) -> CoreResult<()> {
             self.save_history.lock().push(session.clone());
             self.sessions
                 .lock()
@@ -1718,7 +1740,7 @@ mod tests {
             Ok(())
         }
 
-        fn load_role_session(
+        async fn load_role_session(
             &self,
             run_id: &str,
             role_id: &str,
@@ -1730,14 +1752,17 @@ mod tests {
                 .cloned())
         }
 
-        fn delete_role_sessions(&self, run_id: &str) -> CoreResult<()> {
+        async fn delete_role_sessions(&self, run_id: &str) -> CoreResult<()> {
             self.sessions
                 .lock()
                 .retain(|(stored_run, _), _| stored_run != run_id);
             Ok(())
         }
+    }
 
-        fn append_turn(
+    #[async_trait]
+    impl TurnStore for FakeStore {
+        async fn append_turn(
             &self,
             _run_id: &str,
             _turn: cowboy_workflow_core::TurnRecord,
@@ -1745,11 +1770,22 @@ mod tests {
             Ok("turn".to_string())
         }
 
-        fn load_user_prompts(&self, _run_id: &str) -> CoreResult<Vec<RunUserPrompt>> {
-            Ok(self.accepted_prompts.lock().clone())
+        async fn load_turn(&self, _hash: &ObjectHash) -> CoreResult<TurnRecord> {
+            Err(WorkflowError::InvalidAction("unused".to_string()))
         }
 
-        fn append_user_prompt(
+        async fn load_turns(
+            &self,
+            _run_id: &str,
+            _step_record_id: &str,
+        ) -> CoreResult<Vec<TurnRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl PromptWindowStore for FakeStore {
+        async fn append_user_prompt(
             &self,
             _run_id: &str,
             window_id: &str,
@@ -1775,7 +1811,7 @@ mod tests {
             Ok(AppendUserPromptOutcome::Accepted(prompt))
         }
 
-        fn open_agent_prompt_window(
+        async fn open_agent_prompt_window(
             &self,
             window: AgentPromptWindow,
         ) -> CoreResult<OpenAgentPromptWindowOutcome> {
@@ -1783,7 +1819,7 @@ mod tests {
             Ok(OpenAgentPromptWindowOutcome::Opened(window))
         }
 
-        fn compare_and_seal_agent_prompt_window(
+        async fn compare_and_seal_agent_prompt_window(
             &self,
             _run_id: &str,
             window_id: &str,
@@ -1817,7 +1853,7 @@ mod tests {
             Ok(CompareAndSealPromptWindowOutcome::Sealed(active.clone()))
         }
 
-        fn abort_agent_prompt_window(
+        async fn abort_agent_prompt_window(
             &self,
             _run_id: &str,
             window_id: &str,
@@ -1834,7 +1870,7 @@ mod tests {
             Ok(AbortAgentPromptWindowOutcome::Aborted(active.clone()))
         }
 
-        fn clear_agent_prompt_window(
+        async fn clear_agent_prompt_window(
             &self,
             _run_id: &str,
         ) -> CoreResult<Option<AgentPromptWindow>> {
@@ -2568,6 +2604,7 @@ mod tests {
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
             })
+            .await
             .unwrap();
         let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
 
@@ -2580,6 +2617,7 @@ mod tests {
             execution.record.detail.session_id.as_deref(),
             Some("persisted-session")
         );
+        println!("EVIDENCE agent-session persisted_load=true");
     }
 
     #[tokio::test]
@@ -2735,6 +2773,7 @@ mod tests {
 
         let first = match store
             .append_user_prompt("run", &window_id, "first follow-up".to_string())
+            .await
             .unwrap()
         {
             AppendUserPromptOutcome::Accepted(prompt) => prompt,
@@ -2742,6 +2781,7 @@ mod tests {
         };
         let second = match store
             .append_user_prompt("run", &window_id, "second follow-up".to_string())
+            .await
             .unwrap()
         {
             AppendUserPromptOutcome::Accepted(prompt) => prompt,
@@ -2789,6 +2829,7 @@ mod tests {
 
         let third = match store
             .append_user_prompt("run", &window_id, "third follow-up".to_string())
+            .await
             .unwrap()
         {
             AppendUserPromptOutcome::Accepted(prompt) => prompt,
@@ -2929,6 +2970,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|window| !window.is_open())
         );
+        println!("EVIDENCE agent-prompt-cleanup success=true backend_error=true");
     }
 
     #[tokio::test]
@@ -2977,6 +3019,21 @@ mod tests {
         execution.abort();
         assert!(execution.await.unwrap_err().is_cancelled());
         assert!(controls.is_empty());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store
+                    .window
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|window| !window.is_open())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped execution should durably abort its prompt window");
         assert!(
             store
                 .window
@@ -2984,6 +3041,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|window| !window.is_open())
         );
+        println!("EVIDENCE agent-drop control_removed=true window_aborted=true");
     }
 
     #[tokio::test]
@@ -3235,8 +3293,11 @@ still applies, got non-recoverable: {error:?}"
     async fn ensure_session_fresh_then_reused() {
         let store = SharedFakeStore::default();
         let store_handle = store.clone();
-        let executor =
-            AgentExecutor::new(FakeFactory::default(), store, AgentExecutionConfig::default());
+        let executor = AgentExecutor::new(
+            FakeFactory::default(),
+            store,
+            AgentExecutionConfig::default(),
+        );
         let key = RoleSessionKey {
             run_id: "run".into(),
             role_id: "developer".into(),
@@ -3251,6 +3312,7 @@ still applies, got non-recoverable: {error:?}"
         assert!(acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert!(!stored.role_instructions_sent);
@@ -3266,16 +3328,19 @@ still applies, got non-recoverable: {error:?}"
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(3),
             })
+            .await
             .unwrap();
 
         let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
         assert!(!acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert!(stored.role_instructions_sent);
         assert_eq!(stored.last_sent_input_sequence, Some(3));
+        println!("EVIDENCE agent-session fresh=true reused=true");
     }
 
     #[tokio::test]
@@ -3296,24 +3361,27 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap();
 
-        let calls = prompt_calls.lock();
-        assert_eq!(calls.len(), 2);
-        let first = &calls[0][0].text;
-        let second = &calls[1][0].text;
-        assert!(first.contains("Instructions for developer"));
-        assert!(!second.contains("Instructions for developer"));
-        assert!(first.contains("Do work"));
-        assert!(second.contains("Do work"));
-        assert!(first.contains("valid YAML frontmatter"));
-        assert!(second.contains("valid YAML frontmatter"));
-        drop(calls);
+        {
+            let calls = prompt_calls.lock();
+            assert_eq!(calls.len(), 2);
+            let first = &calls[0][0].text;
+            let second = &calls[1][0].text;
+            assert!(first.contains("Instructions for developer"));
+            assert!(!second.contains("Instructions for developer"));
+            assert!(first.contains("Do work"));
+            assert!(second.contains("Do work"));
+            assert!(first.contains("valid YAML frontmatter"));
+            assert!(second.contains("valid YAML frontmatter"));
+        }
 
         let stored = store_handle
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert!(stored.role_instructions_sent);
         assert_eq!(stored.last_sent_input_sequence, Some(0));
+        println!("EVIDENCE agent-watermark advanced=true role_resent=false");
     }
 
     #[tokio::test]
@@ -3364,6 +3432,7 @@ still applies, got non-recoverable: {error:?}"
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
             })
+            .await
             .unwrap();
         let factory = FakeFactory::new(vec![FakeClient::with_load(vec![event()])]);
         let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
@@ -3375,6 +3444,7 @@ still applies, got non-recoverable: {error:?}"
 
         let stored = store_handle
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert!(stored.role_instructions_sent);
@@ -3397,9 +3467,10 @@ still applies, got non-recoverable: {error:?}"
             role_instructions_sent: true,
             last_sent_input_sequence: Some(2),
         };
-        store.save_role_session(session.clone()).unwrap();
+        store.save_role_session(session.clone()).await.unwrap();
         let loaded = clone
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert_eq!(loaded, session);
@@ -3465,6 +3536,7 @@ still applies, got non-recoverable: {error:?}"
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(1),
             })
+            .await
             .unwrap();
         let seeded_saves = store_handle.inner.save_history.lock().len();
 
@@ -3535,6 +3607,7 @@ still applies, got non-recoverable: {error:?}"
 
         let after_first = store_handle
             .load_role_session("run", "developer")
+            .await
             .unwrap()
             .unwrap();
         assert!(after_first.role_instructions_sent);

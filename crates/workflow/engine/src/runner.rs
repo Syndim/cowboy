@@ -2,10 +2,10 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    ActionDispatcher, Result, RunStatus, RunStore, RunUserPrompt, RunnerLimits, StepAction,
-    StepActionProvider, StepDefinition, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun,
-    WorkflowSourceSnapshot, apply_run_status, execute_step, ordered_user_inputs,
-    retry_current_step,
+    ActionDispatcher, Result, RunStatus, RunUserPrompt, RunnerLimits, StepAction,
+    StepActionProvider, StepDefinition, StepRecord, UserPromptStore, WorkflowDefinition,
+    WorkflowError, WorkflowObjectStore, WorkflowRun, WorkflowSourceSnapshot, WorkflowStateStore,
+    apply_run_status, execute_step, ordered_user_inputs, retry_current_step,
 };
 use serde_json::{Value, json};
 
@@ -101,7 +101,7 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
 
 impl<S, E, P> WorkflowRunner<S, E, P>
 where
-    S: RunStore,
+    S: WorkflowStateStore + WorkflowObjectStore + UserPromptStore,
     E: ActionDispatcher,
     P: StepActionProvider,
 {
@@ -122,7 +122,7 @@ where
             }
         }
 
-        self.close_active_window(&mut run)?;
+        self.close_active_window(&mut run).await?;
         execution?;
         Ok(run)
     }
@@ -144,14 +144,14 @@ where
             execution = Err(err);
         }
 
-        self.close_active_window(&mut run)?;
+        self.close_active_window(&mut run).await?;
         execution?;
         Ok(run)
     }
 
-    fn close_active_window(&self, run: &mut WorkflowRun) -> Result<()> {
+    async fn close_active_window(&self, run: &mut WorkflowRun) -> Result<()> {
         if let Some(clock) = &self.active_clock {
-            clock.close(&self.store, run)?;
+            clock.close(&self.store, run).await?;
         }
 
         Ok(())
@@ -195,7 +195,8 @@ where
                         RunStatus::Failed {
                             reason: reason.clone(),
                         },
-                    );
+                    )
+                    .await;
                     self.events.emit(
                         self.workflow_event_for_run(run, WorkflowEventKind::RunFailed { reason }),
                     );
@@ -207,7 +208,7 @@ where
         if run.head != previous_head
             && let Some(head) = &run.head
         {
-            let record = self.store.get_object::<StepRecord>(head)?;
+            let record = self.store.load_step_record(head).await?;
             self.events.emit(self.step_completed_event(run, &record));
         }
         self.events
@@ -247,7 +248,7 @@ where
                 .entry(step_id.to_string())
                 .or_default() += 1;
             run.updated_at = Utc::now();
-            self.store.save_run(run)?;
+            self.store.save_run(run).await?;
 
             let attempt = u64::from(retry_index) + 1;
             self.events.emit(self.workflow_event_for_run(
@@ -389,11 +390,10 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionDispatcher, ActionResult, ObjectHash, ObjectKind, RunHead, RunnerLimits,
-        StatusAction, StepDetail, StepInput, StepOutput, TurnRecord,
+        ActionDispatcher, ActionResult, ObjectHash, RunHead, RunnerLimits, StatusAction,
+        StepDetail, StepInput, StepOutput,
     };
     use parking_lot::Mutex;
-    use serde::{Serialize, de::DeserializeOwned};
     use serde_json::Value;
 
     use super::*;
@@ -405,13 +405,17 @@ mod tests {
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     }
 
-    impl RunStore for MemoryStore {
-        fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+    #[async_trait]
+    impl WorkflowStateStore for MemoryStore {
+        async fn save_run(&self, run: &WorkflowRun) -> Result<()> {
             self.runs.lock().insert(run.id.clone(), run.clone());
+            self.heads
+                .lock()
+                .insert(run.id.clone(), RunHead::from_run(run));
             Ok(())
         }
 
-        fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> Result<WorkflowRun> {
+        async fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> Result<WorkflowRun> {
             self.runs
                 .lock()
                 .get(run_id)
@@ -419,18 +423,55 @@ mod tests {
                 .ok_or_else(|| WorkflowError::InvalidAction("missing run".to_string()))
         }
 
-        fn list_runs(&self) -> Result<Vec<RunHead>> {
+        async fn list_runs(&self) -> Result<Vec<RunHead>> {
             Ok(self.heads.lock().values().cloned().collect())
         }
 
-        fn put_object<T: Serialize>(&self, _kind: ObjectKind, value: &T) -> Result<ObjectHash> {
+        async fn load_run_head(&self, run_id: &str) -> Result<RunHead> {
+            self.heads
+                .lock()
+                .get(run_id)
+                .cloned()
+                .ok_or_else(|| WorkflowError::InvalidAction("missing head".to_string()))
+        }
+
+        async fn commit_completed_step(
+            &self,
+            run: &WorkflowRun,
+            record: &StepRecord,
+        ) -> Result<ObjectHash> {
+            let bytes = serde_json::to_vec(record).unwrap();
+            let hash = format!("hash-{}", self.objects.lock().len() + 1);
+            self.objects.lock().insert(hash.clone(), bytes);
+            let mut stored_run = run.clone();
+            stored_run.head = Some(hash.clone());
+            self.save_run(&stored_run).await?;
+            Ok(hash)
+        }
+
+        async fn delete_run(&self, run_id: &str) -> Result<()> {
+            self.runs.lock().remove(run_id);
+            self.heads.lock().remove(run_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowObjectStore for MemoryStore {
+        async fn store_workflow_source_snapshot(
+            &self,
+            value: &WorkflowSourceSnapshot,
+        ) -> Result<ObjectHash> {
             let bytes = serde_json::to_vec(value).unwrap();
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
             self.objects.lock().insert(hash.clone(), bytes);
             Ok(hash)
         }
 
-        fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> Result<T> {
+        async fn load_workflow_source_snapshot(
+            &self,
+            hash: &ObjectHash,
+        ) -> Result<WorkflowSourceSnapshot> {
             let bytes = self
                 .objects
                 .lock()
@@ -440,96 +481,36 @@ mod tests {
             Ok(serde_json::from_slice(&bytes).unwrap())
         }
 
-        fn update_run_head(&self, run_id: &str, head: RunHead) -> Result<()> {
-            self.heads.lock().insert(run_id.to_string(), head);
-            Ok(())
+        async fn store_step_record(&self, value: &StepRecord) -> Result<ObjectHash> {
+            let bytes = serde_json::to_vec(value).unwrap();
+            let hash = format!("hash-{}", self.objects.lock().len() + 1);
+            self.objects.lock().insert(hash.clone(), bytes);
+            Ok(hash)
         }
 
-        fn load_run_head(&self, run_id: &str) -> Result<RunHead> {
-            self.heads
+        async fn load_step_record(&self, hash: &ObjectHash) -> Result<StepRecord> {
+            let bytes = self
+                .objects
                 .lock()
-                .get(run_id)
+                .get(hash)
                 .cloned()
-                .ok_or_else(|| WorkflowError::InvalidAction("missing head".to_string()))
+                .ok_or_else(|| WorkflowError::InvalidAction("missing object".to_string()))?;
+            Ok(serde_json::from_slice(&bytes).unwrap())
         }
 
-        fn save_role_session(&self, _session: cowboy_workflow_core::RoleSession) -> Result<()> {
+        async fn delete_object(&self, hash: &ObjectHash) -> Result<()> {
+            self.objects.lock().remove(hash);
             Ok(())
         }
+    }
 
-        fn load_role_session(
-            &self,
-            _run_id: &str,
-            _role_id: &str,
-        ) -> Result<Option<cowboy_workflow_core::RoleSession>> {
-            Ok(None)
-        }
-
-        fn delete_role_sessions(&self, _run_id: &str) -> Result<()> {
-            Ok(())
-        }
-
-        fn append_turn(&self, _run_id: &str, _turn: TurnRecord) -> Result<ObjectHash> {
-            Ok("turn".to_string())
-        }
-
-        fn load_user_prompts(
+    #[async_trait]
+    impl UserPromptStore for MemoryStore {
+        async fn load_user_prompts(
             &self,
             _run_id: &str,
         ) -> Result<Vec<cowboy_workflow_core::RunUserPrompt>> {
             Ok(Vec::new())
-        }
-
-        fn open_agent_prompt_window(
-            &self,
-            _window: cowboy_workflow_core::AgentPromptWindow,
-        ) -> Result<cowboy_workflow_core::OpenAgentPromptWindowOutcome> {
-            Err(WorkflowError::InvalidAction(
-                "runner test store does not execute agent prompt windows".to_string(),
-            ))
-        }
-
-        fn append_user_prompt(
-            &self,
-            _run_id: &str,
-            _window_id: &str,
-            _content: String,
-        ) -> Result<cowboy_workflow_core::AppendUserPromptOutcome> {
-            Err(WorkflowError::InvalidAction(
-                "runner test store does not accept agent prompts".to_string(),
-            ))
-        }
-
-        fn compare_and_seal_agent_prompt_window(
-            &self,
-            _run_id: &str,
-            _window_id: &str,
-            _applied_sequence: u64,
-            _sealed_at: chrono::DateTime<Utc>,
-        ) -> Result<cowboy_workflow_core::CompareAndSealPromptWindowOutcome> {
-            Err(WorkflowError::InvalidAction(
-                "runner test store does not execute agent prompt windows".to_string(),
-            ))
-        }
-
-        fn abort_agent_prompt_window(
-            &self,
-            _run_id: &str,
-            _window_id: &str,
-            _aborted_at: chrono::DateTime<Utc>,
-        ) -> Result<cowboy_workflow_core::AbortAgentPromptWindowOutcome> {
-            Err(WorkflowError::InvalidAction(
-                "runner test store does not execute agent prompt windows".to_string(),
-            ))
-        }
-
-        fn clear_agent_prompt_window(
-            &self,
-            _run_id: &str,
-        ) -> Result<Option<cowboy_workflow_core::AgentPromptWindow>> {
-            Err(WorkflowError::InvalidAction(
-                "runner test store does not execute agent prompt windows".to_string(),
-            ))
         }
     }
 
@@ -667,7 +648,7 @@ mod tests {
         ) -> Result<ActionResult> {
             *self.dispatches.lock() += 1;
             if context.attempt > 1 {
-                let persisted = self.store.load_run(&context.run_id)?;
+                let persisted = self.store.load_run(&context.run_id).await?;
                 assert_eq!(persisted.retries_used, 1);
                 assert_eq!(persisted.step_retries_used[&context.step_id], 1);
             }
@@ -941,7 +922,7 @@ mod tests {
 
         assert_eq!(run.status, RunStatus::Completed);
         let head = run.head.as_ref().expect("final step should be persisted");
-        let record = runner.store().get_object::<StepRecord>(head).unwrap();
+        let record = runner.store().load_step_record(head).await.unwrap();
         let output = record.output.expect("final step should have output");
         assert_eq!(output.status, "success");
         assert_eq!(output.fields["previous_step"], "start");
@@ -949,10 +930,11 @@ mod tests {
         assert_eq!(output.fields["summary"], "planned");
         assert_eq!(output.fields["first_file"], "AGENTS.md");
         assert_eq!(output.body, "plan body");
+        println!("EVIDENCE runner-prev output_exposed=true");
     }
 
-    #[test]
-    fn lua_provider_returns_action_from_snapshot() {
+    #[tokio::test]
+    async fn lua_provider_returns_action_from_snapshot() {
         let provider = LuaStepActionProvider::new(WorkflowSourceSnapshot {
             root: None,
             entry: "main.lua".to_string(),
@@ -988,8 +970,8 @@ mod tests {
         assert_eq!(action.body, "do it");
     }
 
-    #[test]
-    fn lua_provider_exposes_ordered_user_inputs_without_changing_request() {
+    #[tokio::test]
+    async fn lua_provider_exposes_ordered_user_inputs_without_changing_request() {
         let provider = LuaStepActionProvider::new(WorkflowSourceSnapshot {
             root: None,
             entry: "main.lua".to_string(),
@@ -1090,7 +1072,7 @@ mod tests {
 
         assert_eq!(run.status, RunStatus::Completed);
         let head = run.head.as_ref().expect("final step should be persisted");
-        let record = runner.store().get_object::<StepRecord>(head).unwrap();
+        let record = runner.store().load_step_record(head).await.unwrap();
         let output = record.output.expect("final step should have output");
         assert_eq!(output.body, std::env::consts::OS);
     }
@@ -1230,7 +1212,7 @@ mod tests {
         // Initial attempt + 2 retries.
         assert_eq!(*dispatches.lock(), 3);
 
-        let stored = runner.store().load_run(&"run-1".to_string()).unwrap();
+        let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert!(matches!(stored.status, RunStatus::Failed { .. }));
         // The failed step stays current so it can be resolved manually.
         assert_eq!(stored.current_step, "agent");
@@ -1288,7 +1270,7 @@ mod tests {
         // No retry attempted for a non-recoverable error.
         assert_eq!(*dispatches.lock(), 1);
 
-        let stored = runner.store().load_run(&"run-1".to_string()).unwrap();
+        let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert!(matches!(stored.status, RunStatus::Failed { .. }));
         assert_eq!(stored.retries_used, 0);
         assert!(stored.step_retries_used.is_empty());
@@ -1329,7 +1311,7 @@ mod tests {
         assert!(err.to_string().contains("exhausted run retry budget"));
         assert!(err.to_string().contains("0/0 retries used"));
         assert_eq!(*dispatches.lock(), 1);
-        let stored = runner.store().load_run(&"run-1".to_string()).unwrap();
+        let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert_eq!(stored.retries_used, 0);
         assert!(stored.step_retries_used.is_empty());
     }
@@ -1420,6 +1402,7 @@ mod tests {
         let stored = second_runner
             .store()
             .load_run(&"run-1".to_string())
+            .await
             .unwrap();
         assert_eq!(stored.step_retries_used["agent"], 2);
     }
@@ -1446,9 +1429,10 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(*first_dispatches.lock(), 2);
-        let persisted = store.load_run(&"run-1".to_string()).unwrap();
+        let persisted = store.load_run(&"run-1".to_string()).await.unwrap();
         assert_eq!(persisted.retries_used, 1);
         assert_eq!(persisted.step_retries_used["agent"], 1);
+        println!("EVIDENCE runner-retry reserved_before_dispatch=true");
     }
 
     async fn reconstructed_retry_failure(
@@ -1466,8 +1450,8 @@ mod tests {
         persisted
             .step_retries_used
             .insert("agent".to_string(), step_retries_used);
-        store.save_run(&persisted).unwrap();
-        let reloaded = store.load_run(&persisted.id).unwrap();
+        store.save_run(&persisted).await.unwrap();
+        let reloaded = store.load_run(&persisted.id).await.unwrap();
 
         let dispatches = Arc::new(Mutex::new(0));
         let reconstructed = WorkflowRunner::new(
@@ -1569,8 +1553,8 @@ mod tests {
         assert!(err.contains("config set \"default\""), "{err}");
         assert!(!err.contains("careful"), "{err}");
     }
-    #[test]
-    fn maximum_u32_retry_allowance_has_representable_attempt_bounds() {
+    #[tokio::test]
+    async fn maximum_u32_retry_allowance_has_representable_attempt_bounds() {
         let (allowance, max_attempts) = retry_visit_bounds(u32::MAX, u32::MAX);
 
         assert_eq!(allowance, u32::MAX);

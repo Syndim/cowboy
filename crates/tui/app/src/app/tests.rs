@@ -18,7 +18,7 @@ fn test_state() -> AppState {
     let dir = tempfile::tempdir().unwrap();
     AppState::new(AppConfig {
         state_dir: dir.path().to_path_buf(),
-        workflow_store: dir.path().join("workflow.redb"),
+        workflow_store: dir.path().join("data.db"),
         config_sets: std::collections::BTreeMap::from([(
             "default".to_string(),
             crate::config::ConfigSetConfig {
@@ -187,7 +187,7 @@ impl Backend for CursorVisibilityProbeBackend {
 fn idle_draw_hides_debug_paths() {
     let dir = tempfile::tempdir().unwrap();
     let state_dir = dir.path().join("visible-state-dir");
-    let workflow_store = dir.path().join("visible-workflow.redb");
+    let workflow_store = dir.path().join("visible-data.db");
     let state = AppState::new(AppConfig {
         state_dir: state_dir.clone(),
         workflow_store: workflow_store.clone(),
@@ -206,7 +206,7 @@ fn idle_draw_hides_debug_paths() {
 
     assert!(rendered.contains("No workflow transcript yet."));
     assert!(!rendered.contains("visible-state-dir"));
-    assert!(!rendered.contains("visible-workflow.redb"));
+    assert!(!rendered.contains("visible-data.db"));
     assert!(!rendered.contains(state_dir.to_string_lossy().as_ref()));
     assert!(!rendered.contains(workflow_store.to_string_lossy().as_ref()));
 }
@@ -1118,7 +1118,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
     .unwrap();
     let config = AppConfig {
         state_dir: dir.path().join("state"),
-        workflow_store: dir.path().join("state/workflow.redb"),
+        workflow_store: dir.path().join("state/data.db"),
         workflow_dirs: vec![workflow_dir],
         config_sets: std::collections::BTreeMap::from([(
             "default".to_string(),
@@ -1131,6 +1131,8 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         ..AppConfig::default()
     };
     let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+        .await
+        .unwrap()
         .with_deterministic_selector();
     let start = runtime
         .start_run_with_workflow("ask", "needs approval")
@@ -1144,7 +1146,16 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
     let mut state = AppState::new(config);
     state.spawn_test_card_report_task("seed waiting run".to_string(), async move { Ok(start) });
     tokio::task::yield_now().await;
-    assert!(state.drain_background_tasks().await);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state.drain_background_tasks().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("answer task should complete");
     assert_eq!(
         state.pending_prompt_answer_target(),
         Some((run_id.clone(), "approval".to_string()))
@@ -1165,8 +1176,16 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
     assert!(state.composer_accepts_edits());
     assert!(!state.composer_accepts_submit());
 
-    tokio::task::yield_now().await;
-    assert!(state.drain_background_tasks().await);
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state.drain_background_tasks().await {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("answer task should complete");
     assert_eq!(state.background_task_count(), 0);
     assert_eq!(state.display_state(), "completed");
     assert!(state.composer_accepts_submit());

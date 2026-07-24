@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     /// Directory for app/session state.
     pub state_dir: PathBuf,
-    /// Redb file that will back workflow run storage once the runner is wired in.
+    /// SQLite database that stores workflow runtime state.
     pub workflow_store: PathBuf,
     /// Named workflow runner policies. The built-in `default` set is always present.
     ///
@@ -164,7 +164,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         let state_dir = state_root();
         Self {
-            workflow_store: state_dir.join("workflow.redb"),
+            workflow_store: state_dir.join("data.db"),
             state_dir,
             config_sets: default_config_sets(),
             workflow_dirs: vec![config_root().join("workflows")],
@@ -359,7 +359,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_config_uses_default_config_set() {
+    fn missing_config_uses_sqlite_store_default() {
         let dir = tempfile::tempdir().unwrap();
         let config = load_config(&dir.path().join("missing.toml")).unwrap();
         assert_eq!(config.config_sets.len(), 1);
@@ -377,6 +377,33 @@ mod tests {
         assert_eq!(config.agents[0].command, "copilot");
         assert_eq!(config.agents[0].watchdog, AgentWatchdogConfig::default());
         assert_eq!(config.mouse_scroll_lines, 3);
+        assert_eq!(config.workflow_store, config.state_dir.join("data.db"));
+        println!("EVIDENCE config-default workflow_store=data.db");
+    }
+
+    #[tokio::test]
+    async fn non_sqlite_store_file_is_rejected_without_modification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.redb");
+        let before = b"legacy-redb-placeholder\n".to_vec();
+        fs::write(&path, &before).unwrap();
+        let config = AppConfig {
+            state_dir: dir.path().join("state"),
+            workflow_store: path.clone(),
+            ..AppConfig::default()
+        };
+
+        let result = cowboy_workflow_engine::WorkflowRuntime::new(
+            config.runtime_config(dir.path().to_path_buf()),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("non-SQLite workflow store unexpectedly opened")
+        };
+
+        assert!(error.to_string().contains("not a SQLite database"));
+        assert_eq!(fs::read(path).unwrap(), before);
+        println!("EVIDENCE clean-cutover rejected=true bytes_unchanged=true");
     }
 
     #[test]

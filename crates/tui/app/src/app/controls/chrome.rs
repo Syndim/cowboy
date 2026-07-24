@@ -168,7 +168,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
-            workflow_store: dir.path().join("workflow.redb"),
+            workflow_store: dir.path().join("data.db"),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {

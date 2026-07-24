@@ -3,20 +3,21 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use cowboy_workflow_core::{
-    ObjectKind, RunHead, RunStatus, StepDetail, StepInput, StepOutput, StepRecord, TurnRecord,
-    WorkflowRun, WorkflowSourceSnapshot,
+    RunStatus, StepDetail, StepInput, StepOutput, StepRecord, TurnRecord, WorkflowRun,
+    WorkflowSourceSnapshot,
 };
-use cowboy_workflow_store::RedbRunStore;
+use cowboy_workflow_store::SqliteWorkflowStore;
 use serde_json::Value;
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(err) = run().await {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(db) = args.next() else {
         usage();
@@ -25,35 +26,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         usage();
     };
     let rest = args.collect::<Vec<_>>();
-    let store = open_store(db)?;
+    let store = open_store(db).await?;
 
     match command.as_str() {
         "save-run" => {
             require_len(&rest, 4)?;
             let run = sample_run(&rest[0], &rest[1], &rest[2], &rest[3]);
-            store.save_run(&run)?;
+            store.save_run(&run).await?;
             println!("saved run {}", run.id);
         }
         "load-run" => {
             require_len(&rest, 1)?;
-            let run = store.load_run(&rest[0])?;
+            let run = store.load_run(&rest[0]).await?;
             println!("{}", serde_json::to_string_pretty(&run)?);
         }
         "list-runs" => {
             require_len(&rest, 0)?;
-            for head in store.list_runs()? {
+            for head in store.list_runs().await? {
                 println!("{}", serde_json::to_string_pretty(&head)?);
             }
         }
         "put-step" => {
             require_len(&rest, 3)?;
             let record = sample_step(&rest[0], &rest[1], &rest[2]);
-            let hash = store.put_object(ObjectKind::StepRecord, &record)?;
+            let hash = store.store_step_record(&record).await?;
             println!("{hash}");
         }
         "get-step" => {
             require_len(&rest, 1)?;
-            let record: StepRecord = store.get_object(&rest[0])?;
+            let record = store.load_step_record(&rest[0]).await?;
             println!("{}", serde_json::to_string_pretty(&record)?);
         }
         "put-source" => {
@@ -63,25 +64,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 entry: rest[0].clone(),
                 files: [(rest[0].clone(), rest[1].clone())].into_iter().collect(),
             };
-            let hash = store.put_object(ObjectKind::WorkflowSourceSnapshot, &bundle)?;
+            let hash = store.store_workflow_source_snapshot(&bundle).await?;
             println!("{hash}");
-        }
-        "save-head" => {
-            require_len(&rest, 4)?;
-            let head = RunHead {
-                run_id: rest[0].clone(),
-                workflow_hash: rest[1].clone(),
-                head_step: none_if_dash(&rest[2]),
-                status: parse_status(&rest[3]),
-                updated_at: Utc::now(),
-                summary: None,
-            };
-            store.update_run_head(&head.run_id, head.clone())?;
-            println!("saved head {}", head.run_id);
         }
         "load-head" => {
             require_len(&rest, 1)?;
-            let head = store.load_run_head(&rest[0])?;
+            let head = store.load_run_head(&rest[0]).await?;
             println!("{}", serde_json::to_string_pretty(&head)?);
         }
         "append-turn" => {
@@ -94,17 +82,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 timestamp: Utc::now(),
                 prev: None,
             };
-            let hash = store.append_turn(&rest[0], turn)?;
+            let hash = store.append_turn(&rest[0], turn).await?;
             println!("{hash}");
         }
         "delete-run" => {
             require_len(&rest, 1)?;
-            store.delete_run(&rest[0])?;
+            store.delete_run(&rest[0]).await?;
             println!("deleted run {}", rest[0]);
         }
         "delete-object" => {
             require_len(&rest, 1)?;
-            store.delete_object(&rest[0])?;
+            store.delete_object(&rest[0]).await?;
             println!("deleted object {}", rest[0]);
         }
         _ => usage(),
@@ -112,13 +100,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn open_store(path: String) -> Result<RedbRunStore, Box<dyn std::error::Error>> {
+async fn open_store(path: String) -> Result<SqliteWorkflowStore, Box<dyn std::error::Error>> {
     let path = PathBuf::from(path);
-    if path.exists() {
-        Ok(RedbRunStore::open(path)?)
-    } else {
-        Ok(RedbRunStore::create(path)?)
-    }
+    Ok(SqliteWorkflowStore::connect(path).await?)
 }
 
 fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str) -> WorkflowRun {
@@ -175,28 +159,6 @@ fn sample_step(id: &str, step: &str, status: &str) -> StepRecord {
     }
 }
 
-fn parse_status(status: &str) -> RunStatus {
-    match status {
-        "running" => RunStatus::Running,
-        "completed" => RunStatus::Completed,
-        "cancelled" => RunStatus::Cancelled,
-        value if value.starts_with("failed:") => RunStatus::Failed {
-            reason: value.trim_start_matches("failed:").to_string(),
-        },
-        other => RunStatus::Failed {
-            reason: format!("unknown status argument: {other}"),
-        },
-    }
-}
-
-fn none_if_dash(value: &str) -> Option<String> {
-    if value == "-" {
-        None
-    } else {
-        Some(value.to_string())
-    }
-}
-
 fn require_len(args: &[String], expected: usize) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != expected {
         usage();
@@ -206,7 +168,7 @@ fn require_len(args: &[String], expected: usize) -> Result<(), Box<dyn std::erro
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  store-cli <db> save-run <run-id> <workflow> <workflow-hash> <current-step>\n  store-cli <db> load-run <run-id>\n  store-cli <db> list-runs\n  store-cli <db> put-step <record-id> <step-id> <status>\n  store-cli <db> get-step <hash>\n  store-cli <db> put-source <entry> <source>\n  store-cli <db> save-head <run-id> <workflow-hash> <head-hash|-> <running|completed|cancelled|failed:reason>\n  store-cli <db> load-head <run-id>\n  store-cli <db> append-turn <run-id> <step-record-id> <turn-id> <content>\n  store-cli <db> delete-run <run-id>\n  store-cli <db> delete-object <hash>"
+        "usage:\n  store-cli <db> save-run <run-id> <workflow> <workflow-hash> <current-step>\n  store-cli <db> load-run <run-id>\n  store-cli <db> list-runs\n  store-cli <db> put-step <record-id> <step-id> <status>\n  store-cli <db> get-step <hash>\n  store-cli <db> put-source <entry> <source>\n  store-cli <db> load-head <run-id>\n  store-cli <db> append-turn <run-id> <step-record-id> <turn-id> <content>\n  store-cli <db> delete-run <run-id>\n  store-cli <db> delete-object <hash>"
     );
     std::process::exit(2)
 }

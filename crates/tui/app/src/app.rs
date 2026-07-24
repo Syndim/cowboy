@@ -29,7 +29,7 @@ use state::AppState;
 /// Start the new workflow-first terminal shell.
 pub async fn run_tui(config: AppConfig) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let runtime = WorkflowRuntime::new(config.runtime_config(cwd));
+    let runtime = WorkflowRuntime::new(config.runtime_config(cwd)).await?;
     let events = runtime.events();
     let mut workflow_events = events.subscribe();
     let state = AppState::new(config);
@@ -82,7 +82,10 @@ fn finish_tui(
     out: &mut impl io::Write,
 ) -> Result<()> {
     guard.restore()?;
-    print_resume_hint(out, loop_result.as_ref().ok().and_then(|hint| hint.as_deref()))?;
+    print_resume_hint(
+        out,
+        loop_result.as_ref().ok().and_then(|hint| hint.as_deref()),
+    )?;
     loop_result.map(|_| ())
 }
 

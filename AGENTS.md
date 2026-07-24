@@ -26,7 +26,7 @@ Default config path: `${XDG_CONFIG_HOME:-~/.config}/cowboy/config.toml`.
 If no config exists, Cowboy uses defaults:
 
 - state dir: `${XDG_STATE_HOME:-~/.local/state}/cowboy`
-- workflow store: `${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`
+- workflow store: `${XDG_STATE_HOME:-~/.local/state}/cowboy/data.db`
 - agent command: `copilot --acp`
 - user workflows: `${XDG_CONFIG_HOME:-~/.config}/cowboy/workflows`
 
@@ -116,7 +116,7 @@ Keys currently supported:
 │   │   ├── core/                 # workflow model, traits, graph validation, execute_step
 │   │   ├── engine/               # product runtime used by CLI/TUI
 │   │   ├── lua/                  # sandboxed Lua workflow loader/runtime
-│   │   └── store/                # redb-backed RunStore
+│   │   └── store/                # SQLx/SQLite WorkflowStore implementation
 │   └── tui/
 │       ├── app/                  # cowboy package: CLI/config + ratatui shell only
 │       └── command-parser/       # CLI argv and interactive slash command grammar
@@ -190,7 +190,7 @@ Owns:
 - workflow event projection and event logs
 - ask-user answer routing through `ResumeRouter`
 - selector/summarizer adapters
-- runtime wiring for catalog, Lua, redb store, action dispatch, and ACP-backed agent execution
+- runtime wiring for catalog, Lua, SQLite store, action dispatch, and ACP-backed agent execution
 
 Important modules:
 
@@ -246,7 +246,7 @@ Owns:
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
 - `StepAction`: `agent`, `command`, `status`, `ask_user`, `fail`
 - `WorkflowRun`, durable name-only config-set pointer (`ConfigSetRef`) and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
-- `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, `RunStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
+- `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, async typed store capabilities and composite `WorkflowStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
 - `execute_step`, step/visit budget enforcement, and step-record/status application helpers
 
 Important modules:
@@ -260,7 +260,7 @@ Important modules:
 - `summary.rs` — workflow improvement/summary types.
 - `error.rs` — workflow errors.
 
-Core must stay independent of TUI, Lua, redb, ACP, and SDK/provider details.
+Core must stay independent of TUI, Lua, SQLite/SQLx, ACP, and SDK/provider details.
 
 ### `cowboy-workflow-lua` (`crates/workflow/lua`)
 
@@ -286,7 +286,7 @@ Important modules:
 
 ### `cowboy-workflow-store` (`crates/workflow/store`)
 
-redb-backed `RunStore` implementation.
+SQLx-backed SQLite implementation of the async `WorkflowStore` capabilities.
 
 Owns:
 
@@ -295,12 +295,15 @@ Owns:
 - immutable content-addressed objects
 - turn indexes
 - role sessions
+- user prompts and prompt windows
+- schema bootstrap/versioning, WAL, pooling, and cancellable busy/locked retry
 - low-level cleanup helpers
 
 Important modules:
 
-- `redb_store.rs` — redb-backed `RunStore`, object, turn, and role-session operations.
-- `tables.rs` — table definitions.
+- `sqlite_store.rs` — typed transactional workflow state, object, turn, session, and prompt operations.
+- `schema.rs` — schema version 1 bootstrap, validation, WAL, and SQLx pool policy.
+- `contract.rs` — reusable public-interface behavior tests.
 - `hash.rs` — content-addressed object hashing.
 - `error.rs` — store-specific errors.
 - `bin/store-cli.rs` — store inspection test app.
@@ -374,7 +377,7 @@ CLI argv or TUI composer input
   -> catalog loads/selects WorkflowSourceRef
   -> workflow-lua compiles/snapshots Lua source
   -> engine resolves the workflow config_set name (or default); limits are resolved live per operation
-  -> WorkflowRun is saved through RunStore
+  -> WorkflowRun is saved through async WorkflowStore capabilities
   -> WorkflowRunner loops execute_step until terminal/waiting/failed
   -> ActionDispatcher maps StepAction to ActionResult
   -> EventBus emits WorkflowEvent / StepProgress
@@ -396,7 +399,7 @@ WorkflowRun.current_step
        fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed stores a StepRecord and routes by output.status
   -> ActionResult::Blocked stores the run status
-  -> RunStore saves WorkflowRun + RunHead + objects
+  -> WorkflowStore transactions save WorkflowRun + RunHead + objects
 ```
 
 ### Resume / answer
@@ -440,7 +443,7 @@ Example `~/.config/cowboy/config.toml`:
 
 ```toml
 state_dir = "~/.local/state/cowboy"
-workflow_store = "~/.local/state/cowboy/workflow.redb"
+workflow_store = "~/.local/state/cowboy/data.db"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 
 [config_sets.default]
@@ -481,13 +484,11 @@ cumulative across a run and across repeated visits to one step id, so a raised
 limit adds budget without resetting accounting; events keep visit-local attempt
 numbering with a fixed per-visit `max_attempts`.
 
-This name-only persisted shape is a breaking change with no migration;
-pre-existing runs may be discarded. To reset the store, in order: (1) stop all
-Cowboy processes; (2) delete the configured `workflow_store` file (default
-`${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`, which MAY be
-configured to a path outside `state_dir`); (3) delete the `<state_dir>/events`
-directory (always under `state_dir`, default
-`${XDG_STATE_HOME:-~/.local/state}/cowboy/events`).
+SQLite is a clean persisted-store cutover with no automatic conversion of old
+store files. Preserve the old file and choose a new SQLite path, or stop all
+Cowboy processes before clearing the configured `workflow_store` file (default
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/data.db`, which MAY be configured
+outside `state_dir`). Event logs remain under `<state_dir>/events`.
 
 The config migration is a clean cutover: top-level `max_steps_per_run`,
 `max_visits_per_step`, and `max_retries_per_step` are rejected. Move them under
@@ -500,10 +501,16 @@ The config migration is a clean cutover: top-level `max_steps_per_run`,
 Cowboy stores workflow runtime state under `state_dir`:
 
 ```text
-workflow.redb                    # runs, run heads, immutable step/source/turn objects, role sessions
+data.db                          # SQLite runs, heads, objects, turns, sessions, and prompts
+data.db.locks/<run-id>.lock      # sidecar same-run execution guards
 events/<run-id>.json             # persisted workflow event log for display/debugging
 logs/cowboy.log                  # diagnostic log; level from COWBOY_LOG / RUST_LOG
 ```
+
+The SQLite store validates or creates schema version 1 before returning its
+cloneable SQLx pool, enables WAL, and uses async transactions for atomic
+run/head and completed-step persistence. Only busy/locked writes are retried;
+waits emit one sanitized notification and can be cancelled.
 
 The final `cowboy` binary defaults to `info` logging. Test apps default to
 `debug` because they are diagnostic tools. Override either with `COWBOY_LOG` or

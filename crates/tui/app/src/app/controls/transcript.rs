@@ -451,16 +451,13 @@ fn entry_tail_visual_rows(
         TranscriptEntry::Workflow {
             event,
             agent_descriptor,
-        } => stream_event_tail_visual_rows(
-            event,
-            agent_descriptor.clone(),
-            rows_needed,
-            wrap_width,
-        )
-        .unwrap_or_else(|| EntryVisualRows {
-            rows: entry.render_lines_for_width(wrap_width),
-            older_unmeasured: false,
-        }),
+        } => {
+            stream_event_tail_visual_rows(event, agent_descriptor.clone(), rows_needed, wrap_width)
+                .unwrap_or_else(|| EntryVisualRows {
+                    rows: entry.render_lines_for_width(wrap_width),
+                    older_unmeasured: false,
+                })
+        }
         TranscriptEntry::Card { .. } => EntryVisualRows {
             rows: entry.render_lines_for_width(wrap_width),
             older_unmeasured: false,
@@ -629,7 +626,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
-            workflow_store: dir.path().join("workflow.redb"),
+            workflow_store: dir.path().join("data.db"),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {

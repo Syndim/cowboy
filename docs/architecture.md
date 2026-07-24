@@ -31,7 +31,7 @@ process argv / slash composer input
 | `cowboy-workflow-catalog` | Built-in workflow source plus project/user `.lua` workflow catalog loading and update application. |
 | `cowboy-workflow-core` | Serializable workflow domain model, graph validation, `execute_step`, runner traits. |
 | `cowboy-workflow-lua` | Sandboxed Lua workflow loader and one-step runtime. |
-| `cowboy-workflow-store` | `redb`-backed `RunStore` for runs, run heads, immutable objects, turns, and role sessions. |
+| `cowboy-workflow-store` | SQLx/SQLite implementation of async typed `WorkflowStore` capabilities. |
 | `cowboy-workflow-agent` | Agent action executor, YAML-frontmatter output parsing, role-session reuse. |
 | `cowboy-agent-client` | Provider-neutral `Client` trait and normalized agent events/types. |
 | `cowboy-agent-acp` | ACP JSON-RPC client and stdio/Zellij transports implementing the agent client seam. |
@@ -79,7 +79,11 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - inactive legacy resume data retained for old serialized runs
 - step/visit counters and durable total/per-step retry counters
 
-`RunHead` is the small mutable pointer for quick lookup/resume. Immutable step/turn/source objects are stored by content hash in `cowboy-workflow-store`.
+`RunHead` is the small mutable pointer for quick lookup/resume. Immutable
+step/turn/source objects are stored by content hash. The core persistence seam is
+split into object-safe async capabilities for workflow state, objects, agent
+sessions, turns, user prompts, and prompt windows, with `WorkflowStore` as their
+composite.
 
 ### Step execution
 
@@ -105,8 +109,8 @@ current WorkflowRun
       status   -> StatusActionRunner -> completed StepRecord
       ask_user -> AskUserActionRunner -> WaitingForInput with ResumeCallback descriptor
       fail     -> FailActionRunner -> RunStatus::Failed
-  -> ActionResult::Completed -> apply_step_record stores record and routes by output.status
-  -> ActionResult::Blocked   -> apply_run_status persists waiting/failed status
+  -> ActionResult::Completed -> one transaction stores the record and advances run/head
+  -> ActionResult::Blocked   -> one transaction persists the run and derived head
   -> EventBus emits WorkflowEvent
 ```
 
@@ -160,7 +164,7 @@ consuming updates until the original `session/prompt` returns
 batch through compare-and-seal and sends the replacement `session/prompt`
 serially on the same session. If the active turn completes before cancellation
 is sent, the same compare-and-seal path provides the post-turn fallback. The
-redb append and compare-and-seal operations remain totally ordered: a prompt
+SQLite append and compare-and-seal transactions remain totally ordered: a prompt
 committed before seal is returned for another correction turn; a prompt
 serialized after seal is rejected. Cancellation, failure, retry, dropped
 futures, and guarded process recovery abort or replace stale window tokens and
@@ -222,12 +226,21 @@ No Lua coroutine or host-call replay cache is persisted.
 
 ### Event logs
 
-Run bodies live in `RunStore` (`workflow_store`, currently `redb`). Workflow
-events are persisted for display/debugging under:
+Run bodies live in the configured SQLite `WorkflowStore` (`workflow_store`,
+default `data.db`). The store bootstraps schema version 1, uses WAL and a
+bounded SQLx pool, and retries only SQLite busy/locked writes with cancellable
+async backoff. The first retry emits one sanitized `WorkflowStoreWaiting`
+event for CLI/TUI progress without exposing SQL or database paths. Per-run
+sidecar locks remain under `<workflow_store>.locks`, which is `data.db.locks`
+for the default database.
+Workflow events are persisted separately for display/debugging under:
 
 ```text
 <state_dir>/events/<run-id>.json
 ```
+
+Existing non-SQLite files are rejected without modification. There is no
+automatic conversion; preserve the old file and choose or clear a SQLite path.
 
 ## CLI
 

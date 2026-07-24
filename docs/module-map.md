@@ -16,7 +16,7 @@ Current workspace/module structure. The TUI app crate is intentionally thin; wor
 │   │   ├── catalog/         # built-in + filesystem workflow catalog
 │   │   ├── engine/          # product runtime used by UI/CLI
 │   │   ├── lua/             # sandboxed Lua workflow loader/runtime
-│   │   ├── store/           # redb-backed RunStore
+│   │   ├── store/           # SQLx/SQLite WorkflowStore implementation
 │   │   └── agent/           # agent action executor + output parsing
 │   └── tui/
 │       ├── app/             # cowboy CLI/TUI shell and ratatui controls
@@ -91,7 +91,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 Important seams:
 
 - `WorkflowRuntime` is the high-level application interface.
-- `WorkflowRunner<S, D, P>` depends on `RunStore`, `ActionDispatcher`, and `StepActionProvider`.
+- `WorkflowRunner<S, D, P>` depends on the async typed store capabilities it uses, plus `ActionDispatcher` and `StepActionProvider`.
 - `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
 - `ResumeRouter` does not mutate `WorkflowRun.resume`; it validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
@@ -128,7 +128,7 @@ Owns workflow domain data and pure execution rules.
 | `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `fail`. |
 | `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
-| `traits.rs` | Interfaces implemented by outer crates: loader, selector, executor, summarizer, run store. |
+| `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
 | `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, and step/visit budget enforcement. |
 | `error.rs` | `WorkflowError` and `Result`. |
 
@@ -151,15 +151,18 @@ Owns Lua workflow definition loading and step evaluation.
 
 ## Crate: `cowboy-workflow-store`
 
-Owns the first durable `RunStore` implementation.
+Owns the SQLx-backed SQLite implementation of the async `WorkflowStore`
+capabilities. Schema bootstrap/version checks happen before the cloneable pool is
+returned; writes use transactions and busy/locked retry with cancellation.
 
 | Module | Responsibility |
 | --- | --- |
-| `redb_store.rs` | `RedbRunStore`; saves runs, heads, role sessions, immutable objects, turn indexes. Cloneable handles share one redb `Database` to avoid reopening locks inside one runtime. |
+| `sqlite_store.rs` | `SqliteWorkflowStore`; typed transactional state, object, session, turn, prompt, and prompt-window operations. |
+| `schema.rs` | SQLite schema version 1 bootstrap, validation, WAL, and SQLx pool policy. |
+| `contract.rs` | Reusable public-interface behavioral tests. |
 | `hash.rs` | Canonical JSON object envelope and BLAKE3 object hashes. |
-| `tables.rs` | redb table definitions. |
 | `error.rs` | Store-specific errors mapped into core errors by the trait implementation. |
-| `bin/store-cli.rs` | Test app for saving/loading/deleting store objects and runs. |
+| `bin/store-cli.rs` | Async test app for saving/loading/deleting typed store objects and runs. |
 
 ## Crate: `cowboy-workflow-agent`
 
@@ -220,12 +223,12 @@ CLI/TUI command
   -> catalog chooses/loads workflow source
   -> workflow-lua compiles/snapshots workflow source
   -> engine resolves workflow config_set name (or default); limits resolved live per operation
-  -> WorkflowRun persisted through RunStore
+  -> WorkflowRun persisted through async WorkflowStore capabilities
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction
   -> ActionDispatcher/action runners handle initial StepAction values
   -> ResumeRouter dispatches waiting answers through ResumeCallbackRegistry
-  -> RunStore saves run/head/objects
+  -> WorkflowStore transactions save run/head/objects
   -> EventBus emits WorkflowEvent
   -> TUI renders events or CLI prints report
 ```

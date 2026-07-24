@@ -2,7 +2,7 @@
 # Use with: cargo run -p cowboy -- --config demo-config.toml <command>
 
 state_dir = ".cowboy/demo-state"
-workflow_store = ".cowboy/demo-state/workflow.redb"
+workflow_store = ".cowboy/demo-state/data.db"
 workflow_dirs = ["crates/workflow/engine/test_files"]
 mouse_scroll_lines = 3
 

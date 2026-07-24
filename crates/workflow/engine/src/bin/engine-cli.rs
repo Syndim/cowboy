@@ -1,6 +1,6 @@
 //! `engine-cli` — a playground for the `cowboy-workflow-engine` runtime.
 //!
-//! It drives a real `WorkflowRuntime` (catalog selection, redb persistence,
+//! It drives a real `WorkflowRuntime` (catalog selection, SQLite persistence,
 //! event projection, single-step / run-until-blocked, ask-user input) so the
 //! engine logic can be exercised from the shell without the full TUI.
 //!
@@ -67,11 +67,11 @@ async fn run() -> CliResult {
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else { usage() };
     let rest = args.collect::<Vec<_>>();
-    let rt = build_runtime()?;
+    let rt = build_runtime().await?;
 
     match command.as_str() {
         "catalog" => catalog(&rt)?,
-        "runs" => runs(&rt)?,
+        "runs" => runs(&rt).await?,
         "run" => {
             let request = joined_request(&rest);
             let report = run_with_live_events(&rt, || rt.start_run(request)).await?;
@@ -102,7 +102,7 @@ async fn run() -> CliResult {
         }
         "show" => {
             let [run_id] = rest.as_slice() else { usage() };
-            show(&rt, run_id)?;
+            show(&rt, run_id).await?;
         }
         "events" => {
             let [run_id] = rest.as_slice() else { usage() };
@@ -113,10 +113,10 @@ async fn run() -> CliResult {
     Ok(())
 }
 
-fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
+async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let state_dir = PathBuf::from(env_or("COWBOY_ENGINE_STATE", "engine-state"));
-    let workflow_store = state_dir.join("workflow.redb");
+    let workflow_store = state_dir.join("data.db");
     let workflow_dirs: Vec<PathBuf> = env::var("COWBOY_ENGINE_WORKFLOWS")
         .ok()
         .filter(|value| !value.is_empty())
@@ -161,7 +161,8 @@ fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> {
         workflow_dirs,
         vec![agent],
         BTreeMap::from([("default".to_string(), limits)]),
-    ));
+    ))
+    .await?;
     match selector.as_str() {
         "agent" => Ok(runtime),
         "deterministic" => Ok(runtime.with_deterministic_selector()),
@@ -224,8 +225,8 @@ fn catalog(rt: &WorkflowRuntime) -> CliResult {
     Ok(())
 }
 
-fn runs(rt: &WorkflowRuntime) -> CliResult {
-    let runs = rt.list_runs(None)?;
+async fn runs(rt: &WorkflowRuntime) -> CliResult {
+    let runs = rt.list_runs(None).await?;
     println!("runs ({})", runs.len());
     for run in &runs {
         print_run_summary(run);
@@ -269,8 +270,8 @@ fn print_run_summary(run: &RunSummaryLine) {
     }
 }
 
-fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
-    let run = rt.load_run(run_id)?;
+async fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
+    let run = rt.load_run(run_id).await?;
     println!("id:             {}", run.id);
     println!("workflow:       {}", run.workflow_name);
     println!("status:         {}", status_label(&run.status));

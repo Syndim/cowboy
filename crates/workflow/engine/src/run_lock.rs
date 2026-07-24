@@ -98,7 +98,7 @@ fn workflow_store_lock_dir(workflow_store: &Path) -> PathBuf {
     let file_name = workflow_store
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("workflow.redb");
+        .unwrap_or("data.db");
     workflow_store.with_file_name(format!("{file_name}.locks"))
 }
 
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn run_lock_rejects_same_run_in_process() {
         let dir = tempfile::tempdir().unwrap();
-        let locks = RunExecutionLocks::new(dir.path().join("state/workflow.redb"));
+        let locks = RunExecutionLocks::new(dir.path().join("state/data.db"));
         let run_id = "run-00000000-0000-0000-0000-000000000001";
         let _first = locks.acquire(run_id).unwrap();
 
@@ -135,23 +135,25 @@ mod tests {
 
         assert!(err.to_string().contains("already active"));
         assert!(!err.to_string().contains("redb"));
+        println!("EVIDENCE run-lock same_run=rejected");
     }
 
     #[test]
     fn run_lock_allows_different_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let locks = RunExecutionLocks::new(dir.path().join("state/workflow.redb"));
+        let locks = RunExecutionLocks::new(dir.path().join("state/data.db"));
         let first = "run-00000000-0000-0000-0000-000000000001";
         let second = "run-00000000-0000-0000-0000-000000000002";
 
         let _first = locks.acquire(first).unwrap();
         let _second = locks.acquire(second).unwrap();
+        println!("EVIDENCE run-lock different_runs=allowed");
     }
 
     #[test]
     fn run_lock_rejects_invalid_ids_before_creating_lock_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let workflow_store = dir.path().join("state/workflow.redb");
+        let workflow_store = dir.path().join("state/data.db");
         let locks = RunExecutionLocks::new(workflow_store);
 
         for run_id in [
@@ -165,28 +167,27 @@ mod tests {
         }
 
         assert!(!locks.lock_dir.exists());
+        println!("EVIDENCE run-lock invalid_id=rejected lock_dir_created=false");
     }
 
     #[test]
     fn run_lock_uses_canonical_uuid_filename_next_to_workflow_store() {
         let dir = tempfile::tempdir().unwrap();
-        let workflow_store = dir.path().join("shared/workflow.redb");
+        let workflow_store = dir.path().join("shared/data.db");
         let locks = RunExecutionLocks::new(workflow_store);
         let run_id = "run-00000000-0000-0000-0000-000000000001";
 
         let _guard = locks.acquire(run_id).unwrap();
 
-        assert_eq!(
-            locks.lock_dir,
-            dir.path().join("shared/workflow.redb.locks")
-        );
+        assert_eq!(locks.lock_dir, dir.path().join("shared/data.db.locks"));
         assert!(locks.lock_dir.join(format!("{run_id}.lock")).exists());
+        println!("EVIDENCE run-lock filename=canonical location=data.db.locks");
     }
 
     #[test]
     fn run_lock_namespace_follows_workflow_store_not_state_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let shared_store = dir.path().join("shared/workflow.redb");
+        let shared_store = dir.path().join("shared/data.db");
         let locks_a = RunExecutionLocks::new(shared_store.clone());
         let locks_b = RunExecutionLocks::new(shared_store);
         let run_id = "run-00000000-0000-0000-0000-000000000001";
@@ -195,5 +196,6 @@ mod tests {
         let err = locks_b.acquire(run_id).unwrap_err();
 
         assert!(err.to_string().contains("already active"));
+        println!("EVIDENCE run-lock namespace=workflow_store");
     }
 }

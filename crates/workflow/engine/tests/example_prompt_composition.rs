@@ -59,7 +59,7 @@ fn actual_example_lua_prompt_includes_each_user_input_once() {
             .contains("All entries below are cumulative user direction")
     );
 
-    let final_prompt = build_agent_prompt(role, &action, &user_inputs);
+    let final_prompt = build_agent_prompt(role, &action, &user_inputs, true);
     assert_eq!(
         final_prompt
             .matches("ACTUAL_INITIAL_REQUEST_SENTINEL")

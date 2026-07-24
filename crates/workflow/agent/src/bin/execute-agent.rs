@@ -2,37 +2,30 @@ use std::env;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use cowboy_agent_acp::Client as AcpClient;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
 };
 use cowboy_workflow_core::{
-    AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow, AppendUserPromptOutcome,
-    CompareAndSealPromptWindowOutcome, ObjectHash, ObjectKind, OpenAgentPromptWindowOutcome,
-    RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunStore, RunUserPrompt, TurnRecord,
-    WorkflowRun,
+    AgentAction, RoleDefinition, RunId, RunStatus, RunUserPrompt, WorkflowRun,
 };
-use cowboy_workflow_store::{Error as StoreError, RedbRunStore};
+use cowboy_workflow_store::{Error as StoreError, SqliteWorkflowStore};
 
-fn main() {
-    if let Err(err) = run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    if let Err(err) = run().await {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = parse_args()?;
-    let store = if config.db.exists() {
-        RedbRunStore::open(&config.db)?
-    } else {
-        RedbRunStore::create(&config.db)?
-    };
-    let run_state = ensure_standalone_run(&store, &config)?;
-    let user_prompts = store.load_user_prompts(&run_state.id)?;
+    let store = SqliteWorkflowStore::connect(&config.db).await?;
+    let run_state = ensure_standalone_run(&store, &config).await?;
+    let user_prompts = store.load_user_prompts(&run_state.id).await?;
     let action = AgentAction {
         role: config.role.clone(),
         prompt: config.prompt.clone(),
@@ -48,7 +41,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let executor = AgentExecutor::new(
         factory,
-        StoreWithSessions { inner: store },
+        store,
         AgentExecutionConfig {
             cwd: config.cwd,
             ..AgentExecutionConfig::default()
@@ -91,8 +84,11 @@ fn execution_context(
     }
 }
 
-fn ensure_standalone_run(store: &RedbRunStore, config: &Args) -> Result<WorkflowRun, StoreError> {
-    match store.load_run(&config.run_id) {
+async fn ensure_standalone_run(
+    store: &SqliteWorkflowStore,
+    config: &Args,
+) -> Result<WorkflowRun, StoreError> {
+    match store.load_run(&config.run_id).await {
         Ok(run) => Ok(run),
         Err(StoreError::RunNotFound(_)) => {
             let now = Utc::now();
@@ -117,14 +113,7 @@ fn ensure_standalone_run(store: &RedbRunStore, config: &Args) -> Result<Workflow
                 created_at: now,
                 updated_at: now,
             };
-            store.save_run(&run)?;
-            let has_head = store.list_runs()?.iter().any(|head| head.run_id == run.id);
-            if !has_head {
-                store.update_run_head(
-                    &run.id,
-                    RunHead::from_run(&run),
-                )?;
-            }
+            store.save_run(&run).await?;
             Ok(run)
         }
         Err(err) => Err(err),
@@ -189,7 +178,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: execute-agent --db <store.redb> --cmd <agent-cmd> [--arg <arg> ...] --prompt <text> [--run <id>] [--step <id>] [--record <id>] [--role <id>] [--cwd <path>]"
+        "usage: execute-agent --db <data.db> --cmd <agent-cmd> [--arg <arg> ...] --prompt <text> [--run <id>] [--step <id>] [--record <id>] [--role <id>] [--cwd <path>]"
     );
     std::process::exit(2)
 }
@@ -213,138 +202,18 @@ impl ClientFactory for AcpFactory {
     }
 }
 
-struct StoreWithSessions {
-    inner: RedbRunStore,
-}
-
-impl RunStore for StoreWithSessions {
-    fn save_run(&self, run: &WorkflowRun) -> cowboy_workflow_core::Result<()> {
-        self.inner.save_run(run).map_err(Into::into)
-    }
-
-    fn load_run(&self, run_id: &RunId) -> cowboy_workflow_core::Result<WorkflowRun> {
-        self.inner.load_run(run_id).map_err(Into::into)
-    }
-
-    fn list_runs(&self) -> cowboy_workflow_core::Result<Vec<RunHead>> {
-        self.inner.list_runs().map_err(Into::into)
-    }
-
-    fn put_object<T: serde::Serialize>(
-        &self,
-        kind: ObjectKind,
-        value: &T,
-    ) -> cowboy_workflow_core::Result<ObjectHash> {
-        self.inner.put_object(kind, value).map_err(Into::into)
-    }
-
-    fn get_object<T: serde::de::DeserializeOwned>(
-        &self,
-        hash: &ObjectHash,
-    ) -> cowboy_workflow_core::Result<T> {
-        self.inner.get_object(hash).map_err(Into::into)
-    }
-
-    fn update_run_head(&self, run_id: &str, head: RunHead) -> cowboy_workflow_core::Result<()> {
-        self.inner.update_run_head(run_id, head).map_err(Into::into)
-    }
-
-    fn load_run_head(&self, run_id: &str) -> cowboy_workflow_core::Result<RunHead> {
-        self.inner.load_run_head(run_id).map_err(Into::into)
-    }
-
-    fn save_role_session(&self, session: RoleSession) -> cowboy_workflow_core::Result<()> {
-        self.inner.save_role_session(session).map_err(Into::into)
-    }
-
-    fn load_role_session(
-        &self,
-        run_id: &str,
-        role_id: &str,
-    ) -> cowboy_workflow_core::Result<Option<RoleSession>> {
-        self.inner
-            .load_role_session(run_id, role_id)
-            .map_err(Into::into)
-    }
-
-    fn delete_role_sessions(&self, run_id: &str) -> cowboy_workflow_core::Result<()> {
-        self.inner.delete_role_sessions(run_id).map_err(Into::into)
-    }
-
-    fn append_turn(
-        &self,
-        run_id: &str,
-        turn: TurnRecord,
-    ) -> cowboy_workflow_core::Result<ObjectHash> {
-        self.inner.append_turn(run_id, turn).map_err(Into::into)
-    }
-
-    fn load_user_prompts(&self, run_id: &str) -> cowboy_workflow_core::Result<Vec<RunUserPrompt>> {
-        self.inner.load_user_prompts(run_id).map_err(Into::into)
-    }
-
-    fn open_agent_prompt_window(
-        &self,
-        window: AgentPromptWindow,
-    ) -> cowboy_workflow_core::Result<OpenAgentPromptWindowOutcome> {
-        self.inner
-            .open_agent_prompt_window(window)
-            .map_err(Into::into)
-    }
-
-    fn append_user_prompt(
-        &self,
-        run_id: &str,
-        window_id: &str,
-        content: String,
-    ) -> cowboy_workflow_core::Result<AppendUserPromptOutcome> {
-        self.inner
-            .append_user_prompt(run_id, window_id, content)
-            .map_err(Into::into)
-    }
-
-    fn compare_and_seal_agent_prompt_window(
-        &self,
-        run_id: &str,
-        window_id: &str,
-        applied_sequence: u64,
-        sealed_at: DateTime<Utc>,
-    ) -> cowboy_workflow_core::Result<CompareAndSealPromptWindowOutcome> {
-        self.inner
-            .compare_and_seal_agent_prompt_window(run_id, window_id, applied_sequence, sealed_at)
-            .map_err(Into::into)
-    }
-
-    fn abort_agent_prompt_window(
-        &self,
-        run_id: &str,
-        window_id: &str,
-        aborted_at: DateTime<Utc>,
-    ) -> cowboy_workflow_core::Result<AbortAgentPromptWindowOutcome> {
-        self.inner
-            .abort_agent_prompt_window(run_id, window_id, aborted_at)
-            .map_err(Into::into)
-    }
-
-    fn clear_agent_prompt_window(
-        &self,
-        run_id: &str,
-    ) -> cowboy_workflow_core::Result<Option<AgentPromptWindow>> {
-        self.inner
-            .clear_agent_prompt_window(run_id)
-            .map_err(Into::into)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowboy_workflow_core::{
+        AgentPromptWindow, AppendUserPromptOutcome, OpenAgentPromptWindowOutcome,
+    };
 
-    #[test]
-    fn fresh_database_supports_prompt_windows_without_overwriting_existing_run() {
+    #[tokio::test]
+    async fn fresh_database_supports_prompt_windows_without_overwriting_existing_run() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("workflow.redb");
-        let store = RedbRunStore::create(&db).unwrap();
+        let db = dir.path().join("data.db");
+        let store = SqliteWorkflowStore::connect(&db).await.unwrap();
         let config = Args {
             db,
             command: "unused".to_string(),
@@ -357,11 +226,12 @@ mod tests {
             cwd: ".".to_string(),
         };
 
-        let seeded = ensure_standalone_run(&store, &config).unwrap();
+        let seeded = ensure_standalone_run(&store, &config).await.unwrap();
         assert_eq!(seeded.status, RunStatus::Running);
         assert!(
             store
                 .list_runs()
+                .await
                 .unwrap()
                 .iter()
                 .any(|head| { head.run_id == config.run_id && head.status == RunStatus::Running })
@@ -379,21 +249,25 @@ mod tests {
                     opened_at: Utc::now(),
                     sealed_at: None,
                 })
+                .await
                 .unwrap(),
             OpenAgentPromptWindowOutcome::Opened(_)
         ));
 
-        let mut existing = store.load_run(&config.run_id).unwrap();
+        let mut existing = store.load_run(&config.run_id).await.unwrap();
         existing.status = RunStatus::Completed;
-        store.save_run(&existing).unwrap();
-        assert_eq!(ensure_standalone_run(&store, &config).unwrap(), existing);
+        store.save_run(&existing).await.unwrap();
+        assert_eq!(
+            ensure_standalone_run(&store, &config).await.unwrap(),
+            existing
+        );
     }
 
-    #[test]
-    fn existing_run_context_uses_durable_request_timestamp_and_follow_ups() {
+    #[tokio::test]
+    async fn existing_run_context_uses_durable_request_timestamp_and_follow_ups() {
         let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("workflow.redb");
-        let store = RedbRunStore::create(&db).unwrap();
+        let db = dir.path().join("data.db");
+        let store = SqliteWorkflowStore::connect(&db).await.unwrap();
         let config = Args {
             db,
             command: "unused".to_string(),
@@ -405,10 +279,10 @@ mod tests {
             prompt: "new CLI prompt".to_string(),
             cwd: ".".to_string(),
         };
-        let mut existing = ensure_standalone_run(&store, &config).unwrap();
+        let mut existing = ensure_standalone_run(&store, &config).await.unwrap();
         existing.original_request = "durable original request".to_string();
         existing.created_at = Utc::now() - chrono::Duration::hours(1);
-        store.save_run(&existing).unwrap();
+        store.save_run(&existing).await.unwrap();
         store
             .open_agent_prompt_window(AgentPromptWindow {
                 window_id: "accept-follow-up".to_string(),
@@ -421,6 +295,7 @@ mod tests {
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .unwrap();
         let accepted = store
             .append_user_prompt(
@@ -428,12 +303,13 @@ mod tests {
                 "accept-follow-up",
                 "durable follow-up".to_string(),
             )
+            .await
             .unwrap();
         assert!(matches!(accepted, AppendUserPromptOutcome::Accepted(_)));
-        store.clear_agent_prompt_window(&existing.id).unwrap();
+        store.clear_agent_prompt_window(&existing.id).await.unwrap();
 
-        let loaded = ensure_standalone_run(&store, &config).unwrap();
-        let prompts = store.load_user_prompts(&loaded.id).unwrap();
+        let loaded = ensure_standalone_run(&store, &config).await.unwrap();
+        let prompts = store.load_user_prompts(&loaded.id).await.unwrap();
         let context = execution_context(&config, &loaded, prompts.clone());
         assert_eq!(context.original_request, existing.original_request);
         assert_eq!(context.run_created_at, existing.created_at);
@@ -452,6 +328,7 @@ mod tests {
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .unwrap();
         assert!(matches!(
             opened,

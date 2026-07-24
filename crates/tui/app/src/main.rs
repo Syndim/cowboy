@@ -44,7 +44,7 @@ async fn run_shared_command(
     config: cowboy::AppConfig,
     cwd: std::path::PathBuf,
 ) -> Result<()> {
-    let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd));
+    let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd)).await?;
 
     match command {
         SharedCommand::Run(args) => {
@@ -98,7 +98,7 @@ async fn run_shared_command(
             Ok(())
         }
         SharedCommand::Runs(args) => {
-            for run in runtime.list_runs(args.partial_run_id.as_deref())? {
+            for run in runtime.list_runs(args.partial_run_id.as_deref()).await? {
                 for line in cowboy::run_summary::render_run_summary_lines(&run) {
                     println!("{line}");
                 }
@@ -115,7 +115,7 @@ async fn run_shared_command(
             let fields = resolve_fields_object(fields)?;
             match status {
                 None => {
-                    let options = runtime.resolution_options(&run_id)?;
+                    let options = runtime.resolution_options(&run_id).await?;
                     print_resolution_options(&options);
                     Ok(())
                 }

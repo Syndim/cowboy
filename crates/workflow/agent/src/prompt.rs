@@ -268,7 +268,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_agent_prompt(&role, &action, &user_inputs);
+        let prompt = build_agent_prompt(&role, &action, &user_inputs, true);
 
         assert_eq!(prompt.matches("## Role").count(), 1);
         assert_eq!(prompt.matches("## Task").count(), 1);

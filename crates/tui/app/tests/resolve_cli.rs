@@ -98,7 +98,7 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
             args = []
             "#,
             dir.path().join("state").display(),
-            dir.path().join("state/workflow.redb").display(),
+            dir.path().join("state/data.db").display(),
             workflow_dir.display()
         ),
     )

@@ -827,12 +827,13 @@ mod tests {
         );
         assert!(text.contains("Workflow store is busy; waiting"), "{text}");
         assert!(!text.contains("/home/"), "{text}");
-        assert!(!text.contains("workflow.redb"), "{text}");
+        assert!(!text.contains("data.db"), "{text}");
         assert!(line_has_style(
             rendered.lines(),
             "Workflow store waiting",
             style_warning()
         ));
+        println!("EVIDENCE wait-card rendered=true sanitized=true");
     }
 
     #[test]
@@ -1504,8 +1505,8 @@ mod tests {
 
         for kind in variants {
             let event = event(kind);
-            let title = render_workflow_event_width(&event, Some(descriptor), 200).lines()[0]
-                .to_string();
+            let title =
+                render_workflow_event_width(&event, Some(descriptor), 200).lines()[0].to_string();
             assert!(
                 title.contains(descriptor),
                 "expected descriptor suffix on agent card title: {title}"

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use cowboy_workflow_core::{Result, RunStore, StepRecord, WorkflowRun};
+use cowboy_workflow_core::{Result, StepRecord, WorkflowRun, WorkflowStateStore};
 
 use crate::events::{WorkflowEvent, WorkflowEventKind};
 
@@ -94,19 +94,22 @@ impl ActiveRunClock {
             ))
     }
 
-    pub(crate) fn close<S: RunStore>(&self, store: &S, run: &mut WorkflowRun) -> Result<()> {
-        self.close_at(store, run, Utc::now())
+    pub(crate) async fn close<S: WorkflowStateStore + ?Sized>(
+        &self,
+        store: &S,
+        run: &mut WorkflowRun,
+    ) -> Result<()> {
+        self.close_at(store, run, Utc::now()).await
     }
 
-    pub(crate) fn close_at<S: RunStore>(
+    pub(crate) async fn close_at<S: WorkflowStateStore + ?Sized>(
         &self,
         store: &S,
         run: &mut WorkflowRun,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
         run.active_duration_ms = self.active_duration_at(timestamp);
-        store.save_run(run)?;
-        store.update_run_head(&run.id, cowboy_workflow_core::RunHead::from_run(run))?;
+        store.save_run(run).await?;
         Ok(())
     }
 }

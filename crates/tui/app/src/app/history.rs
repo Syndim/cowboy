@@ -525,7 +525,7 @@ mod tests {
     fn history_paths_are_under_state_dir_and_separate_from_workflow_store() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
-        let workflow_store = dir.path().join("workflow.redb");
+        let workflow_store = dir.path().join("data.db");
         let history = InputHistory::new(state_dir.clone());
 
         assert!(history.history_path().starts_with(&state_dir));

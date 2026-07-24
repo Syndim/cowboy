@@ -1564,7 +1564,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
-            workflow_store: dir.path().join("workflow.redb"),
+            workflow_store: dir.path().join("data.db"),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {
@@ -1651,7 +1651,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
-            workflow_store: dir.path().join("workflow.redb"),
+            workflow_store: dir.path().join("data.db"),
             mouse_scroll_lines: 7,
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1714,7 +1714,7 @@ mod tests {
         });
     }
 
-    fn runtime_with_completed_workflow(dir: &tempfile::TempDir) -> WorkflowRuntime {
+    async fn runtime_with_completed_workflow(dir: &tempfile::TempDir) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
         fs::write(
@@ -1731,7 +1731,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1745,6 +1745,8 @@ mod tests {
         };
 
         WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap()
             .with_deterministic_selector()
     }
 
@@ -2098,7 +2100,7 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains("/home/"), "{rendered}");
-        assert!(!rendered.contains("workflow.redb"), "{rendered}");
+        assert!(!rendered.contains("data.db"), "{rendered}");
     }
 
     #[test]
@@ -2151,7 +2153,7 @@ mod tests {
     async fn report_for_different_run_without_topic_clears_stale_topic() {
         let mut state = test_state();
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_with_completed_workflow(&dir);
+        let runtime = runtime_with_completed_workflow(&dir).await;
         let run_a = runtime.start_run("first").await.unwrap().run.id;
         let run_b = runtime.start_run("second").await.unwrap().run.id;
         state.apply_workflow_event(WorkflowEvent::new(
@@ -2280,7 +2282,7 @@ mod tests {
 
         let mut completed_state = test_state();
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_with_completed_workflow(&dir);
+        let runtime = runtime_with_completed_workflow(&dir).await;
         completed_state.spawn_card_report_task(
             "Run",
             ["00:00:00".to_string()],
@@ -2463,7 +2465,7 @@ mod tests {
         wait_for_ready(&ready_path);
         let config = AppConfig {
             state_dir: state_dir.clone(),
-            workflow_store: state_dir.join("workflow.redb"),
+            workflow_store: state_dir.join("data.db"),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {

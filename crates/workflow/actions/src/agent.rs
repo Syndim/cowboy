@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cowboy_workflow_agent::{AgentExecutor, ClientFactory};
 use cowboy_workflow_core::{
-    ActionResult, AgentAction, ExecutionContext, Result, RunStore, StepRecord, WorkflowError,
+    ActionResult, AgentAction, ExecutionContext, Result, StepRecord, WorkflowError,
 };
 
 #[async_trait]
@@ -14,7 +14,7 @@ pub trait AgentActionHandler: Send + Sync {
 impl<F, S> AgentActionHandler for AgentExecutor<F, S>
 where
     F: ClientFactory,
-    S: RunStore + 'static,
+    S: cowboy_workflow_agent::AgentStore + 'static,
 {
     async fn run_agent(
         &self,

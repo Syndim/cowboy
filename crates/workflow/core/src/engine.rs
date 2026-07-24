@@ -2,8 +2,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionDispatcher, ActionResult, ObjectKind, Result, RunHead, RunStatus, RunStore, StepAction,
-    StepActionProvider, StepRecord, WorkflowDefinition, WorkflowError, WorkflowRun, next_step,
+    ActionDispatcher, ActionResult, Result, RunStatus, StepAction, StepActionProvider, StepRecord,
+    UserPromptStore, WorkflowDefinition, WorkflowError, WorkflowObjectStore, WorkflowRun,
+    WorkflowStateStore, next_step,
 };
 
 /// Safety budgets enforced by the workflow runner.
@@ -45,7 +46,7 @@ pub async fn execute_step<S, D, P>(
     limits: &RunnerLimits,
 ) -> Result<RunStatus>
 where
-    S: RunStore,
+    S: WorkflowStateStore + WorkflowObjectStore + UserPromptStore + ?Sized,
     D: ActionDispatcher,
     P: StepActionProvider,
 {
@@ -69,7 +70,7 @@ pub async fn retry_current_step<S, D, P>(
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
 where
-    S: RunStore,
+    S: WorkflowStateStore + WorkflowObjectStore + UserPromptStore + ?Sized,
     D: ActionDispatcher,
     P: StepActionProvider,
 {
@@ -95,7 +96,7 @@ async fn dispatch_current_step<S, D, P>(
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
 where
-    S: RunStore,
+    S: WorkflowStateStore + WorkflowObjectStore + UserPromptStore + ?Sized,
     D: ActionDispatcher,
     P: StepActionProvider,
 {
@@ -107,12 +108,12 @@ where
                 step: run.current_step.clone(),
             })?;
 
-    let prev_record = run
-        .head
-        .as_ref()
-        .map(|head| store.get_object::<StepRecord>(head))
-        .transpose()?;
-    let user_prompts = store.load_user_prompts(&run.id)?;
+    let previous_head = run.head.clone();
+    let prev_record = match previous_head {
+        Some(head) => Some(store.load_step_record(&head).await?),
+        None => None,
+    };
+    let user_prompts = store.load_user_prompts(&run.id).await?;
     let action =
         provider.step_action(definition, run, step, prev_record.as_ref(), &user_prompts)?;
     let role = match &action {
@@ -142,8 +143,8 @@ where
     };
 
     match dispatcher.dispatch(action, context).await? {
-        ActionResult::Completed(record) => apply_step_record(store, definition, run, *record),
-        ActionResult::Blocked(status) => apply_run_status(store, run, status),
+        ActionResult::Completed(record) => apply_step_record(store, definition, run, *record).await,
+        ActionResult::Blocked(status) => apply_run_status(store, run, status).await,
     }
 }
 
@@ -170,7 +171,7 @@ fn increment_budget(run: &mut WorkflowRun) {
 }
 
 /// Persist a completed step record, advance the run head, and route by output status.
-pub fn apply_step_record<S: RunStore>(
+pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
     store: &S,
     definition: &WorkflowDefinition,
     run: &mut WorkflowRun,
@@ -181,8 +182,6 @@ pub fn apply_step_record<S: RunStore>(
         .as_ref()
         .ok_or_else(|| WorkflowError::InvalidAction("step record missing output".to_string()))?;
     let next = next_step(definition, &record.step, &output.status)?.cloned();
-    let hash = store.put_object(ObjectKind::StepRecord, &record)?;
-    run.head = Some(hash.clone());
     run.updated_at = Utc::now();
 
     let status = if let Some(next) = next {
@@ -192,21 +191,20 @@ pub fn apply_step_record<S: RunStore>(
         RunStatus::Completed
     };
     run.status = status.clone();
-    store.save_run(run)?;
-    store.update_run_head(&run.id, RunHead::from_run(run))?;
+    let hash = store.commit_completed_step(run, &record).await?;
+    run.head = Some(hash);
     Ok(status)
 }
 
 /// Persist a run status produced by a blocked or terminal action.
-pub fn apply_run_status<S: RunStore>(
+pub async fn apply_run_status<S: WorkflowStateStore + ?Sized>(
     store: &S,
     run: &mut WorkflowRun,
     status: RunStatus,
 ) -> Result<RunStatus> {
     run.status = status.clone();
     run.updated_at = Utc::now();
-    store.save_run(run)?;
-    store.update_run_head(&run.id, RunHead::from_run(run))?;
+    store.save_run(run).await?;
     Ok(status)
 }
 
@@ -221,7 +219,6 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use parking_lot::Mutex;
-    use serde::{Serialize, de::DeserializeOwned};
     use serde_json::Value;
 
     use super::*;
@@ -382,19 +379,23 @@ mod tests {
     #[derive(Default)]
     struct MemoryStore {
         runs: Mutex<HashMap<String, WorkflowRun>>,
-        heads: Mutex<HashMap<String, RunHead>>,
+        heads: Mutex<HashMap<String, crate::RunHead>>,
         sessions: Mutex<HashMap<(String, String), crate::RoleSession>>,
         objects: Mutex<HashMap<String, Vec<u8>>>,
         prompts: Mutex<HashMap<String, Vec<crate::RunUserPrompt>>>,
     }
 
-    impl RunStore for MemoryStore {
-        fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+    #[async_trait]
+    impl WorkflowStateStore for MemoryStore {
+        async fn save_run(&self, run: &WorkflowRun) -> Result<()> {
             self.runs.lock().insert(run.id.clone(), run.clone());
+            self.heads
+                .lock()
+                .insert(run.id.clone(), crate::RunHead::from_run(run));
             Ok(())
         }
 
-        fn load_run(&self, run_id: &crate::RunId) -> Result<WorkflowRun> {
+        async fn load_run(&self, run_id: &crate::RunId) -> Result<WorkflowRun> {
             self.runs
                 .lock()
                 .get(run_id)
@@ -402,14 +403,44 @@ mod tests {
                 .ok_or_else(|| WorkflowError::InvalidAction("missing run".to_string()))
         }
 
-        fn list_runs(&self) -> Result<Vec<RunHead>> {
+        async fn list_runs(&self) -> Result<Vec<crate::RunHead>> {
             Ok(self.heads.lock().values().cloned().collect())
         }
 
-        fn put_object<T: Serialize>(
+        async fn load_run_head(&self, run_id: &str) -> Result<crate::RunHead> {
+            self.heads
+                .lock()
+                .get(run_id)
+                .cloned()
+                .ok_or_else(|| WorkflowError::InvalidAction("missing head".to_string()))
+        }
+
+        async fn commit_completed_step(
             &self,
-            _kind: ObjectKind,
-            value: &T,
+            run: &WorkflowRun,
+            record: &StepRecord,
+        ) -> Result<crate::ObjectHash> {
+            let bytes = serde_json::to_vec(record).unwrap();
+            let hash = format!("hash-{}", self.objects.lock().len() + 1);
+            self.objects.lock().insert(hash.clone(), bytes);
+            let mut stored_run = run.clone();
+            stored_run.head = Some(hash.clone());
+            self.save_run(&stored_run).await?;
+            Ok(hash)
+        }
+
+        async fn delete_run(&self, run_id: &str) -> Result<()> {
+            self.runs.lock().remove(run_id);
+            self.heads.lock().remove(run_id);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowObjectStore for MemoryStore {
+        async fn store_workflow_source_snapshot(
+            &self,
+            value: &crate::WorkflowSourceSnapshot,
         ) -> Result<crate::ObjectHash> {
             let bytes = serde_json::to_vec(value).unwrap();
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
@@ -417,7 +448,10 @@ mod tests {
             Ok(hash)
         }
 
-        fn get_object<T: DeserializeOwned>(&self, hash: &crate::ObjectHash) -> Result<T> {
+        async fn load_workflow_source_snapshot(
+            &self,
+            hash: &crate::ObjectHash,
+        ) -> Result<crate::WorkflowSourceSnapshot> {
             let bytes = self
                 .objects
                 .lock()
@@ -427,27 +461,39 @@ mod tests {
             Ok(serde_json::from_slice(&bytes).unwrap())
         }
 
-        fn update_run_head(&self, run_id: &str, head: RunHead) -> Result<()> {
-            self.heads.lock().insert(run_id.to_string(), head);
+        async fn store_step_record(&self, value: &StepRecord) -> Result<crate::ObjectHash> {
+            let bytes = serde_json::to_vec(value).unwrap();
+            let hash = format!("hash-{}", self.objects.lock().len() + 1);
+            self.objects.lock().insert(hash.clone(), bytes);
+            Ok(hash)
+        }
+
+        async fn load_step_record(&self, hash: &crate::ObjectHash) -> Result<StepRecord> {
+            let bytes = self
+                .objects
+                .lock()
+                .get(hash)
+                .cloned()
+                .ok_or_else(|| WorkflowError::InvalidAction("missing object".to_string()))?;
+            Ok(serde_json::from_slice(&bytes).unwrap())
+        }
+
+        async fn delete_object(&self, hash: &crate::ObjectHash) -> Result<()> {
+            self.objects.lock().remove(hash);
             Ok(())
         }
+    }
 
-        fn load_run_head(&self, run_id: &str) -> Result<RunHead> {
-            self.heads
-                .lock()
-                .get(run_id)
-                .cloned()
-                .ok_or_else(|| WorkflowError::InvalidAction("missing head".to_string()))
-        }
-
-        fn save_role_session(&self, session: crate::RoleSession) -> Result<()> {
+    #[async_trait]
+    impl crate::AgentSessionStore for MemoryStore {
+        async fn save_role_session(&self, session: crate::RoleSession) -> Result<()> {
             self.sessions
                 .lock()
                 .insert((session.run_id.clone(), session.role_id.clone()), session);
             Ok(())
         }
 
-        fn load_role_session(
+        async fn load_role_session(
             &self,
             run_id: &str,
             role_id: &str,
@@ -459,25 +505,47 @@ mod tests {
                 .cloned())
         }
 
-        fn delete_role_sessions(&self, run_id: &str) -> Result<()> {
+        async fn delete_role_sessions(&self, run_id: &str) -> Result<()> {
             self.sessions
                 .lock()
                 .retain(|(stored_run, _), _| stored_run != run_id);
             Ok(())
         }
+    }
 
-        fn append_turn(
+    #[async_trait]
+    impl crate::TurnStore for MemoryStore {
+        async fn append_turn(
             &self,
             _run_id: &str,
             _turn: crate::TurnRecord,
         ) -> Result<crate::ObjectHash> {
             Ok("turn".to_string())
         }
-        fn load_user_prompts(&self, run_id: &str) -> Result<Vec<crate::RunUserPrompt>> {
-            Ok(self.prompts.lock().get(run_id).cloned().unwrap_or_default())
+
+        async fn load_turn(&self, _hash: &crate::ObjectHash) -> Result<crate::TurnRecord> {
+            Err(WorkflowError::InvalidAction("missing turn".to_string()))
         }
 
-        fn open_agent_prompt_window(
+        async fn load_turns(
+            &self,
+            _run_id: &str,
+            _step_record_id: &str,
+        ) -> Result<Vec<crate::TurnRecord>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl UserPromptStore for MemoryStore {
+        async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<crate::RunUserPrompt>> {
+            Ok(self.prompts.lock().get(run_id).cloned().unwrap_or_default())
+        }
+    }
+
+    #[async_trait]
+    impl crate::PromptWindowStore for MemoryStore {
+        async fn open_agent_prompt_window(
             &self,
             _window: crate::AgentPromptWindow,
         ) -> Result<crate::OpenAgentPromptWindowOutcome> {
@@ -486,7 +554,7 @@ mod tests {
             ))
         }
 
-        fn append_user_prompt(
+        async fn append_user_prompt(
             &self,
             _run_id: &str,
             _window_id: &str,
@@ -497,7 +565,7 @@ mod tests {
             ))
         }
 
-        fn compare_and_seal_agent_prompt_window(
+        async fn compare_and_seal_agent_prompt_window(
             &self,
             _run_id: &str,
             _window_id: &str,
@@ -509,7 +577,7 @@ mod tests {
             ))
         }
 
-        fn abort_agent_prompt_window(
+        async fn abort_agent_prompt_window(
             &self,
             _run_id: &str,
             _window_id: &str,
@@ -520,7 +588,7 @@ mod tests {
             ))
         }
 
-        fn clear_agent_prompt_window(
+        async fn clear_agent_prompt_window(
             &self,
             _run_id: &str,
         ) -> Result<Option<crate::AgentPromptWindow>> {
@@ -865,8 +933,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_step_record_stores_head_and_routes() {
+    #[tokio::test]
+    async fn apply_step_record_stores_head_and_routes() {
         let store = MemoryStore::default();
         let mut run = run();
         let now = Utc::now();
@@ -896,13 +964,21 @@ mod tests {
             completed_at: Some(now),
         };
 
-        let status = apply_step_record(&store, &definition(), &mut run, record).unwrap();
+        let status = apply_step_record(&store, &definition(), &mut run, record)
+            .await
+            .unwrap();
 
         assert_eq!(status, RunStatus::Running);
         assert_eq!(run.current_step, "next");
         assert!(run.head.is_some());
-        assert_eq!(store.load_run(&run.id).unwrap().status, RunStatus::Running);
-        assert_eq!(store.load_run_head(&run.id).unwrap().head_step, run.head);
+        assert_eq!(
+            store.load_run(&run.id).await.unwrap().status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            store.load_run_head(&run.id).await.unwrap().head_step,
+            run.head
+        );
     }
 
     #[tokio::test]

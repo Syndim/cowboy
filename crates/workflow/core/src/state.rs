@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId,
-    WorkflowError, WorkflowId,
+    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError, WorkflowId,
 };
 
 /// Name used when a workflow does not explicitly select a config set.

@@ -1,0 +1,45 @@
+cowboy-workflow-core	traits::tests::workflow_store_capabilities_are_object_safe	EVIDENCE workflow-store-traits object_safe=7 async=true
+cowboy-workflow-store	schema::tests::initializes_new_and_empty_files	EVIDENCE schema-init header=SQLite_format_3 user_version=1 wal=true foreign_keys=true max_connections=4
+cowboy-workflow-store	schema::tests::reopens_supported_schema_version	EVIDENCE schema-reopen user_version=1 tables=7
+cowboy-workflow-store	schema::tests::rejects_future_schema_version_without_modifying_file	EVIDENCE schema-future rejected=true bytes_unchanged=true
+cowboy-workflow-store	schema::tests::rejects_non_sqlite_file_without_modifying_file	EVIDENCE schema-non-sqlite rejected=true bytes_unchanged=true
+cowboy-workflow-store	schema::tests::concurrent_first_connects_initialize_one_schema	EVIDENCE schema-concurrent connects=2 user_version=1 tables=7
+cowboy-workflow-store	contract::tests::run_head_round_trip_and_deterministic_listing	EVIDENCE contract-run-head round_trip=true deterministic=true
+cowboy-workflow-store	contract::tests::source_step_hashes_and_reopen_durability	EVIDENCE contract-objects source_hash=true step_hash=true reopen=true
+cowboy-workflow-store	contract::tests::role_session_and_turn_ordering	EVIDENCE contract-agent session_crud=true turn_order=true
+cowboy-workflow-store	contract::tests::run_deletion_retains_objects_and_low_level_delete_removes_them	EVIDENCE contract-delete mutable_removed=true immutable_retained=true explicit_delete=true
+cowboy-workflow-store	sqlite_store::tests::save_run_updates_run_and_head_atomically	EVIDENCE transaction-run-head committed=true snapshots_match=true
+cowboy-workflow-store	sqlite_store::tests::completed_step_transaction_rolls_back_on_injected_failure	EVIDENCE transaction-step rollback=true pool_reusable=true
+cowboy-workflow-store	sqlite_store::tests::prompt_append_and_compare_and_seal_are_totally_ordered	EVIDENCE prompt-order legal_outcomes=2 partial_state=false
+cowboy-workflow-store	sqlite_store::tests::immutable_object_collision_is_rejected_without_overwrite	EVIDENCE object-collision rejected=true bytes_unchanged=true
+cowboy-workflow-store	sqlite_store::tests::store_wait_observer_fires_once_for_contended_write	EVIDENCE store-wait observer_count=1 retries_at_least=1 path_leaked=false
+cowboy-workflow-store	sqlite_store::tests::store_wait_cancellation_interrupts_contended_write	EVIDENCE store-cancel cancelled=true pool_reusable=true
+cowboy-workflow-store	sqlite_store::tests::extended_busy_code_is_retryable	EVIDENCE sqlite-code value=517 primary=5 retryable=true
+cowboy-workflow-store	sqlite_store::tests::extended_locked_code_is_retryable	EVIDENCE sqlite-code value=262 primary=6 retryable=true
+cowboy-workflow-store	sqlite_store::tests::non_locking_sqlx_errors_are_not_retried	EVIDENCE sqlite-code non_locking=true attempts=1
+cowboy-workflow-store	sqlite_store::tests::two_pools_share_wal_reads_writes_and_reuse_connections	EVIDENCE wal-concurrency pools=2 readers=concurrent writes=visible reusable=true
+cowboy-workflow-store	sqlite_store::tests::prompt_windows_preserve_content_sequences_rejections_and_cleanup	EVIDENCE prompt-window content=exact sequence=monotonic cleanup=true
+cowboy-workflow-agent	executor::tests::loads_persisted_role_session	EVIDENCE agent-session persisted_load=true
+cowboy-workflow-agent	executor::tests::ensure_session_fresh_then_reused	EVIDENCE agent-session fresh=true reused=true
+cowboy-workflow-agent	executor::tests::reused_session_omits_role_and_advances_watermark	EVIDENCE agent-watermark advanced=true role_resent=false
+cowboy-workflow-agent	executor::tests::prompt_window_controls_cleanup_on_success_and_backend_error	EVIDENCE agent-prompt-cleanup success=true backend_error=true
+cowboy-workflow-agent	executor::tests::dropped_execution_removes_prompt_window_control_and_aborts_window	EVIDENCE agent-drop control_removed=true window_aborted=true
+cowboy-workflow-engine	runner::tests::lua_provider_exposes_previous_step_output	EVIDENCE runner-prev output_exposed=true
+cowboy-workflow-engine	runner::tests::retry_reservation_is_saved_before_dispatch	EVIDENCE runner-retry reserved_before_dispatch=true
+cowboy-workflow-engine	runtime::tests::two_runtime_instances_share_sqlite_store_for_independent_runs	EVIDENCE runtime-shared-store runtimes=2 runs=2 pools=independent
+cowboy-workflow-engine	runtime::tests::workflow_store_wait_event_emits_once_during_contended_resume	EVIDENCE runtime-wait-event count=1 sanitized=true
+cowboy-workflow-engine	runtime::tests::cancelling_runtime_store_wait_interrupts_contended_operation	EVIDENCE runtime-wait-cancel cancelled=true bounded=true
+cowboy-workflow-engine	runtime::tests::cancellation_cleanup_retains_run_lock_until_persistence_finishes	EVIDENCE runtime-cancel lock_retained_until_persisted=true
+cowboy-workflow-engine	runtime::tests::list_runs_reads_persisted_head_summaries_without_full_runs	EVIDENCE runtime-list source=heads full_run_loads=0
+cowboy-workflow-engine	runtime::tests::answer_run_persists_ask_user_completion_when_resumed_step_fails	EVIDENCE runtime-answer prompt_completion=persisted resumed_step=failed
+cowboy-workflow-engine	runtime::tests::resolve_run_restores_persisted_request_topic_and_exposes_fields_to_next_step	EVIDENCE runtime-resolve topic_restored=true fields_exposed=true
+cowboy-workflow-engine	runtime::tests::failed_runner_events_are_persisted_with_active_duration	EVIDENCE runtime-events persisted=true active_duration=true
+cowboy-workflow-engine	run_lock::tests::run_lock_rejects_same_run_in_process	EVIDENCE run-lock same_run=rejected
+cowboy-workflow-engine	run_lock::tests::run_lock_allows_different_runs	EVIDENCE run-lock different_runs=allowed
+cowboy-workflow-engine	run_lock::tests::run_lock_rejects_invalid_ids_before_creating_lock_dir	EVIDENCE run-lock invalid_id=rejected lock_dir_created=false
+cowboy-workflow-engine	run_lock::tests::run_lock_uses_canonical_uuid_filename_next_to_workflow_store	EVIDENCE run-lock filename=canonical location=data.db.locks
+cowboy-workflow-engine	run_lock::tests::run_lock_namespace_follows_workflow_store_not_state_dir	EVIDENCE run-lock namespace=workflow_store
+cowboy-workflow-engine	events::tests::workflow_store_waiting_event_round_trips	EVIDENCE wait-event round_trip=true
+cowboy	app::events::tests::renders_workflow_store_waiting_card_with_sanitized_message	EVIDENCE wait-card rendered=true sanitized=true
+cowboy	config::tests::missing_config_uses_sqlite_store_default	EVIDENCE config-default workflow_store=data.db
+cowboy	config::tests::non_sqlite_store_file_is_rejected_without_modification	EVIDENCE clean-cutover rejected=true bytes_unchanged=true

@@ -64,7 +64,10 @@ pub(in crate::app) async fn submit_input(state: &mut AppState, runtime: &Workflo
                 let Some(window) = state.agent_prompt_window().cloned() else {
                     return;
                 };
-                match runtime.submit_user_prompt(&window.run_id, &window.window_id, input.clone()) {
+                match runtime
+                    .submit_user_prompt(&window.run_id, &window.window_id, input.clone())
+                    .await
+                {
                     Ok(UserPromptSubmission::Accepted(prompt)) => {
                         state.commit_submitted_input(&input);
                         state.set_status(format!(
@@ -403,13 +406,10 @@ fn spawn_runs_list(
     let runtime = runtime.clone();
     let filter_for_task = partial_run_id.clone();
     state.spawn_runs_list_task("loading runs".to_string(), partial_run_id, async move {
-        let runs = tokio::task::spawn_blocking(move || {
-            runtime
-                .list_runs(filter_for_task.as_deref())
-                .map_err(|err| err.to_string())
-        })
-        .await
-        .map_err(|err| err.to_string())??;
+        let runs = runtime
+            .list_runs(filter_for_task.as_deref())
+            .await
+            .map_err(|err| err.to_string())?;
         Ok(runs)
     });
 }
@@ -431,7 +431,7 @@ async fn resolve_run(
 ) -> Result<()> {
     match status {
         None => {
-            let options = runtime.resolution_options(&run_id)?;
+            let options = runtime.resolution_options(&run_id).await?;
             state.set_status(format!("resolve options for {}", options.run_id));
             let mut details = vec![
                 format!("failed step: {}", options.failed_step),
@@ -516,18 +516,16 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, AppConfig};
     use chrono::Utc;
-    use cowboy_workflow_core::{
-        AgentPromptWindow, ResumeCallback, RunHead, RunStatus, StepRecord, WorkflowRun,
-    };
+    use cowboy_workflow_core::{AgentPromptWindow, ResumeCallback, RunStatus, WorkflowRun};
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
-    use cowboy_workflow_store::RedbRunStore;
+    use cowboy_workflow_store::SqliteWorkflowStore;
     use serde_json::Value;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
         AppState::new(AppConfig {
             state_dir: dir.path().to_path_buf(),
-            workflow_store: dir.path().join("workflow.redb"),
+            workflow_store: dir.path().join("data.db"),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {
@@ -540,11 +538,11 @@ mod tests {
         })
     }
 
-    fn test_runtime_state() -> (tempfile::TempDir, WorkflowRuntime, AppState) {
+    async fn test_runtime_state() -> (tempfile::TempDir, WorkflowRuntime, AppState) {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -556,7 +554,9 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         let state = AppState::new(config);
         (dir, runtime, state)
     }
@@ -678,10 +678,8 @@ mod tests {
         }
     }
 
-    fn seed_run(store: &RedbRunStore, run: WorkflowRun) {
-        let head = RunHead::from_run(&run);
-        store.save_run(&run).unwrap();
-        store.update_run_head(&run.id, head).unwrap();
+    async fn seed_run(store: &SqliteWorkflowStore, run: WorkflowRun) {
+        store.save_run(&run).await.unwrap();
     }
 
     fn assert_rendered_contains(rendered: &str, expected: &str) {
@@ -704,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn plain_request_submission_renders_initial_input_as_card() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.push_input("build health route");
 
         let before = chrono::Local::now();
@@ -790,7 +788,7 @@ mod tests {
         // Category 0 (known-good control): workflow-event cards already stamp the
         // current time via events.rs::workflow_title_prefix.
         {
-            let (_dir, _runtime, mut state) = test_runtime_state();
+            let (_dir, _runtime, mut state) = test_runtime_state().await;
             let before = chrono::Local::now();
             state.apply_workflow_event(WorkflowEvent::new(
                 "run-control",
@@ -818,7 +816,7 @@ mod tests {
 
         // Category 1: action-submission card (spawn_card_report_task) — plain Run.
         {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             state.push_input("build health route");
             let before = chrono::Local::now();
             submit_input(&mut state, &runtime).await;
@@ -841,7 +839,7 @@ mod tests {
 
         // Category 2: push_card path — /help card.
         {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             state.push_input("/help");
             let before = chrono::Local::now();
             submit_input(&mut state, &runtime).await;
@@ -864,7 +862,7 @@ mod tests {
 
         // Category 3: background-list card — /runs loading card.
         {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             state.push_input("/runs");
             let before = chrono::Local::now();
             submit_input(&mut state, &runtime).await;
@@ -887,7 +885,7 @@ mod tests {
 
         // Category 4: direct Card::new path — pending-prompt "Waiting for input".
         {
-            let (_dir, _runtime, mut state) = test_runtime_state();
+            let (_dir, _runtime, mut state) = test_runtime_state().await;
             let before = chrono::Local::now();
             state.apply_workflow_event(WorkflowEvent::new(
                 "pending-run",
@@ -1000,7 +998,7 @@ mod tests {
         ];
 
         for case in cases {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             if case.seed_pending {
                 state.apply_workflow_event(WorkflowEvent::new(
                     "pending-run",
@@ -1029,7 +1027,7 @@ mod tests {
 
     #[tokio::test]
     async fn card_wall_clock_push_card_shows_current_time() {
-        let (_dir, _runtime, mut state) = test_runtime_state();
+        let (_dir, _runtime, mut state) = test_runtime_state().await;
         let before = chrono::Local::now();
         state.push_card("Notice", ["a note".to_string()]);
         let after = chrono::Local::now();
@@ -1044,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn card_wall_clock_runs_loading_shows_current_time() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.push_input("/runs");
         let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
@@ -1060,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn card_wall_clock_pending_prompt_shows_current_time() {
-        let (_dir, _runtime, mut state) = test_runtime_state();
+        let (_dir, _runtime, mut state) = test_runtime_state().await;
         let before = chrono::Local::now();
         state.apply_workflow_event(WorkflowEvent::new(
             "pending-run",
@@ -1096,7 +1094,7 @@ mod tests {
         // independent of when the test runs.
         let fixed_utc = chrono::DateTime::<chrono::Utc>::from_timestamp(1_600_000_000, 0)
             .expect("valid fixed UTC timestamp");
-        let (_dir, _runtime, mut state) = test_runtime_state();
+        let (_dir, _runtime, mut state) = test_runtime_state().await;
         state.apply_workflow_event(WorkflowEvent::with_timing(
             "pending-run",
             fixed_utc,
@@ -1148,8 +1146,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn card_wall_clock_helper_rejects_missing_and_nontime_prefix() {
+    #[tokio::test]
+    async fn card_wall_clock_helper_rejects_missing_and_nontime_prefix() {
         let before = chrono::Local::now();
         let after = chrono::Local::now();
 
@@ -1198,7 +1196,7 @@ mod tests {
                 "submitted run --step --workflow test-failure-fix: build health route",
             ),
         ] {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             state.push_input(input);
 
             let before = chrono::Local::now();
@@ -1241,7 +1239,7 @@ mod tests {
                 vec!["run-123", "accepted"],
             ),
         ] {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
             state.push_input(input);
 
             let before = chrono::Local::now();
@@ -1257,7 +1255,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_submission_is_dispatched_as_background_task_to_keep_ui_responsive() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.push_input("/runs");
 
         submit_input(&mut state, &runtime).await;
@@ -1272,7 +1270,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_submission_does_not_mark_workflow_execution_running() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.push_input("/runs");
 
         submit_input(&mut state, &runtime).await;
@@ -1292,8 +1290,8 @@ mod tests {
         state.cancel_background_tasks();
     }
 
-    #[test]
-    fn help_uses_generated_slash_command_rows() {
+    #[tokio::test]
+    async fn help_uses_generated_slash_command_rows() {
         let mut state = test_state();
 
         show_help(&mut state);
@@ -1311,12 +1309,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn workflows_command_renders_catalog_details() {
+    #[tokio::test]
+    async fn workflows_command_renders_catalog_details() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1328,7 +1326,9 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         let mut state = AppState::new(config);
 
         show_workflows(&mut state, &runtime).unwrap();
@@ -1353,7 +1353,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1365,8 +1365,12 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
-        let store = RedbRunStore::create(&config.workflow_store).unwrap();
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let store = SqliteWorkflowStore::connect(&config.workflow_store)
+            .await
+            .unwrap();
         let mut state = AppState::new(config);
 
         seed_run(
@@ -1378,7 +1382,8 @@ mod tests {
                 "done",
                 Some("record-completed"),
             ),
-        );
+        )
+        .await;
         seed_run(
             &store,
             workflow_run(
@@ -1398,7 +1403,8 @@ mod tests {
                 "approval",
                 Some("record-waiting"),
             ),
-        );
+        )
+        .await;
         seed_run(
             &store,
             workflow_run(
@@ -1410,7 +1416,8 @@ mod tests {
                 "deploy",
                 Some("record-failed"),
             ),
-        );
+        )
+        .await;
 
         state.push_input("/runs");
         submit_input(&mut state, &runtime).await;
@@ -1522,7 +1529,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1534,8 +1541,12 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
-        let store = RedbRunStore::create(&config.workflow_store).unwrap();
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
+        let store = SqliteWorkflowStore::connect(&config.workflow_store)
+            .await
+            .unwrap();
         let mut matching_state = AppState::new(config.clone());
 
         seed_run(
@@ -1547,7 +1558,8 @@ mod tests {
                 "done",
                 Some("record-completed"),
             ),
-        );
+        )
+        .await;
         seed_run(
             &store,
             workflow_run(
@@ -1567,7 +1579,8 @@ mod tests {
                 "approval",
                 Some("record-waiting"),
             ),
-        );
+        )
+        .await;
 
         matching_state.push_input("/runs waiting");
         submit_input(&mut matching_state, &runtime).await;
@@ -1606,7 +1619,7 @@ mod tests {
 
     #[tokio::test]
     async fn runs_submission_eventually_renders_empty_state_card_after_background_drain() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
 
         state.push_input("/runs");
         submit_input(&mut state, &runtime).await;
@@ -1625,8 +1638,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn slash_suggestions_filter_by_command_prefix() {
+    #[tokio::test]
+    async fn slash_suggestions_filter_by_command_prefix() {
         let suggestions = slash_suggestions("/run")
             .into_iter()
             .map(|command| command.usage)
@@ -1646,8 +1659,8 @@ mod tests {
         assert!(!suggestions.iter().any(|usage| usage.starts_with("/answer")));
     }
 
-    #[test]
-    fn slash_suggestions_include_resume_usage() {
+    #[tokio::test]
+    async fn slash_suggestions_include_resume_usage() {
         let suggestions = slash_suggestions("/res")
             .into_iter()
             .map(|command| command.usage)
@@ -1685,7 +1698,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -1698,6 +1711,8 @@ mod tests {
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap()
             .with_deterministic_selector();
         let mut state = AppState::new(config);
 
@@ -1707,7 +1722,7 @@ mod tests {
         assert!(state.status().contains("run --workflow review"));
         assert_eq!(state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        assert!(state.drain_background_tasks().await);
+        drain_finished_background_task(&mut state).await;
         assert_eq!(state.background_task_count(), 0);
         assert_eq!(state.workflow_name(), Some("review"));
     }
@@ -1733,7 +1748,7 @@ mod tests {
                 "/run [--step] [--workflow <workflow-id>] <request>",
             ),
         ] {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
 
             state.push_input(input);
             submit_input(&mut state, &runtime).await;
@@ -1804,7 +1819,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             mouse_scroll_lines: crate::config::AppConfig::default().mouse_scroll_lines,
             config_sets: std::collections::BTreeMap::from([(
@@ -1821,14 +1836,16 @@ mod tests {
                 ..AgentConfig::default()
             }],
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         let mut state = AppState::new(config);
 
         runtime
             .start_run_with_workflow("resolve-smoke", "do it")
             .await
             .unwrap_err();
-        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
         assert!(!state.workflow_execution_running());
 
         let options_input = format!("/resolve {run_id}");
@@ -1883,14 +1900,17 @@ mod tests {
             &[&run_id, "planned"],
         );
         tokio::task::yield_now().await;
-        assert!(state.drain_background_tasks().await);
-        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
+        drain_finished_background_task(&mut state).await;
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
 
-        let run = runtime.load_run(&run_id).unwrap();
+        let run = runtime.load_run(&run_id).await.unwrap();
         assert_eq!(run.status, RunStatus::Completed);
-        let store = RedbRunStore::create(dir.path().join("state/workflow.redb")).unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
         let record = store
-            .get_object::<StepRecord>(run.head.as_ref().unwrap())
+            .load_step_record(run.head.as_ref().unwrap())
+            .await
             .unwrap();
         let output = record.output.unwrap();
         assert_eq!(output.fields["summary"], "manual resolution");
@@ -1904,7 +1924,7 @@ mod tests {
 
     #[tokio::test]
     async fn parser_errors_show_usage_without_starting_plain_text_run() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
 
         state.push_input("/run \"unterminated");
         submit_input(&mut state, &runtime).await;
@@ -1924,7 +1944,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_resolve_field_shows_reason_and_usage() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
 
         state
             .push_input(r#"/resolve run-1 success --field credentials '{"token":"private-token"'"#);
@@ -1954,7 +1974,7 @@ mod tests {
             "/resolve run-1 --field summary one --field summary two",
             "/resolve run-1 --body details",
         ] {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
 
             state.push_input(input);
             submit_input(&mut state, &runtime).await;
@@ -1972,7 +1992,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_resolve_fields_with_status_are_actionable() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
 
         state.push_input("/resolve run-1 success --field summary one --field summary two");
         submit_input(&mut state, &runtime).await;
@@ -1997,7 +2017,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let config = AppConfig {
                 state_dir: dir.path().join("state"),
-                workflow_store: dir.path().join("state/workflow.redb"),
+                workflow_store: dir.path().join("state/data.db"),
                 workflow_dirs: Vec::new(),
                 config_sets: std::collections::BTreeMap::from([(
                     "default".to_string(),
@@ -2010,6 +2030,8 @@ mod tests {
                 ..AppConfig::default()
             };
             let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+                .await
+                .unwrap()
                 .with_deterministic_selector();
             let mut state = AppState::new(config);
 
@@ -2033,7 +2055,7 @@ mod tests {
                 "submitted run --workflow review: do work",
             ),
         ] {
-            let (_dir, runtime, mut state) = test_runtime_state();
+            let (_dir, runtime, mut state) = test_runtime_state().await;
 
             state.push_input(input);
             submit_input(&mut state, &runtime).await;
@@ -2063,7 +2085,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_prompt_answer_fallback_spawns_answer_task_and_clears_target() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.apply_workflow_event(WorkflowEvent::new(
             "pending-run",
             WorkflowEventKind::WaitingForInput {
@@ -2099,7 +2121,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_answer_slash_command_preempts_pending_prompt_fallback() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.apply_workflow_event(WorkflowEvent::new(
             "pending-run",
             WorkflowEventKind::WaitingForInput {
@@ -2132,8 +2154,8 @@ mod tests {
         state.cancel_background_tasks();
     }
 
-    #[test]
-    fn complete_slash_suggestion_updates_input() {
+    #[tokio::test]
+    async fn complete_slash_suggestion_updates_input() {
         let mut state = test_state();
         state.push_input("/ru");
 
@@ -2147,7 +2169,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -2159,7 +2181,9 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         let mut state = AppState::new(config);
 
         state.push_input("/resume");
@@ -2182,7 +2206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -2194,7 +2218,9 @@ mod tests {
             )]),
             ..AppConfig::default()
         };
-        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()));
+        let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         let mut state = AppState::new(config);
 
         submit_input(&mut state, &runtime).await;
@@ -2210,7 +2236,7 @@ mod tests {
         async fn apply_finished_report(state: &mut AppState, report: RunReport) {
             state.spawn_test_card_report_task("seed report".to_string(), async move { Ok(report) });
             tokio::task::yield_now().await;
-            assert!(state.drain_background_tasks().await);
+            drain_finished_background_task(state).await;
             assert!(!state.workflow_execution_running());
         }
 
@@ -2251,7 +2277,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -2264,6 +2290,8 @@ mod tests {
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap()
             .with_deterministic_selector();
 
         let step_report = runtime
@@ -2278,9 +2306,9 @@ mod tests {
         submit_input(&mut step_state, &runtime).await;
         assert_eq!(step_state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        assert!(step_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut step_state).await;
         assert_eq!(
-            runtime.load_run(&step_run_id).unwrap().status,
+            runtime.load_run(&step_run_id).await.unwrap().status,
             RunStatus::Completed
         );
 
@@ -2300,9 +2328,9 @@ mod tests {
         submit_input(&mut resume_state, &runtime).await;
         assert_eq!(resume_state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        assert!(resume_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut resume_state).await;
         assert_eq!(
-            runtime.load_run(&resume_run_id).unwrap().status,
+            runtime.load_run(&resume_run_id).await.unwrap().status,
             RunStatus::Completed
         );
 
@@ -2317,9 +2345,9 @@ mod tests {
         submit_input(&mut answer_state, &runtime).await;
         assert_eq!(answer_state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        assert!(answer_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut answer_state).await;
         assert_eq!(
-            runtime.load_run(&plain_answer_run).unwrap().status,
+            runtime.load_run(&plain_answer_run).await.unwrap().status,
             RunStatus::Completed
         );
 
@@ -2340,9 +2368,9 @@ mod tests {
         submit_input(&mut explicit_state, &runtime).await;
         assert_eq!(explicit_state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        assert!(explicit_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut explicit_state).await;
         assert_eq!(
-            runtime.load_run(&explicit_answer_run).unwrap().status,
+            runtime.load_run(&explicit_answer_run).await.unwrap().status,
             RunStatus::Completed
         );
 
@@ -2365,7 +2393,7 @@ mod tests {
         async fn apply_finished_report(state: &mut AppState, report: RunReport) {
             state.spawn_test_card_report_task("seed report".to_string(), async move { Ok(report) });
             tokio::task::yield_now().await;
-            assert!(state.drain_background_tasks().await);
+            drain_finished_background_task(state).await;
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -2400,7 +2428,7 @@ mod tests {
         .unwrap();
         let config = AppConfig {
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
@@ -2409,17 +2437,23 @@ mod tests {
             ..AppConfig::default()
         };
         let runtime = WorkflowRuntime::new(config.runtime_config(dir.path().to_path_buf()))
+            .await
+            .unwrap()
             .with_deterministic_selector();
         let mut idle_state = AppState::new(config.clone());
         idle_state.push_input("  request  ");
 
         submit_input(&mut idle_state, &runtime).await;
         tokio::task::yield_now().await;
-        assert!(idle_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut idle_state).await;
 
-        let idle_run = runtime.list_runs(None).unwrap().remove(0);
+        let idle_run = runtime.list_runs(None).await.unwrap().remove(0);
         assert_eq!(
-            runtime.load_run(&idle_run.run_id).unwrap().original_request,
+            runtime
+                .load_run(&idle_run.run_id)
+                .await
+                .unwrap()
+                .original_request,
             "request"
         );
 
@@ -2434,12 +2468,15 @@ mod tests {
 
         submit_input(&mut answer_state, &runtime).await;
         tokio::task::yield_now().await;
-        assert!(answer_state.drain_background_tasks().await);
+        drain_finished_background_task(&mut answer_state).await;
 
-        let answered = runtime.load_run(&answered_run_id).unwrap();
-        let store = RedbRunStore::create(dir.path().join("state/workflow.redb")).unwrap();
+        let answered = runtime.load_run(&answered_run_id).await.unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
         let record = store
-            .get_object::<StepRecord>(answered.head.as_ref().unwrap())
+            .load_step_record(answered.head.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(record.output.unwrap().body, "yes");
 
@@ -2459,7 +2496,7 @@ mod tests {
 
     #[tokio::test]
     async fn synchronous_idle_dispatch_error_clears_and_records_trimmed_submission() {
-        let (dir, runtime, mut state) = test_runtime_state();
+        let (dir, runtime, mut state) = test_runtime_state().await;
         state.push_input("  /resolve missing-run  ");
 
         let before = chrono::Local::now();
@@ -2484,10 +2521,12 @@ mod tests {
 
     #[tokio::test]
     async fn active_agent_prompt_is_persisted_verbatim_without_starting_another_task() {
-        let (dir, runtime, mut state) = test_runtime_state();
-        let store = RedbRunStore::create(dir.path().join("state/workflow.redb")).unwrap();
+        let (dir, runtime, mut state) = test_runtime_state().await;
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
         let run = workflow_run("run-live", None, RunStatus::Running, "implement", None);
-        seed_run(&store, run.clone());
+        seed_run(&store, run.clone()).await;
         let window = AgentPromptWindow {
             window_id: "window-live".to_string(),
             run_id: run.id.clone(),
@@ -2499,7 +2538,10 @@ mod tests {
             opened_at: Utc::now(),
             sealed_at: None,
         };
-        store.open_agent_prompt_window(window.clone()).unwrap();
+        store
+            .open_agent_prompt_window(window.clone())
+            .await
+            .unwrap();
         state.spawn_test_card_report_task("running".to_string(), async {
             std::future::pending::<Result<RunReport, String>>().await
         });
@@ -2527,7 +2569,7 @@ mod tests {
         assert_eq!(state.input(), "");
         assert_eq!(state.background_task_count(), 1);
         assert!(!state.history_is_empty());
-        let prompts = store.load_user_prompts(&run.id).unwrap();
+        let prompts = store.load_user_prompts(&run.id).await.unwrap();
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].content, prompt);
         assert_eq!(prompts[0].sequence, 1);
@@ -2539,10 +2581,12 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_active_prompt_retains_exact_draft_and_history() {
-        let (dir, runtime, mut state) = test_runtime_state();
-        let store = RedbRunStore::create(dir.path().join("state/workflow.redb")).unwrap();
+        let (dir, runtime, mut state) = test_runtime_state().await;
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
         let run = workflow_run("run-live", None, RunStatus::Running, "implement", None);
-        seed_run(&store, run.clone());
+        seed_run(&store, run.clone()).await;
         store
             .open_agent_prompt_window(AgentPromptWindow {
                 window_id: "current-window".to_string(),
@@ -2555,6 +2599,7 @@ mod tests {
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .unwrap();
         state.spawn_test_card_report_task("running".to_string(), async {
             std::future::pending::<Result<RunReport, String>>().await
@@ -2582,14 +2627,14 @@ mod tests {
 
         assert_eq!(state.input(), draft);
         assert!(state.history_is_empty());
-        assert!(store.load_user_prompts(&run.id).unwrap().is_empty());
+        assert!(store.load_user_prompts(&run.id).await.unwrap().is_empty());
         assert!(state.status().contains("draft retained"));
         state.cancel_background_tasks();
     }
 
     #[tokio::test]
     async fn active_execution_rejects_mutating_commands_but_allows_read_only_commands() {
-        let (_dir, runtime, mut state) = test_runtime_state();
+        let (_dir, runtime, mut state) = test_runtime_state().await;
         state.spawn_test_card_report_task("running".to_string(), async {
             std::future::pending::<Result<RunReport, String>>().await
         });
@@ -2612,8 +2657,8 @@ mod tests {
         state.cancel_background_tasks();
     }
 
-    #[test]
-    fn execution_command_policy_matches_control_matrix() {
+    #[tokio::test]
+    async fn execution_command_policy_matches_control_matrix() {
         for input in [
             "/cancel",
             "/help",

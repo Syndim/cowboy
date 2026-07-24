@@ -1,14 +1,12 @@
-use async_trait::async_trait;
-use chrono::{DateTime, Utc};
-use serde::{Serialize, de::DeserializeOwned};
-
 use crate::{
     AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome,
-    CompareAndSealPromptWindowOutcome, ObjectHash, ObjectKind, OpenAgentPromptWindowOutcome,
-    Result, ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
+    CompareAndSealPromptWindowOutcome, ObjectHash, OpenAgentPromptWindowOutcome, Result,
+    ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
     StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
     WorkflowDefinition, WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
 };
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 /// Result of loading and compiling a workflow source.
 #[derive(Debug, Clone, PartialEq)]
@@ -132,44 +130,67 @@ pub trait WorkflowSummarizer: Send + Sync {
     async fn summarize(&self, run: &WorkflowRun) -> Result<WorkflowSummary>;
 }
 
-pub trait RunStore: Send + Sync {
-    fn save_run(&self, run: &WorkflowRun) -> Result<()>;
+#[async_trait]
+pub trait WorkflowStateStore: Send + Sync {
+    async fn save_run(&self, run: &WorkflowRun) -> Result<()>;
+    async fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun>;
+    async fn list_runs(&self) -> Result<Vec<RunHead>>;
+    async fn load_run_head(&self, run_id: &str) -> Result<RunHead>;
+    async fn commit_completed_step(
+        &self,
+        run: &WorkflowRun,
+        record: &StepRecord,
+    ) -> Result<ObjectHash>;
+    async fn delete_run(&self, run_id: &str) -> Result<()>;
+}
 
-    fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun>;
+#[async_trait]
+pub trait WorkflowObjectStore: Send + Sync {
+    async fn store_workflow_source_snapshot(
+        &self,
+        snapshot: &WorkflowSourceSnapshot,
+    ) -> Result<ObjectHash>;
+    async fn load_workflow_source_snapshot(
+        &self,
+        hash: &ObjectHash,
+    ) -> Result<WorkflowSourceSnapshot>;
+    async fn store_step_record(&self, record: &StepRecord) -> Result<ObjectHash>;
+    async fn load_step_record(&self, hash: &ObjectHash) -> Result<StepRecord>;
+    async fn delete_object(&self, hash: &ObjectHash) -> Result<()>;
+}
 
-    fn list_runs(&self) -> Result<Vec<RunHead>>;
+#[async_trait]
+pub trait AgentSessionStore: Send + Sync {
+    async fn save_role_session(&self, session: RoleSession) -> Result<()>;
+    async fn load_role_session(&self, run_id: &str, role_id: &str) -> Result<Option<RoleSession>>;
+    async fn delete_role_sessions(&self, run_id: &str) -> Result<()>;
+}
 
-    fn put_object<T: Serialize>(&self, kind: ObjectKind, value: &T) -> Result<ObjectHash>;
+#[async_trait]
+pub trait TurnStore: Send + Sync {
+    async fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash>;
+    async fn load_turn(&self, hash: &ObjectHash) -> Result<TurnRecord>;
+    async fn load_turns(&self, run_id: &str, step_record_id: &str) -> Result<Vec<TurnRecord>>;
+}
 
-    fn get_object<T: DeserializeOwned>(&self, hash: &ObjectHash) -> Result<T>;
+#[async_trait]
+pub trait UserPromptStore: Send + Sync {
+    async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>>;
+}
 
-    fn update_run_head(&self, run_id: &str, head: RunHead) -> Result<()>;
-
-    fn load_run_head(&self, run_id: &str) -> Result<RunHead>;
-
-    fn save_role_session(&self, session: RoleSession) -> Result<()>;
-
-    fn load_role_session(&self, run_id: &str, role_id: &str) -> Result<Option<RoleSession>>;
-
-    fn delete_role_sessions(&self, run_id: &str) -> Result<()>;
-
-    fn append_turn(&self, run_id: &str, turn: TurnRecord) -> Result<ObjectHash>;
-
-    fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>>;
-
-    fn open_agent_prompt_window(
+#[async_trait]
+pub trait PromptWindowStore: Send + Sync {
+    async fn open_agent_prompt_window(
         &self,
         window: AgentPromptWindow,
     ) -> Result<OpenAgentPromptWindowOutcome>;
-
-    fn append_user_prompt(
+    async fn append_user_prompt(
         &self,
         run_id: &str,
         window_id: &str,
         content: String,
     ) -> Result<AppendUserPromptOutcome>;
-
-    fn compare_and_seal_agent_prompt_window(
+    async fn compare_and_seal_agent_prompt_window(
         &self,
         run_id: &str,
         window_id: &str,
@@ -177,7 +198,7 @@ pub trait RunStore: Send + Sync {
         sealed_at: DateTime<Utc>,
     ) -> Result<CompareAndSealPromptWindowOutcome>;
 
-    fn abort_agent_prompt_window(
+    async fn abort_agent_prompt_window(
         &self,
         run_id: &str,
         window_id: &str,
@@ -185,7 +206,28 @@ pub trait RunStore: Send + Sync {
     ) -> Result<AbortAgentPromptWindowOutcome>;
 
     /// Clear any process-stale prompt window while holding the run execution guard.
-    fn clear_agent_prompt_window(&self, run_id: &str) -> Result<Option<AgentPromptWindow>>;
+    async fn clear_agent_prompt_window(&self, run_id: &str) -> Result<Option<AgentPromptWindow>>;
+}
+
+pub trait WorkflowStore:
+    WorkflowStateStore
+    + WorkflowObjectStore
+    + AgentSessionStore
+    + TurnStore
+    + UserPromptStore
+    + PromptWindowStore
+{
+}
+
+impl<T> WorkflowStore for T where
+    T: WorkflowStateStore
+        + WorkflowObjectStore
+        + AgentSessionStore
+        + TurnStore
+        + UserPromptStore
+        + PromptWindowStore
+        + ?Sized
+{
 }
 
 #[cfg(test)]
@@ -195,6 +237,24 @@ mod tests {
 
     use super::*;
     use crate::{StepDetail, StepInput, StepOutput};
+
+    #[allow(dead_code)]
+    fn assert_object_safe(
+        _: &dyn WorkflowStateStore,
+        _: &dyn WorkflowObjectStore,
+        _: &dyn AgentSessionStore,
+        _: &dyn TurnStore,
+        _: &dyn UserPromptStore,
+        _: &dyn PromptWindowStore,
+        _: &dyn WorkflowStore,
+    ) {
+    }
+
+    #[test]
+    fn workflow_store_capabilities_are_object_safe() {
+        let _ = assert_object_safe;
+        println!("EVIDENCE workflow-store-traits object_safe=7 async=true");
+    }
 
     fn record() -> StepRecord {
         let now = Utc::now();

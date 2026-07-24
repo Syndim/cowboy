@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 use chrono::Utc;
 use cowboy_agent_client::ModelInfo;
@@ -21,20 +18,21 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
-    ObjectKind, Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction,
-    StepActionProvider, StepRecord, WorkflowCatalog, WorkflowDefinition, WorkflowError,
-    WorkflowRun, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
+    Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction,
+    StepActionProvider, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun,
+    WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
 };
-use cowboy_workflow_store::{RedbRunStore, StoreWaitCancellation, StoreWaitObserver};
+use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::active_clock::ActiveRunClock;
 use crate::agent_resolver::AgentResolver;
 use crate::events::WORKFLOW_STORE_WAITING_MESSAGE;
-use crate::run_lock::RunExecutionLocks;
+use crate::run_lock::{RunExecutionGuard, RunExecutionLocks};
 use crate::runtime_dependencies::{
     AcpConnector, ProductionAcpConnector, ProductionRuntimeDependencies, RuntimeDependencies,
     transport_for, watchdog_options_for,
@@ -319,8 +317,8 @@ pub struct ResolutionStatus {
 #[derive(Clone)]
 pub struct WorkflowRuntime {
     config: RuntimeConfig,
-    store: RedbRunStore,
-    store_wait_generation: Arc<AtomicU64>,
+    store: SqliteWorkflowStore,
+    store_wait_generation: watch::Sender<u64>,
     events: Arc<EventBus>,
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
@@ -343,21 +341,29 @@ struct ActiveRunExecution {
     request_topic: Option<String>,
     events: Vec<WorkflowEvent>,
     active_clock: ActiveRunClock,
+    run_guard: RunExecutionGuard,
 }
 
 struct ActiveRunCancellationGuard {
-    store: RedbRunStore,
+    store: SqliteWorkflowStore,
     run_id: String,
     active_clock: ActiveRunClock,
+    run_guard: Option<RunExecutionGuard>,
     armed: bool,
 }
 
 impl ActiveRunCancellationGuard {
-    fn new(store: RedbRunStore, run_id: String, active_clock: ActiveRunClock) -> Self {
+    fn new(
+        store: SqliteWorkflowStore,
+        run_id: String,
+        active_clock: ActiveRunClock,
+        run_guard: Option<RunExecutionGuard>,
+    ) -> Self {
         Self {
             store,
             run_id,
             active_clock,
+            run_guard,
             armed: true,
         }
     }
@@ -373,19 +379,27 @@ impl Drop for ActiveRunCancellationGuard {
             return;
         }
 
-        if let Err(err) = self.store.clear_agent_prompt_window(&self.run_id) {
-            tracing::warn!(run_id = %self.run_id, error = %err, "failed to clear agent prompt window during cancellation");
-        }
-
-        match self.store.load_run(&self.run_id) {
-            Ok(mut run) => {
-                if let Err(err) = self.active_clock.close(&self.store, &mut run) {
-                    tracing::warn!(run_id = %self.run_id, error = %err, "failed to close active run clock during cancellation");
+        let store = self.store.clone();
+        let run_id = self.run_id.clone();
+        let active_clock = self.active_clock.clone();
+        let run_guard = self.run_guard.take();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _run_guard = run_guard;
+                if let Err(err) = store.clear_agent_prompt_window(&run_id).await {
+                    tracing::warn!(run_id = %run_id, error = %err, "failed to clear agent prompt window during cancellation");
                 }
-            }
-            Err(err) => {
-                tracing::warn!(run_id = %self.run_id, error = %err, "failed to load run during active clock cancellation cleanup");
-            }
+                match store.load_run(&run_id).await {
+                    Ok(mut run) => {
+                        if let Err(err) = active_clock.close(&store, &mut run).await {
+                            tracing::warn!(run_id = %run_id, error = %err, "failed to close active run clock during cancellation");
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(run_id = %run_id, error = %err, "failed to load run during active clock cancellation cleanup");
+                    }
+                }
+            });
         }
     }
 }
@@ -400,39 +414,44 @@ pub(crate) enum SelectorMode {
 }
 
 impl WorkflowRuntime {
-    pub fn new(config: RuntimeConfig) -> Self {
+    pub async fn new(config: RuntimeConfig) -> Result<Self> {
         let acp_connector = Arc::new(ProductionAcpConnector);
         Self::with_dependencies_and_connector(
             config,
             Arc::new(ProductionRuntimeDependencies::new(acp_connector.clone())),
             acp_connector,
         )
+        .await
     }
 
     #[cfg(test)]
-    fn with_dependencies(
+    async fn with_dependencies(
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::with_dependencies_and_connector(
             config,
             dependencies,
             Arc::new(ProductionAcpConnector),
         )
+        .await
     }
 
-    fn with_dependencies_and_connector(
+    async fn with_dependencies_and_connector(
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
         acp_connector: Arc<dyn AcpConnector>,
-    ) -> Self {
-        let store = RedbRunStore::lazy(&config.workflow_store);
+    ) -> Result<Self> {
+        let store = SqliteWorkflowStore::connect(&config.workflow_store)
+            .await
+            .map_err(WorkflowError::from)?;
+        let (store_wait_generation, _) = watch::channel(0_u64);
 
-        Self {
+        Ok(Self {
             run_locks: RunExecutionLocks::new(config.workflow_store.clone()),
             config,
             store,
-            store_wait_generation: Arc::new(AtomicU64::new(0)),
+            store_wait_generation,
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
@@ -440,7 +459,7 @@ impl WorkflowRuntime {
             prompt_turn_controls: PromptTurnControlRegistry::default(),
             #[cfg(feature = "test-support")]
             handoff_observer: None,
-        }
+        })
     }
 
     /// Use the deterministic (first-by-id) selector instead of the agent-backed
@@ -452,7 +471,8 @@ impl WorkflowRuntime {
 
     /// Interrupt database availability waits started by current runtime operations.
     pub fn cancel_store_waits(&self) {
-        let generation = self.store_wait_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let generation = *self.store_wait_generation.borrow() + 1;
+        self.store_wait_generation.send_replace(generation);
         tracing::debug!(generation, "cancelled pending workflow store waits");
     }
 
@@ -485,10 +505,10 @@ impl WorkflowRuntime {
         Ok(catalog)
     }
 
-    pub fn list_runs(&self, partial_run_id: Option<&str>) -> Result<Vec<RunSummaryLine>> {
+    pub async fn list_runs(&self, partial_run_id: Option<&str>) -> Result<Vec<RunSummaryLine>> {
         let store = self.store()?;
         let mut runs = Vec::new();
-        for head in store.list_runs()? {
+        for head in store.list_runs().await? {
             if partial_run_id.is_some_and(|partial| !head.run_id.contains(partial)) {
                 continue;
             }
@@ -516,7 +536,7 @@ impl WorkflowRuntime {
                 continue;
             }
 
-            if let Ok(run) = store.load_run(&run_id) {
+            if let Ok(run) = store.load_run(&run_id).await {
                 let topic = self.summary_topic(&run);
                 runs.push(RunSummaryLine {
                     run_id: run.id,
@@ -543,11 +563,11 @@ impl WorkflowRuntime {
         })
     }
 
-    pub fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
-        Ok(self.store()?.load_run(&run_id.to_string())?)
+    pub async fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
+        Ok(self.store()?.load_run(run_id).await?)
     }
 
-    pub fn submit_user_prompt(
+    pub async fn submit_user_prompt(
         &self,
         run_id: &str,
         window_id: &str,
@@ -558,7 +578,8 @@ impl WorkflowRuntime {
         }
         let outcome = self
             .store()?
-            .append_user_prompt(run_id, window_id, content)?;
+            .append_user_prompt(run_id, window_id, content)
+            .await?;
         Ok(match outcome {
             AppendUserPromptOutcome::Accepted(prompt) => {
                 self.prompt_turn_controls
@@ -670,12 +691,12 @@ impl WorkflowRuntime {
         workflow_id: &str,
     ) -> Result<RunReport> {
         let run_id = format!("run-{}", Uuid::new_v4());
-        let _run_guard = self.run_locks.acquire(&run_id)?;
+        let run_guard = self.run_locks.acquire(&run_id)?;
         let source_ref = catalog
             .workflows
             .get(workflow_id)
             .ok_or_else(|| WorkflowError::InvalidAction("selected workflow missing".to_string()))?;
-        let (definition, snapshot, workflow_hash) = self.compile_source(source_ref)?;
+        let (definition, snapshot, workflow_hash) = self.compile_source(source_ref).await?;
         let config_set = self.resolve_config_set(&definition)?;
         tracing::debug!(
             workflow_id = %workflow_id,
@@ -707,20 +728,29 @@ impl WorkflowRuntime {
             updated_at: now,
         };
         let store = self.store_for_run(&run.id)?;
-        store.save_run(&run)?;
-        store.update_run_head(&run.id, run_head(&run))?;
+        store.save_run(&run).await?;
         let active_clock = ActiveRunClock::open(&run);
         tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
         let request_topic = self.generate_request_topic(&run.original_request).await;
         if let Some(topic) = &request_topic {
             run.request_topic = Some(topic.clone());
             run.updated_at = Utc::now();
-            store.save_run(&run)?;
-            store.update_run_head(&run.id, run_head(&run))?;
+            store.save_run(&run).await?;
         }
 
-        self.run_existing(run, definition, snapshot, mode, request_topic, active_clock)
-            .await
+        self.run_existing_with_events(
+            run,
+            definition,
+            snapshot,
+            mode,
+            ActiveRunExecution {
+                request_topic,
+                events: Vec::new(),
+                active_clock,
+                run_guard,
+            },
+        )
+        .await
     }
 
     /// Resolve the config-set **name** a workflow selects, validating it against
@@ -835,9 +865,9 @@ impl WorkflowRuntime {
 
     async fn resume_with(&self, run_id: &str, mode: RunMode) -> Result<RunReport> {
         tracing::debug!(run_id, mode = ?mode, "resuming workflow run");
-        let _run_guard = self.run_locks.acquire(run_id)?;
+        let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
-        let mut run = store.load_run(&run_id.to_string())?;
+        let mut run = store.load_run(run_id).await?;
         tracing::debug!(
             run_id = %run.id,
             status = ?run.status,
@@ -865,7 +895,7 @@ impl WorkflowRuntime {
                     current_step = %run.current_step,
                     "resuming non-terminal run; re-executing the retained current step"
                 );
-                apply_run_status(&store, &mut run, RunStatus::Running)?;
+                apply_run_status(&store, &mut run, RunStatus::Running).await?;
             }
             RunStatus::Completed | RunStatus::Cancelled => {
                 tracing::debug!(run_id = %run.id, status = ?run.status, "workflow run is not resumable; returning without execution");
@@ -882,8 +912,19 @@ impl WorkflowRuntime {
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
         let request_topic = run.request_topic.clone();
-        self.run_existing(run, definition, snapshot, mode, request_topic, active_clock)
-            .await
+        self.run_existing_with_events(
+            run,
+            definition,
+            snapshot,
+            mode,
+            ActiveRunExecution {
+                request_topic,
+                events: Vec::new(),
+                active_clock,
+                run_guard,
+            },
+        )
+        .await
     }
 
     pub async fn answer_run(
@@ -898,9 +939,9 @@ impl WorkflowRuntime {
             answer_chars = answer.chars().count(),
             "answering workflow prompt"
         );
-        let _run_guard = self.run_locks.acquire(run_id)?;
+        let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
-        let mut run = store.load_run(&run_id.to_string())?;
+        let mut run = store.load_run(run_id).await?;
         let router = ResumeRouter::default();
         let answer = router.validate_answer(&run, prompt_id, answer)?;
         let active_clock = ActiveRunClock::open(&run);
@@ -914,13 +955,14 @@ impl WorkflowRuntime {
         let status = match result {
             ActionResult::Completed(record) => {
                 let record = *record;
-                let status = apply_step_record(&store, &definition, &mut run, record.clone())?;
+                let status =
+                    apply_step_record(&store, &definition, &mut run, record.clone()).await?;
                 events.push(active_clock.step_completed_for_run(&run, &record));
                 events.push(active_clock.run_status_for_run(&run, &status));
                 status
             }
             ActionResult::Blocked(status) => {
-                let status = apply_run_status(&store, &mut run, status)?;
+                let status = apply_run_status(&store, &mut run, status).await?;
                 events.push(active_clock.run_status_for_run(&run, &status));
                 status
             }
@@ -941,11 +983,12 @@ impl WorkflowRuntime {
                     request_topic,
                     events,
                     active_clock,
+                    run_guard,
                 },
             )
             .await
         } else {
-            active_clock.close(&store, &mut run)?;
+            active_clock.close(&store, &mut run).await?;
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
         }
@@ -953,16 +996,16 @@ impl WorkflowRuntime {
 
     /// Inspect a failed run and return the statuses it can be resolved to along
     /// with the information each status requires. See [`resolve_run`].
-    pub fn resolution_options(&self, run_id: &str) -> Result<ResolutionOptions> {
+    pub async fn resolution_options(&self, run_id: &str) -> Result<ResolutionOptions> {
         let store = self.store_for_run(run_id)?;
-        let run = store.load_run(&run_id.to_string())?;
-        self.build_resolution_options(&run, &store)
+        let run = store.load_run(run_id).await?;
+        self.build_resolution_options(&run, &store).await
     }
 
-    fn build_resolution_options(
+    async fn build_resolution_options(
         &self,
         run: &WorkflowRun,
-        store: &RedbRunStore,
+        store: &SqliteWorkflowStore,
     ) -> Result<ResolutionOptions> {
         ensure_resolvable(run)?;
         let snapshot = snapshot_from_run(run);
@@ -982,12 +1025,11 @@ impl WorkflowRuntime {
 
         // Recompute the failed step's action to recover its output shape; a
         // failed step persists no StepRecord, so the schema must be re-evaluated.
-        let prev_record = run
-            .head
-            .as_ref()
-            .map(|head| store.get_object::<StepRecord>(head))
-            .transpose()?;
-        let user_prompts = store.load_user_prompts(&run.id)?;
+        let prev_record = match &run.head {
+            Some(head) => Some(store.load_step_record(head).await?),
+            None => None,
+        };
+        let user_prompts = store.load_user_prompts(&run.id).await?;
         let provider = LuaStepActionProvider::new(snapshot);
         let action = provider
             .step_action(&definition, run, &step, prev_record.as_ref(), &user_prompts)
@@ -1038,12 +1080,12 @@ impl WorkflowRuntime {
         body: Option<String>,
     ) -> Result<RunReport> {
         tracing::info!(run_id, status, "resolving failed workflow run");
-        let _run_guard = self.run_locks.acquire(run_id)?;
+        let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
-        let mut run = store.load_run(&run_id.to_string())?;
+        let mut run = store.load_run(run_id).await?;
         ensure_resolvable(&run)?;
 
-        let options = self.build_resolution_options(&run, &store)?;
+        let options = self.build_resolution_options(&run, &store).await?;
         let Some(chosen) = options.statuses.iter().find(|s| s.status == status) else {
             return Err(WorkflowError::InvalidAction(format!(
                 "status {status:?} cannot resolve step {:?}. {}",
@@ -1089,7 +1131,7 @@ impl WorkflowRuntime {
             retry_reason: None,
             original_request: run.original_request.clone(),
             run_created_at: run.created_at,
-            user_prompts: store.load_user_prompts(&run.id)?,
+            user_prompts: store.load_user_prompts(&run.id).await?,
         };
         let ActionResult::Completed(record) = crate::StatusActionRunner.run(
             StatusAction {
@@ -1107,7 +1149,8 @@ impl WorkflowRuntime {
         record.action = "manual_resolution".to_string();
 
         let mut events = Vec::new();
-        let status_result = apply_step_record(&store, &definition, &mut run, record.clone())?;
+        let status_result =
+            apply_step_record(&store, &definition, &mut run, record.clone()).await?;
         events.push(active_clock.step_completed_for_run(&run, &record));
         events.push(active_clock.event_for_run(
             &run,
@@ -1132,11 +1175,12 @@ impl WorkflowRuntime {
                     request_topic,
                     events,
                     active_clock,
+                    run_guard,
                 },
             )
             .await
         } else {
-            active_clock.close(&store, &mut run)?;
+            active_clock.close(&store, &mut run).await?;
             self.persist_events(&run.id, &events)?;
             Ok(RunReport { run, events })
         }
@@ -1144,7 +1188,7 @@ impl WorkflowRuntime {
 
     pub async fn improve_run(&self, run_id: &str) -> Result<AppliedWorkflowImprovement> {
         tracing::info!(run_id, "improving workflow from run");
-        let run = self.load_run(run_id)?;
+        let run = self.load_run(run_id).await?;
         let resolver = AgentResolver::new(self.config.agents.clone())?;
         let agent = resolver.resolve_default()?;
         let client = self
@@ -1179,7 +1223,7 @@ impl WorkflowRuntime {
             .unwrap_or_else(|| self.config.state_dir.join("workflows"))
     }
 
-    fn compile_source(
+    async fn compile_source(
         &self,
         source_ref: &WorkflowSourceRef,
     ) -> Result<(
@@ -1214,7 +1258,7 @@ impl WorkflowRuntime {
             (definition, snapshot, loaded.source_ref.id)
         };
         let store = self.store()?;
-        let workflow_hash = store.put_object(ObjectKind::WorkflowSourceSnapshot, &snapshot)?;
+        let workflow_hash = store.store_workflow_source_snapshot(&snapshot).await?;
         tracing::debug!(
             workflow_id = %workflow_name,
             files = snapshot.files.len(),
@@ -1225,29 +1269,6 @@ impl WorkflowRuntime {
         definition.source_hash = workflow_hash.clone();
         Ok((definition, snapshot, workflow_hash))
     }
-    async fn run_existing(
-        &self,
-        run: WorkflowRun,
-        definition: cowboy_workflow_core::WorkflowDefinition,
-        snapshot: WorkflowSourceSnapshot,
-        mode: RunMode,
-        request_topic: Option<String>,
-        active_clock: ActiveRunClock,
-    ) -> Result<RunReport> {
-        self.run_existing_with_events(
-            run,
-            definition,
-            snapshot,
-            mode,
-            ActiveRunExecution {
-                request_topic,
-                events: Vec::new(),
-                active_clock,
-            },
-        )
-        .await
-    }
-
     async fn run_existing_with_events(
         &self,
         run: WorkflowRun,
@@ -1260,6 +1281,7 @@ impl WorkflowRuntime {
             request_topic,
             mut events,
             active_clock,
+            run_guard,
         } = execution;
         tracing::debug!(
             run_id = %run.id,
@@ -1273,9 +1295,13 @@ impl WorkflowRuntime {
         let progress_clock = active_clock.clone();
         let mut rx = self.events.subscribe();
         let store = self.store_for_run(&run_id)?;
-        store.clear_agent_prompt_window(&run_id)?;
-        let mut cancellation_guard =
-            ActiveRunCancellationGuard::new(store.clone(), run_id.clone(), active_clock.clone());
+        store.clear_agent_prompt_window(&run_id).await?;
+        let mut cancellation_guard = ActiveRunCancellationGuard::new(
+            store.clone(),
+            run_id.clone(),
+            active_clock.clone(),
+            Some(run_guard),
+        );
         let agent_store = store.clone();
         let progress_events = self.events.clone();
         let agent_config = AgentExecutionConfig {
@@ -1423,11 +1449,11 @@ impl WorkflowRuntime {
         }
     }
 
-    fn store(&self) -> Result<RedbRunStore> {
+    fn store(&self) -> Result<SqliteWorkflowStore> {
         Ok(self.store_with_cancellation(self.store.clone()))
     }
 
-    fn store_for_run(&self, run_id: &str) -> Result<RedbRunStore> {
+    fn store_for_run(&self, run_id: &str) -> Result<SqliteWorkflowStore> {
         let run_id = run_id.to_string();
         let events = self.events.clone();
         let observer: StoreWaitObserver = Arc::new(move |_| {
@@ -1441,10 +1467,8 @@ impl WorkflowRuntime {
         Ok(self.store_with_cancellation(self.store.with_wait_observer(observer)))
     }
 
-    fn store_with_cancellation(&self, store: RedbRunStore) -> RedbRunStore {
-        let expected_generation = self.store_wait_generation.load(Ordering::Acquire);
-        let cancellation =
-            StoreWaitCancellation::new(self.store_wait_generation.clone(), expected_generation);
+    fn store_with_cancellation(&self, store: SqliteWorkflowStore) -> SqliteWorkflowStore {
+        let cancellation = StoreWaitCancellation::new(self.store_wait_generation.subscribe());
         store.with_wait_cancellation(cancellation)
     }
 
@@ -1592,6 +1616,7 @@ fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
     }
 }
 
+#[cfg(test)]
 fn run_head(run: &WorkflowRun) -> RunHead {
     RunHead::from_run(run)
 }
@@ -1608,12 +1633,12 @@ mod tests {
     use cowboy_workflow_agent::PromptWindowHandoffPoint;
     use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
     use cowboy_workflow_core::{
-        AgentPromptWindow, ResumeCallback, RoleDefinition, RunStatus, StepAction,
+        AgentPromptWindow, ResumeCallback, RoleDefinition, RunStatus, StepAction, StepRecord,
     };
     use parking_lot::Mutex as SyncMutex;
+    use sqlx::Executor;
     use std::collections::VecDeque;
     use std::os::unix::fs::PermissionsExt;
-    use std::thread;
     use std::time::Duration;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1926,7 +1951,7 @@ mod tests {
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "definitely-missing-topic-agent")],
             config_sets: BTreeMap::new(),
@@ -1943,7 +1968,7 @@ mod tests {
         RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
@@ -1960,7 +1985,7 @@ mod tests {
         }
     }
 
-    fn runtime_with_recording_connector(
+    async fn runtime_with_recording_connector(
         config: RuntimeConfig,
         connector: Arc<RecordingRuntimeAcpConnector>,
     ) -> WorkflowRuntime {
@@ -1969,6 +1994,8 @@ mod tests {
             Arc::new(MockRuntimeDependencies::new()),
             connector,
         )
+        .await
+        .unwrap()
     }
 
     fn expected_default_runtime_connection() -> RecordedRuntimeAcpConnection {
@@ -1989,7 +2016,8 @@ mod tests {
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
-        );
+        )
+        .await;
         let catalog = runtime.catalog().unwrap();
 
         let error = runtime
@@ -2011,9 +2039,10 @@ mod tests {
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
-        );
+        )
+        .await;
         let run = summary_test_run("improve-connector", RunStatus::Completed, None);
-        runtime.store().unwrap().save_run(&run).unwrap();
+        runtime.store().unwrap().save_run(&run).await.unwrap();
 
         let error = runtime.improve_run(&run.id).await.unwrap_err();
 
@@ -2043,7 +2072,7 @@ mod tests {
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
@@ -2059,6 +2088,8 @@ mod tests {
             ))
         });
         let runtime = WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
+            .await
+            .unwrap()
             .with_deterministic_selector();
 
         let error = runtime.start_run("request").await.unwrap_err();
@@ -2066,7 +2097,7 @@ mod tests {
         assert!(error.to_string().contains("injected factory failure"));
     }
 
-    fn runtime_for_example_workflow(
+    async fn runtime_for_example_workflow(
         dir: &tempfile::TempDir,
         factory: ScriptedAgentFactory,
     ) -> WorkflowRuntime {
@@ -2078,7 +2109,7 @@ mod tests {
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![examples_root],
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
@@ -2092,6 +2123,8 @@ mod tests {
             )]),
         };
         WorkflowRuntime::with_dependencies(config, mock_runtime_dependencies(None, Some(factory)))
+            .await
+            .unwrap()
             .with_deterministic_selector()
     }
 
@@ -2102,7 +2135,7 @@ mod tests {
         }
     }
 
-    fn runtime_for_agent_workflow(
+    async fn runtime_for_agent_workflow(
         dir: &tempfile::TempDir,
         role_agent: Option<&str>,
         agents: Vec<AgentRuntimeConfig>,
@@ -2133,7 +2166,7 @@ mod tests {
         WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents,
             config_sets: BTreeMap::from([(
@@ -2146,10 +2179,15 @@ mod tests {
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector()
     }
 
-    fn runtime_for_workflow_dir(dir: &tempfile::TempDir, workflow_dir: PathBuf) -> WorkflowRuntime {
+    async fn runtime_for_workflow_dir(
+        dir: &tempfile::TempDir,
+        workflow_dir: PathBuf,
+    ) -> WorkflowRuntime {
         runtime_for_workflow_dir_with_config_sets(
             dir,
             workflow_dir,
@@ -2163,6 +2201,7 @@ mod tests {
                 },
             )]),
         )
+        .await
     }
 
     #[tokio::test]
@@ -2237,7 +2276,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 model: Some(ModelInfo::default()),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
-        );
+        )
+        .await;
         let submit_runtime = runtime.clone();
         let mut events = runtime.events().subscribe();
         let executing_runtime = runtime.clone();
@@ -2266,13 +2306,15 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         let accepted_content = "steer by cancelling the active turn";
         let accepted = submit_runtime
             .submit_user_prompt(&run_id, &window_id, accepted_content.to_string())
+            .await
             .unwrap();
         assert!(matches!(accepted, UserPromptSubmission::Accepted(_)));
 
         let report = run_task.await.unwrap().unwrap();
         let store = runtime.store().unwrap();
         let record = store
-            .get_object::<StepRecord>(report.run.head.as_ref().unwrap())
+            .load_step_record(report.run.head.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(record.output.as_ref().unwrap().body, "corrected");
 
@@ -2350,7 +2392,8 @@ done
                 model: None,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
-        );
+        )
+        .await;
 
         let mut events = runtime.events().subscribe();
         let executing_runtime = runtime.clone();
@@ -2419,12 +2462,12 @@ done
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
-        let submit_runtime = WorkflowRuntime::new(config.clone());
+        let submit_runtime = WorkflowRuntime::new(config.clone()).await.unwrap();
         let factory = ScriptedAgentFactory::new(vec![
             "---\nstatus: success\nsummary: initial\n---\ninitial".to_string(),
             "---\nstatus: success\nsummary: corrected\n---\ncorrected".to_string(),
@@ -2435,6 +2478,8 @@ done
             config,
             mock_runtime_dependencies(None, Some(factory.clone())),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector()
         .with_handoff_observer(observer.clone());
         let executing_runtime = runtime.clone();
@@ -2448,6 +2493,7 @@ done
 
         let accepted = submit_runtime
             .submit_user_prompt(&run_id, &window_id, "  correct\nnow  ".to_string())
+            .await
             .unwrap();
         assert!(matches!(accepted, UserPromptSubmission::Accepted(_)));
         observer.resume();
@@ -2456,12 +2502,14 @@ done
         assert_eq!(report.run.status, RunStatus::Completed);
         let store = runtime.store().unwrap();
         let final_record = store
-            .get_object::<StepRecord>(report.run.head.as_ref().unwrap())
+            .load_step_record(report.run.head.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(final_record.step, "verify");
         assert_eq!(final_record.output.as_ref().unwrap().body, "verified");
         let inspect_record = store
-            .get_object::<StepRecord>(final_record.prev.as_ref().unwrap())
+            .load_step_record(final_record.prev.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(inspect_record.step, "inspect");
         assert_eq!(inspect_record.output.as_ref().unwrap().fields["count"], 2);
@@ -2474,7 +2522,8 @@ done
             "  correct\nnow  "
         );
         let first_record = store
-            .get_object::<StepRecord>(inspect_record.prev.as_ref().unwrap())
+            .load_step_record(inspect_record.prev.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(first_record.output.as_ref().unwrap().body, "corrected");
         assert_eq!(factory.created_roles(), ["developer"]);
@@ -2497,7 +2546,7 @@ done
                     "sequence": 1,
                     "kind": "follow_up",
                     "content": "  correct\nnow  ",
-                    "submitted_at": submit_runtime.store().unwrap().load_user_prompts(&run_id).unwrap()[0]
+                    "submitted_at": submit_runtime.store().unwrap().load_user_prompts(&run_id).await.unwrap()[0]
                         .submitted_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 }
             ])
@@ -2529,12 +2578,12 @@ done
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state-seal"),
-            workflow_store: dir.path().join("state-seal/workflow.redb"),
+            workflow_store: dir.path().join("state-seal/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
-        let submit_runtime = WorkflowRuntime::new(config.clone());
+        let submit_runtime = WorkflowRuntime::new(config.clone()).await.unwrap();
         let factory = ScriptedAgentFactory::new(vec![
             "---\nstatus: success\nsummary: done\n---\ndone".to_string(),
         ]);
@@ -2543,6 +2592,8 @@ done
             config,
             mock_runtime_dependencies(None, Some(factory)),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector()
         .with_handoff_observer(observer.clone());
         let executing_runtime = runtime.clone();
@@ -2560,13 +2611,14 @@ done
 
         let rejected = submit_runtime
             .submit_user_prompt(&run_id, &window_id, "too late".to_string())
+            .await
             .unwrap();
         assert_eq!(
             rejected,
             UserPromptSubmission::Rejected(UserPromptRejection::SealedWindow)
         );
         assert!(matches!(
-            submit_runtime.load_run(&run_id).unwrap().status,
+            submit_runtime.load_run(&run_id).await.unwrap().status,
             RunStatus::Running
         ));
         observer.resume();
@@ -2577,11 +2629,12 @@ done
                 .store()
                 .unwrap()
                 .load_user_prompts(&run_id)
+                .await
                 .unwrap()
                 .is_empty()
         );
     }
-    fn runtime_for_workflow_dir_with_config_sets(
+    async fn runtime_for_workflow_dir_with_config_sets(
         dir: &tempfile::TempDir,
         workflow_dir: PathBuf,
         config_sets: BTreeMap<String, RunnerLimitsConfig>,
@@ -2589,19 +2642,21 @@ done
         WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
+        .await
+        .unwrap()
         .with_deterministic_selector()
     }
 
-    fn runtime_for_empty_state(dir: &tempfile::TempDir) -> WorkflowRuntime {
+    async fn runtime_for_empty_state(dir: &tempfile::TempDir) -> WorkflowRuntime {
         WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -2614,6 +2669,8 @@ done
                 },
             )]),
         })
+        .await
+        .unwrap()
     }
 
     fn summary_test_run(
@@ -2645,13 +2702,13 @@ done
         }
     }
 
-    #[test]
-    fn submit_user_prompt_validates_empty_and_preserves_run_counters_and_content() {
+    #[tokio::test]
+    async fn submit_user_prompt_validates_empty_and_preserves_run_counters_and_content() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         let run = summary_test_run("run-prompt", RunStatus::Running, None);
-        store.save_run(&run).unwrap();
+        store.save_run(&run).await.unwrap();
         store
             .open_agent_prompt_window(AgentPromptWindow {
                 window_id: "window-1".to_string(),
@@ -2664,11 +2721,13 @@ done
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .unwrap();
 
         assert_eq!(
             runtime
                 .submit_user_prompt(&run.id, "window-1", " \n\t ".to_string())
+                .await
                 .unwrap(),
             UserPromptSubmission::Rejected(UserPromptRejection::Empty)
         );
@@ -2676,23 +2735,27 @@ done
         let accepted = runtime
             .clone()
             .submit_user_prompt(&run.id, "window-1", exact.clone())
+            .await
             .unwrap();
         let UserPromptSubmission::Accepted(prompt) = accepted else {
             panic!("expected durable acceptance")
         };
         assert_eq!(prompt.sequence, 1);
         assert_eq!(prompt.content, exact);
-        assert_eq!(store.load_user_prompts(&run.id).unwrap(), vec![prompt]);
-        assert_eq!(store.load_run(&run.id).unwrap(), run);
+        assert_eq!(
+            store.load_user_prompts(&run.id).await.unwrap(),
+            vec![prompt]
+        );
+        assert_eq!(store.load_run(&run.id).await.unwrap(), run);
     }
 
-    #[test]
-    fn cancellation_guard_clears_active_prompt_window() {
+    #[tokio::test]
+    async fn cancellation_guard_clears_active_prompt_window() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         let run = summary_test_run("run-cancel", RunStatus::Running, None);
-        store.save_run(&run).unwrap();
+        store.save_run(&run).await.unwrap();
         store
             .open_agent_prompt_window(AgentPromptWindow {
                 window_id: "window-cancel".to_string(),
@@ -2705,18 +2768,36 @@ done
                 opened_at: Utc::now(),
                 sealed_at: None,
             })
+            .await
             .unwrap();
 
         drop(ActiveRunCancellationGuard::new(
             store.clone(),
             run.id.clone(),
             ActiveRunClock::open(&run),
+            None,
         ));
 
-        assert!(store.clear_agent_prompt_window(&run.id).unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM agent_prompt_windows WHERE run_id = ?",
+                )
+                .bind(&run.id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+                if count == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup should clear the active prompt window");
     }
 
-    fn runtime_for_topic_workflow(dir: &tempfile::TempDir, topic: &str) -> WorkflowRuntime {
+    async fn runtime_for_topic_workflow(dir: &tempfile::TempDir, topic: &str) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("topic-workflows");
         fs::create_dir(&workflow_dir).unwrap();
         fs::write(
@@ -2740,7 +2821,7 @@ done
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -2754,6 +2835,8 @@ done
             )]),
         };
         WorkflowRuntime::with_dependencies(config, mock_runtime_dependencies(Some(topic), None))
+            .await
+            .unwrap()
             .with_deterministic_selector()
     }
 
@@ -2777,12 +2860,13 @@ exit 0
         script
     }
 
-    fn command_output_record(runtime: &WorkflowRuntime, report: &RunReport) -> StepRecord {
+    async fn command_output_record(runtime: &WorkflowRuntime, report: &RunReport) -> StepRecord {
         let head = report.run.head.as_ref().expect("completed head");
         runtime
             .store()
             .unwrap()
-            .get_object::<StepRecord>(head)
+            .load_step_record(head)
+            .await
             .unwrap()
     }
 
@@ -2829,14 +2913,17 @@ exit 0
             ),
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let success = runtime
             .start_run_with_workflow("aaa", "success")
             .await
             .unwrap();
         assert_eq!(success.run.status, RunStatus::Completed);
-        let output = command_output_record(&runtime, &success).output.unwrap();
+        let output = command_output_record(&runtime, &success)
+            .await
+            .output
+            .unwrap();
         assert_eq!(output.fields["prev_action"], "command");
         assert_eq!(output.fields["prev_status"], "command_ok");
         assert_eq!(output.fields["success"], true);
@@ -2859,7 +2946,10 @@ exit 0
             .await
             .unwrap();
         assert_eq!(failure.run.status, RunStatus::Completed);
-        let output = command_output_record(&runtime, &failure).output.unwrap();
+        let output = command_output_record(&runtime, &failure)
+            .await
+            .output
+            .unwrap();
         assert_eq!(output.fields["prev_action"], "command");
         assert_eq!(output.fields["prev_status"], "command_failed");
         assert_eq!(output.fields["success"], false);
@@ -2878,11 +2968,11 @@ exit 0
         );
     }
 
-    fn runtime_for_inline_workflow(dir: &tempfile::TempDir, source: &str) -> WorkflowRuntime {
+    async fn runtime_for_inline_workflow(dir: &tempfile::TempDir, source: &str) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
         fs::write(workflow_dir.join("aaa.lua"), source).unwrap();
-        runtime_for_workflow_dir(dir, workflow_dir)
+        runtime_for_workflow_dir(dir, workflow_dir).await
     }
 
     fn config_sets_with_careful(
@@ -2907,25 +2997,19 @@ exit 0
         )
     }
 
-    #[test]
-    fn idle_runtime_does_not_keep_workflow_store_locked() {
+    #[tokio::test]
+    async fn idle_runtime_does_not_keep_workflow_store_locked() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
-        assert!(runtime.list_runs(None).unwrap().is_empty());
-        let store_path = dir.path().join("state/workflow.redb");
+        let runtime = runtime_for_empty_state(&dir).await;
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
+        let store_path = dir.path().join("state/data.db");
 
-        let database = redb::Database::create(&store_path).unwrap_or_else(|err| {
-            panic!(
-                "idle runtime retained the workflow store lock at {}: {err}",
-                store_path.display()
-            )
-        });
-
-        drop(database);
+        let second = SqliteWorkflowStore::connect(&store_path).await.unwrap();
+        assert!(second.list_runs().await.unwrap().is_empty());
     }
 
-    #[test]
-    fn cancelling_runtime_store_wait_interrupts_contended_operation() {
+    #[tokio::test]
+    async fn cancelling_runtime_store_wait_interrupts_contended_operation() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_inline_workflow(
             &dir,
@@ -2937,53 +3021,44 @@ exit 0
             first:on("next", second)
             return workflow("declared", first)
             "#,
-        );
-        let async_runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
+        )
+        .await;
+        let started = runtime
+            .start_run_with_workflow_stepwise("aaa", "do it")
+            .await
             .unwrap();
-        let started = async_runtime
-            .block_on(runtime.start_run_with_workflow_stepwise("aaa", "do it"))
-            .unwrap();
-        let store_path = dir.path().join("state/workflow.redb");
-        let database = redb::Database::create(store_path).unwrap();
+        let mut holder = runtime.store.pool().acquire().await.unwrap();
+        holder.execute("BEGIN IMMEDIATE").await.unwrap();
         let mut events = runtime.events().subscribe();
         let executing_runtime = runtime.clone();
         let run_id = started.run.id.clone();
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let worker = thread::spawn(move || {
-            let async_runtime = tokio::runtime::Builder::new_current_thread()
-                .build()
-                .unwrap();
-            let result = async_runtime.block_on(executing_runtime.resume_run(&run_id));
-            result_tx.send(result).unwrap();
-        });
-        let wait_started = std::time::Instant::now();
-        'waiting: loop {
-            while let Ok(event) = events.try_recv() {
-                if matches!(event.kind, WorkflowEventKind::WorkflowStoreWaiting { .. }) {
-                    break 'waiting;
+        let worker = tokio::spawn(async move { executing_runtime.resume_run(&run_id).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap().kind,
+                    WorkflowEventKind::WorkflowStoreWaiting { .. }
+                ) {
+                    break;
                 }
             }
-
-            assert!(
-                wait_started.elapsed() < Duration::from_secs(1),
-                "runtime did not report the contended store wait"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+        })
+        .await
+        .expect("runtime did not report the contended store wait");
 
         runtime.cancel_store_waits();
-        let result = result_rx.recv_timeout(Duration::from_millis(250));
-        drop(database);
-        worker.join().unwrap();
-        let error = result
+        let error = tokio::time::timeout(Duration::from_millis(250), worker)
+            .await
             .expect("cancelled runtime store wait should finish promptly")
+            .unwrap()
             .expect_err("cancelled store wait should fail the runtime operation");
+        holder.execute("ROLLBACK").await.unwrap();
 
         assert!(
             error.to_string().contains("workflow store wait cancelled"),
             "{error}"
         );
+        println!("EVIDENCE runtime-wait-cancel cancelled=true bounded=true");
     }
 
     #[tokio::test]
@@ -2999,27 +3074,22 @@ exit 0
             first:on("next", second)
             return workflow("declared", first)
             "#,
-        );
+        )
+        .await;
         let started = runtime
             .start_run_with_workflow_stepwise("aaa", "do it")
             .await
             .unwrap();
         assert_eq!(started.run.status, RunStatus::Running);
-        let store_path = dir.path().join("state/workflow.redb");
-        let holder_path = store_path.clone();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let holder = thread::spawn(move || {
-            let database = redb::Database::create(holder_path).unwrap();
-            locked_tx.send(()).unwrap();
-            thread::sleep(Duration::from_millis(750));
-            drop(database);
-        });
-        locked_rx.recv().unwrap();
+        let mut holder = runtime.store.pool().acquire().await.unwrap();
+        holder.execute("BEGIN IMMEDIATE").await.unwrap();
         let mut rx = runtime.events().subscribe();
-
-        let report = runtime.resume_run(&started.run.id).await.unwrap();
-
-        holder.join().unwrap();
+        let executing_runtime = runtime.clone();
+        let run_id = started.run.id.clone();
+        let task = tokio::spawn(async move { executing_runtime.resume_run(&run_id).await });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        holder.execute("ROLLBACK").await.unwrap();
+        let report = task.await.unwrap().unwrap();
         assert_eq!(report.run.status, RunStatus::Completed);
         let mut wait_events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -3035,6 +3105,7 @@ exit 0
                 .1
                 .contains(dir.path().to_string_lossy().as_ref())
         );
+        println!("EVIDENCE runtime-wait-event count=1 sanitized=true");
     }
 
     #[tokio::test]
@@ -3058,7 +3129,8 @@ exit 0
             &dir,
             workflow_dir,
             config_sets_with_careful(Some(careful)),
-        );
+        )
+        .await;
 
         let explicit = runtime
             .start_run_with_workflow("explicit", "do it")
@@ -3073,22 +3145,24 @@ exit 0
         assert_eq!(implicit.run.config_set.name, "default");
     }
 
-    fn runtime_with_config_sets(
+    async fn runtime_with_config_sets(
         dir: &tempfile::TempDir,
         config_sets: BTreeMap<String, RunnerLimitsConfig>,
     ) -> WorkflowRuntime {
         WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
+        .await
+        .unwrap()
     }
 
-    #[test]
-    fn resolve_limits_uses_requested_set_when_present() {
+    #[tokio::test]
+    async fn resolve_limits_uses_requested_set_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let careful = RunnerLimitsConfig {
             max_steps_per_run: 9,
@@ -3102,32 +3176,34 @@ exit 0
                 ("default".to_string(), RunnerLimitsConfig::default()),
                 ("careful".to_string(), careful),
             ]),
-        );
+        )
+        .await;
 
         let policy = runtime.resolve_limits("careful");
         assert_eq!(policy.name, "careful");
         assert_eq!(policy.limits, careful.into());
     }
 
-    #[test]
-    fn resolve_limits_falls_back_to_default_when_requested_missing() {
+    #[tokio::test]
+    async fn resolve_limits_falls_back_to_default_when_requested_missing() {
         let dir = tempfile::tempdir().unwrap();
         let default = RunnerLimitsConfig {
             max_steps_per_run: 3,
             ..RunnerLimitsConfig::default()
         };
         let runtime =
-            runtime_with_config_sets(&dir, BTreeMap::from([("default".to_string(), default)]));
+            runtime_with_config_sets(&dir, BTreeMap::from([("default".to_string(), default)]))
+                .await;
 
         let policy = runtime.resolve_limits("careful");
         assert_eq!(policy.name, "default");
         assert_eq!(policy.limits, default.into());
     }
 
-    #[test]
-    fn resolve_limits_falls_back_to_builtin_default_when_all_sets_missing() {
+    #[tokio::test]
+    async fn resolve_limits_falls_back_to_builtin_default_when_all_sets_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_with_config_sets(&dir, BTreeMap::new());
+        let runtime = runtime_with_config_sets(&dir, BTreeMap::new()).await;
 
         let policy = runtime.resolve_limits("careful");
         assert_eq!(policy.name, "default");
@@ -3148,7 +3224,8 @@ exit 0
             &dir,
             workflow_dir,
             config_sets_with_careful(Some(RunnerLimitsConfig::default())),
-        );
+        )
+        .await;
 
         let err = runtime
             .start_run_with_workflow("unknown", "do it")
@@ -3162,7 +3239,7 @@ exit 0
             "{message}"
         );
         assert!(message.contains("careful, default"), "{message}");
-        assert!(runtime.list_runs(None).unwrap().is_empty());
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -3195,7 +3272,8 @@ exit 0
             &dir,
             workflow_dir.clone(),
             config_sets_with_careful(Some(original)),
-        );
+        )
+        .await;
         let run_a = creator
             .start_run_with_workflow_stepwise("multi", "do it")
             .await
@@ -3218,7 +3296,8 @@ exit 0
             &dir,
             workflow_dir,
             config_sets_with_careful(Some(changed)),
-        );
+        )
+        .await;
 
         // Run A: `step_run` applies the lowered live limit and is blocked.
         let stepped_err = resumed_runtime.step_run(&run_a.run.id).await.unwrap_err();
@@ -3228,7 +3307,7 @@ exit 0
                 .contains("run exceeded max step count (1)"),
             "{stepped_err}"
         );
-        let loaded_a = resumed_runtime.load_run(&run_a.run.id).unwrap();
+        let loaded_a = resumed_runtime.load_run(&run_a.run.id).await.unwrap();
         assert!(matches!(loaded_a.status, RunStatus::Failed { .. }));
         assert_eq!(loaded_a.current_step, "second");
         assert_eq!(loaded_a.steps_executed, 1);
@@ -3241,7 +3320,7 @@ exit 0
                 .contains("run exceeded max step count (1)"),
             "{resumed_err}"
         );
-        let loaded_b = resumed_runtime.load_run(&run_b.run.id).unwrap();
+        let loaded_b = resumed_runtime.load_run(&run_b.run.id).await.unwrap();
         assert!(matches!(loaded_b.status, RunStatus::Failed { .. }));
         assert_eq!(loaded_b.current_step, "second");
         assert_eq!(loaded_b.steps_executed, 1);
@@ -3293,7 +3372,8 @@ exit 0
                 ("default".to_string(), current_default),
                 ("careful".to_string(), careful),
             ]),
-        );
+        )
+        .await;
         let waiting = creator
             .start_run_with_workflow("answer", "do it")
             .await
@@ -3324,7 +3404,8 @@ exit 0
             &dir,
             workflow_dir,
             BTreeMap::from([("default".to_string(), lowered_default)]),
-        );
+        )
+        .await;
         let store = without_careful.store().unwrap();
 
         let answered_err = without_careful
@@ -3337,19 +3418,23 @@ exit 0
                 .contains("run exceeded max step count (1)"),
             "{answered_err}"
         );
-        let loaded_answer = without_careful.load_run(&waiting.run.id).unwrap();
+        let loaded_answer = without_careful.load_run(&waiting.run.id).await.unwrap();
         assert!(matches!(loaded_answer.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_answer.status, RunStatus::Completed);
         assert_eq!(loaded_answer.current_step, "done");
         assert_eq!(loaded_answer.steps_executed, 1);
         assert_ne!(loaded_answer.head, waiting_head);
         let answer_record = store
-            .get_object::<StepRecord>(loaded_answer.head.as_ref().unwrap())
+            .load_step_record(loaded_answer.head.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(answer_record.step, "ask");
         assert_eq!(answer_record.output.unwrap().fields["answer"], "yes");
 
-        let options = without_careful.resolution_options(&failed.run.id).unwrap();
+        let options = without_careful
+            .resolution_options(&failed.run.id)
+            .await
+            .unwrap();
         assert!(
             options
                 .statuses
@@ -3366,14 +3451,15 @@ exit 0
                 .contains("run exceeded max step count (1)"),
             "{resolved_err}"
         );
-        let loaded_resolve = without_careful.load_run(&failed.run.id).unwrap();
+        let loaded_resolve = without_careful.load_run(&failed.run.id).await.unwrap();
         assert!(matches!(loaded_resolve.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_resolve.status, RunStatus::Completed);
         assert_eq!(loaded_resolve.current_step, "done");
         assert_eq!(loaded_resolve.steps_executed, 1);
         assert_ne!(loaded_resolve.head, failed_head);
         let resolve_record = store
-            .get_object::<StepRecord>(loaded_resolve.head.as_ref().unwrap())
+            .load_step_record(loaded_resolve.head.as_ref().unwrap())
+            .await
             .unwrap();
         assert_eq!(resolve_record.action, "manual_resolution");
     }
@@ -3404,18 +3490,17 @@ exit 0
         "#
     }
 
-    #[test]
-    fn cancellation_guard_closes_active_window_when_dropped() {
+    #[tokio::test]
+    async fn cancellation_guard_closes_active_window_when_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         let mut run = summary_test_run("run-cancel", RunStatus::Running, None);
         let started_at = Utc::now() - chrono::Duration::hours(1);
         run.created_at = started_at;
         run.updated_at = started_at;
         run.active_duration_ms = 7;
-        store.save_run(&run).unwrap();
-        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        store.save_run(&run).await.unwrap();
         let window_started_at = Utc::now() - chrono::Duration::milliseconds(25);
         let active_clock = ActiveRunClock::open_at(&run, window_started_at);
 
@@ -3423,9 +3508,19 @@ exit 0
             store.clone(),
             run.id.clone(),
             active_clock,
+            None,
         ));
-
-        let stored = store.load_run(&run.id).unwrap();
+        let stored = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let stored = store.load_run(&run.id).await.unwrap();
+                if stored.active_duration_ms >= 32 {
+                    break stored;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancellation cleanup should persist active duration");
         assert!(
             stored.active_duration_ms >= 32,
             "cancel cleanup should add the open active window: {stored:#?}"
@@ -3436,19 +3531,58 @@ exit 0
         );
     }
 
-    fn persist_run_active_duration(
+    #[tokio::test]
+    async fn cancellation_cleanup_retains_run_lock_until_persistence_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir).await;
+        let store = runtime.store().unwrap();
+        let run_id = "run-00000000-0000-0000-0000-000000000001";
+        let mut run = summary_test_run(run_id, RunStatus::Running, None);
+        run.active_duration_ms = 0;
+        store.save_run(&run).await.unwrap();
+        let run_guard = runtime.run_locks.acquire(run_id).unwrap();
+
+        drop(ActiveRunCancellationGuard::new(
+            store.clone(),
+            run_id.to_string(),
+            ActiveRunClock::open_at(&run, Utc::now() - chrono::Duration::milliseconds(25)),
+            Some(run_guard),
+        ));
+
+        assert!(
+            runtime.run_locks.acquire(run_id).is_err(),
+            "cleanup must retain the run lock while its async writes are pending"
+        );
+        let reacquired = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(guard) = runtime.run_locks.acquire(run_id) {
+                    break guard;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup should release the run lock after persistence");
+        drop(reacquired);
+        assert!(
+            store.load_run(run_id).await.unwrap().active_duration_ms >= 25,
+            "cleanup must persist active duration before releasing the run lock"
+        );
+        println!("EVIDENCE runtime-cancel lock_retained_until_persisted=true");
+    }
+
+    async fn persist_run_active_duration(
         runtime: &WorkflowRuntime,
         run_id: &str,
         active_duration_ms: u64,
         created_at: chrono::DateTime<Utc>,
     ) -> WorkflowRun {
         let store = runtime.store().unwrap();
-        let mut run = store.load_run(&run_id.to_string()).unwrap();
+        let mut run = store.load_run(run_id).await.unwrap();
         run.created_at = created_at;
         run.updated_at = created_at;
         run.active_duration_ms = active_duration_ms;
-        store.save_run(&run).unwrap();
-        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        store.save_run(&run).await.unwrap();
         run
     }
     fn first_run_started_topic(report: &RunReport) -> Option<&str> {
@@ -3458,8 +3592,8 @@ exit 0
         })
     }
 
-    #[test]
-    fn run_summary_legacy_workflow_run_json_defaults_missing_request_topic() {
+    #[tokio::test]
+    async fn run_summary_legacy_workflow_run_json_defaults_missing_request_topic() {
         let mut raw = serde_json::to_value(summary_test_run(
             "legacy-run",
             RunStatus::Running,
@@ -3476,10 +3610,10 @@ exit 0
         assert_eq!(run.status, RunStatus::Running);
     }
 
-    #[test]
-    fn run_summary_list_runs_projects_structured_status_detail_for_every_status() {
+    #[tokio::test]
+    async fn run_summary_list_runs_projects_structured_status_detail_for_every_status() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         let waiting = RunStatus::WaitingForInput {
             step: "review".to_string(),
@@ -3558,11 +3692,10 @@ exit 0
         ];
         for (run_id, status, _) in &cases {
             let run = summary_test_run(run_id, status.clone(), None);
-            store.save_run(&run).unwrap();
-            store.update_run_head(&run.id, run_head(&run)).unwrap();
+            store.save_run(&run).await.unwrap();
         }
 
-        let summaries = runtime.list_runs(None).unwrap();
+        let summaries = runtime.list_runs(None).await.unwrap();
 
         for (run_id, _, expected_detail) in cases {
             let summary = summaries
@@ -3584,10 +3717,10 @@ exit 0
         }
     }
 
-    #[test]
-    fn list_runs_filters_by_partial_run_id() {
+    #[tokio::test]
+    async fn list_runs_filters_by_partial_run_id() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         for run in [
             summary_test_run(
@@ -3616,12 +3749,12 @@ exit 0
                 Some("Keep working"),
             ),
         ] {
-            store.save_run(&run).unwrap();
-            store.update_run_head(&run.id, run_head(&run)).unwrap();
+            store.save_run(&run).await.unwrap();
         }
 
         let mut all_ids = runtime
             .list_runs(None)
+            .await
             .unwrap()
             .into_iter()
             .map(|summary| summary.run_id)
@@ -3632,7 +3765,7 @@ exit 0
             vec!["alpha-wait-run", "beta-completed-run", "gamma-running-run"]
         );
 
-        let filtered = runtime.list_runs(Some("wait")).unwrap();
+        let filtered = runtime.list_runs(Some("wait")).await.unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].run_id, "alpha-wait-run");
         assert_eq!(filtered[0].topic.as_deref(), Some("Approve release"));
@@ -3644,14 +3777,14 @@ exit 0
         assert_eq!(filtered[0].current_step, "start");
         assert_eq!(filtered[0].head_step, None);
 
-        let no_matches = runtime.list_runs(Some("WAIT")).unwrap();
+        let no_matches = runtime.list_runs(Some("WAIT")).await.unwrap();
         assert!(no_matches.is_empty());
     }
 
-    #[test]
-    fn list_runs_reads_persisted_head_summaries_without_full_runs() {
+    #[tokio::test]
+    async fn list_runs_reads_persisted_head_summaries_without_full_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
 
         for index in 0..100 {
@@ -3660,10 +3793,16 @@ exit 0
                 RunStatus::Completed,
                 Some(&format!("Bulk run {index}")),
             );
-            store.update_run_head(&run.id, run_head(&run)).unwrap();
+            let head = RunHead::from_run(&run);
+            sqlx::query("INSERT INTO run_heads(run_id, data) VALUES(?, ?)")
+                .bind(&run.id)
+                .bind(serde_json::to_vec(&head).unwrap())
+                .execute(store.pool())
+                .await
+                .unwrap();
         }
 
-        let summaries = runtime.list_runs(None).unwrap();
+        let summaries = runtime.list_runs(None).await.unwrap();
 
         assert_eq!(summaries.len(), 100);
         let summary = summaries
@@ -3672,12 +3811,13 @@ exit 0
             .expect("persisted run-head summary");
         assert_eq!(summary.topic.as_deref(), Some("Bulk run 42"));
         assert_eq!(summary.workflow_name, "aaa");
+        println!("EVIDENCE runtime-list source=heads full_run_loads=0");
     }
 
     #[tokio::test]
     async fn run_summary_start_run_persists_generated_topic_on_run_and_list_summary() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Persisted generated topic");
+        let runtime = runtime_for_topic_workflow(&dir, "Persisted generated topic").await;
 
         let report = runtime.start_run("add a health endpoint").await.unwrap();
         let run_id = report.run.id.clone();
@@ -3686,7 +3826,7 @@ exit 0
             report.run.request_topic.as_deref(),
             Some("Persisted generated topic")
         );
-        let persisted = runtime.load_run(&run_id).unwrap();
+        let persisted = runtime.load_run(&run_id).await.unwrap();
         assert_eq!(
             persisted.request_topic.as_deref(),
             Some("Persisted generated topic")
@@ -3694,6 +3834,7 @@ exit 0
         runtime.persist_events(&run_id, &[]).unwrap();
         let summary = runtime
             .list_runs(None)
+            .await
             .unwrap()
             .into_iter()
             .find(|summary| summary.run_id == run_id)
@@ -3701,17 +3842,22 @@ exit 0
         assert_eq!(summary.topic.as_deref(), Some("Persisted generated topic"));
     }
 
-    #[test]
-    fn run_summary_list_runs_backfills_topic_from_persisted_run_started_event() {
+    #[tokio::test]
+    async fn run_summary_list_runs_backfills_topic_from_persisted_run_started_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let run = summary_test_run("legacy-event-run", RunStatus::Completed, None);
         let run_id = run.id.clone();
         let store = runtime.store().unwrap();
-        store.save_run(&run).unwrap();
+        store.save_run(&run).await.unwrap();
         let mut head = run_head(&run);
         head.summary = None;
-        store.update_run_head(&run.id, head).unwrap();
+        sqlx::query("UPDATE run_heads SET data = ? WHERE run_id = ?")
+            .bind(serde_json::to_vec(&head).unwrap())
+            .bind(&run.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
         runtime
             .persist_events(
                 &run.id,
@@ -3724,19 +3870,20 @@ exit 0
 
         let summary = runtime
             .list_runs(None)
+            .await
             .unwrap()
             .into_iter()
             .find(|summary| summary.run_id == run_id)
             .expect("run summary");
 
         assert_eq!(summary.topic.as_deref(), Some("Recovered event topic"));
-        assert_eq!(runtime.load_run(&run_id).unwrap().request_topic, None);
+        assert_eq!(runtime.load_run(&run_id).await.unwrap().request_topic, None);
     }
 
     #[tokio::test]
     async fn start_run_attaches_generated_topic_to_runner_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Add health route");
+        let runtime = runtime_for_topic_workflow(&dir, "Add health route").await;
 
         let report = runtime.start_run("add a /healthz route").await.unwrap();
 
@@ -3746,7 +3893,7 @@ exit 0
     #[tokio::test]
     async fn start_run_stepwise_attaches_generated_topic_to_runner_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Plan implementation");
+        let runtime = runtime_for_topic_workflow(&dir, "Plan implementation").await;
 
         let report = runtime
             .start_run_stepwise("plan implementation")
@@ -3763,7 +3910,7 @@ exit 0
     #[tokio::test]
     async fn start_run_with_workflow_attaches_generated_topic_to_runner_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Review branch");
+        let runtime = runtime_for_topic_workflow(&dir, "Review branch").await;
 
         let report = runtime
             .start_run_with_workflow("aaa", "review branch")
@@ -3777,7 +3924,7 @@ exit 0
     #[tokio::test]
     async fn start_run_with_workflow_stepwise_attaches_generated_topic_to_runner_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Scoped fix");
+        let runtime = runtime_for_topic_workflow(&dir, "Scoped fix").await;
 
         let report = runtime
             .start_run_with_workflow_stepwise("aaa", "fix scoped issue")
@@ -3791,13 +3938,14 @@ exit 0
     #[tokio::test]
     async fn resume_run_restores_persisted_request_topic_in_run_started_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Initial topic");
+        let runtime = runtime_for_topic_workflow(&dir, "Initial topic").await;
         let start = runtime.start_run_stepwise("do first step").await.unwrap();
 
         assert_eq!(start.run.request_topic.as_deref(), Some("Initial topic"));
         assert_eq!(
             runtime
                 .load_run(&start.run.id)
+                .await
                 .unwrap()
                 .request_topic
                 .as_deref(),
@@ -3813,7 +3961,7 @@ exit 0
     #[tokio::test]
     async fn step_run_restores_persisted_request_topic_in_run_started_event() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_topic_workflow(&dir, "Step topic");
+        let runtime = runtime_for_topic_workflow(&dir, "Step topic").await;
         let start = runtime.start_run_stepwise("do first step").await.unwrap();
 
         assert_eq!(start.run.request_topic.as_deref(), Some("Step topic"));
@@ -3851,7 +3999,7 @@ exit 0
             middle:on("more", finish)
             return workflow("aaa", start)
             "#,
-        );
+        ).await;
         let start = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(start.run.status, RunStatus::Running);
         assert_eq!(start.run.current_step, "middle");
@@ -3862,13 +4010,14 @@ exit 0
             &start.run.id,
             active_before_idle_ms,
             Utc::now() - chrono::Duration::hours(1),
-        );
+        )
+        .await;
 
         let report = runtime.step_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Running);
         assert_eq!(report.run.current_step, "finish");
-        let stored = runtime.load_run(&start.run.id).unwrap();
+        let stored = runtime.load_run(&start.run.id).await.unwrap();
         assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
         assert!(
             stored.active_duration_ms > active_before_idle_ms,
@@ -3894,7 +4043,7 @@ exit 0
     #[tokio::test]
     async fn answer_run_counts_answer_execution_without_counting_prompt_wait() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source());
+        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source()).await;
         let start = runtime.start_run("request").await.unwrap();
         assert!(matches!(
             start.run.status,
@@ -3907,7 +4056,8 @@ exit 0
             &start.run.id,
             active_before_wait_ms,
             Utc::now() - chrono::Duration::hours(1),
-        );
+        )
+        .await;
 
         let report = runtime
             .answer_run(&start.run.id, "approval", "yes")
@@ -3915,7 +4065,7 @@ exit 0
             .unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        let stored = runtime.load_run(&start.run.id).unwrap();
+        let stored = runtime.load_run(&start.run.id).await.unwrap();
         assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
         assert!(
             stored.active_duration_ms > active_before_wait_ms,
@@ -3940,7 +4090,7 @@ exit 0
     #[tokio::test]
     async fn invalid_prompt_answers_do_not_advance_active_duration() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source());
+        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source()).await;
         let start = runtime.start_run("request").await.unwrap();
         assert!(matches!(
             start.run.status,
@@ -3952,7 +4102,8 @@ exit 0
             &start.run.id,
             unchanged_active_ms,
             Utc::now() - chrono::Duration::hours(1),
-        );
+        )
+        .await;
 
         let err = runtime
             .answer_run(&start.run.id, "other-prompt", "yes")
@@ -3960,7 +4111,11 @@ exit 0
             .unwrap_err();
         assert!(err.to_string().contains("prompt"), "{err}");
         assert_eq!(
-            runtime.load_run(&start.run.id).unwrap().active_duration_ms,
+            runtime
+                .load_run(&start.run.id)
+                .await
+                .unwrap()
+                .active_duration_ms,
             unchanged_active_ms
         );
 
@@ -3970,7 +4125,11 @@ exit 0
             .unwrap_err();
         assert!(err.to_string().contains("choice"), "{err}");
         assert_eq!(
-            runtime.load_run(&start.run.id).unwrap().active_duration_ms,
+            runtime
+                .load_run(&start.run.id)
+                .await
+                .unwrap()
+                .active_duration_ms,
             unchanged_active_ms
         );
     }
@@ -3982,16 +4141,18 @@ exit 0
             &dir,
             None,
             vec![agent("default", "definitely-missing-agent")],
-        );
+        )
+        .await;
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
         let unchanged_active_ms = 5_000;
         persist_run_active_duration(
             &runtime,
             &run_id,
             unchanged_active_ms,
             Utc::now() - chrono::Duration::hours(1),
-        );
+        )
+        .await;
 
         let err = runtime
             .resolve_run(
@@ -4004,7 +4165,7 @@ exit 0
             .unwrap_err();
         assert!(err.to_string().contains("Valid statuses"), "{err}");
         assert_eq!(
-            runtime.load_run(&run_id).unwrap().active_duration_ms,
+            runtime.load_run(&run_id).await.unwrap().active_duration_ms,
             unchanged_active_ms
         );
 
@@ -4014,7 +4175,7 @@ exit 0
             .unwrap_err();
         assert!(err.to_string().contains("summary"), "{err}");
         assert_eq!(
-            runtime.load_run(&run_id).unwrap().active_duration_ms,
+            runtime.load_run(&run_id).await.unwrap().active_duration_ms,
             unchanged_active_ms
         );
     }
@@ -4026,14 +4187,15 @@ exit 0
             &dir,
             None,
             vec![agent("default", "definitely-missing-agent")],
-        );
+        )
+        .await;
 
         let err = runtime.start_run("do it").await.unwrap_err();
         assert!(
             err.to_string().contains("definitely-missing-agent"),
             "{err}"
         );
-        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
         let events = runtime.load_events(&run_id).unwrap();
 
         assert!(
@@ -4054,6 +4216,7 @@ exit 0
                 .all(|event| event.run_active_duration_ms.is_some()),
             "{events:#?}"
         );
+        println!("EVIDENCE runtime-events persisted=true active_duration=true");
     }
 
     #[tokio::test]
@@ -4062,7 +4225,7 @@ exit 0
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
@@ -4081,24 +4244,27 @@ exit 0
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let err = runtime.start_run("do it").await.unwrap_err();
         // A missing agent command is retried until the snapshotted per-step
         // budget is exhausted, then reported as a distinct policy failure.
         assert!(err.to_string().contains("exhausted retry budget for step"));
-        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
         // The give-up path persists a clean Failed status for later resolution.
         let run = runtime
-            .load_run(&runtime.list_runs(None).unwrap()[0].run_id)
+            .load_run(&runtime.list_runs(None).await.unwrap()[0].run_id)
+            .await
             .unwrap();
         assert!(matches!(run.status, RunStatus::Failed { .. }));
         assert_eq!(run.retries_used, 2);
         assert_eq!(run.step_retries_used.values().copied().sum::<u32>(), 2);
     }
 
-    #[test]
-    fn resolution_field_guidance_quotes_boundary_names() {
+    #[tokio::test]
+    async fn resolution_field_guidance_quotes_boundary_names() {
         let fields = vec![
             "foo=bar".to_string(),
             "-review".to_string(),
@@ -4119,13 +4285,14 @@ exit 0
             &dir,
             None,
             vec![agent("default", "definitely-missing-agent")],
-        );
+        )
+        .await;
 
         // Fails on the agent step and persists a resolvable Failed run.
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
 
-        let options = runtime.resolution_options(&run_id).unwrap();
+        let options = runtime.resolution_options(&run_id).await.unwrap();
         assert_eq!(options.failed_step, "start");
         assert!(options.failure_reason.is_some());
         // The step has no transitions, so only the implicit `success` is offered.
@@ -4213,7 +4380,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "definitely-missing-agent")],
             config_sets: BTreeMap::from([(
@@ -4230,10 +4397,12 @@ exit 0
             config,
             mock_runtime_dependencies(Some("Original topic"), None),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         runtime.start_run("do it").await.unwrap_err();
-        let run_id = runtime.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
 
         // "planned" routes to `finish`; supply the required field and a body.
         let report = runtime
@@ -4249,7 +4418,7 @@ exit 0
         assert_eq!(report.run.status, RunStatus::Completed);
         let head = report.run.head.as_ref().expect("final head");
         let store = runtime.store().unwrap();
-        let record = store.get_object::<StepRecord>(head).unwrap();
+        let record = store.load_step_record(head).await.unwrap();
         let output = record.output.expect("finish output");
         // The synthesized fields/body are visible to the next step via ctx.prev.
         assert_eq!(output.fields["prev_status"], "planned");
@@ -4264,6 +4433,7 @@ exit 0
                 .iter()
                 .any(|event| matches!(event.kind, WorkflowEventKind::ManuallyResolved { .. }))
         );
+        println!("EVIDENCE runtime-resolve topic_restored=true fields_exposed=true");
     }
 
     #[tokio::test]
@@ -4276,7 +4446,8 @@ exit 0
                 agent("default", "definitely-missing-default-agent"),
                 agent("other", "definitely-missing-other-agent"),
             ],
-        );
+        )
+        .await;
 
         let err = runtime.start_run("do it").await.unwrap_err();
 
@@ -4291,7 +4462,8 @@ exit 0
             &dir,
             Some("missing"),
             vec![agent("default", "definitely-missing-default-agent")],
-        );
+        )
+        .await;
 
         let err = runtime.start_run("do it").await.unwrap_err();
 
@@ -4310,7 +4482,8 @@ exit 0
                 agent("planner", "definitely-missing-planner-agent"),
                 agent("reviewer", "definitely-missing-reviewer-agent"),
             ],
-        );
+        )
+        .await;
 
         let err = runtime.start_run("do it").await.unwrap_err();
 
@@ -4337,7 +4510,7 @@ exit 0
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
@@ -4356,13 +4529,15 @@ exit 0
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let report = runtime.start_run("request").await.unwrap();
 
         assert_eq!(report.run.workflow_name, "aaa");
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
     }
 
@@ -4393,7 +4568,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let report = runtime
             .start_run_with_workflow("review", "do work")
@@ -4407,11 +4582,12 @@ exit 0
         let record = runtime
             .store()
             .unwrap()
-            .get_object::<StepRecord>(head)
+            .load_step_record(head)
+            .await
             .unwrap();
         let output = record.output.expect("status output");
         assert_eq!(output.body, "review selected: do work");
-        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4448,7 +4624,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let report = runtime
             .start_run_with_workflow_stepwise("review", "do work")
@@ -4459,7 +4635,7 @@ exit 0
         assert_eq!(report.run.status, RunStatus::Running);
         assert_eq!(report.run.current_step, "review-finish");
         assert_eq!(report.run.steps_executed, 1);
-        assert_eq!(runtime.list_runs(None).unwrap().len(), 1);
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -4478,7 +4654,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let err = runtime
             .start_run_with_workflow("review-declared", "do work")
@@ -4488,7 +4664,7 @@ exit 0
         assert!(err.to_string().contains("unknown workflow id"), "{err}");
         assert!(err.to_string().contains("review-declared"), "{err}");
         assert!(err.to_string().contains("review"), "{err}");
-        assert!(runtime.list_runs(None).unwrap().is_empty());
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4518,7 +4694,7 @@ exit 0
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -4531,6 +4707,8 @@ exit 0
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start = runtime.start_run_stepwise("request").await.unwrap();
@@ -4596,7 +4774,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let started = runtime
             .start_run_with_workflow_stepwise("aaa", "request")
@@ -4671,7 +4849,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
@@ -4698,6 +4876,8 @@ exit 0
             config,
             mock_runtime_dependencies(None, Some(factory.clone())),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         // Exhausted recoverable retries persist the run as Failed while keeping
@@ -4708,10 +4888,10 @@ exit 0
             "unexpected start error: {start_err}"
         );
 
-        let runs = runtime.list_runs(None).unwrap();
+        let runs = runtime.list_runs(None).await.unwrap();
         assert_eq!(runs.len(), 1);
         let run_id = runs[0].run_id.clone();
-        let failed = runtime.load_run(&run_id).unwrap();
+        let failed = runtime.load_run(&run_id).await.unwrap();
         assert!(
             matches!(failed.status, RunStatus::Failed { .. }),
             "expected Failed run, got {:?}",
@@ -4743,7 +4923,7 @@ exit 0
     /// its per-step recoverable retry budget, then hands control to a `finish`
     /// status step on `success`. The scripted `responses` drive the agent
     /// backend deterministically.
-    fn agent_exhaustion_runtime(
+    async fn agent_exhaustion_runtime(
         dir: &tempfile::TempDir,
         responses: Vec<String>,
     ) -> (WorkflowRuntime, ScriptedAgentFactory) {
@@ -4773,7 +4953,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
@@ -4791,6 +4971,8 @@ exit 0
             config,
             mock_runtime_dependencies(None, Some(factory.clone())),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
         (runtime, factory)
     }
@@ -4803,10 +4985,10 @@ exit 0
             start_err.to_string().contains("exhausted retry budget"),
             "unexpected start error: {start_err}"
         );
-        let runs = runtime.list_runs(None).unwrap();
+        let runs = runtime.list_runs(None).await.unwrap();
         assert_eq!(runs.len(), 1);
         let run_id = runs[0].run_id.clone();
-        let failed = runtime.load_run(&run_id).unwrap();
+        let failed = runtime.load_run(&run_id).await.unwrap();
         assert!(
             matches!(failed.status, RunStatus::Failed { .. }),
             "expected Failed run, got {:?}",
@@ -4834,11 +5016,11 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let started = runtime.start_run("do work").await.unwrap();
         assert_eq!(started.run.status, RunStatus::Completed);
-        let before = runtime.load_run(&started.run.id).unwrap();
+        let before = runtime.load_run(&started.run.id).await.unwrap();
 
         let report = runtime.resume_run(&started.run.id).await.unwrap();
 
@@ -4847,21 +5029,20 @@ exit 0
             report.events.is_empty(),
             "resuming a completed run should emit no events"
         );
-        assert_eq!(runtime.load_run(&started.run.id).unwrap(), before);
+        assert_eq!(runtime.load_run(&started.run.id).await.unwrap(), before);
     }
 
     #[tokio::test]
     async fn resume_is_noop_for_cancelled_run() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = runtime_for_empty_state(&dir);
+        let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
         let run = summary_test_run(
             "run-00000000-0000-0000-0000-000000000000",
             RunStatus::Cancelled,
             None,
         );
-        store.save_run(&run).unwrap();
-        store.update_run_head(&run.id, run_head(&run)).unwrap();
+        store.save_run(&run).await.unwrap();
 
         let report = runtime.resume_run(&run.id).await.unwrap();
 
@@ -4870,7 +5051,7 @@ exit 0
             report.events.is_empty(),
             "resuming a cancelled run should emit no events"
         );
-        assert_eq!(runtime.load_run(&run.id).unwrap(), run);
+        assert_eq!(runtime.load_run(&run.id).await.unwrap(), run);
     }
 
     /// Extract the durable ask-user resume-callback `record_id` from a
@@ -4909,7 +5090,7 @@ exit 0
             "#,
         )
         .unwrap();
-        let runtime = runtime_for_workflow_dir(&dir, workflow_dir);
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let started = runtime.start_run("do work").await.unwrap();
         // The ask_user step blocks the run, retaining "ask" as the current step
@@ -4943,7 +5124,7 @@ exit 0
 
         // The durable pending callback is safely replaced by the fresh
         // execution's callback, not left dangling or duplicated.
-        let reloaded = runtime.load_run(&started.run.id).unwrap();
+        let reloaded = runtime.load_run(&started.run.id).await.unwrap();
         let second_callback_record = waiting_callback_record_id(&reloaded.status);
         assert_ne!(
             first_callback_record, second_callback_record,
@@ -4972,7 +5153,8 @@ exit 0
                 "again no frontmatter".to_string(),
                 "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
             ],
-        );
+        )
+        .await;
         let run_id = failed_agent_run(&runtime).await;
 
         let report = runtime.step_run(&run_id).await.unwrap();
@@ -4986,7 +5168,7 @@ exit 0
             WorkflowEventKind::StepStarted { step_id } if step_id == "start"
         )));
 
-        let loaded = runtime.load_run(&run_id).unwrap();
+        let loaded = runtime.load_run(&run_id).await.unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
         assert_eq!(loaded.current_step, "finish");
         // The fresh initial attempt does not consume retry budget.
@@ -5008,7 +5190,8 @@ exit 0
                 "again no frontmatter".to_string(),
                 "yet again no frontmatter".to_string(),
             ],
-        );
+        )
+        .await;
         let run_id = failed_agent_run(&runtime).await;
 
         let resume_err = runtime.resume_run(&run_id).await.unwrap_err();
@@ -5017,7 +5200,7 @@ exit 0
             "unexpected resume error: {resume_err}"
         );
 
-        let loaded = runtime.load_run(&run_id).unwrap();
+        let loaded = runtime.load_run(&run_id).await.unwrap();
         assert!(
             matches!(loaded.status, RunStatus::Failed { .. }),
             "expected Failed run, got {:?}",
@@ -5066,7 +5249,7 @@ exit 0
         let config_for = |limit: u32| RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir.clone()],
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
@@ -5092,6 +5275,8 @@ exit 0
             config_for(2),
             mock_runtime_dependencies(None, Some(low_factory.clone())),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start_err = low.start_run("do work").await.unwrap_err();
@@ -5101,10 +5286,10 @@ exit 0
         );
         low_factory.assert_exhausted();
 
-        let runs = low.list_runs(None).unwrap();
+        let runs = low.list_runs(None).await.unwrap();
         assert_eq!(runs.len(), 1);
         let run_id = runs[0].run_id.clone();
-        let failed = low.load_run(&run_id).unwrap();
+        let failed = low.load_run(&run_id).await.unwrap();
         assert!(
             matches!(failed.status, RunStatus::Failed { .. }),
             "expected Failed run, got {:?}",
@@ -5125,6 +5310,8 @@ exit 0
             .expect_agent_factory()
             .returning(move |_| Ok(high_shared.clone()));
         let high = WorkflowRuntime::with_dependencies(config_for(20), Arc::new(high_deps))
+            .await
+            .unwrap()
             .with_deterministic_selector();
 
         let report = high.resume_run(&run_id).await.expect(
@@ -5180,7 +5367,7 @@ exit 0
         RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: Vec::new(),
             config_sets,
@@ -5215,6 +5402,8 @@ exit 0
                 ])),
             ),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start_err = low.start_run("do work").await.unwrap_err();
@@ -5222,8 +5411,8 @@ exit 0
             start_err.to_string().contains("2/2 retries used"),
             "{start_err}"
         );
-        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
-        let failed = low.load_run(&run_id).unwrap();
+        let run_id = low.list_runs(None).await.unwrap()[0].run_id.clone();
+        let failed = low.load_run(&run_id).await.unwrap();
         assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
         assert_eq!(failed.retries_used, 2);
 
@@ -5234,6 +5423,8 @@ exit 0
                 "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
             ])),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let report = high.resume_run(&run_id).await.unwrap();
@@ -5260,12 +5451,15 @@ exit 0
                 ])),
             ),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         low.start_run("do work").await.unwrap_err();
-        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = low.list_runs(None).await.unwrap()[0].run_id.clone();
         assert_eq!(
             low.load_run(&run_id)
+                .await
                 .unwrap()
                 .step_retries_used
                 .get("start")
@@ -5280,6 +5474,8 @@ exit 0
                 "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
             ])),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let report = high.step_run(&run_id).await.unwrap();
@@ -5311,12 +5507,15 @@ exit 0
                 ])),
             ),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         high.start_run("do work").await.unwrap_err();
-        let run_id = high.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = high.list_runs(None).await.unwrap()[0].run_id.clone();
         assert_eq!(
             high.load_run(&run_id)
+                .await
                 .unwrap()
                 .step_retries_used
                 .get("start")
@@ -5331,11 +5530,13 @@ exit 0
                 "still no frontmatter".to_string(),
             ])),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let err = low.resume_run(&run_id).await.unwrap_err();
         assert!(err.to_string().contains("5/3 retries used"), "{err}");
-        let reloaded = low.load_run(&run_id).unwrap();
+        let reloaded = low.load_run(&run_id).await.unwrap();
         assert_eq!(reloaded.retries_used, 5);
         assert_eq!(reloaded.step_retries_used.get("start").copied(), Some(5));
     }
@@ -5374,6 +5575,8 @@ exit 0
                 ])),
             ),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start_err = low.start_run("do work").await.unwrap_err();
@@ -5381,9 +5584,10 @@ exit 0
             start_err.to_string().contains("2/2 retries used"),
             "{start_err}"
         );
-        let run_id = low.list_runs(None).unwrap()[0].run_id.clone();
+        let run_id = low.list_runs(None).await.unwrap()[0].run_id.clone();
         assert_eq!(
             low.load_run(&run_id)
+                .await
                 .unwrap()
                 .step_retries_used
                 .get("start")
@@ -5400,6 +5604,8 @@ exit 0
                 "---\nstatus: success\nsummary: done\n---\nrecovered".to_string(),
             ])),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let report = high.resume_run(&run_id).await.unwrap();
@@ -5410,7 +5616,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn two_runtimes_start_independent_runs_against_one_store() {
+    async fn two_runtime_instances_share_sqlite_store_for_independent_runs() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -5428,7 +5634,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -5441,8 +5647,14 @@ exit 0
                 },
             )]),
         };
-        let runtime_a = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
-        let runtime_b = WorkflowRuntime::new(config).with_deterministic_selector();
+        let runtime_a = WorkflowRuntime::new(config.clone())
+            .await
+            .unwrap()
+            .with_deterministic_selector();
+        let runtime_b = WorkflowRuntime::new(config)
+            .await
+            .unwrap()
+            .with_deterministic_selector();
 
         let first = runtime_a.start_run("first").await.unwrap();
         let second = runtime_b.start_run("second").await.unwrap();
@@ -5452,6 +5664,7 @@ exit 0
         assert_ne!(first.run.id, second.run.id);
         let mut run_ids = runtime_a
             .list_runs(None)
+            .await
             .unwrap()
             .into_iter()
             .map(|run| run.run_id)
@@ -5460,6 +5673,7 @@ exit 0
         let mut expected = vec![first.run.id, second.run.id];
         expected.sort();
         assert_eq!(run_ids, expected);
+        println!("EVIDENCE runtime-shared-store runtimes=2 runs=2 pools=independent");
     }
 
     #[tokio::test]
@@ -5469,7 +5683,7 @@ exit 0
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: state_dir.clone(),
-            workflow_store: state_dir.join("workflow.redb"),
+            workflow_store: state_dir.join("data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -5482,6 +5696,8 @@ exit 0
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let err = runtime
@@ -5490,7 +5706,7 @@ exit 0
             .unwrap_err();
 
         assert!(err.to_string().contains("invalid run id"));
-        assert!(!state_dir.join("workflow.redb.locks").exists());
+        assert!(!state_dir.join("data.db.locks").exists());
         assert!(!state_dir.join("locks").exists());
         assert!(
             !dir.path()
@@ -5525,7 +5741,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state-a"),
-            workflow_store: dir.path().join("shared/workflow.redb"),
+            workflow_store: dir.path().join("shared/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -5538,7 +5754,10 @@ exit 0
                 },
             )]),
         };
-        let runtime = WorkflowRuntime::new(config.clone()).with_deterministic_selector();
+        let runtime = WorkflowRuntime::new(config.clone())
+            .await
+            .unwrap()
+            .with_deterministic_selector();
         let report = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(report.run.status, RunStatus::Running);
 
@@ -5548,6 +5767,8 @@ exit 0
             state_dir: dir.path().join("state-b"),
             ..config
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
         let err = runtime_with_other_state
             .step_run(&report.run.id)
@@ -5591,7 +5812,7 @@ exit 0
         let config = RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -5608,6 +5829,8 @@ exit 0
             config,
             mock_runtime_dependencies(Some("Initial prompt topic"), None),
         )
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start = runtime.start_run("request").await.unwrap();
@@ -5683,7 +5906,7 @@ exit 0
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
@@ -5696,6 +5919,8 @@ exit 0
                 },
             )]),
         })
+        .await
+        .unwrap()
         .with_deterministic_selector();
 
         let start = runtime.start_run("request").await.unwrap();
@@ -5715,10 +5940,11 @@ exit 0
             &persisted[1].kind,
             WorkflowEventKind::RunStatusChanged { status } if status == "running"
         ));
+        println!("EVIDENCE runtime-answer prompt_completion=persisted resumed_step=failed");
     }
 
-    #[test]
-    fn agent_feature_unclear_step_requests_and_reuses_clarification() {
+    #[tokio::test]
+    async fn agent_feature_unclear_step_requests_and_reuses_clarification() {
         let source = include_str!("../test_files/agent/00-feature.lua");
         let bundle = WorkflowSourceSnapshot {
             root: None,
@@ -5933,8 +6159,8 @@ exit 0
         );
     }
 
-    #[test]
-    fn example_workflows_enforce_plan_document_todo_contract() {
+    #[tokio::test]
+    async fn example_workflows_enforce_plan_document_todo_contract() {
         let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .join("examples/workflows")
@@ -6234,7 +6460,7 @@ Revised review body"#
         ];
         let dir = tempfile::tempdir().unwrap();
         let factory = ScriptedAgentFactory::new(responses);
-        let runtime = runtime_for_example_workflow(&dir, factory.clone());
+        let runtime = runtime_for_example_workflow(&dir, factory.clone()).await;
 
         let start = runtime
             .start_run_with_workflow("workflows/feature", "preserve feedback for plan reviewers")
@@ -6251,7 +6477,7 @@ Revised review body"#
             revised.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        let persisted_review = command_output_record(&runtime, &revised);
+        let persisted_review = command_output_record(&runtime, &revised).await;
         assert_eq!(persisted_review.step, "review_plan");
         assert_eq!(
             persisted_review.output.unwrap().fields["user_feedback"],
@@ -6491,7 +6717,7 @@ Recovery implementation review"#
         ];
         let dir = tempfile::tempdir().unwrap();
         let factory = ScriptedAgentFactory::new(responses);
-        let runtime = runtime_for_example_workflow(&dir, factory.clone());
+        let runtime = runtime_for_example_workflow(&dir, factory.clone()).await;
 
         let mut report = runtime
             .start_run_with_workflow(
@@ -6513,7 +6739,7 @@ Recovery implementation review"#
             .await
             .unwrap();
 
-        let persisted_review = command_output_record(&runtime, &report);
+        let persisted_review = command_output_record(&runtime, &report).await;
         assert_eq!(persisted_review.step, "review");
         let pre_recovery_prompt = persisted_review.input.prompt.as_deref().unwrap();
         assert!(pre_recovery_prompt.contains("Goal: Preserve reviewer feedback context"));
@@ -6541,7 +6767,7 @@ Recovery implementation review"#
             report.run.status,
             RunStatus::WaitingForInput { ref step, .. } if step == "blocked"
         ));
-        let persisted_blocker_review = command_output_record(&runtime, &report);
+        let persisted_blocker_review = command_output_record(&runtime, &report).await;
         assert_eq!(persisted_blocker_review.step, "review_blocker");
         let commit_output = persisted_blocker_review.output.unwrap();
         assert_eq!(commit_output.fields["work_dir"], "docs/plans/example");
@@ -6572,7 +6798,7 @@ Recovery implementation review"#
             .await
             .unwrap();
 
-        let persisted_recovery_review = command_output_record(&runtime, &report);
+        let persisted_recovery_review = command_output_record(&runtime, &report).await;
         assert_eq!(persisted_recovery_review.step, "review");
         let post_recovery_prompt = persisted_recovery_review.input.prompt.as_deref().unwrap();
         assert!(post_recovery_prompt.contains("Goal: Preserve reviewer feedback context"));
@@ -6630,8 +6856,8 @@ Recovery implementation review"#
         factory.assert_exhausted();
     }
 
-    #[test]
-    fn example_blocked_step_requests_user_direction() {
+    #[tokio::test]
+    async fn example_blocked_step_requests_user_direction() {
         let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .join("examples/workflows")
@@ -6828,8 +7054,8 @@ Recovery implementation review"#
         assert_eq!(action.status, "revise");
     }
 
-    #[test]
-    fn catalog_loads_filesystem_workflow_description() {
+    #[tokio::test]
+    async fn catalog_loads_filesystem_workflow_description() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -6845,7 +7071,7 @@ Recovery implementation review"#
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
@@ -6863,7 +7089,9 @@ Recovery implementation review"#
                     max_retries_per_step: 2,
                 },
             )]),
-        });
+        })
+        .await
+        .unwrap();
 
         let catalog = runtime.catalog().unwrap();
         assert_eq!(
@@ -6874,8 +7102,8 @@ Recovery implementation review"#
         assert!(catalog.workflows["default"].description.is_some());
     }
 
-    #[test]
-    fn snapshot_from_run_uses_workflow_entry_not_first_import() {
+    #[tokio::test]
+    async fn snapshot_from_run_uses_workflow_entry_not_first_import() {
         let now = Utc::now();
         let run = WorkflowRun {
             id: "run-1".to_string(),
@@ -6919,13 +7147,13 @@ Recovery implementation review"#
         cowboy_workflow_lua::compile_snapshot(&snapshot).unwrap();
     }
 
-    #[test]
-    fn lists_no_runs_for_fresh_store() {
+    #[tokio::test]
+    async fn lists_no_runs_for_fresh_store() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = WorkflowRuntime::new(RuntimeConfig {
             cwd: dir.path().to_path_buf(),
             state_dir: dir.path().join("state"),
-            workflow_store: dir.path().join("state/workflow.redb"),
+            workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
@@ -6943,8 +7171,10 @@ Recovery implementation review"#
                     max_retries_per_step: 2,
                 },
             )]),
-        });
-        assert!(runtime.list_runs(None).unwrap().is_empty());
+        })
+        .await
+        .unwrap();
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
     }
 
     fn progress(kind: AgentProgressKind) -> AgentProgress {
@@ -6955,8 +7185,8 @@ Recovery implementation review"#
         }
     }
 
-    #[test]
-    fn maps_every_agent_progress_kind_to_typed_workflow_event() {
+    #[tokio::test]
+    async fn maps_every_agent_progress_kind_to_typed_workflow_event() {
         let cases = vec![
             (
                 progress(AgentProgressKind::SessionReady {
@@ -7053,8 +7283,8 @@ Recovery implementation review"#
         }
     }
 
-    #[test]
-    fn agent_progress_workflow_events_use_run_creation_timestamp_and_active_duration() {
+    #[tokio::test]
+    async fn agent_progress_workflow_events_use_run_creation_timestamp_and_active_duration() {
         let run_started_at = Utc::now() - chrono::Duration::hours(1);
         let mut run = summary_test_run("run-1", RunStatus::Running, None);
         run.created_at = run_started_at;

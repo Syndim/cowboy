@@ -391,6 +391,7 @@ mod tests {
 
         let reparsed: WorkflowEvent = serde_json::from_str(&raw).unwrap();
         assert_eq!(reparsed, event);
+        println!("EVIDENCE wait-event round_trip=true");
     }
 
     #[test]

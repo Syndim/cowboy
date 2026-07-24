@@ -8,7 +8,7 @@ mod prompt;
 pub use error::{Error, Result};
 pub use executor::{
     AgentExecution, AgentExecutionConfig, AgentExecutor, AgentProgress, AgentProgressKind,
-    ClientFactory, ProgressSink, PromptTurnControlRegistry, ResolvedAgentClient,
+    AgentStore, ClientFactory, ProgressSink, PromptTurnControlRegistry, ResolvedAgentClient,
 };
 #[cfg(feature = "test-support")]
 pub use executor::{PromptWindowHandoffObserver, PromptWindowHandoffPoint};

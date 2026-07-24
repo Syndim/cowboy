@@ -19,7 +19,7 @@ Current capabilities:
 - Built-in default developer workflow plus user/project workflow directories.
 - ACP-backed agent execution through commands such as `copilot --acp`, `claude --acp`, or `omp acp`.
 - Reused backend agent sessions per `(run_id, role_id)`.
-- Redb-backed run store with content-addressed source, step, and turn objects.
+- Async SQLx/SQLite workflow store with content-addressed source, step, and turn objects.
 - TUI event transcript for workflow lifecycle, prompts, agent thinking/responses, and tool calls.
 
 ## Requirements
@@ -169,7 +169,7 @@ ${XDG_CONFIG_HOME:-~/.config}/cowboy/config.toml
 If no config exists, Cowboy uses defaults:
 
 - state dir: `${XDG_STATE_HOME:-~/.local/state}/cowboy`
-- workflow store: `${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`
+- workflow store: `${XDG_STATE_HOME:-~/.local/state}/cowboy/data.db`
 - agent command: `copilot --acp`
 - user workflows: `${XDG_CONFIG_HOME:-~/.config}/cowboy/workflows`
 
@@ -177,7 +177,7 @@ Example config:
 
 ```toml
 state_dir = "~/.local/state/cowboy"
-workflow_store = "~/.local/state/cowboy/workflow.redb"
+workflow_store = "~/.local/state/cowboy/data.db"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 mouse_scroll_lines = 3
 
@@ -275,12 +275,11 @@ visit-local attempt numbers (`2..=max_attempts`) and use one fixed
 A long-lived TUI still loads config once per process, so **new** runs pick up
 config edits only after a restart.
 
-This persisted-shape change is a breaking change with no migration: pre-existing
-runs may be discarded. To reset the store, in order: (1) stop all Cowboy
-processes; (2) delete the configured `workflow_store` file (default
-`${XDG_STATE_HOME:-~/.local/state}/cowboy/workflow.redb`, which may be
-configured outside `state_dir`); (3) delete the `<state_dir>/events` directory
-(default `${XDG_STATE_HOME:-~/.local/state}/cowboy/events`).
+SQLite persistence is a clean cutover with no automatic conversion of an old
+store file. Preserve the old file and choose a new SQLite `workflow_store` path,
+or stop all Cowboy processes before clearing the configured path. The default is
+`${XDG_STATE_HOME:-~/.local/state}/cowboy/data.db`, which may be configured
+outside `state_dir`. Event logs remain under `<state_dir>/events`.
 
 This is a clean cutover: old top-level `max_steps_per_run`,
 `max_visits_per_step`, and `max_retries_per_step` keys are rejected. Move them
@@ -336,10 +335,18 @@ Read [Workflow authoring](docs/workflow-authoring.md) for the Lua API, runtime c
 Cowboy stores runtime state under `state_dir`:
 
 ```text
-workflow.redb                    # runs, heads, immutable source/step/turn objects, role sessions
+data.db                          # SQLite runs, heads, objects, turns, sessions, and prompts
+data.db.locks/<run-id>.lock      # sidecar same-run execution guards
 events/<run-id>.json             # persisted workflow event log for display/debugging
 logs/cowboy.<YYYY-MM-DD>.<pid>.log  # diagnostic log per process and UTC date
 ```
+
+The store uses SQLx's Tokio SQLite driver, schema versioning, WAL, and a small
+connection pool. Mutable domain operations use transactions: saving a run also
+updates its derived head, and completing a step stores the record and advances
+the run/head atomically. Busy/locked writes retry asynchronously with cancellable
+wait notifications; sidecar locks still prevent two Cowboy processes from
+advancing the same run.
 
 Logging defaults to `info`. Set `COWBOY_LOG` or `RUST_LOG` for more detail, for example:
 
@@ -354,7 +361,7 @@ CLI/TUI request
   -> workflow catalog selects a Lua workflow
   -> Lua source is snapshotted and compiled into a WorkflowDefinition
   -> engine records the selected config_set name (limits resolved live per operation)
-  -> WorkflowRun is persisted through redb
+  -> WorkflowRun is persisted through async WorkflowStore capabilities in SQLite
   -> WorkflowRunner executes steps until completed/failed/waiting
   -> agent steps go through ACP and parse YAML-frontmatter output
   -> workflow events are emitted and persisted for UI/CLI display
