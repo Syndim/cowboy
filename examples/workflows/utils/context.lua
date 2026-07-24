@@ -426,6 +426,151 @@ local function validate_evidence_records(errors, field, records)
   end
 end
 
+local evidence_record_sources = {
+  implementation = "implementer",
+  tester = "tester",
+  validator = "validator",
+  reviewer = "reviewer",
+}
+
+local function evidence_record_key(record)
+  return tostring(record.subject_kind) .. "\0" .. tostring(record.subject_id)
+end
+
+local function validate_source_record_contract(errors, prefix, commands, records)
+  local expected_source = evidence_record_sources[prefix]
+  local records_by_key = {}
+  local commands_by_key = {}
+  local records_with_commands = {}
+
+  local _, record_count = array_shape(records)
+  for index = 1, record_count do
+    local record = records[index]
+    if type(record) == "table" then
+      local path = "prev.fields." .. prefix .. "_evidence[" .. tostring(index) .. "]"
+      local key = evidence_record_key(record)
+      records_by_key[key] = record
+      if record.source ~= expected_source then
+        add_error(errors, path .. ".source", expected_source, tostring(record.source))
+      end
+      if record.subject_kind ~= "todo" and record.subject_kind ~= "validation_criterion" then
+        add_error(errors, path .. ".subject_kind", "todo or validation_criterion", tostring(record.subject_kind))
+      end
+      if type(record.procedure) == "table"
+          and record.procedure.kind ~= "command"
+          and record.procedure.kind ~= "manual" then
+        add_error(errors, path .. ".procedure.kind", "command or manual", tostring(record.procedure.kind))
+      end
+      if record.applicability ~= "applicable" and record.applicability ~= "not_applicable" then
+        add_error(errors, path .. ".applicability", "applicable or not_applicable", tostring(record.applicability))
+      end
+      if record.match ~= "matched" and record.match ~= "mismatched" and record.match ~= "not_run" then
+        add_error(errors, path .. ".match", "matched, mismatched, or not_run", tostring(record.match))
+      end
+      local comparison_shape, comparison_count = array_shape(record.comparisons)
+      if expected_source == "implementer"
+          and comparison_shape == "nonempty"
+          and comparison_count > 0 then
+        add_error(errors, path .. ".comparisons", "empty array for implementer", "nonempty")
+      end
+      if record.applicability == "not_applicable" and record.match ~= "not_run" then
+        add_error(errors, path .. ".match", "not_run for not_applicable evidence", tostring(record.match))
+      end
+    end
+  end
+
+  local _, command_count = array_shape(commands)
+  for index = 1, command_count do
+    local command = commands[index]
+    if type(command) == "table" then
+      local path = "prev.fields." .. prefix .. "_commands[" .. tostring(index) .. "]"
+      local key = evidence_record_key(command)
+      local record = records_by_key[key]
+      local procedure_index = command.procedure_index
+      if not record then
+        add_error(errors, path, "command mapped to evidence record", "unmapped")
+      elseif type(procedure_index) ~= "number"
+          or procedure_index < 1
+          or procedure_index % 1 ~= 0 then
+        add_error(errors, path .. ".procedure_index", "positive integer", tostring(procedure_index))
+      elseif type(record.procedure) == "table" and type(record.procedure.steps) == "table" then
+        local expected_command = record.procedure.steps[procedure_index]
+        if expected_command == nil then
+          add_error(errors, path .. ".procedure_index", "existing procedure step", tostring(procedure_index))
+        elseif command.command ~= expected_command then
+          add_error(errors, path .. ".command", "matching procedure step", tostring(command.command))
+        end
+        local mapping_key = key .. "\0" .. tostring(procedure_index)
+        if commands_by_key[mapping_key] then
+          add_error(errors, path, "unique evidence procedure mapping", "duplicate")
+        else
+          commands_by_key[mapping_key] = true
+          records_with_commands[key] = true
+        end
+      end
+    end
+  end
+
+  for key, record in pairs(records_by_key) do
+    if type(record.procedure) == "table"
+        and record.procedure.kind == "command"
+        and record.applicability == "applicable" then
+      local steps_shape = array_shape(record.procedure.steps)
+      if steps_shape == "nonempty" and not records_with_commands[key] then
+        add_error(
+          errors,
+          "prev.fields." .. prefix .. "_commands",
+          "command record mapped to command procedure",
+          "missing"
+        )
+      end
+    end
+  end
+end
+
+function M.validate_evidence_source(fields, prefix, required)
+  local errors = {}
+  local commands_field = prefix .. "_commands"
+  local evidence_field = prefix .. "_evidence"
+  local commands_path = "prev.fields." .. commands_field
+  local evidence_path = "prev.fields." .. evidence_field
+  local commands = fields and fields[commands_field]
+  local records = fields and fields[evidence_field]
+
+  if commands == nil and records ~= nil then
+    add_error(errors, commands_path, "array paired with present " .. evidence_path, "missing")
+  elseif commands ~= nil and records == nil then
+    add_error(errors, evidence_path, "array paired with present " .. commands_path, "missing")
+  else
+    if validate_array(errors, commands_path, commands, required) then
+      validate_command_records(errors, commands_path, commands)
+    end
+    if validate_array(errors, evidence_path, records, required) then
+      validate_evidence_records(errors, evidence_path, records)
+      local shape = array_shape(records)
+      if required and shape == "empty" then
+        add_error(errors, evidence_path, "nonempty array", "empty")
+      end
+    end
+  end
+
+  if #errors == 0 and commands ~= nil and records ~= nil then
+    validate_source_record_contract(errors, prefix, commands, records)
+  end
+  return #errors == 0, errors
+end
+
+function M.format_validation_errors(errors)
+  local diagnostics = {}
+  for _, error in ipairs(errors or {}) do
+    table.insert(
+      diagnostics,
+      error.field .. ": expected " .. error.expected .. ", got " .. error.actual
+    )
+  end
+  return diagnostics
+end
+
 local function validate_assessments(errors, assessments)
   local shape, count = array_shape(assessments)
   if shape == "empty" then return true end
@@ -639,13 +784,7 @@ end
 
 function M.invalid_context_action(ctx, status, errors)
   local fields = (ctx.prev and ctx.prev.fields) or {}
-  local diagnostics = {}
-  for _, error in ipairs(errors or {}) do
-    table.insert(
-      diagnostics,
-      error.field .. ": expected " .. error.expected .. ", got " .. error.actual
-    )
-  end
+  local diagnostics = M.format_validation_errors(errors)
   local diagnostic_text = table.concat(diagnostics, "; ")
   local preserved = M.copy_evidence_fields(fields, {
     user_feedback = M.copy_user_feedback(fields),
