@@ -661,6 +661,14 @@ max_retries_per_step = 4
             ],
         );
         assert_agent(
+            "tester",
+            &[
+                "--model=github-copilot/claude-sonnet-5",
+                "--thinking=medium",
+                "acp",
+            ],
+        );
+        assert_agent(
             "committer",
             &[
                 "--model=github-copilot/claude-haiku-4.5",

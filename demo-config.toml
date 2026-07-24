@@ -51,6 +51,11 @@ command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=medium", "acp"]
 
 [[agents]]
+name = "tester"
+command = "omp"
+args = ["--model=github-copilot/claude-sonnet-5", "--thinking=medium", "acp"]
+
+[[agents]]
 name = "committer"
 command = "omp"
 args = ["--model=github-copilot/claude-haiku-4.5", "--thinking=low", "acp"]
