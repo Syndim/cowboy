@@ -4050,6 +4050,7 @@ mod tests {
             &[
                 ("planner", "planner"),
                 ("implementer", "implementer"),
+                ("tester", "tester"),
                 ("reviewer", "reviewer"),
                 ("committer", "committer"),
             ],
@@ -4063,6 +4064,7 @@ mod tests {
                 ("investigator", "default"),
                 ("planner", "planner"),
                 ("implementer", "implementer"),
+                ("tester", "tester"),
                 ("reviewer", "reviewer"),
                 ("committer", "committer"),
             ],
@@ -4125,6 +4127,7 @@ mod tests {
             &[
                 ("planner", "planner"),
                 ("implementer", "implementer"),
+                ("tester", "tester"),
                 ("validator", "reviewer"),
                 ("reviewer", "reviewer"),
                 ("committer", "committer"),
