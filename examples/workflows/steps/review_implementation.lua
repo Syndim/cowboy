@@ -70,6 +70,7 @@ For bug fixes, also inspect the bug-fix work folder at `Work dir: ...`, the RCA 
       output = {
         status = { "approved", "changes_requested", "replan_requested" },
         fields = { feedback = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", validator_commands = "array", validator_evidence = "array", reviewer_commands = "array", reviewer_evidence = "array", reviewer_assessments = "array" },
+        required_fields = { "implementation_commands", "implementation_evidence" },
       },
     }
   end

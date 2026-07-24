@@ -1,0 +1,46 @@
+diff --git a/crates/workflow/lua/src/loader.rs b/crates/workflow/lua/src/loader.rs
+index 3612849..e85b631 100644
+--- a/crates/workflow/lua/src/loader.rs
++++ b/crates/workflow/lua/src/loader.rs
+@@ -760,6 +760,41 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn examples_workflows_review_output_cannot_drop_revision_context_into_blocker_loop() {
++        for workflow_name in ["feature", "bugfix", "dev-loop"] {
++            let compiled = load_example_compiled_workflow(workflow_name);
++            let result = run_step(
++                &compiled.source_bundle,
++                "review",
++                serde_json::json!({
++                    "request": "Preserve revision context",
++                    "prev": {
++                        "step": if workflow_name == "dev-loop" { "validate" } else { "test" },
++                        "action": "agent",
++                        "status": if workflow_name == "dev-loop" { "achieved" } else { "passed" },
++                        "fields": sample_evidence_fields()
++                    }
++                }),
++            )
++            .unwrap();
++            let StepAction::Agent(review) = result.action else {
++                panic!("{workflow_name} review should request an agent action")
++            };
++            let output = review.output.expect("reviewer should declare output");
++
++            for field in ["implementation_commands", "implementation_evidence"] {
++                assert!(
++                    output
++                        .required_fields
++                        .iter()
++                        .any(|required| required == field),
++                    "{workflow_name} reviewer output must require {field} because a changes_requested result routes directly to revise"
++                );
++            }
++        }
++    }
++
+     #[test]
+     fn examples_workflows_render_source_labeled_evidence_in_stable_order() {
+         let compiled = load_example_compiled_workflow("dev-loop");

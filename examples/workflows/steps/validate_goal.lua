@@ -52,6 +52,10 @@ Return "achieved" only when the exact user Validation method, all ordered checks
           validator_evidence = "array",
           failures = "array",
         },
+        required_fields = {
+          "implementation_commands",
+          "implementation_evidence",
+        },
       },
 
     }

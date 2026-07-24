@@ -761,6 +761,309 @@ mod tests {
     }
 
     #[test]
+    fn examples_workflows_review_output_cannot_drop_revision_context_into_blocker_loop() {
+        for workflow_name in ["feature", "bugfix", "dev-loop"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let result = run_step(
+                &compiled.source_bundle,
+                "review",
+                serde_json::json!({
+                    "request": "Preserve revision context",
+                    "prev": {
+                        "step": if workflow_name == "dev-loop" { "validate" } else { "test" },
+                        "action": "agent",
+                        "status": if workflow_name == "dev-loop" { "achieved" } else { "passed" },
+                        "fields": sample_evidence_fields()
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(review) = result.action else {
+                panic!("{workflow_name} review should request an agent action")
+            };
+            let output = review.output.expect("reviewer should declare output");
+
+            for field in ["implementation_commands", "implementation_evidence"] {
+                assert!(
+                    output
+                        .required_fields
+                        .iter()
+                        .any(|required| required == field),
+                    "{workflow_name} reviewer output must require {field} because a changes_requested result routes directly to revise"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_other_revise_inputs_require_implementation_context() {
+        for workflow_name in ["feature", "bugfix", "dev-loop"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let mut fields = sample_evidence_fields();
+            fields["user_feedback"] = serde_json::json!([{
+                "sequence": 0,
+                "kind": "initial",
+                "content": "Preserve raw feedback",
+                "submitted_at": "2026-07-24T03:12:51.216Z"
+            }]);
+            fields["goal"] = serde_json::json!("Preserve revision context");
+            fields["validation"] = serde_json::json!("cargo test -p sample acceptance_contract");
+            fields["work_dir"] = serde_json::json!("docs/plans/revision_context");
+            fields["plan_doc"] = serde_json::json!("docs/plans/revision_context/plan.md");
+            fields["validation_doc"] =
+                serde_json::json!("docs/plans/revision_context/validation.md");
+            fields["rca_doc"] = serde_json::json!("docs/plans/revision_context/rca.md");
+            fields["repro_test"] = serde_json::json!("loader::tests::revision_context");
+
+            let feedback_result = run_step(
+                &compiled.source_bundle,
+                "review_result_feedback",
+                serde_json::json!({
+                    "request": "Preserve revision context",
+                    "prev": {
+                        "step": "confirm_result_answer",
+                        "action": "status",
+                        "status": "changes_requested",
+                        "fields": fields.clone()
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Agent(feedback_review) = feedback_result.action else {
+                panic!("{workflow_name} result feedback review should request an agent action")
+            };
+            assert_revise_input_contract(workflow_name, "review_result_feedback", &feedback_review);
+
+            if workflow_name == "dev-loop" {
+                let validate_result = run_step(
+                    &compiled.source_bundle,
+                    "validate",
+                    serde_json::json!({
+                        "request": "Preserve revision context",
+                        "prev": {
+                            "step": "test",
+                            "action": "agent",
+                            "status": "passed",
+                            "fields": fields
+                        }
+                    }),
+                )
+                .unwrap();
+                let StepAction::Agent(validate) = validate_result.action else {
+                    panic!("dev-loop validate should request an agent action")
+                };
+                assert_revise_input_contract("dev-loop", "validate", &validate);
+            }
+        }
+    }
+
+    fn assert_revise_input_contract(
+        workflow_name: &str,
+        step_id: &str,
+        action: &cowboy_workflow_core::AgentAction,
+    ) {
+        let output = action
+            .output
+            .as_ref()
+            .unwrap_or_else(|| panic!("{workflow_name} {step_id} should declare output"));
+        assert_eq!(output.fields["user_feedback"], "array");
+        for field in ["implementation_commands", "implementation_evidence"] {
+            assert_eq!(output.fields[field], "array");
+            assert!(
+                output
+                    .required_fields
+                    .iter()
+                    .any(|required| required == field),
+                "{workflow_name} {step_id} must require {field}"
+            );
+        }
+        assert!(
+            action
+                .prompt
+                .contains("Preserve `user_feedback` exactly in output fields when present")
+        );
+        assert!(action.prompt.contains(
+            "Semantic deep equality is required: array length and element order must be unchanged"
+        ));
+    }
+
+    #[test]
+    fn examples_workflows_triage_does_not_retry_revise_with_invalid_implementation_context() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let user_feedback = serde_json::json!([{
+            "sequence": 0,
+            "kind": "initial",
+            "content": "Keep this raw",
+            "submitted_at": "2026-07-24T03:12:51.216Z"
+        }]);
+        let base_fields = {
+            let mut fields = sample_evidence_fields();
+            fields["user_feedback"] = user_feedback.clone();
+            fields["blocker_statement"] =
+                serde_json::json!("Revision context is missing or malformed");
+            fields["blocked_from_step"] = serde_json::json!("revise");
+            fields["blocked_from_status"] = serde_json::json!("blocked");
+            fields["blocker_reason"] = serde_json::json!("Local context can be reconstructed");
+            fields["blocker_resolution"] =
+                serde_json::json!("Retry revision after restoring implementation context");
+            fields["goal"] = serde_json::json!("Prevent blocker recovery loops");
+            fields["validation"] = serde_json::json!("Run the focused routing test");
+            fields["work_dir"] = serde_json::json!("docs/plans/revision_context");
+            fields["plan_doc"] = serde_json::json!("docs/plans/revision_context/plan.md");
+            fields["validation_doc"] =
+                serde_json::json!("docs/plans/revision_context/validation.md");
+            fields["rca_doc"] = serde_json::json!("docs/plans/revision_context/rca.md");
+            fields["repro_test"] = serde_json::json!("loader::tests::revision_context");
+            fields["files"] = serde_json::json!(["examples/workflows/steps/triage_blocked.lua"]);
+            fields
+        };
+
+        let mut cases = Vec::new();
+        let mut missing = base_fields.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("implementation_commands");
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("implementation_evidence");
+        cases.push((
+            "both missing",
+            missing,
+            "prev.fields.implementation_commands",
+        ));
+
+        let mut unpaired = base_fields.clone();
+        unpaired
+            .as_object_mut()
+            .unwrap()
+            .remove("implementation_evidence");
+        cases.push((
+            "unpaired arrays",
+            unpaired,
+            "prev.fields.implementation_evidence",
+        ));
+
+        let mut wrong_type = base_fields.clone();
+        wrong_type["implementation_commands"] = serde_json::json!("not an array");
+        cases.push((
+            "wrong field type",
+            wrong_type,
+            "prev.fields.implementation_commands",
+        ));
+
+        let mut malformed = base_fields.clone();
+        malformed["implementation_commands"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("procedure_index");
+        cases.push((
+            "malformed command record",
+            malformed,
+            "prev.fields.implementation_commands[1].procedure_index",
+        ));
+
+        let mut malformed_evidence = base_fields.clone();
+        malformed_evidence["implementation_evidence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_result");
+        cases.push((
+            "malformed evidence record",
+            malformed_evidence,
+            "prev.fields.implementation_evidence[1].observed_result",
+        ));
+
+        for (name, fields, diagnostic_path) in cases {
+            let expected = fields.clone();
+            let result = run_step(
+                &compiled.source_bundle,
+                "triage_blocked",
+                serde_json::json!({
+                    "prev": {
+                        "step": "review_blocker",
+                        "action": "agent",
+                        "status": "recoverable",
+                        "fields": fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Status(triage) = result.action else {
+                panic!("{name} triage should return a status action")
+            };
+
+            assert_eq!(
+                triage.status, "implement",
+                "{name} must reconstruct context instead of retrying revise"
+            );
+            assert!(
+                triage.fields["feedback"]
+                    .as_str()
+                    .unwrap()
+                    .contains(diagnostic_path)
+            );
+            assert!(triage.body.contains(diagnostic_path));
+            assert_eq!(triage.fields["user_feedback"], user_feedback);
+            for field in [
+                "blocker_statement",
+                "blocked_from_step",
+                "blocked_from_status",
+                "blocker_reason",
+                "blocker_resolution",
+                "goal",
+                "validation",
+                "work_dir",
+                "plan_doc",
+                "validation_doc",
+                "rca_doc",
+                "repro_test",
+                "files",
+                "tester_commands",
+                "tester_evidence",
+                "validator_commands",
+                "validator_evidence",
+                "reviewer_commands",
+                "reviewer_evidence",
+                "reviewer_assessments",
+            ] {
+                assert_eq!(
+                    triage.fields[field], expected[field],
+                    "{name} changed preserved field {field}"
+                );
+            }
+        }
+
+        let valid_result = run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "agent",
+                    "status": "recoverable",
+                    "fields": base_fields.clone()
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(valid) = valid_result.action else {
+            panic!("valid triage should return a status action")
+        };
+        assert_eq!(valid.status, "revise");
+        assert_eq!(
+            valid.fields["implementation_commands"],
+            base_fields["implementation_commands"]
+        );
+        assert_eq!(
+            valid.fields["implementation_evidence"],
+            base_fields["implementation_evidence"]
+        );
+        assert_eq!(valid.fields["user_feedback"], user_feedback);
+    }
+
+    #[test]
     fn examples_workflows_render_source_labeled_evidence_in_stable_order() {
         let compiled = load_example_compiled_workflow("dev-loop");
         let result = run_step(
@@ -1598,8 +1901,13 @@ mod tests {
             panic!("triage_blocked should return a status action")
         };
 
-        assert_eq!(triaged.status, "revise");
-        assert_eq!(triaged.fields["feedback"], serde_json::json!(user_answer));
+        assert_eq!(triaged.status, "implement");
+        assert!(
+            triaged.fields["feedback"]
+                .as_str()
+                .unwrap()
+                .contains("prev.fields.implementation_commands")
+        );
         assert_eq!(
             triaged.fields["user_feedback"],
             serde_json::json!(["keep the original raw request", user_answer]),
