@@ -4061,7 +4061,7 @@ mod tests {
             "bugfix",
             &bugfix,
             &[
-                ("investigator", "default"),
+                ("investigator", "investigator"),
                 ("planner", "planner"),
                 ("implementer", "implementer"),
                 ("tester", "tester"),
