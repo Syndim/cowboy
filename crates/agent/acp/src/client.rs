@@ -63,6 +63,9 @@ pub struct Client {
     #[cfg(test)]
     #[serde(skip)]
     replacement_factory: ReplacementTransportFactory,
+    #[cfg(test)]
+    #[serde(skip)]
+    reconnect_factory: ReplacementTransportFactory,
 }
 
 impl Clone for Client {
@@ -79,6 +82,8 @@ impl Clone for Client {
             watchdog: self.watchdog,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
+            #[cfg(test)]
+            reconnect_factory: ReplacementTransportFactory::default(),
         }
     }
 }
@@ -272,11 +277,11 @@ impl Client {
                 session_id = ?self.session_id,
                 "Reconnecting client transport"
             );
-            let transport =
-                Self::create_transport(&self.transport_config, self.session_id.as_deref()).await?;
+            let transport = self.create_reconnect_transport().await?;
             self.transport = Some(transport);
             self.pushback.clear();
-            self.initialize().await?;
+            self.initialize_bounded("ACP lazy reconnect initialization")
+                .await?;
             tracing::info!(
                 transport = transport_kind(&self.transport_config),
                 session_id = ?self.session_id,
@@ -322,6 +327,14 @@ impl Client {
             return outcome.into_transport().await;
         }
         Self::create_transport(&self.transport_config, Some(session_id)).await
+    }
+
+    async fn create_reconnect_transport(&mut self) -> anyhow::Result<Box<dyn Transport>> {
+        #[cfg(test)]
+        if let Some(outcome) = self.reconnect_factory.next() {
+            return outcome.into_transport().await;
+        }
+        Self::create_transport(&self.transport_config, self.session_id.as_deref()).await
     }
 
     /// Run the ACP initialize handshake on the current transport.
@@ -381,6 +394,53 @@ impl Client {
         }
     }
 
+    async fn initialize_bounded(&mut self, operation: &'static str) -> anyhow::Result<()> {
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let initialization_error = match tokio::time::timeout(timeout, self.initialize()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(error)) => anyhow::anyhow!("{operation} failed: {error}"),
+            Err(_) => anyhow::anyhow!("{operation} timed out"),
+        };
+
+        Err(self
+            .dispose_failed_initialization(initialization_error)
+            .await)
+    }
+
+    async fn dispose_failed_initialization(
+        &mut self,
+        initialization_error: anyhow::Error,
+    ) -> anyhow::Error {
+        let Some(mut transport) = self.transport.take() else {
+            return initialization_error;
+        };
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let primary_error = initialization_error.to_string();
+
+        let cleanup_error = match tokio::time::timeout(timeout, transport.force_terminate()).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => {
+                tracing::error!(
+                    error = %error,
+                    "Transport force termination failed after ACP initialization failure"
+                );
+                Some(format!("transport force termination failed: {error}"))
+            }
+            Err(_) => {
+                tracing::error!(
+                    "Transport force termination timed out after ACP initialization failure"
+                );
+                Some("transport force termination timed out".to_string())
+            }
+        };
+        drop(transport);
+
+        match cleanup_error {
+            Some(cleanup_error) => anyhow::anyhow!("{primary_error}; {cleanup_error}"),
+            None => initialization_error,
+        }
+    }
+
     /// Connect to the agent with TransportConfig and complete the ACP initialize handshake.
     pub async fn connect(transport_config: TransportConfig) -> anyhow::Result<Self> {
         Self::connect_with_options(transport_config, AgentWatchdogOptions::default()).await
@@ -424,15 +484,23 @@ impl Client {
             watchdog,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
+            #[cfg(test)]
+            reconnect_factory: ReplacementTransportFactory::default(),
         };
 
-        client.initialize().await?;
+        client.initialize_bounded("ACP initialize").await?;
         Ok(client)
     }
 
     #[cfg(test)]
     fn push_replacement_transport(&mut self, transport: Box<dyn Transport>) {
         self.replacement_factory
+            .push(ReplacementTransportFactoryOutcome::Ready(transport));
+    }
+
+    #[cfg(test)]
+    fn push_reconnect_transport(&mut self, transport: Box<dyn Transport>) {
+        self.reconnect_factory
             .push(ReplacementTransportFactoryOutcome::Ready(transport));
     }
 
@@ -817,17 +885,8 @@ impl Client {
         self.transport = Some(replacement);
         self.pushback.clear();
 
-        match tokio::time::timeout(timeout, self.initialize()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                self.cleanup_replacement().await;
-                anyhow::bail!("agent watchdog replacement initialization failed: {err}");
-            }
-            Err(_) => {
-                self.cleanup_replacement().await;
-                anyhow::bail!("agent watchdog replacement initialization timed out");
-            }
-        }
+        self.initialize_bounded("agent watchdog replacement initialization")
+            .await?;
 
         tracing::warn!(
             event = "agent_watchdog_transport_resumed",
@@ -1773,6 +1832,161 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connect_times_out_when_initialize_never_responds() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport =
+            ScriptedTransport::new(vec![ScriptedReceive::Pending], Arc::clone(&counters));
+        let watchdog = AgentWatchdogOptions {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 1,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            Client::connect_with_transport_and_options(
+                Box::new(transport),
+                dummy_transport_config(),
+                watchdog,
+            ),
+        )
+        .await
+        .expect("ACP initialize should honor the recovery operation timeout");
+        let error = result.expect_err("a missing initialize response should fail the connection");
+
+        assert!(
+            error.to_string().contains("initialize"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_timeout_disposes_transport() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport =
+            ScriptedTransport::new(vec![ScriptedReceive::Pending], Arc::clone(&counters));
+        let watchdog = AgentWatchdogOptions {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 1,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            Client::connect_with_transport_and_options(
+                Box::new(transport),
+                dummy_transport_config(),
+                watchdog,
+            ),
+        )
+        .await
+        .expect("ACP initialize and cleanup should honor the recovery operation timeout");
+        let error = result.expect_err("a missing initialize response should fail the connection");
+
+        assert_eq!(error.to_string(), "ACP initialize timed out");
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_timeout_preserves_force_termination_error() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport =
+            ScriptedTransport::new(vec![ScriptedReceive::Pending], Arc::clone(&counters))
+                .force_action(ScriptedOperation::Error("cleanup failed"));
+        let watchdog = AgentWatchdogOptions {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 1,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Client::connect_with_transport_and_options(
+                Box::new(transport),
+                dummy_transport_config(),
+                watchdog,
+            ),
+        )
+        .await
+        .expect("initialization and cleanup should be bounded");
+        let error = result.expect_err("a missing initialize response should fail the connection");
+
+        assert_eq!(
+            error.to_string(),
+            "ACP initialize timed out; transport force termination failed: cleanup failed"
+        );
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn initialize_timeout_preserves_force_termination_timeout() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport =
+            ScriptedTransport::new(vec![ScriptedReceive::Pending], Arc::clone(&counters))
+                .force_action(ScriptedOperation::Pending);
+        let watchdog = AgentWatchdogOptions {
+            response_timeout_seconds: 100,
+            cancel_timeout_seconds: 10,
+            recovery_operation_timeout_seconds: 1,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Client::connect_with_transport_and_options(
+                Box::new(transport),
+                dummy_transport_config(),
+                watchdog,
+            ),
+        )
+        .await
+        .expect("initialization and cleanup should be bounded");
+        let error = result.expect_err("a missing initialize response should fail the connection");
+
+        assert_eq!(
+            error.to_string(),
+            "ACP initialize timed out; transport force termination timed out"
+        );
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lazy_reconnect_times_out_and_disposes_transport() {
+        let transport = MockTransport::new(vec![&init_response(0)]);
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.transport = None;
+
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        client.push_reconnect_transport(Box::new(ScriptedTransport::new(
+            vec![ScriptedReceive::Pending],
+            Arc::clone(&counters),
+        )));
+        client.watchdog.recovery_operation_timeout_seconds = 1;
+
+        let result = tokio::time::timeout(Duration::from_secs(3), client.ensure_transport())
+            .await
+            .expect("lazy reconnect initialization and cleanup should be bounded");
+        let error = match result {
+            Ok(_) => panic!("a missing reconnect initialize response should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ACP lazy reconnect initialization timed out"
+        );
+        assert_eq!(counters.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
+        assert!(!client.is_connected());
     }
 
     #[tokio::test]
