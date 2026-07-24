@@ -71,6 +71,7 @@ Owns reusable host-action runners and the dispatcher that maps `StepAction` vari
 | `command.rs` | `CommandActionRunner` for direct non-shell process execution from runtime cwd. |
 | `ask_user.rs` | `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
 | `status.rs` | `StatusActionRunner` for immediate completed records. |
+| `workflow.rs` | `WorkflowActionHandler` trait and `WorkflowActionRunner` adapter for `StepAction::Workflow`; routed to the engine's runtime handler. |
 | `fail.rs` | `FailActionRunner` for failed run statuses. |
 
 ## Crate: `cowboy-workflow-engine`
@@ -125,7 +126,7 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `fail`. |
+| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`. |
 | `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |

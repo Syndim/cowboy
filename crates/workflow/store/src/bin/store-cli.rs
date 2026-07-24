@@ -116,6 +116,7 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
         original_request: "manual store-cli run".to_string(),
         request_topic: None,
         config_set: Default::default(),
+        parent: None,
         status: RunStatus::Running,
         retries_used: 0,
         step_retries_used: Default::default(),

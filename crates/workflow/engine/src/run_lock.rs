@@ -10,6 +10,39 @@ use uuid::Uuid;
 static ACTIVE_RUN_LOCKS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Test-only instrumentation counting how many times a run lock is successfully
+/// acquired per run id. It lets cycle-rejection tests prove that a rejected
+/// ancestor target's child run lock is never acquired, keyed by globally unique
+/// run ids so parallel tests never collide.
+#[cfg(test)]
+pub(crate) mod lock_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static ACQUIRED: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+    fn map() -> &'static Mutex<HashMap<String, usize>> {
+        ACQUIRED.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn record(run_id: &str) {
+        *map()
+            .lock()
+            .expect("lock probe mutex poisoned")
+            .entry(run_id.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn count(run_id: &str) -> usize {
+        map()
+            .lock()
+            .expect("lock probe mutex poisoned")
+            .get(run_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct RunExecutionLocks {
     lock_dir: PathBuf,
@@ -43,7 +76,11 @@ impl RunExecutionLocks {
         }
 
         match self.acquire_file_lock(&lock_key) {
-            Ok(file) => Ok(RunExecutionGuard { active_key, file }),
+            Ok(file) => {
+                #[cfg(test)]
+                lock_probe::record(run_id);
+                Ok(RunExecutionGuard { active_key, file })
+            }
             Err(err) => {
                 release_in_process(&active_key)?;
                 Err(err)

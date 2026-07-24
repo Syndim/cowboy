@@ -107,6 +107,68 @@ mod tests {
     }
 
     #[test]
+    fn workflow_action_converts_and_preserves_request() {
+        let source = snapshot(
+            r#"
+            local step = step("delegate")
+            step.run = function(ctx)
+              return action.workflow {
+                workflow = "review/security",
+                request = "  Review this\nexactly  ",
+              }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let result = run_step(&source, "delegate", serde_json::json!({})).unwrap();
+        let StepAction::Workflow(action) = result.action else {
+            panic!("expected workflow action")
+        };
+        assert_eq!(action.workflow, "review/security");
+        assert_eq!(action.request, "  Review this\nexactly  ");
+    }
+
+    #[test]
+    fn workflow_action_rejects_invalid_fields() {
+        let cases = [
+            ("missing workflow", r#"request = "x""#, "workflow"),
+            (
+                "blank workflow",
+                r#"workflow = "  ", request = "x""#,
+                "non-empty",
+            ),
+            (
+                "non-string workflow",
+                r#"workflow = 1, request = "x""#,
+                "workflow",
+            ),
+            ("missing request", r#"workflow = "child""#, "request"),
+            (
+                "non-string request",
+                r#"workflow = "child", request = 1"#,
+                "request",
+            ),
+        ];
+
+        for (name, fields, expected) in cases {
+            let source = snapshot(&format!(
+                r#"
+                local step = step("delegate")
+                step.run = function(ctx)
+                  return action.workflow {{ {fields} }}
+                end
+                return workflow("wf", step)
+                "#
+            ));
+            let err = run_step(&source, "delegate", serde_json::json!({})).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "{name}: expected error containing {expected:?}, got {err}"
+            );
+        }
+    }
+
+    #[test]
     fn converts_command_action() {
         let source = snapshot(
             r#"

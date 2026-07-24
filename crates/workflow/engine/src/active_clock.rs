@@ -180,6 +180,7 @@ mod tests {
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
+            parent: None,
             status: RunStatus::Running,
             retries_used: 0,
             step_retries_used: Default::default(),

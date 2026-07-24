@@ -15,6 +15,8 @@ pub enum StepAction {
     Status(StatusAction),
     /// Pause the run and ask the user for input.
     AskUser(AskUserAction),
+    /// Invoke another catalog workflow as a durable child run.
+    Workflow(WorkflowAction),
     /// Fail the run immediately with a reason.
     Fail(FailAction),
 }
@@ -26,6 +28,7 @@ impl StepAction {
             Self::Command(_) => "command",
             Self::Status(_) => "status",
             Self::AskUser(_) => "ask_user",
+            Self::Workflow(_) => "workflow",
             Self::Fail(_) => "fail",
         }
     }
@@ -119,6 +122,15 @@ fn default_ask_user_status() -> Status {
     "answered".to_string()
 }
 
+/// Request to invoke another workflow from the catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAction {
+    /// Catalog workflow id, matching the id shown by `/workflows`.
+    pub workflow: String,
+    /// Exact initial request supplied to the child workflow.
+    pub request: String,
+}
+
 /// Request to fail the workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FailAction {
@@ -186,6 +198,26 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn workflow_action_serializes_and_names_variant() {
+        let action = StepAction::Workflow(WorkflowAction {
+            workflow: "review/security".to_string(),
+            request: "  Review this\nexactly  ".to_string(),
+        });
+
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "action": "workflow",
+                "workflow": "review/security",
+                "request": "  Review this\nexactly  ",
+            })
+        );
+        assert_eq!(action.action_name(), "workflow");
+        assert_eq!(serde_json::from_value::<StepAction>(json).unwrap(), action);
     }
 
     #[test]

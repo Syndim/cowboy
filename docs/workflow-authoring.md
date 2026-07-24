@@ -288,7 +288,7 @@ them under `[config_sets.default]`.
 
 ## Actions
 
-Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.ask_user`, or `action.fail`.
+Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.ask_user`, `action.workflow`, or `action.fail`.
 
 ### `action.agent { role, prompt, output }`
 
@@ -442,9 +442,60 @@ Fields:
 `fail` does not create a step output record and does not use transitions.
 
 
+### `action.workflow { workflow, request }`
+
+Invokes another catalog workflow as a durable child run and, when the child
+finishes, completes the calling step with the child's terminal output.
+
+```lua
+return action.workflow {
+  workflow = "review/security",
+  request = "Review the current implementation",
+}
+```
+
+Fields:
+
+- `workflow` (required): the catalog workflow id shown by `/workflows`, exactly
+  as used with `cowboy run --workflow` — not necessarily the Lua-declared
+  display name. Must be a non-blank string.
+- `request` (required): the initial request handed to the child workflow,
+  preserved byte-for-byte (including leading/trailing whitespace and newlines).
+
+Behavior:
+
+- The child is a normal, durable `WorkflowRun`. It uses the same catalog, store,
+  run locks, agent factory, config-set resolution, `WorkflowRunner`, event bus,
+  retry policy, and cancellation path as a top-level run, and runs until it
+  completes, fails, is cancelled, or asks for input.
+- On completion, the calling step's `StepOutput` copies the child terminal
+  step's `status`, `fields`, `body`, and `raw` unchanged, so the parent routes
+  directly on the status the child returned and its next step reads the child
+  result through `ctx.prev`. The target workflow id, exact request, and child
+  run id are recorded under the parent step's `StepInput.context`, with
+  `StepDetail.backend = "workflow"` and `StepDetail.session_id = <child run id>`.
+- A child `RunStatus::Failed` becomes a completed parent output with status
+  `"failed"` (carrying the child run id and reason). A child cancellation becomes
+  status `"cancelled"`. Route these like any other status.
+- If the child waits for input, its prompt is mirrored on the parent's own
+  `WaitingForInput` state; answering the parent (`cowboy answer <parent-run-id>
+  ...`) answers and continues the child. If the child asks again, the parent
+  prompt refreshes; when the child becomes terminal, the parent workflow action
+  completes and the parent continues automatically.
+- Child creation is idempotent across retries, resume, and process interruption:
+  the child run id is a stable UUID-v5 derived from the parent run id, the
+  calling step id, and the parent's previous head. Retrying or resuming reuses
+  the same child rather than creating a new one.
+- Direct (`A -> A`) and indirect (`A -> B -> A`) workflow-call cycles are
+  rejected with a clear error before any child lock is acquired.
+- Parent and child keep separate event logs; the active parent reports child
+  lifecycle progress (`child workflow <id> started/waiting for input/resumed/
+  finished`).
+
+
 ## Transitions
 
-Transitions route completed `agent`, `command`, `status`, or answered `ask_user` step outputs by status.
+Transitions route completed `agent`, `command`, `status`, `workflow`, or answered `ask_user` step outputs by status.
 
 ```lua
 implement:on("success", finish)
@@ -458,8 +509,9 @@ Rules:
 - `status` must be a non-empty string.
 - `target_step` can be a step table or step id string.
 - Validation rejects unknown target steps.
-- If a completed step returns status `success` and there is no explicit `success` transition, the workflow completes.
-- If a completed step returns any other status without a matching transition, the run errors with an unknown runtime transition.
+- If a completed step declares no transitions at all, it is terminal: the workflow completes with whatever status the step returned (this is how a child workflow completes with a domain status such as the one its caller routes on).
+- If a completed step declares transitions and returns `success` without an explicit `success` transition, the workflow completes.
+- If a completed step declares transitions and returns any other status without a matching transition, the run errors with an unknown runtime transition.
 - `ask_user` and `fail` are run-state changes, not completed step outputs, so transition tables are not consulted when they initially block or fail the run. The completed ask-user record produced after an answer is routed by its output status.
 
 A common pattern is to normalize agent outputs into terminal status steps:

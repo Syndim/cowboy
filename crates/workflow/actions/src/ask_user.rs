@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cowboy_workflow_core::{
     ActionResult, AskUserAction, ExecutionContext, Result, ResumeCallback, ResumeCallbackHandler,
@@ -75,8 +76,9 @@ impl AskUserActionRunner {
     }
 }
 
+#[async_trait]
 impl ResumeCallbackHandler for AskUserActionRunner {
-    fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
+    async fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
         let pending = PendingAskUser::from_callback(callback)?;
         Ok(ActionResult::completed(self.complete(pending, input)))
     }

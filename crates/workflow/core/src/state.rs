@@ -53,6 +53,9 @@ pub struct WorkflowRun {
     /// are resolved live from current config on every operation.
     #[serde(default)]
     pub config_set: ConfigSetRef,
+    /// Durable lineage when this run was invoked by a parent workflow action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<WorkflowRunParent>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
     /// Step id that should run next when the run resumes.
@@ -81,6 +84,19 @@ pub struct WorkflowRun {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Durable identity linking a child run to one parent workflow-step invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunParent {
+    /// Parent workflow run id.
+    pub run_id: RunId,
+    /// Parent step that invoked the child.
+    pub step_id: StepId,
+    /// Parent head before the workflow action started.
+    pub previous_head: Option<ObjectHash>,
+    /// Stable UUID-v5 workflow invocation identity.
+    pub invocation_id: String,
 }
 
 /// Durable on-the-fly prompt accepted for a workflow run.
@@ -612,8 +628,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(run.config_set, ConfigSetRef::default());
+        assert_eq!(run.parent, None);
         assert_eq!(run.retries_used, 0);
         assert!(run.step_retries_used.is_empty());
+    }
+
+    #[test]
+    fn workflow_run_parent_lineage_defaults_and_round_trips() {
+        let old_json = serde_json::json!({
+            "id": "legacy",
+            "workflow_name": "wf",
+            "workflow_api_version": 1,
+            "workflow_hash": "hash",
+            "workflow_sources": {},
+            "original_request": "do it",
+            "status": { "status": "running" },
+            "current_step": "start",
+            "head": null,
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z"
+        });
+        let legacy: WorkflowRun = serde_json::from_value(old_json).unwrap();
+        assert_eq!(legacy.parent, None);
+
+        let mut linked = legacy;
+        linked.parent = Some(WorkflowRunParent {
+            run_id: "parent-run".to_string(),
+            step_id: "call_child".to_string(),
+            previous_head: Some("previous-head".to_string()),
+            invocation_id: "9a39cab2-8417-5ca4-b545-6f0a30bb913f".to_string(),
+        });
+        let round_trip: WorkflowRun =
+            serde_json::from_value(serde_json::to_value(&linked).unwrap()).unwrap();
+        assert_eq!(round_trip.parent, linked.parent);
     }
 
     #[test]

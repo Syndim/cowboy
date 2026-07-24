@@ -22,6 +22,7 @@ pub(crate) mod tests {
             config_set: ConfigSetRef {
                 name: "careful".into(),
             },
+            parent: None,
             status: RunStatus::Running,
             retries_used: 2,
             step_retries_used: [("start".into(), 1)].into_iter().collect(),

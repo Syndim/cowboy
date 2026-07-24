@@ -101,6 +101,7 @@ async fn ensure_standalone_run(
                 original_request: config.prompt.clone(),
                 request_topic: None,
                 config_set: Default::default(),
+                parent: None,
                 status: RunStatus::Running,
                 current_step: config.step_id.clone(),
                 head: None,

@@ -210,7 +210,12 @@ pub fn next_step<'a>(
     if let Some(next) = step.transitions.next_for(status) {
         return Ok(Some(next));
     }
-    if status == "success" {
+    // A leaf step (one declaring no outgoing transitions) is terminal for any
+    // status it returns, so a workflow can complete with a domain status such as
+    // the custom status a child workflow reports back to its caller. Steps that
+    // declare transitions still only complete implicitly on `success`, so a typo
+    // in a routed status is caught rather than silently ending the run.
+    if status == "success" || step.transitions.by_status.is_empty() {
         return Ok(None);
     }
     Err(WorkflowError::UnknownRuntimeTransition {
@@ -363,13 +368,24 @@ mod tests {
     }
 
     #[test]
-    fn non_success_without_transition_fails() {
+    fn leaf_step_without_transition_is_terminal_for_any_status() {
         let definition = definition();
-        let err = next_step(&definition, &"review".to_string(), "needs_fix").unwrap_err();
+        // `review` declares no outgoing transitions, so it is terminal for any
+        // status it returns, not only `success`.
+        let next = next_step(&definition, &"review".to_string(), "needs_fix").unwrap();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn non_success_without_matching_transition_fails() {
+        let definition = definition();
+        // `plan` declares a `success` transition, so an unmatched non-success
+        // status is a routing error rather than a silent completion.
+        let err = next_step(&definition, &"plan".to_string(), "needs_fix").unwrap_err();
         assert_eq!(
             err,
             WorkflowError::UnknownRuntimeTransition {
-                step: "review".to_string(),
+                step: "plan".to_string(),
                 status: "needs_fix".to_string()
             }
         );

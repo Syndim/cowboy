@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
     AgentAction, AskUserAction, CommandAction, FailAction, OutputSpec, RoleDefinition,
-    StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowDefinition,
+    StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowAction, WorkflowDefinition,
     default_command_failure_status, default_command_success_status,
 };
 use mlua::{Lua, Table, Value};
@@ -150,6 +150,10 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             choices: string_array(table.get::<Value>("choices")?)?,
             status: optional_string(&table, "status")?.unwrap_or_else(|| "answered".to_string()),
             fields: lua_to_json(table.get::<Value>("fields")?)?,
+        })),
+        "workflow" => Ok(StepAction::Workflow(WorkflowAction {
+            workflow: non_empty_required_string(&table, &action, "workflow")?,
+            request: required_string(&table, &action, "request")?,
         })),
         "fail" => Ok(StepAction::Fail(FailAction {
             reason: required_string(&table, &action, "reason")?,

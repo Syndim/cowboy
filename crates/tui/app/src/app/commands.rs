@@ -664,6 +664,7 @@ mod tests {
             original_request: format!("request for {id}"),
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
+            parent: None,
             status,
             current_step: current_step.to_string(),
             head: head.map(ToString::to_string),

@@ -122,8 +122,9 @@ pub trait ActionDispatcher: Send + Sync {
     -> Result<ActionResult>;
 }
 
+#[async_trait]
 pub trait ResumeCallbackHandler: Send + Sync {
-    fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult>;
+    async fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult>;
 }
 #[async_trait]
 pub trait WorkflowSummarizer: Send + Sync {
