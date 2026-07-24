@@ -27,7 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "macros", "rt"] }
 tracing.workspace = true
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 whoami = "1"
 
 [dev-dependencies]

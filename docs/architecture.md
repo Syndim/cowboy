@@ -108,6 +108,7 @@ current WorkflowRun
       command  -> CommandActionRunner -> tokio::process::Command -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
       ask_user -> AskUserActionRunner -> WaitingForInput with ResumeCallback descriptor
+      workflow -> WorkflowActionRunner -> WorkflowRuntime child run -> completed StepRecord (or mirrored WaitingForInput)
       fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed -> one transaction stores the record and advances run/head
   -> ActionResult::Blocked   -> one transaction persists the run and derived head
@@ -223,6 +224,30 @@ request. Every agent base prompt includes the same ordered history. Explicit
 Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`; `ctx.resume` is inactive legacy state.
 
 No Lua coroutine or host-call replay cache is persisted.
+
+### Nested workflow calls
+
+`StepAction::Workflow` lets a step invoke another catalog workflow (by the id
+shown by `/workflows`) as a durable child `WorkflowRun`. The engine reuses one
+internal execution helper for both top-level starts and children, so a child
+independently compiles/snapshots its source, resolves its own config set,
+acquires its own run lock, and runs through the same `WorkflowRunner` and event
+bus. The child run id is a stable UUID-v5 of `(parent run id, calling step id,
+parent previous head)`, making creation idempotent across retries, resume, and
+process interruption; durable child lineage records the parent run/step/previous
+head and invocation id. Direct and indirect workflow-call cycles are rejected by
+walking that lineage before any child lock is acquired.
+
+On a terminal child, the parent workflow step record copies the child terminal
+`StepOutput` unchanged (recording the workflow id, request, and child run id in
+`StepInput.context`, with `StepDetail.backend = "workflow"` and
+`session_id = <child run id>`), so the parent routes directly on the child's
+status. A failed child maps to a `"failed"` output, a cancelled child to
+`"cancelled"`. When a child waits for input, the parent mirrors the child prompt
+through its own `WaitingForInput` with a durable workflow-child resume callback;
+answering the parent answers and continues the child through the shared executor.
+Parent and child keep isolated per-run event logs, and the active parent emits
+`child workflow <id> started/waiting for input/resumed/finished` progress.
 
 ### Event logs
 

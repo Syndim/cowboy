@@ -77,31 +77,33 @@ impl ResumeRouter {
         })
     }
 
-    pub fn dispatch_validated_answer(
+    pub async fn dispatch_validated_answer(
         &self,
         answer: ValidatedAnswer,
     ) -> cowboy_workflow_core::Result<ActionResult> {
-        self.registry.dispatch(
-            &answer.resume_callback,
-            ResumeInput {
-                step: answer.step,
-                prompt_id: answer.prompt_id,
-                message: answer.message,
-                choices: answer.choices,
-                answer: answer.answer,
-                completed_at: Utc::now(),
-            },
-        )
+        self.registry
+            .dispatch(
+                &answer.resume_callback,
+                ResumeInput {
+                    step: answer.step,
+                    prompt_id: answer.prompt_id,
+                    message: answer.message,
+                    choices: answer.choices,
+                    answer: answer.answer,
+                    completed_at: Utc::now(),
+                },
+            )
+            .await
     }
 
-    pub fn answer(
+    pub async fn answer(
         &self,
         run: &WorkflowRun,
         prompt_id: &str,
         answer: impl Into<String>,
     ) -> cowboy_workflow_core::Result<ActionResult> {
         let answer = self.validate_answer(run, prompt_id, answer)?;
-        self.dispatch_validated_answer(answer)
+        self.dispatch_validated_answer(answer).await
     }
 }
 
@@ -114,9 +116,9 @@ impl Default for ResumeRouter {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::thread;
     use std::time::Duration;
 
+    use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus};
     use serde_json::{Value, json};
@@ -134,6 +136,7 @@ mod tests {
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
+            parent: None,
             status: RunStatus::WaitingForInput {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
@@ -166,25 +169,27 @@ mod tests {
 
     struct SlowHandler;
 
+    #[async_trait]
     impl ResumeCallbackHandler for SlowHandler {
-        fn resume(
+        async fn resume(
             &self,
             _callback: &ResumeCallback,
             _input: ResumeInput,
         ) -> cowboy_workflow_core::Result<ActionResult> {
-            thread::sleep(Duration::from_millis(20));
+            tokio::time::sleep(Duration::from_millis(20)).await;
             Ok(ActionResult::blocked(RunStatus::Completed))
         }
     }
 
-    #[test]
-    fn answer_dispatches_callback_without_mutating_resume_or_counters() {
+    #[tokio::test]
+    async fn answer_dispatches_callback_without_mutating_resume_or_counters() {
         let run = waiting_run();
         let before_resume = run.resume.clone();
         let before_steps = run.steps_executed;
         let before_visits = run.step_visits.clone();
         let ActionResult::Completed(record) = ResumeRouter::default()
             .answer(&run, "approval", "yes")
+            .await
             .unwrap()
         else {
             panic!("expected completed ask-user result")
@@ -204,8 +209,8 @@ mod tests {
         assert_eq!(output.raw["prompt_id"], "approval");
     }
 
-    #[test]
-    fn validated_answer_dispatch_can_be_active_timed() {
+    #[tokio::test]
+    async fn validated_answer_dispatch_can_be_active_timed() {
         let mut run = waiting_run();
         let RunStatus::WaitingForInput {
             resume_callback, ..
@@ -220,28 +225,53 @@ mod tests {
         let answer = router.validate_answer(&run, "approval", "yes").unwrap();
         let active_clock = crate::active_clock::ActiveRunClock::open_at(&run, Utc::now());
 
-        router.dispatch_validated_answer(answer).unwrap();
+        router.dispatch_validated_answer(answer).await.unwrap();
 
         assert!(active_clock.active_duration_at(Utc::now()) >= 20);
     }
 
-    #[test]
-    fn answer_rejects_wrong_prompt_id_before_callback_dispatch() {
+    #[tokio::test]
+    async fn answer_rejects_wrong_prompt_id_before_callback_dispatch() {
         let run = waiting_run();
         let err = ResumeRouter::default()
             .answer(&run, "other", "yes")
+            .await
             .unwrap_err();
 
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
     }
 
-    #[test]
-    fn answer_rejects_invalid_choice_before_callback_dispatch() {
+    #[tokio::test]
+    async fn answer_rejects_invalid_choice_before_callback_dispatch() {
         let run = waiting_run();
         let err = ResumeRouter::default()
             .answer(&run, "approval", "maybe")
+            .await
             .unwrap_err();
 
+        assert!(matches!(err, WorkflowError::InvalidAction(_)));
+    }
+
+    #[tokio::test]
+    async fn async_resume_router_preserves_ask_user_behavior() {
+        let run = waiting_run();
+        let ActionResult::Completed(record) = ResumeRouter::default()
+            .answer(&run, "approval", "yes")
+            .await
+            .unwrap()
+        else {
+            panic!("expected completed ask-user result")
+        };
+        assert_eq!(record.step, "approve");
+        assert_eq!(record.input.prompt.as_deref(), Some("Approve?"));
+        assert_eq!(record.input.context["prompt_id"], "approval");
+        assert_eq!(record.input.context["choices"], json!(["yes", "no"]));
+        assert_eq!(record.output.as_ref().unwrap().fields["answer"], "yes");
+
+        let err = ResumeRouter::default()
+            .answer(&run, "approval", "maybe")
+            .await
+            .unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
     }
 }

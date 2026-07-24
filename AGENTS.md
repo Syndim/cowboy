@@ -9,7 +9,7 @@ It has one binary with two interfaces:
 - `cowboy` with no subcommand launches the interactive terminal UI.
 - `cowboy <subcommand>` runs a non-interactive CLI command against the same workflow runtime and persisted state.
 
-Workflows are Lua files. A workflow step can run an ACP-compatible coding agent, run a command-line program with explicit args, return a status immediately, ask the user for input, or fail.
+Workflows are Lua files. A workflow step can run an ACP-compatible coding agent, run a command-line program with explicit args, return a status immediately, ask the user for input, invoke another catalog workflow as a durable child run, or fail.
 
 ## Quick Start
 
@@ -208,7 +208,7 @@ Owns:
 
 - `EngineActionDispatcher`
 - `ResumeCallbackRegistry`
-- action runners for `agent`, `command`, `status`, `ask_user`, and `fail`
+- action runners for `agent`, `command`, `status`, `ask_user`, `workflow`, and `fail`
 - `ask_user` resume callback payloads and callback-to-`StepRecord` handling
 
 Important modules:
@@ -244,7 +244,7 @@ Owns:
 
 - `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
-- `StepAction`: `agent`, `command`, `status`, `ask_user`, `fail`
+- `StepAction`: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`
 - `WorkflowRun`, durable name-only config-set pointer (`ConfigSetRef`) and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
 - `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, async typed store capabilities and composite `WorkflowStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
 - `execute_step`, step/visit budget enforcement, and step-record/status application helpers

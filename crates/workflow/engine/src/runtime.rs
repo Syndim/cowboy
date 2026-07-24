@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
@@ -18,10 +19,11 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
-    Result, RunHead, RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction,
-    StepActionProvider, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun,
-    WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
-    apply_run_status, apply_step_record,
+    Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead, RunStatus, RunUserPrompt,
+    RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail, StepInput, StepOutput,
+    StepRecord, WorkflowAction, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun,
+    WorkflowRunParent, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
+    WorkflowSummarizer, apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -39,9 +41,46 @@ use crate::runtime_dependencies::{
 };
 use crate::workflow::DeterministicSelector;
 use crate::{
-    EngineActionDispatcher, EventBus, LuaStepActionProvider, ResolvedRuntimePolicy, ResumeRouter,
-    WorkflowEvent, WorkflowEventKind, WorkflowRunner,
+    EngineActionDispatcher, EventBus, LuaStepActionProvider, ResolvedRuntimePolicy,
+    ResumeCallbackRegistry, ResumeRouter, WorkflowActionHandler, WorkflowEvent, WorkflowEventKind,
+    WorkflowRunner,
 };
+
+const WORKFLOW_CHILD_CALLBACK_KIND: &str = "workflow_child";
+const WORKFLOW_INVOCATION_NAMESPACE: Uuid = Uuid::from_u128(0xd31e45ed_1aac_578f_9314_765ee417df28);
+
+/// Test-only instrumentation counting how many times the single shared workflow
+/// execution helper (`run_existing_with_events`) is entered per run id. It lets
+/// tests prove top-level runs and nested child runs use the same executor path,
+/// keyed by globally unique run ids so parallel tests never collide.
+#[cfg(test)]
+pub(crate) mod executor_probe {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENTRIES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+    fn entries() -> &'static Mutex<HashMap<String, usize>> {
+        ENTRIES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(crate) fn record(run_id: &str) {
+        *entries()
+            .lock()
+            .expect("executor probe mutex poisoned")
+            .entry(run_id.to_string())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn count(run_id: &str) -> usize {
+        entries()
+            .lock()
+            .expect("executor probe mutex poisoned")
+            .get(run_id)
+            .copied()
+            .unwrap_or(0)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -342,6 +381,32 @@ struct ActiveRunExecution {
     events: Vec<WorkflowEvent>,
     active_clock: ActiveRunClock,
     run_guard: RunExecutionGuard,
+}
+
+#[derive(Debug, Clone)]
+struct CatalogRunSpec {
+    run_id: String,
+    workflow_id: String,
+    request: String,
+    parent: Option<WorkflowRunParent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingWorkflowChild {
+    parent_run_id: String,
+    parent_step_id: String,
+    parent_record_id: String,
+    parent_previous_head: Option<String>,
+    workflow: String,
+    request: String,
+    child_run_id: String,
+    invocation_id: String,
+    started_at: chrono::DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct WorkflowChildResumeHandler {
+    runtime: WorkflowRuntime,
 }
 
 struct ActiveRunCancellationGuard {
@@ -690,54 +755,135 @@ impl WorkflowRuntime {
         catalog: &WorkflowCatalog,
         workflow_id: &str,
     ) -> Result<RunReport> {
-        let run_id = format!("run-{}", Uuid::new_v4());
-        let run_guard = self.run_locks.acquire(&run_id)?;
-        let source_ref = catalog
-            .workflows
-            .get(workflow_id)
-            .ok_or_else(|| WorkflowError::InvalidAction("selected workflow missing".to_string()))?;
-        let (definition, snapshot, workflow_hash) = self.compile_source(source_ref).await?;
-        let config_set = self.resolve_config_set(&definition)?;
-        tracing::debug!(
-            workflow_id = %workflow_id,
-            source_entry = %source_ref.entry,
-            source_root = ?source_ref.root,
-            workflow_hash = %workflow_hash,
-            "workflow source compiled"
-        );
-        let now = Utc::now();
-        let mut run = WorkflowRun {
-            id: run_id,
-            workflow_name: definition.name.clone(),
-            workflow_api_version: 1,
-            workflow_hash,
-            workflow_sources: snapshot.files.clone(),
-            original_request: request,
-            request_topic: None,
-            config_set,
-            status: RunStatus::Running,
-            current_step: definition.head.clone(),
-            head: None,
-            resume: Value::Null,
-            retries_used: 0,
-            step_retries_used: BTreeMap::new(),
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
-            active_duration_ms: 0,
-            created_at: now,
-            updated_at: now,
-        };
-        let store = self.store_for_run(&run.id)?;
-        store.save_run(&run).await?;
-        let active_clock = ActiveRunClock::open(&run);
-        tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
-        let request_topic = self.generate_request_topic(&run.original_request).await;
-        if let Some(topic) = &request_topic {
-            run.request_topic = Some(topic.clone());
-            run.updated_at = Utc::now();
-            store.save_run(&run).await?;
+        self.execute_catalog_run(
+            CatalogRunSpec {
+                run_id: format!("run-{}", Uuid::new_v4()),
+                workflow_id: workflow_id.to_string(),
+                request,
+                parent: None,
+            },
+            mode,
+            catalog,
+        )
+        .await
+    }
+
+    async fn execute_catalog_run(
+        &self,
+        spec: CatalogRunSpec,
+        mode: RunMode,
+        catalog: &WorkflowCatalog,
+    ) -> Result<RunReport> {
+        self.ensure_workflow_exists(catalog, &spec.workflow_id)?;
+        if let Ok(existing) = self.store.load_run(&spec.run_id).await {
+            self.validate_catalog_run_match(&existing, &spec)?;
         }
 
+        let run_guard = self.run_locks.acquire(&spec.run_id)?;
+        match self.store.load_run(&spec.run_id).await {
+            Ok(run) => {
+                self.validate_catalog_run_match(&run, &spec)?;
+                if !matches!(run.status, RunStatus::Running) {
+                    return Ok(RunReport {
+                        run,
+                        events: Vec::new(),
+                    });
+                }
+                self.execute_loaded_run(run, mode, run_guard, Vec::new())
+                    .await
+            }
+            Err(cowboy_workflow_store::Error::RunNotFound(_)) => {
+                let source_ref = catalog.workflows.get(&spec.workflow_id).ok_or_else(|| {
+                    WorkflowError::InvalidAction("selected workflow missing".to_string())
+                })?;
+                let (definition, snapshot, workflow_hash) = self.compile_source(source_ref).await?;
+                let config_set = self.resolve_config_set(&definition)?;
+                tracing::debug!(
+                    workflow_id = %spec.workflow_id,
+                    source_entry = %source_ref.entry,
+                    source_root = ?source_ref.root,
+                    workflow_hash = %workflow_hash,
+                    "workflow source compiled"
+                );
+                let now = Utc::now();
+                let mut run = WorkflowRun {
+                    id: spec.run_id,
+                    workflow_name: definition.name.clone(),
+                    workflow_api_version: 1,
+                    workflow_hash,
+                    workflow_sources: snapshot.files.clone(),
+                    original_request: spec.request,
+                    request_topic: None,
+                    config_set,
+                    parent: spec.parent,
+                    status: RunStatus::Running,
+                    current_step: definition.head.clone(),
+                    head: None,
+                    resume: Value::Null,
+                    retries_used: 0,
+                    step_retries_used: BTreeMap::new(),
+                    steps_executed: 0,
+                    step_visits: BTreeMap::new(),
+                    active_duration_ms: 0,
+                    created_at: now,
+                    updated_at: now,
+                };
+                let store = self.store_for_run(&run.id)?;
+                store.save_run(&run).await?;
+                let active_clock = ActiveRunClock::open(&run);
+                tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
+                let request_topic = self.generate_request_topic(&run.original_request).await;
+                if let Some(topic) = &request_topic {
+                    run.request_topic = Some(topic.clone());
+                    run.updated_at = Utc::now();
+                    store.save_run(&run).await?;
+                }
+
+                self.run_existing_with_events(
+                    run,
+                    definition,
+                    snapshot,
+                    mode,
+                    ActiveRunExecution {
+                        request_topic,
+                        events: Vec::new(),
+                        active_clock,
+                        run_guard,
+                    },
+                )
+                .await
+            }
+            Err(err) => Err(WorkflowError::from(err)),
+        }
+    }
+
+    fn validate_catalog_run_match(&self, run: &WorkflowRun, spec: &CatalogRunSpec) -> Result<()> {
+        if run.workflow_name != spec.workflow_id
+            || run.original_request != spec.request
+            || run.parent != spec.parent
+        {
+            return Err(WorkflowError::InvalidAction(format!(
+                "existing child run {:?} does not match workflow invocation (workflow/request/lineage mismatch)",
+                spec.run_id
+            )));
+        }
+        Ok(())
+    }
+
+    async fn execute_loaded_run(
+        &self,
+        run: WorkflowRun,
+        mode: RunMode,
+        run_guard: RunExecutionGuard,
+        events: Vec<WorkflowEvent>,
+    ) -> Result<RunReport> {
+        let active_clock = ActiveRunClock::open(&run);
+        let snapshot = snapshot_from_run(&run);
+        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        definition.name = run.workflow_name.clone();
+        definition.source_hash = run.workflow_hash.clone();
+        let request_topic = run.request_topic.clone();
         self.run_existing_with_events(
             run,
             definition,
@@ -745,12 +891,307 @@ impl WorkflowRuntime {
             mode,
             ActiveRunExecution {
                 request_topic,
-                events: Vec::new(),
+                events,
                 active_clock,
                 run_guard,
             },
         )
         .await
+    }
+
+    async fn run_workflow_action(
+        &self,
+        action: WorkflowAction,
+        context: ExecutionContext,
+    ) -> Result<ActionResult> {
+        self.validate_workflow_call_cycle(&context.run_id, &action.workflow)
+            .await?;
+        let invocation_id =
+            workflow_invocation_id(&context.run_id, &context.step_id, context.prev.as_deref());
+        let child_run_id = format!("run-{invocation_id}");
+        let pending = PendingWorkflowChild {
+            parent_run_id: context.run_id.clone(),
+            parent_step_id: context.step_id.clone(),
+            parent_record_id: context.step_record_id,
+            parent_previous_head: context.prev.clone(),
+            workflow: action.workflow.clone(),
+            request: action.request.clone(),
+            child_run_id: child_run_id.clone(),
+            invocation_id: invocation_id.to_string(),
+            started_at: Utc::now(),
+        };
+        self.emit_child_progress(
+            &pending,
+            format!(
+                "child workflow {} started ({})",
+                pending.workflow, pending.child_run_id
+            ),
+        );
+        let catalog = self.catalog()?;
+        let result = self
+            .execute_catalog_run(
+                CatalogRunSpec {
+                    run_id: child_run_id,
+                    workflow_id: action.workflow,
+                    request: action.request,
+                    parent: Some(WorkflowRunParent {
+                        run_id: context.run_id,
+                        step_id: context.step_id,
+                        previous_head: context.prev,
+                        invocation_id: invocation_id.to_string(),
+                    }),
+                },
+                RunMode::UntilBlocked,
+                &catalog,
+            )
+            .await;
+        let child = self
+            .child_report_or_failed_run(&pending.child_run_id, result)
+            .await?;
+        self.workflow_action_result(&pending, &child).await
+    }
+
+    async fn resume_workflow_child(
+        &self,
+        callback: &ResumeCallback,
+        input: ResumeInput,
+    ) -> Result<ActionResult> {
+        if callback.kind() != WORKFLOW_CHILD_CALLBACK_KIND {
+            return Err(WorkflowError::InvalidAction(format!(
+                "resume callback kind {:?} is not supported by workflow actions",
+                callback.kind()
+            )));
+        }
+        let pending: PendingWorkflowChild = serde_json::from_value(callback.payload().clone())
+            .map_err(|err| {
+                WorkflowError::InvalidAction(format!(
+                    "invalid workflow-child resume callback payload: {err}"
+                ))
+            })?;
+        if input.step != pending.parent_step_id {
+            return Err(WorkflowError::InvalidAction(format!(
+                "workflow-child callback step {:?} does not match parent step {:?}",
+                input.step, pending.parent_step_id
+            )));
+        }
+        self.emit_child_progress(
+            &pending,
+            format!(
+                "child workflow {} resumed ({})",
+                pending.workflow, pending.child_run_id
+            ),
+        );
+        let result = self
+            .answer_run(&pending.child_run_id, &input.prompt_id, &input.answer)
+            .await;
+        let child = self
+            .child_report_or_failed_run(&pending.child_run_id, result)
+            .await?;
+        self.workflow_action_result(&pending, &child).await
+    }
+
+    async fn child_report_or_failed_run(
+        &self,
+        child_run_id: &str,
+        result: Result<RunReport>,
+    ) -> Result<WorkflowRun> {
+        match result {
+            Ok(report) => Ok(report.run),
+            Err(err) => {
+                let run = self
+                    .store_for_run(child_run_id)?
+                    .load_run(child_run_id)
+                    .await;
+                match run {
+                    Ok(run) if matches!(run.status, RunStatus::Failed { .. }) => Ok(run),
+                    _ => Err(err),
+                }
+            }
+        }
+    }
+
+    async fn workflow_action_result(
+        &self,
+        pending: &PendingWorkflowChild,
+        child: &WorkflowRun,
+    ) -> Result<ActionResult> {
+        match &child.status {
+            RunStatus::WaitingForInput {
+                prompt_id,
+                message,
+                choices,
+                ..
+            } => {
+                self.emit_child_progress(
+                    pending,
+                    format!(
+                        "child workflow {} waiting for input ({})",
+                        pending.workflow, pending.child_run_id
+                    ),
+                );
+                let resume_callback = ResumeCallback::new(
+                    WORKFLOW_CHILD_CALLBACK_KIND,
+                    serde_json::to_value(pending).map_err(|err| {
+                        WorkflowError::InvalidAction(format!(
+                            "failed to serialize workflow-child callback: {err}"
+                        ))
+                    })?,
+                )?;
+                Ok(ActionResult::blocked(RunStatus::WaitingForInput {
+                    step: pending.parent_step_id.clone(),
+                    prompt_id: prompt_id.clone(),
+                    message: message.clone(),
+                    choices: choices.clone(),
+                    resume_callback,
+                }))
+            }
+            RunStatus::Completed => {
+                let head = child.head.as_ref().ok_or_else(|| {
+                    WorkflowError::InvalidAction(format!(
+                        "completed child run {:?} has no terminal step record",
+                        child.id
+                    ))
+                })?;
+                let record = self
+                    .store_for_run(&child.id)?
+                    .load_step_record(head)
+                    .await?;
+                let output = record.output.ok_or_else(|| {
+                    WorkflowError::InvalidAction(format!(
+                        "completed child run {:?} terminal record has no output",
+                        child.id
+                    ))
+                })?;
+                self.finish_workflow_action(pending, output)
+            }
+            RunStatus::Failed { reason } => self.finish_workflow_action(
+                pending,
+                StepOutput {
+                    status: "failed".to_string(),
+                    fields: serde_json::json!({
+                        "child_run_id": child.id,
+                        "reason": reason,
+                    }),
+                    body: reason.clone(),
+                    raw: serde_json::json!({
+                        "child_run_id": child.id,
+                        "reason": reason,
+                    }),
+                },
+            ),
+            RunStatus::Cancelled => self.finish_workflow_action(
+                pending,
+                StepOutput {
+                    status: "cancelled".to_string(),
+                    fields: serde_json::json!({
+                        "child_run_id": child.id,
+                    }),
+                    body: String::new(),
+                    raw: serde_json::json!({
+                        "child_run_id": child.id,
+                    }),
+                },
+            ),
+            RunStatus::Running => Err(WorkflowError::InvalidAction(format!(
+                "child workflow {:?} returned while still running",
+                child.id
+            ))),
+        }
+    }
+
+    fn finish_workflow_action(
+        &self,
+        pending: &PendingWorkflowChild,
+        output: StepOutput,
+    ) -> Result<ActionResult> {
+        self.emit_child_progress(
+            pending,
+            format!(
+                "child workflow {} finished ({}, status={})",
+                pending.workflow, pending.child_run_id, output.status
+            ),
+        );
+        let completed_at = Utc::now();
+        Ok(ActionResult::completed(StepRecord {
+            id: pending.parent_record_id.clone(),
+            prev: pending.parent_previous_head.clone(),
+            step: pending.parent_step_id.clone(),
+            action: "workflow".to_string(),
+            input: StepInput {
+                prompt: None,
+                context: serde_json::json!({
+                    "workflow": pending.workflow,
+                    "request": pending.request,
+                    "child_run_id": pending.child_run_id,
+                    "invocation_id": pending.invocation_id,
+                }),
+            },
+            output: Some(output),
+            detail: StepDetail {
+                backend: Some("workflow".to_string()),
+                session_id: Some(pending.child_run_id.clone()),
+                duration_ms: (completed_at - pending.started_at)
+                    .num_milliseconds()
+                    .max(0) as u64,
+                turn_count: 0,
+                usage: None,
+            },
+            started_at: pending.started_at,
+            completed_at: Some(completed_at),
+        }))
+    }
+
+    fn emit_child_progress(&self, pending: &PendingWorkflowChild, message: String) {
+        self.events.emit(WorkflowEvent::new(
+            pending.parent_run_id.clone(),
+            WorkflowEventKind::StepProgress {
+                step_id: pending.parent_step_id.clone(),
+                message,
+            },
+        ));
+    }
+
+    async fn validate_workflow_call_cycle(
+        &self,
+        parent_run_id: &str,
+        target_workflow: &str,
+    ) -> Result<()> {
+        let store = self.store()?;
+        let mut chain = Vec::new();
+        let mut cursor = Some(parent_run_id.to_string());
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(run_id) = cursor {
+            if !seen.insert(run_id.clone()) {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "invalid workflow lineage cycle while checking run {parent_run_id:?}"
+                )));
+            }
+            let run = store.load_run(&run_id).await?;
+            chain.push(run.workflow_name.clone());
+            cursor = run.parent.map(|parent| parent.run_id);
+        }
+        chain.reverse();
+        if chain.iter().any(|workflow| workflow == target_workflow) {
+            chain.push(target_workflow.to_string());
+            return Err(WorkflowError::InvalidAction(format!(
+                "workflow call cycle rejected: {}",
+                chain.join(" -> ")
+            )));
+        }
+        Ok(())
+    }
+
+    fn resume_router(&self) -> ResumeRouter {
+        let mut registry = ResumeCallbackRegistry::default();
+        registry
+            .register(
+                WORKFLOW_CHILD_CALLBACK_KIND,
+                WorkflowChildResumeHandler {
+                    runtime: self.clone(),
+                },
+            )
+            .expect("workflow-child callback kind is static and valid");
+        ResumeRouter::new(registry)
     }
 
     /// Resolve the config-set **name** a workflow selects, validating it against
@@ -905,26 +1346,8 @@ impl WorkflowRuntime {
                 });
             }
         }
-        let active_clock = ActiveRunClock::open(&run);
-        let snapshot = snapshot_from_run(&run);
-        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
-            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        definition.name = run.workflow_name.clone();
-        definition.source_hash = run.workflow_hash.clone();
-        let request_topic = run.request_topic.clone();
-        self.run_existing_with_events(
-            run,
-            definition,
-            snapshot,
-            mode,
-            ActiveRunExecution {
-                request_topic,
-                events: Vec::new(),
-                active_clock,
-                run_guard,
-            },
-        )
-        .await
+        self.execute_loaded_run(run, mode, run_guard, Vec::new())
+            .await
     }
 
     pub async fn answer_run(
@@ -942,16 +1365,18 @@ impl WorkflowRuntime {
         let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
-        let router = ResumeRouter::default();
+        let router = self.resume_router();
         let answer = router.validate_answer(&run, prompt_id, answer)?;
         let active_clock = ActiveRunClock::open(&run);
-        let result = router.dispatch_validated_answer(answer)?;
+        let mut rx = self.events.subscribe();
+        let result = router.dispatch_validated_answer(answer).await?;
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         definition.name = run.workflow_name.clone();
         definition.source_hash = run.workflow_hash.clone();
         let mut events = Vec::new();
+        drain_available_workflow_events(&mut rx, &mut events, run_id);
         let status = match result {
             ActionResult::Completed(record) => {
                 let record = *record;
@@ -1292,6 +1717,8 @@ impl WorkflowRuntime {
             "running workflow"
         );
         let run_id = run.id.clone();
+        #[cfg(test)]
+        executor_probe::record(&run_id);
         let progress_clock = active_clock.clone();
         let mut rx = self.events.subscribe();
         let store = self.store_for_run(&run_id)?;
@@ -1319,7 +1746,11 @@ impl WorkflowRuntime {
         let factory = self.dependencies.agent_factory(&self.config)?;
         let executor = AgentExecutor::new(factory, agent_store, agent_config)
             .with_prompt_turn_controls(self.prompt_turn_controls.clone());
-        let dispatcher = EngineActionDispatcher::new(executor, self.config.cwd.clone());
+        let dispatcher = EngineActionDispatcher::with_workflow_handler(
+            executor,
+            self.clone(),
+            self.config.cwd.clone(),
+        );
         let provider = LuaStepActionProvider::new(snapshot);
         let policy = self.resolve_limits(&run.config_set.name);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone(), policy)
@@ -1340,7 +1771,8 @@ impl WorkflowRuntime {
             tokio::select! {
                 result = &mut run_future => break result,
                 received = rx.recv() => match received {
-                    Ok(event) => events.push(event),
+                    Ok(event) if event.run_id == run_id => events.push(event),
+                    Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(run_id = %run_id, skipped, "workflow event collector lagged");
                     }
@@ -1351,7 +1783,7 @@ impl WorkflowRuntime {
                 }
             }
         };
-        drain_available_workflow_events(&mut rx, &mut events);
+        drain_available_workflow_events(&mut rx, &mut events, &run_id);
         match &run_result {
             Ok(run) => {
                 tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
@@ -1497,13 +1929,64 @@ impl WorkflowRuntime {
         serde_json::from_str(&raw).map_err(|err| WorkflowError::InvalidAction(err.to_string()))
     }
 }
+
+#[async_trait]
+impl WorkflowActionHandler for WorkflowRuntime {
+    async fn run_workflow(
+        &self,
+        action: WorkflowAction,
+        context: ExecutionContext,
+    ) -> Result<ActionResult> {
+        self.run_workflow_action(action, context).await
+    }
+}
+
+#[async_trait]
+impl ResumeCallbackHandler for WorkflowChildResumeHandler {
+    async fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
+        self.runtime.resume_workflow_child(callback, input).await
+    }
+}
+
+fn workflow_invocation_id(parent_run_id: &str, step_id: &str, previous_head: Option<&str>) -> Uuid {
+    Uuid::new_v5(
+        &WORKFLOW_INVOCATION_NAMESPACE,
+        &workflow_invocation_name(parent_run_id, step_id, previous_head),
+    )
+}
+
+fn workflow_invocation_name(
+    parent_run_id: &str,
+    step_id: &str,
+    previous_head: Option<&str>,
+) -> Vec<u8> {
+    fn append_string(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    let mut canonical = b"cowboy.workflow.invocation.v1\0".to_vec();
+    append_string(&mut canonical, parent_run_id);
+    append_string(&mut canonical, step_id);
+    match previous_head {
+        None => canonical.push(0),
+        Some(previous_head) => {
+            canonical.push(1);
+            append_string(&mut canonical, previous_head);
+        }
+    }
+    canonical
+}
+
 fn drain_available_workflow_events(
     rx: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
     events: &mut Vec<WorkflowEvent>,
+    run_id: &str,
 ) {
     loop {
         match rx.try_recv() {
-            Ok(event) => events.push(event),
+            Ok(event) if event.run_id == run_id => events.push(event),
+            Ok(_) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                 tracing::warn!(skipped, "workflow event final drain lagged");
             }
@@ -2688,6 +3171,7 @@ done
             original_request: "do it".to_string(),
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
+            parent: None,
             status,
             current_step: "start".to_string(),
             head: None,
@@ -7129,6 +7613,7 @@ Recovery implementation review"#
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
+            parent: None,
             status: RunStatus::Running,
             retries_used: 0,
             step_retries_used: Default::default(),
@@ -7308,5 +7793,867 @@ Recovery implementation review"#
             &event.kind,
             WorkflowEventKind::AgentResponse { content, .. } if content == "answer"
         ));
+    }
+
+    // ---- action.workflow (nested workflow calls) -------------------------------
+
+    async fn runtime_for_workflow_files(
+        dir: &tempfile::TempDir,
+        files: &[(&str, &str)],
+        config_sets: BTreeMap<String, RunnerLimitsConfig>,
+    ) -> WorkflowRuntime {
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        for (name, source) in files {
+            fs::write(workflow_dir.join(name), source).unwrap();
+        }
+        runtime_for_workflow_dir_with_config_sets(dir, workflow_dir, config_sets).await
+    }
+
+    fn default_config_sets() -> BTreeMap<String, RunnerLimitsConfig> {
+        BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())])
+    }
+
+    fn child_run_id_for(parent_id: &str, step_id: &str, prev: Option<&str>) -> String {
+        format!("run-{}", workflow_invocation_id(parent_id, step_id, prev))
+    }
+
+    #[test]
+    fn workflow_action_invocation_id_matches_fixed_uuid_v5_vector() {
+        fn decode_hex(value: &str) -> Vec<u8> {
+            value
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).unwrap();
+                    u8::from_str_radix(pair, 16).unwrap()
+                })
+                .collect()
+        }
+
+        let vectors = [
+            (
+                None,
+                "636f77626f792e776f726b666c6f772e696e766f636174696f6e2e763100000000000000000a72756e2d706172656e74000000000000000864656c656761746500",
+                "b31f15e7-8e04-5446-b17e-ffc74442ce9a",
+            ),
+            (
+                Some("abc123"),
+                "636f77626f792e776f726b666c6f772e696e766f636174696f6e2e763100000000000000000a72756e2d706172656e74000000000000000864656c6567617465010000000000000006616263313233",
+                "4434c4a7-e226-5ab2-9593-58f07f609931",
+            ),
+        ];
+
+        for (previous_head, expected_name_hex, expected_uuid) in vectors {
+            assert_eq!(
+                workflow_invocation_name("run-parent", "delegate", previous_head),
+                decode_hex(expected_name_hex)
+            );
+            assert_eq!(
+                workflow_invocation_id("run-parent", "delegate", previous_head).to_string(),
+                expected_uuid
+            );
+        }
+    }
+
+    fn lineage_run(
+        id: &str,
+        workflow_name: &str,
+        request: &str,
+        parent: Option<WorkflowRunParent>,
+    ) -> WorkflowRun {
+        let now = Utc::now();
+        WorkflowRun {
+            id: id.to_string(),
+            workflow_name: workflow_name.to_string(),
+            workflow_api_version: 1,
+            workflow_hash: "hash".to_string(),
+            workflow_sources: BTreeMap::new(),
+            original_request: request.to_string(),
+            request_topic: None,
+            config_set: Default::default(),
+            parent,
+            status: RunStatus::Running,
+            current_step: "start".to_string(),
+            head: None,
+            resume: Value::Null,
+            retries_used: 0,
+            step_retries_used: BTreeMap::new(),
+            steps_executed: 0,
+            step_visits: BTreeMap::new(),
+            active_duration_ms: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_action_child_uses_shared_executor_and_persists_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let careful = RunnerLimitsConfig {
+            max_steps_per_run: 9,
+            max_visits_per_step: 8,
+            max_retries_per_run: 7,
+            max_retries_per_step: 6,
+        };
+        let config_sets = BTreeMap::from([
+            ("default".to_string(), RunnerLimitsConfig::default()),
+            ("careful".to_string(), careful),
+        ]);
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                (
+                    "child.lua",
+                    r#"
+                    local finish = step("finish")
+                    finish.run = function(ctx)
+                      return action.status { status = "child_ok", fields = { marker = "child-output" }, body = "child done" }
+                    end
+                    return workflow("smoke-child", finish, { config_set = "careful" })
+                    "#,
+                ),
+                (
+                    "parent.lua",
+                    r#"
+                    local finish = step("finish")
+                    finish.run = function(ctx)
+                      return action.status { status = "success", fields = { child_status = ctx.prev.status } }
+                    end
+                    local call_child = step("call_child")
+                    call_child.run = function(ctx)
+                      return action.workflow { workflow = "child", request = "exact child request" }
+                    end
+                    call_child:on("child_ok", finish)
+                    return workflow("smoke-parent", call_child)
+                    "#,
+                ),
+            ],
+            config_sets,
+        )
+        .await;
+
+        let report = runtime
+            .start_run_with_workflow("parent", "parent request")
+            .await
+            .unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let parent_id = report.run.id.clone();
+        let child_id = child_run_id_for(&parent_id, "call_child", None);
+
+        let runs = runtime.list_runs(None).await.unwrap();
+        assert_eq!(
+            runs.len(),
+            2,
+            "expected exactly parent + child runs: {runs:#?}"
+        );
+
+        let parent = runtime.load_run(&parent_id).await.unwrap();
+        let child = runtime.load_run(&child_id).await.unwrap();
+
+        assert_eq!(child.workflow_name, "child");
+        assert_eq!(child.original_request, "exact child request");
+        assert_eq!(child.config_set.name, "careful");
+        assert_eq!(
+            runtime.resolve_limits("careful").limits.max_steps_per_run,
+            9
+        );
+        assert_ne!(
+            runtime.resolve_limits("careful"),
+            runtime.resolve_limits("default")
+        );
+
+        let lineage = child.parent.clone().expect("child lineage present");
+        assert_eq!(lineage.run_id, parent_id);
+        assert_eq!(lineage.step_id, "call_child");
+        assert_eq!(lineage.previous_head, None);
+        assert_eq!(
+            lineage.invocation_id,
+            workflow_invocation_id(&parent_id, "call_child", None).to_string()
+        );
+
+        assert_ne!(child.workflow_hash, parent.workflow_hash);
+        let catalog = runtime.catalog().unwrap();
+        let child_source = catalog.workflows.get("child").expect("child source ref");
+        let (_, _, child_hash) = runtime.compile_source(child_source).await.unwrap();
+        assert_eq!(child.workflow_hash, child_hash);
+
+        let parent_events = runtime.load_events(&parent_id).unwrap();
+        assert!(
+            parent_events
+                .iter()
+                .any(|e| matches!(e.kind, WorkflowEventKind::RunStarted { .. }))
+        );
+        assert!(
+            parent_events
+                .iter()
+                .any(|e| matches!(e.kind, WorkflowEventKind::RunCompleted))
+        );
+        let child_events = runtime.load_events(&child_id).unwrap();
+        assert!(
+            child_events
+                .iter()
+                .any(|e| matches!(e.kind, WorkflowEventKind::RunStarted { .. }))
+        );
+        assert!(
+            child_events
+                .iter()
+                .any(|e| matches!(e.kind, WorkflowEventKind::RunCompleted))
+        );
+
+        assert_eq!(executor_probe::count(&parent_id), 1);
+        assert_eq!(executor_probe::count(&child_id), 1);
+    }
+
+    fn interactive_child_source(name: &str) -> String {
+        format!(
+            r#"
+            local finish = step("finish")
+            finish.run = function(ctx)
+              return action.status {{ status = "child_ok", fields = {{ answer = ctx.prev.fields.answer }} }}
+            end
+            local confirm = step("confirm")
+            confirm.run = function(ctx)
+              return action.ask_user {{ id = "confirm", message = "Go?", choices = {{ "yes" }} }}
+            end
+            confirm:on("answered", finish)
+            return workflow("{name}", confirm)
+            "#
+        )
+    }
+
+    fn parent_calls_child_source() -> &'static str {
+        r#"
+        local finish = step("finish")
+        finish.run = function(ctx)
+          return action.status { status = "success", fields = { child_status = ctx.prev.status } }
+        end
+        local call = step("call")
+        call.run = function(ctx)
+          return action.workflow { workflow = "child", request = "child req" }
+        end
+        call:on("child_ok", finish)
+        return workflow("parent", call)
+        "#
+    }
+
+    #[tokio::test]
+    async fn workflow_action_retry_and_resume_reuse_child_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                ("child.lua", &interactive_child_source("child")),
+                ("parent.lua", parent_calls_child_source()),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let started = runtime
+            .start_run_with_workflow("parent", "parent request")
+            .await
+            .unwrap();
+        assert!(matches!(
+            started.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+        let parent_id = started.run.id.clone();
+        let expected_child_id = child_run_id_for(&parent_id, "call", None);
+        let expected_invocation = workflow_invocation_id(&parent_id, "call", None).to_string();
+
+        let child = runtime.load_run(&expected_child_id).await.unwrap();
+        assert_eq!(
+            child.parent.as_ref().unwrap().invocation_id,
+            expected_invocation
+        );
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 2);
+
+        // Retry: re-dispatch the same workflow action with an identical durable
+        // context reuses the same child invocation and creates no new run.
+        let ctx = ExecutionContext {
+            run_id: parent_id.clone(),
+            step_id: "call".to_string(),
+            step_record_id: "retry-record".to_string(),
+            prev: None,
+            role: None,
+            attempt: 2,
+            retry_reason: Some("transient".to_string()),
+            original_request: started.run.original_request.clone(),
+            run_created_at: started.run.created_at,
+            user_prompts: Vec::new(),
+        };
+        let retried = runtime
+            .run_workflow_action(
+                WorkflowAction {
+                    workflow: "child".to_string(),
+                    request: "child req".to_string(),
+                },
+                ctx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            retried,
+            ActionResult::Blocked(RunStatus::WaitingForInput { .. })
+        ));
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 2);
+        let child_after_retry = runtime.load_run(&expected_child_id).await.unwrap();
+        assert_eq!(
+            child_after_retry.parent.as_ref().unwrap().invocation_id,
+            expected_invocation
+        );
+
+        // Resume after full runtime reconstruction reuses the same child.
+        drop(runtime);
+        let rebuilt = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            dir.path().join("workflows"),
+            default_config_sets(),
+        )
+        .await;
+        let answered = rebuilt
+            .answer_run(&parent_id, "confirm", "yes")
+            .await
+            .unwrap();
+        assert_eq!(answered.run.status, RunStatus::Completed);
+        assert_eq!(rebuilt.list_runs(None).await.unwrap().len(), 2);
+        let child_final = rebuilt.load_run(&expected_child_id).await.unwrap();
+        assert_eq!(child_final.status, RunStatus::Completed);
+        assert_eq!(
+            child_final.parent.as_ref().unwrap().invocation_id,
+            expected_invocation
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_action_rejects_mismatched_existing_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir).await;
+
+        let parent = WorkflowRunParent {
+            run_id: "run-parent".to_string(),
+            step_id: "call".to_string(),
+            previous_head: None,
+            invocation_id: "invocation".to_string(),
+        };
+        let spec = CatalogRunSpec {
+            run_id: "run-child".to_string(),
+            workflow_id: "child".to_string(),
+            request: "child req".to_string(),
+            parent: Some(parent.clone()),
+        };
+        let matching = lineage_run("run-child", "child", "child req", Some(parent.clone()));
+        runtime
+            .validate_catalog_run_match(&matching, &spec)
+            .unwrap();
+
+        // Mutated workflow id.
+        let mut mismatch = matching.clone();
+        mismatch.workflow_name = "other".to_string();
+        let err = runtime
+            .validate_catalog_run_match(&mismatch, &spec)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match workflow invocation"),
+            "{err}"
+        );
+
+        // Mutated request.
+        let mut mismatch = matching.clone();
+        mismatch.original_request = "different".to_string();
+        let err = runtime
+            .validate_catalog_run_match(&mismatch, &spec)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match workflow invocation"),
+            "{err}"
+        );
+
+        // Mutated lineage (invocation id component).
+        let mut mismatch = matching.clone();
+        mismatch.parent = Some(WorkflowRunParent {
+            invocation_id: "changed".to_string(),
+            ..parent.clone()
+        });
+        let err = runtime
+            .validate_catalog_run_match(&mismatch, &spec)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match workflow invocation"),
+            "{err}"
+        );
+
+        // Mutated lineage (parent run id component).
+        let mut mismatch = matching;
+        mismatch.parent = Some(WorkflowRunParent {
+            run_id: "run-other-parent".to_string(),
+            ..parent
+        });
+        let err = runtime
+            .validate_catalog_run_match(&mismatch, &spec)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match workflow invocation"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_action_rejects_direct_cycle_before_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[(
+                "loop.lua",
+                r#"
+                local call = step("call")
+                call.run = function(ctx)
+                  return action.workflow { workflow = "loop", request = "again" }
+                end
+                return workflow("loop", call)
+                "#,
+            )],
+            default_config_sets(),
+        )
+        .await;
+
+        let err = runtime
+            .start_run_with_workflow("loop", "start")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("loop -> loop"), "{err}");
+
+        let runs = runtime.list_runs(None).await.unwrap();
+        assert_eq!(runs.len(), 1, "no child run should be created: {runs:#?}");
+        let parent_id = runs[0].run_id.clone();
+        let would_be_child = child_run_id_for(&parent_id, "call", None);
+        assert_eq!(crate::run_lock::lock_probe::count(&would_be_child), 0);
+        assert_eq!(executor_probe::count(&would_be_child), 0);
+        assert!(runtime.load_run(&would_be_child).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn workflow_action_rejects_indirect_cycle_before_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                (
+                    "a.lua",
+                    r#"
+                    local call = step("call")
+                    call.run = function(ctx)
+                      return action.workflow { workflow = "b", request = "to b" }
+                    end
+                    return workflow("a", call)
+                    "#,
+                ),
+                (
+                    "b.lua",
+                    r#"
+                    local call = step("call")
+                    call.run = function(ctx)
+                      return action.workflow { workflow = "a", request = "to a" }
+                    end
+                    return workflow("b", call)
+                    "#,
+                ),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let _ = runtime.start_run_with_workflow("a", "start").await;
+
+        let runs = runtime.list_runs(None).await.unwrap();
+        let b_summary = runs
+            .iter()
+            .find(|r| r.workflow_name == "b")
+            .expect("child b run exists");
+        let b_run = runtime.load_run(&b_summary.run_id).await.unwrap();
+        match &b_run.status {
+            RunStatus::Failed { reason } => {
+                assert!(reason.contains("a -> b -> a"), "{reason}")
+            }
+            other => panic!("expected b to fail on cycle, got {other:?}"),
+        }
+
+        // The grandchild that would re-enter workflow "a" is never created/locked.
+        let grandchild = child_run_id_for(&b_summary.run_id, "call", None);
+        assert_eq!(crate::run_lock::lock_probe::count(&grandchild), 0);
+        assert_eq!(executor_probe::count(&grandchild), 0);
+        assert!(runtime.load_run(&grandchild).await.is_err());
+        assert!(runs.iter().all(|r| r.workflow_name != "a" || {
+            // exactly one `a` run (the top-level), never a re-entrant one
+            runs.iter().filter(|x| x.workflow_name == "a").count() == 1
+        }));
+    }
+
+    #[tokio::test]
+    async fn workflow_action_propagates_terminal_child_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                (
+                    "child.lua",
+                    r#"
+                    local finish = step("finish")
+                    finish.run = function(ctx)
+                      return action.status {
+                        status = "child_custom",
+                        fields = { a = 1, b = "two" },
+                        body = "child body",
+                      }
+                    end
+                    return workflow("child", finish)
+                    "#,
+                ),
+                (
+                    "parent.lua",
+                    r#"
+                    local finish = step("finish")
+                    finish.run = function(ctx)
+                      return action.status { status = "success", fields = { got = ctx.prev.status } }
+                    end
+                    local call = step("call")
+                    call.run = function(ctx)
+                      return action.workflow { workflow = "child", request = "req" }
+                    end
+                    call:on("child_custom", finish)
+                    return workflow("parent", call)
+                    "#,
+                ),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let report = runtime
+            .start_run_with_workflow("parent", "req")
+            .await
+            .unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let parent_id = report.run.id.clone();
+        let child_id = child_run_id_for(&parent_id, "call", None);
+
+        let parent = runtime.load_run(&parent_id).await.unwrap();
+        let child = runtime.load_run(&child_id).await.unwrap();
+        let store = runtime.store().unwrap();
+
+        let final_record = store
+            .load_step_record(parent.head.as_ref().unwrap())
+            .await
+            .unwrap();
+        let workflow_record = store
+            .load_step_record(final_record.prev.as_ref().unwrap())
+            .await
+            .unwrap();
+        let child_record = store
+            .load_step_record(child.head.as_ref().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(workflow_record.action, "workflow");
+        assert_eq!(workflow_record.output, child_record.output);
+        assert_eq!(
+            workflow_record.output.as_ref().unwrap().status,
+            "child_custom"
+        );
+        assert_eq!(workflow_record.input.context["workflow"], "child");
+        assert_eq!(workflow_record.input.context["request"], "req");
+        assert_eq!(workflow_record.input.context["child_run_id"], child_id);
+        assert_eq!(workflow_record.detail.backend.as_deref(), Some("workflow"));
+        assert_eq!(
+            workflow_record.detail.session_id.as_deref(),
+            Some(child_id.as_str())
+        );
+
+        // Parent routed on the custom child status.
+        assert_eq!(
+            final_record.output.as_ref().unwrap().fields["got"],
+            "child_custom"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_action_maps_failed_and_cancelled_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir).await;
+
+        let child_id = "run-child".to_string();
+        let pending = PendingWorkflowChild {
+            parent_run_id: "run-parent".to_string(),
+            parent_step_id: "call".to_string(),
+            parent_record_id: "record".to_string(),
+            parent_previous_head: None,
+            workflow: "child".to_string(),
+            request: "child req".to_string(),
+            child_run_id: child_id.clone(),
+            invocation_id: "invocation".to_string(),
+            started_at: Utc::now(),
+        };
+
+        // Failed child -> routable "failed" parent output with diagnostics.
+        let mut failed = lineage_run(&child_id, "child", "child req", None);
+        failed.status = RunStatus::Failed {
+            reason: "boom".to_string(),
+        };
+        let ActionResult::Completed(record) = runtime
+            .workflow_action_result(&pending, &failed)
+            .await
+            .unwrap()
+        else {
+            panic!("expected completed workflow record for failed child")
+        };
+        assert_eq!(record.action, "workflow");
+        let output = record.output.as_ref().unwrap();
+        assert_eq!(output.status, "failed");
+        assert_eq!(output.fields["child_run_id"], child_id);
+        assert_eq!(output.fields["reason"], "boom");
+        assert_eq!(record.input.context["workflow"], "child");
+        assert_eq!(record.input.context["request"], "child req");
+        assert_eq!(record.input.context["child_run_id"], child_id);
+        assert_eq!(record.input.context["invocation_id"], "invocation");
+        assert_eq!(record.detail.backend.as_deref(), Some("workflow"));
+        assert_eq!(record.detail.session_id.as_deref(), Some(child_id.as_str()));
+
+        // Cancelled child -> routable "cancelled" parent output.
+        let mut cancelled = lineage_run(&child_id, "child", "child req", None);
+        cancelled.status = RunStatus::Cancelled;
+        let ActionResult::Completed(record) = runtime
+            .workflow_action_result(&pending, &cancelled)
+            .await
+            .unwrap()
+        else {
+            panic!("expected completed workflow record for cancelled child")
+        };
+        let output = record.output.as_ref().unwrap();
+        assert_eq!(output.status, "cancelled");
+        assert_eq!(output.fields["child_run_id"], child_id);
+        assert_eq!(record.detail.backend.as_deref(), Some("workflow"));
+        assert_eq!(record.detail.session_id.as_deref(), Some(child_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn workflow_action_parent_answers_repeated_child_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                (
+                    "child.lua",
+                    r#"
+                    local finish = step("finish")
+                    finish.run = function(ctx)
+                      return action.status { status = "child_ok", fields = { answer = ctx.prev.fields.answer } }
+                    end
+                    local second = step("second")
+                    second.run = function(ctx)
+                      return action.ask_user { id = "second-confirm", message = "Second?", choices = { "b1", "b2" } }
+                    end
+                    second:on("answered", finish)
+                    local first = step("first")
+                    first.run = function(ctx)
+                      return action.ask_user { id = "first-confirm", message = "First?", choices = { "a1", "a2" } }
+                    end
+                    first:on("answered", second)
+                    return workflow("child", first)
+                    "#,
+                ),
+                ("parent.lua", parent_calls_child_source()),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let started = runtime
+            .start_run_with_workflow("parent", "parent request")
+            .await
+            .unwrap();
+        let parent_id = started.run.id.clone();
+        let child_id = child_run_id_for(&parent_id, "call", None);
+
+        match &started.run.status {
+            RunStatus::WaitingForInput {
+                prompt_id,
+                message,
+                choices,
+                ..
+            } => {
+                assert_eq!(prompt_id, "first-confirm");
+                assert_eq!(message, "First?");
+                assert_eq!(choices, &vec!["a1".to_string(), "a2".to_string()]);
+            }
+            other => panic!("expected first prompt, got {other:?}"),
+        }
+
+        let answered_first = runtime
+            .answer_run(&parent_id, "first-confirm", "a1")
+            .await
+            .unwrap();
+        match &answered_first.run.status {
+            RunStatus::WaitingForInput {
+                prompt_id,
+                message,
+                choices,
+                ..
+            } => {
+                assert_eq!(prompt_id, "second-confirm");
+                assert_eq!(message, "Second?");
+                assert_eq!(choices, &vec!["b1".to_string(), "b2".to_string()]);
+            }
+            other => panic!("expected second prompt, got {other:?}"),
+        }
+        // Child id is unchanged between prompts.
+        assert_eq!(runtime.load_run(&child_id).await.unwrap().id, child_id);
+
+        let answered_second = runtime
+            .answer_run(&parent_id, "second-confirm", "b1")
+            .await
+            .unwrap();
+        assert_eq!(answered_second.run.status, RunStatus::Completed);
+        assert_eq!(answered_second.run.id, parent_id);
+        assert_eq!(
+            runtime.load_run(&child_id).await.unwrap().status,
+            RunStatus::Completed
+        );
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn workflow_action_parent_prompt_survives_runtime_reconstruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                ("child.lua", &interactive_child_source("child")),
+                ("parent.lua", parent_calls_child_source()),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let started = runtime
+            .start_run_with_workflow("parent", "parent request")
+            .await
+            .unwrap();
+        let parent_id = started.run.id.clone();
+        let child_id = child_run_id_for(&parent_id, "call", None);
+        assert!(matches!(
+            started.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+
+        // Drop the runtime entirely; a fresh one must resume from durable state.
+        drop(runtime);
+        let rebuilt = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            dir.path().join("workflows"),
+            default_config_sets(),
+        )
+        .await;
+
+        let answered = rebuilt
+            .answer_run(&parent_id, "confirm", "yes")
+            .await
+            .unwrap();
+        assert_eq!(answered.run.status, RunStatus::Completed);
+        let child = rebuilt.load_run(&child_id).await.unwrap();
+        assert_eq!(child.status, RunStatus::Completed);
+        assert_eq!(child.parent.as_ref().unwrap().run_id, parent_id);
+    }
+
+    #[tokio::test]
+    async fn workflow_action_nested_events_are_isolated_and_parent_reports_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_workflow_files(
+            &dir,
+            &[
+                ("child.lua", &interactive_child_source("child")),
+                ("parent.lua", parent_calls_child_source()),
+            ],
+            default_config_sets(),
+        )
+        .await;
+
+        let report_start = runtime
+            .start_run_with_workflow("parent", "parent request")
+            .await
+            .unwrap();
+        let parent_id = report_start.run.id.clone();
+        let child_id = child_run_id_for(&parent_id, "call", None);
+        assert!(matches!(
+            report_start.run.status,
+            RunStatus::WaitingForInput { .. }
+        ));
+
+        let report_answer = runtime
+            .answer_run(&parent_id, "confirm", "yes")
+            .await
+            .unwrap();
+        assert_eq!(report_answer.run.status, RunStatus::Completed);
+
+        // Every event in each parent operation report carries the parent run id.
+        for report in [&report_start, &report_answer] {
+            assert!(
+                report.events.iter().all(|e| e.run_id == parent_id),
+                "parent report leaked non-parent events"
+            );
+        }
+
+        // Concatenated parent operation reports contain the four lifecycle
+        // progress messages in order.
+        let mut child_progress = Vec::new();
+        for event in report_start
+            .events
+            .iter()
+            .chain(report_answer.events.iter())
+        {
+            if let WorkflowEventKind::StepProgress { message, .. } = &event.kind
+                && message.starts_with("child workflow ")
+            {
+                child_progress.push(message.clone());
+            }
+        }
+        assert_eq!(
+            child_progress,
+            vec![
+                format!("child workflow child started ({child_id})"),
+                format!("child workflow child waiting for input ({child_id})"),
+                format!("child workflow child resumed ({child_id})"),
+                format!("child workflow child finished ({child_id}, status=child_ok)"),
+            ]
+        );
+
+        // Persisted parent file: only parent events, exactly one workflow StepCompleted.
+        let parent_file = runtime.load_events(&parent_id).unwrap();
+        assert!(!parent_file.is_empty());
+        assert!(parent_file.iter().all(|e| e.run_id == parent_id));
+        let workflow_completions = parent_file
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.kind,
+                    WorkflowEventKind::StepCompleted { action, .. } if action == "workflow"
+                )
+            })
+            .count();
+        assert_eq!(workflow_completions, 1);
+
+        // Persisted child file: only child events, contains RunCompleted.
+        let child_file = runtime.load_events(&child_id).unwrap();
+        assert!(!child_file.is_empty());
+        assert!(child_file.iter().all(|e| e.run_id == child_id));
+        assert!(
+            child_file
+                .iter()
+                .any(|e| matches!(e.kind, WorkflowEventKind::RunCompleted))
+        );
     }
 }

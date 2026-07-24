@@ -3,6 +3,7 @@ mod ask_user;
 mod command;
 mod fail;
 mod status;
+mod workflow;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,20 +20,40 @@ pub use ask_user::{ASK_USER_CALLBACK_KIND, AskUserActionRunner, PendingAskUser};
 pub use command::CommandActionRunner;
 pub use fail::FailActionRunner;
 pub use status::StatusActionRunner;
+pub use workflow::{UnsupportedWorkflowActionHandler, WorkflowActionHandler, WorkflowActionRunner};
 
 #[derive(Debug, Clone)]
-pub struct EngineActionDispatcher<A> {
+pub struct EngineActionDispatcher<A, W = UnsupportedWorkflowActionHandler> {
     agent: AgentActionRunner<A>,
+    workflow: WorkflowActionRunner<W>,
     command: CommandActionRunner,
     status: StatusActionRunner,
     fail: FailActionRunner,
     ask_user: AskUserActionRunner,
 }
 
-impl<A> EngineActionDispatcher<A> {
+impl<A> EngineActionDispatcher<A, UnsupportedWorkflowActionHandler> {
     pub fn new(agent: A, cwd: impl Into<std::path::PathBuf>) -> Self {
         Self {
             agent: AgentActionRunner::new(agent),
+            workflow: WorkflowActionRunner::new(UnsupportedWorkflowActionHandler),
+            command: CommandActionRunner::new(cwd),
+            status: StatusActionRunner,
+            fail: FailActionRunner,
+            ask_user: AskUserActionRunner,
+        }
+    }
+}
+
+impl<A, W> EngineActionDispatcher<A, W> {
+    pub fn with_workflow_handler(
+        agent: A,
+        workflow: W,
+        cwd: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            agent: AgentActionRunner::new(agent),
+            workflow: WorkflowActionRunner::new(workflow),
             command: CommandActionRunner::new(cwd),
             status: StatusActionRunner,
             fail: FailActionRunner,
@@ -42,9 +63,10 @@ impl<A> EngineActionDispatcher<A> {
 }
 
 #[async_trait]
-impl<A> ActionDispatcher for EngineActionDispatcher<A>
+impl<A, W> ActionDispatcher for EngineActionDispatcher<A, W>
 where
     A: AgentActionHandler,
+    W: WorkflowActionHandler,
 {
     async fn dispatch(
         &self,
@@ -57,6 +79,7 @@ where
             StepAction::Fail(action) => Ok(self.fail.run(action)),
             StepAction::AskUser(action) => Ok(self.ask_user.run(action, context)),
             StepAction::Agent(action) => self.agent.run(action, context).await,
+            StepAction::Workflow(action) => self.workflow.run(action, context).await,
         }
     }
 }
@@ -95,14 +118,18 @@ impl ResumeCallbackRegistry {
         Ok(())
     }
 
-    pub fn dispatch(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
+    pub async fn dispatch(
+        &self,
+        callback: &ResumeCallback,
+        input: ResumeInput,
+    ) -> Result<ActionResult> {
         let handler = self.handlers.get(callback.kind()).ok_or_else(|| {
             WorkflowError::InvalidAction(format!(
                 "unknown resume callback kind {:?}",
                 callback.kind()
             ))
         })?;
-        handler.resume(callback, input)
+        handler.resume(callback, input).await
     }
 }
 
@@ -127,7 +154,7 @@ mod tests {
     use cowboy_workflow_core::{
         ActionDispatcher, AgentAction, AskUserAction, CommandAction, ExecutionContext, FailAction,
         ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail,
-        StepInput, StepOutput, StepRecord,
+        StepInput, StepOutput, StepRecord, WorkflowAction,
     };
     use serde_json::{Value, json};
 
@@ -224,8 +251,8 @@ mod tests {
         assert_eq!(pending.output_fields, json!({ "plan": "p" }));
     }
 
-    #[test]
-    fn ask_user_callback_completion_merges_answer() {
+    #[tokio::test]
+    async fn ask_user_callback_completion_merges_answer() {
         let started_at = Utc::now();
         let pending = PendingAskUser {
             record_id: "record".to_string(),
@@ -242,6 +269,7 @@ mod tests {
 
         let ActionResult::Completed(record) = AskUserActionRunner
             .resume(&callback, resume_input("yes"))
+            .await
             .unwrap()
         else {
             panic!("expected completed ask-user record")
@@ -260,8 +288,8 @@ mod tests {
         assert_eq!(output.raw["message"], "Approve?");
     }
 
-    #[test]
-    fn registry_dispatches_known_callback_and_rejects_unknown() {
+    #[tokio::test]
+    async fn registry_dispatches_known_callback_and_rejects_unknown() {
         let started_at = Utc::now();
         let callback = ResumeCallback::new(
             ASK_USER_CALLBACK_KIND,
@@ -278,14 +306,129 @@ mod tests {
         assert!(matches!(
             ResumeCallbackRegistry::default()
                 .dispatch(&callback, resume_input("yes"))
+                .await
                 .unwrap(),
             ActionResult::Completed(_)
         ));
 
         let err = ResumeCallbackRegistry::new()
             .dispatch(&callback, resume_input("yes"))
+            .await
             .unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
+    }
+
+    #[tokio::test]
+    async fn async_ask_user_resume_callback_preserves_behavior() {
+        let started_at = Utc::now();
+        let callback = ResumeCallback::new(
+            ASK_USER_CALLBACK_KIND,
+            serde_json::to_value(PendingAskUser {
+                record_id: "record".to_string(),
+                prev: Some("previous".to_string()),
+                started_at,
+                output_status: "accepted".to_string(),
+                output_fields: json!({"plan": "ship"}),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let ActionResult::Completed(record) = ResumeCallbackRegistry::default()
+            .dispatch(&callback, resume_input("yes"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected completed ask-user record")
+        };
+        assert_eq!(record.id, "record");
+        assert_eq!(record.prev.as_deref(), Some("previous"));
+        assert_eq!(record.step, "confirm");
+        assert_eq!(record.input.prompt.as_deref(), Some("Approve?"));
+        assert_eq!(record.input.context["prompt_id"], "approval");
+        assert_eq!(record.input.context["choices"], json!(["yes", "no"]));
+        assert_eq!(record.output.as_ref().unwrap().status, "accepted");
+        assert_eq!(record.output.as_ref().unwrap().fields["answer"], "yes");
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct FakeWorkflow {
+        calls: Arc<std::sync::Mutex<Vec<(WorkflowAction, ExecutionContext)>>>,
+        result: Arc<std::sync::Mutex<Option<ActionResult>>>,
+    }
+
+    #[async_trait]
+    impl WorkflowActionHandler for FakeWorkflow {
+        async fn run_workflow(
+            &self,
+            action: WorkflowAction,
+            context: ExecutionContext,
+        ) -> Result<ActionResult> {
+            self.calls.lock().unwrap().push((action, context));
+            Ok(self.result.lock().unwrap().take().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn action_dispatcher_routes_workflow_variant() {
+        let now = Utc::now();
+        let completed = ActionResult::completed(StepRecord {
+            id: "child-record".to_string(),
+            prev: None,
+            step: "delegate".to_string(),
+            action: "workflow".to_string(),
+            input: StepInput {
+                prompt: None,
+                context: Value::Null,
+            },
+            output: Some(StepOutput {
+                status: "child_ok".to_string(),
+                fields: Value::Null,
+                body: String::new(),
+                raw: Value::Null,
+            }),
+            detail: StepDetail {
+                backend: Some("workflow".to_string()),
+                session_id: Some("child".to_string()),
+                duration_ms: 0,
+                turn_count: 0,
+                usage: None,
+            },
+            started_at: now,
+            completed_at: Some(now),
+        });
+        for expected in [
+            completed,
+            ActionResult::blocked(RunStatus::WaitingForInput {
+                step: "delegate".to_string(),
+                prompt_id: "child-prompt".to_string(),
+                message: "Continue?".to_string(),
+                choices: vec!["yes".to_string()],
+                resume_callback: ResumeCallback::new("test", Value::Null).unwrap(),
+            }),
+        ] {
+            let workflow = FakeWorkflow {
+                result: Arc::new(std::sync::Mutex::new(Some(expected.clone()))),
+                ..Default::default()
+            };
+            let calls = workflow.calls.clone();
+            let dispatcher = EngineActionDispatcher::with_workflow_handler(
+                FakeAgent,
+                workflow,
+                std::env::current_dir().unwrap(),
+            );
+            let action = WorkflowAction {
+                workflow: "child".to_string(),
+                request: "exact request".to_string(),
+            };
+            let execution = context();
+            let actual = dispatcher
+                .dispatch(StepAction::Workflow(action.clone()), execution.clone())
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(calls.lock().unwrap().as_slice(), &[(action, execution)]);
+        }
     }
 
     #[derive(Debug, Clone)]

@@ -369,6 +369,34 @@ mod tests {
                         resume_callback,
                     }))
                 }
+                StepAction::Workflow(action) => Ok(ActionResult::completed(StepRecord {
+                    id: context.step_record_id,
+                    prev: context.prev,
+                    step: context.step_id,
+                    action: "workflow".to_string(),
+                    input: StepInput {
+                        prompt: None,
+                        context: serde_json::json!({
+                            "workflow": action.workflow,
+                            "request": action.request,
+                        }),
+                    },
+                    output: Some(StepOutput {
+                        status: "success".to_string(),
+                        fields: Value::Null,
+                        body: String::new(),
+                        raw: Value::Null,
+                    }),
+                    detail: StepDetail {
+                        backend: Some("workflow".to_string()),
+                        session_id: None,
+                        duration_ms: 0,
+                        turn_count: 0,
+                        usage: None,
+                    },
+                    started_at: now,
+                    completed_at: Some(now),
+                })),
                 StepAction::Fail(action) => Ok(ActionResult::blocked(RunStatus::Failed {
                     reason: action.reason,
                 })),
@@ -648,6 +676,7 @@ mod tests {
             head: None,
             resume: Value::Null,
             config_set: crate::ConfigSetRef::default(),
+            parent: None,
             retries_used: 0,
             step_retries_used: BTreeMap::new(),
             steps_executed: 0,
