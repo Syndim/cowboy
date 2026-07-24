@@ -238,6 +238,46 @@ mod tests {
     }
 
     #[test]
+    fn prompt_includes_each_user_input_exactly_once() {
+        let role = RoleDefinition {
+            id: "planner".into(),
+            instructions: "Plan focused work".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "planner".into(),
+            prompt: "Create the implementation plan without repeating user inputs.".into(),
+            output: None,
+        };
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let user_inputs = vec![
+            RunUserInput {
+                sequence: 0,
+                kind: cowboy_workflow_core::RunUserInputKind::Initial,
+                content: "INITIAL_INPUT_SENTINEL".into(),
+                submitted_at: timestamp,
+            },
+            RunUserInput {
+                sequence: 1,
+                kind: cowboy_workflow_core::RunUserInputKind::FollowUp,
+                content: "FOLLOW_UP_INPUT_SENTINEL".into(),
+                submitted_at: timestamp,
+            },
+        ];
+
+        let prompt = build_agent_prompt(&role, &action, &user_inputs);
+
+        assert_eq!(prompt.matches("## Role").count(), 1);
+        assert_eq!(prompt.matches("## Task").count(), 1);
+        assert_eq!(prompt.matches("## User Inputs").count(), 1);
+        assert_eq!(prompt.matches("INITIAL_INPUT_SENTINEL").count(), 1);
+        assert_eq!(prompt.matches("FOLLOW_UP_INPUT_SENTINEL").count(), 1);
+    }
+
+    #[test]
     fn retry_nudge_includes_reason_and_frontmatter_instruction() {
         let action = AgentAction {
             role: "dev".into(),

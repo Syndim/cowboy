@@ -79,7 +79,7 @@ local implement = step("implement", {
 implement.run = function(ctx)
   return action.agent {
     role = developer,
-    prompt = "Implement: " .. tostring(ctx.request),
+    prompt = "Implement the approved change using the selected workflow context.",
     output = {
       status = { "success", "failed", "needs_fix" },
       fields = {
@@ -152,6 +152,46 @@ history in its base prompt, regardless of the workflow-authored `prompt`.
 Answers to `action.ask_user` are deliberately excluded: they remain available
 only through `ctx.prev.fields.answer` because they are workflow control-point
 answers rather than on-the-fly direction.
+
+### Agent prompt layering
+
+The Rust agent layer is the canonical final prompt assembler. It adds the role
+instructions, workflow-authored task, complete ordered `User Inputs`, deliverable
+format, and blocked-status policy. A workflow-authored `action.agent.prompt`
+must therefore contain only the current stage objective, selected workflow
+context, and stage-specific instructions. Do not concatenate `ctx.request`,
+`ctx.user_inputs`, a `## User Inputs` heading, or cumulative-input boilerplate
+into the Lua prompt; doing so duplicates user direction.
+
+The example workflows use `utils/context.lua::build_agent_prompt(ctx, spec)` to
+declare that selected context explicitly:
+
+```lua
+local prompt, errors = context.build_agent_prompt(ctx, {
+  objective = "Run focused tests for the approved implementation.",
+  heading = "Implementation result:",
+  require_previous = true,
+  fields = { "user_feedback", "plan_doc", "repro_test" },
+  evidence = { { name = "implementation", required = true } },
+  guidance = { "preserve_user_feedback", "preserve_evidence" },
+  instructions = "Run each applicable TODO procedure in plan order.",
+})
+if not prompt then
+  return context.invalid_context_action(ctx, "failed", errors)
+end
+```
+
+Field and evidence order is deterministic. Optional absent context is omitted,
+while a selected valid empty array is rendered as `array(empty)`. Every selected
+evidence source requires both its command array and evidence array, even when
+the source selection is optional. Both arrays may be explicitly empty, but if
+only one is present the builder returns a field-specific non-agent result that
+names the missing field and its present partner. Missing or malformed required
+context is handled the same way; invalid context is never converted to
+placeholder text or sent to the agent. Select only the metadata, artifact
+references, evidence sources, body, and reusable guidance needed by the current
+stage. Preserve cumulative raw `user_feedback` separately when workflow-control
+answers must be shown; never merge reviewer or agent feedback into it.
 
 `ctx.system` is a curated, read-only, best-effort snapshot of the execution
 environment (modelled on the identity data `chezmoi` exposes to templates). Any

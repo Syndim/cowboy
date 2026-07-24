@@ -4,18 +4,32 @@ return function(roles, opts)
   opts = opts or {}
   local review = step(opts.id or "review_blocker", { role = roles.blocker_reviewer })
   review.run = function(ctx)
-    return action.agent {
-      role = roles.blocker_reviewer,
-      prompt = [[Review this workflow blocker before asking the user for help:
-
-Request:
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Captured blocker:") .. context.preserve_user_feedback_guidance() .. context.preserve_evidence_guidance() .. [[
-
-Inspect the repository and every available `Plan doc: ...`, `Validation doc: ...`, `RCA doc: ...`, and `Repro test: ...` artifact. Return exactly one status:
+    local prompt, errors = context.build_agent_prompt(ctx, {
+      objective = "Review this workflow blocker before asking the user for help.",
+      heading = "Captured blocker:",
+      require_previous = true,
+      include_step = true,
+      include_status = true,
+      fields = {
+        "user_feedback", "summary", "blocker_statement", "blocked_from_step",
+        "blocked_from_status", "goal", "validation", "work_dir", "plan_doc",
+        "validation_doc", "rca_doc", "repro_test", "files",
+      },
+      required_fields = { "blocker_statement" },
+      evidence = { "implementation", "tester", "validator", "reviewer" },
+      reviewer_assessments = true,
+      include_body = true,
+      guidance = { "preserve_user_feedback", "preserve_evidence" },
+      instructions = [[Inspect the repository and every available `Plan doc: ...`, `Validation doc: ...`, `RCA doc: ...`, and `Repro test: ...` artifact. Return exactly one status:
 - `recoverable` when the agent can safely clear the blocker from repository context and available tools. Set `blocker_resolution` to concrete, ordered, agent-executable recovery instructions.
 - `user_required` only when a required decision, credential, permission, external resource, or manual action is unavailable to the agent. Set `blocker_resolution` to the exact minimal external input or action the user must provide.
 
 For both statuses, set `blocker_reason` to the evidence-based recoverability analysis. Do not infer facts from generic feedback or body prose beyond the named `blocker_statement`. Preserve every source-specific command and evidence array with semantic deep equality and unchanged array order. Preserve `blocker_statement`, `blocked_from_step`, `blocked_from_status`, `goal`, `validation`, `work_dir`, `plan_doc`, `validation_doc`, `rca_doc`, `repro_test`, and `files` exactly in output fields when present.]],
+    })
+    if not prompt then return context.invalid_context_action(ctx, "user_required", errors) end
+    return action.agent {
+      role = roles.blocker_reviewer,
+      prompt = prompt,
       output = {
         status = { "recoverable", "user_required" },
         fields = {

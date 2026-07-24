@@ -12,13 +12,33 @@ return function(roles, opts)
 The validator result above must preserve the implementation and tester evidence and show that the validation guide's complete ordered procedure, including the exact user-provided Validation method, was executed. During Pass 1, assess every required `VAL-NN` proof and validator submission without executing any reviewer command or manual procedure. Execution remains forbidden until the complete global assessment set passes. The explicit Pass 2 section below defines the only permitted criterion reproduction. Do not approve unless every exit criterion demonstrated the Goal; substitute checks and reviewer inference do not count. Preserve the `Goal`, `Validation`, and `Validation doc` values exactly in output fields.]]
   end
   review.run = function(ctx)
-    return action.agent {
-      role = roles.reviewer,
-      prompt = [[Review the ]] .. review_subject .. [[ for this request:
-
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, evidence_heading) .. validation_guidance .. context.preserve_user_feedback_guidance() .. context.review_user_feedback_guidance() .. context.preserve_evidence_guidance() .. context.evidence_record_guidance() .. [[
-
-When a `Validation doc: ...` path is present, inspect that guide and preserve the path exactly in output fields. Inspect the working tree and plan document at the `Plan doc: ...` path. Require exactly one upstream evidence record per source and subject; reject duplicate records rather than selecting, merging, or reproducing them.
+    local evidence = {
+      { name = "implementation", required = true },
+      { name = "tester", required = true },
+    }
+    if opts.require_user_validation then
+      table.insert(evidence, { name = "validator", required = true })
+    end
+    local prompt, errors = context.build_agent_prompt(ctx, {
+      objective = "Review the " .. review_subject .. ".",
+      heading = evidence_heading,
+      require_previous = true,
+      include_step = true,
+      include_status = true,
+      fields = {
+        "user_feedback", "summary", "feedback", "goal", "validation", "work_dir",
+        "plan_doc", "validation_doc", "rca_doc", "repro_test", "files", "failures",
+      },
+      evidence = evidence,
+      include_body = true,
+      guidance = {
+        validation_guidance,
+        "preserve_user_feedback",
+        "review_user_feedback",
+        "preserve_evidence",
+        "evidence_records",
+      },
+      instructions = [[When a `Validation doc: ...` path is present, inspect that guide and preserve the path exactly in output fields. Inspect the working tree and plan document at the `Plan doc: ...` path. Require exactly one upstream evidence record per source and subject; reject duplicate records rather than selecting, merging, or reproducing them.
 
 Review is a globally gated two-pass process. Read the approved plan and complete Pass 1 for every required `TODO-NN` in plan order—whether checked or unchecked—followed by every required `VAL-NN` in validation-guide order, before running any reviewer command or manual procedure. An unchecked required TODO must remain visible in the assessment set and makes the submission invalid; it must never disappear from the gate. Emit exactly one `reviewer_assessments` record per required subject:
 - `subject_kind`, `subject_id`, and exact `subject`
@@ -42,6 +62,11 @@ Use "replan_requested" when any proof procedure makes the plan or validation gui
 Only when every assessment is `sound` and `valid` may Pass 2 begin. Then independently reproduce every subject's sole complete procedure in the same order. Emit exactly one reviewer evidence record per subject and mapped reviewer command records. Reviewer TODO evidence compares against exactly the matching implementer and tester observations; reviewer validation evidence compares against exactly the matching validator observation. Approval requires every rerun to match. Missing, duplicate, stale, reordered, non-reproducible, contradictory, falsely relabeled, unmapped, not-run, or mismatched evidence cannot be approved.
 
 For bug fixes, also inspect the bug-fix work folder at `Work dir: ...`, the RCA document at `RCA doc: ...`, and the investigator-added regression test identified by `Repro test: ...`; verify that test still validates the original issue and passes because product code was fixed. Preserve all incoming structured arrays with semantic deep equality and preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly. Return `approved` only after both passes succeed; otherwise use the global routing rules above.]],
+    })
+    if not prompt then return context.invalid_context_action(ctx, "changes_requested", errors) end
+    return action.agent {
+      role = roles.reviewer,
+      prompt = prompt,
       output = {
         status = { "approved", "changes_requested", "replan_requested" },
         fields = { feedback = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", validator_commands = "array", validator_evidence = "array", reviewer_commands = "array", reviewer_evidence = "array", reviewer_assessments = "array" },

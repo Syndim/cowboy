@@ -40,13 +40,18 @@ If previous feedback includes `Plan doc: ...`, update that existing plan documen
 If previous feedback includes a valid nested dev-loop `Work dir: ...`, `Plan doc: ...`, and `Validation doc: ...` tuple, update those exact documents and preserve all three values. If the prior tuple is flat, mismatched, or incomplete, replace it with the required nested tuple. Include both current document paths in `files`.]]
   end
   plan.run = function(ctx)
-    return action.agent {
-      role = roles.planner,
-      prompt = [[Create a concrete plan for this ]] .. kind .. [[ request:
-
-]] .. context.request_context(ctx) .. context.previous_step_context(ctx, "Previous feedback:") .. validation_guidance .. validation_guide_guidance .. context.preserve_user_feedback_guidance() .. existing_plan_guidance .. [[
-
-For bug fix requests, base the plan on the reviewed RCA document and investigator-added regression test from the prior step. The plan must reference the RCA doc, keep the repro test as an input to the fix, and must not ask the implementer to rewrite or replace that test. If `Work dir: ...` is present above, write the plan to `<work_dir>/plan.md` in that same bug-fix work folder; otherwise create `docs/plans/<snake_case_bug_summary>/plan.md` next to the RCA. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly in output fields when present.]] .. ordinary_plan_guidance .. [[
+    local prompt, errors = context.build_agent_prompt(ctx, {
+      objective = "Create a concrete plan for this " .. kind .. " request.",
+      heading = "Previous feedback:",
+      include_step = true,
+      include_status = true,
+      fields = {
+        "clarification", "user_feedback", "summary", "feedback", "goal", "validation",
+        "work_dir", "plan_doc", "validation_doc", "rca_doc", "repro_test", "files",
+      },
+      include_body = true,
+      guidance = { validation_guidance, validation_guide_guidance, "preserve_user_feedback", existing_plan_guidance },
+      instructions = [[For bug fix requests, base the plan on the reviewed RCA document and investigator-added regression test from the prior step. The plan must reference the RCA doc, keep the repro test as an input to the fix, and must not ask the implementer to rewrite or replace that test. If `Work dir: ...` is present above, write the plan to `<work_dir>/plan.md` in that same bug-fix work folder; otherwise create `docs/plans/<snake_case_bug_summary>/plan.md` next to the RCA. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly in output fields when present.]] .. ordinary_plan_guidance .. [[
 
 The plan document must contain these sections exactly:
 - Plan
@@ -60,6 +65,11 @@ The plan document must not include sensitive user data. Redact, generalize, or o
 The TODO section must contain every implementation work item as a Markdown task-list item in the form `- [ ] TODO-NN: <exact task text>`. Assign IDs in document order, never renumber or reuse existing IDs during replanning, and give every newly added task the next unused number. Beneath each TODO, define an executable command or ordered manual procedure and an observable expected result. The procedure and expected result are part of the stable subject definition. Do not use vague completion checks. Return `plan_doc` exactly as the written plan path, and include that same path in `files`.
 
 Return status "ready" when the request is specific enough to implement, or "unclear" when more user context is needed.]],
+    })
+    if not prompt then return context.invalid_context_action(ctx, "unclear", errors) end
+    return action.agent {
+      role = roles.planner,
+      prompt = prompt,
       output = {
         status = { "ready", "unclear" },
         fields = { summary = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },

@@ -2215,7 +2215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn progress_reports_prompt_and_agent_stream_chunks() {
+    async fn progress_and_backend_receive_identical_prompt() {
         let events = vec![
             Event::ThoughtChunk {
                 content: serde_json::json!({"text":"checking approach"}),
@@ -2233,7 +2233,9 @@ mod tests {
             },
             event(),
         ];
-        let factory = FakeFactory::new(vec![FakeClient::new(events)]);
+        let client = FakeClient::new(events);
+        let backend_prompts = client.prompt_calls.clone();
+        let factory = FakeFactory::new(vec![client]);
         let store = FakeStore::default();
         let progress_events = Arc::new(SyncMutex::new(Vec::new()));
         let progress_sink = {
@@ -2272,6 +2274,18 @@ mod tests {
             AgentProgressKind::Prompt { role, session_id, prompt }
                 if role == "developer" && session_id == "session-1" && prompt.contains("Do work")
         ));
+        let AgentProgressKind::Prompt {
+            prompt: visible_prompt,
+            ..
+        } = &progress_events[2]
+        else {
+            unreachable!()
+        };
+        let backend_prompts = backend_prompts.lock();
+        let backend_prompt = &backend_prompts[0][0].text;
+        assert_eq!(visible_prompt, backend_prompt);
+        assert!(!visible_prompt.contains("<missing-array>"));
+        assert!(!visible_prompt.contains("<invalid-array:"));
         assert_eq!(
             progress_events[3],
             AgentProgressKind::Thought {

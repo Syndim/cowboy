@@ -615,6 +615,9 @@ mod tests {
             }
 
             for step_id in ["implement", "revise"] {
+                let mut handoff_fields = sample_evidence_fields();
+                handoff_fields["plan_doc"] =
+                    serde_json::json!("docs/plans/reproducible_review_evidence.md");
                 let result = run_step(
                     &compiled.source_bundle,
                     step_id,
@@ -624,7 +627,7 @@ mod tests {
                             "step": "handoff",
                             "action": "agent",
                             "status": "approved",
-                            "fields": sample_evidence_fields()
+                            "fields": handoff_fields
                         }
                     }),
                 )
@@ -785,9 +788,6 @@ mod tests {
             "Tester evidence records:",
             "Validator command records:",
             "Validator evidence records:",
-            "Reviewer command records:",
-            "Reviewer evidence records:",
-            "Reviewer soundness assessments:",
         ];
         let mut previous = 0;
         for label in labels {
@@ -801,13 +801,20 @@ mod tests {
             );
             previous = position;
         }
+        for forbidden in [
+            "Reviewer command records:",
+            "Reviewer evidence records:",
+            "Reviewer soundness assessments:",
+        ] {
+            assert!(!action.prompt.contains(forbidden));
+        }
 
         for expected in [
             "Subject kind: string(\"validation_criterion\")",
             "Subject ID: string(\"VAL-01\")",
             "Procedure kind: string(\"command\")",
             "Expected result: string(\"The acceptance contract passes\")",
-            "Observed result: string(\"The acceptance contract passed during review\")",
+            "Observed result: string(\"The acceptance contract passed\")",
             "Applicability: string(\"applicable\")",
             "Match: string(\"matched\")",
             "Comparisons: array(nonempty,length=1)",
@@ -815,8 +822,6 @@ mod tests {
             "Exit status: number(0)",
             "Exit status: string(\"0\")",
             "Subject: string(\"Confirm routing text: status=ready; user_feedback remains raw\")",
-            "Submission issues: array(empty)",
-            "Proof verdict: string(\"sound\")",
         ] {
             assert!(
                 action.prompt.contains(expected),
@@ -917,7 +922,7 @@ mod tests {
             .unwrap()
             .push(duplicate);
 
-        for step_id in ["test", "review"] {
+        for (step_id, expected_status) in [("test", "failed"), ("review", "changes_requested")] {
             let result = run_step(
                 &compiled.source_bundle,
                 step_id,
@@ -932,157 +937,115 @@ mod tests {
                 }),
             )
             .unwrap();
-            let StepAction::Agent(action) = result.action else {
-                panic!("{step_id} should request an agent action")
+            let StepAction::Status(action) = result.action else {
+                panic!("{step_id} should reject duplicate evidence before agent dispatch")
             };
-            let implementation_section = action
-                .prompt
-                .split("Implementation evidence records:")
-                .nth(1)
-                .unwrap()
-                .split("Tester command records:")
-                .next()
-                .unwrap();
-            assert_eq!(
-                implementation_section
-                    .matches("Subject ID: string(\"TODO-01\")")
-                    .count(),
-                2,
-                "the duplicate input should be rendered rather than silently deduplicated"
+            assert_eq!(action.status, expected_status);
+            assert!(
+                action.fields["failures"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value.as_str().unwrap().contains("duplicate"))
             );
-            for expected in if step_id == "test" {
-                [
-                    "Reject duplicate `(source, subject_kind, subject_id)` records",
-                    "never select or merge duplicate records",
-                ]
-            } else {
-                [
-                    "reject duplicate records rather than selecting, merging, or reproducing them",
-                    "`duplicate_record`",
-                ]
-            } {
-                assert!(action.prompt.contains(expected), "missing {expected:?}");
-            }
         }
     }
 
     #[test]
-    fn examples_workflows_render_typed_evidence_and_invalid_comparisons() {
+    fn examples_workflows_prompt_builder_omits_absent_and_rejects_invalid_context() {
         let compiled = load_example_compiled_workflow("feature");
-        let mut fields = sample_evidence_fields();
-        fields["implementation_commands"] = serde_json::json!([
-            { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 1, "command": false, "exit_status": 0 },
-            { "subject_kind": "todo", "subject_id": "TODO-01", "procedure_index": 2, "command": "false", "exit_status": "0" }
-        ]);
-        fields["implementation_evidence"] = serde_json::json!([
-            {
-                "subject_kind": "todo", "subject_id": "TODO-01", "subject": "Typed: [proof] \"value\"; user_feedback: raw", "source": "implementer",
-                "procedure": { "kind": "command", "steps": [false, "false"] },
-                "expected_result": "Typed values remain distinct", "observed_result": false,
-                "applicability": "applicable", "match": "matched", "comparisons": []
-            },
-            {
-                "subject_kind": "todo", "subject_id": "TODO-02", "subject": "Missing comparisons", "source": "implementer",
-                "procedure": { "kind": "manual", "steps": ["inspect"] },
-                "expected_result": "missing is visible", "observed_result": "false",
-                "applicability": "applicable", "match": "matched"
-            },
-            {
-                "subject_kind": "todo", "subject_id": "TODO-03", "subject": "Invalid comparisons", "source": "implementer",
-                "procedure": { "kind": "manual", "steps": ["inspect"] },
-                "expected_result": "invalid is visible", "observed_result": "done",
-                "applicability": "applicable", "match": "matched", "comparisons": "invalid"
-            },
-            {
-                "subject_kind": "todo", "subject_id": "TODO-04", "subject": "Malformed comparisons", "source": "implementer",
-                "procedure": { "kind": "manual", "steps": ["inspect"] },
-                "expected_result": "malformed is visible", "observed_result": "done",
-                "applicability": "applicable", "match": "matched", "comparisons": { "2": "gap" }
-            },
-            {
-                "subject_kind": "todo", "subject_id": "TODO-05", "subject": "Nonempty comparisons", "source": "tester",
-                "procedure": { "kind": "manual", "steps": ["inspect"] },
-                "expected_result": "nonempty is visible", "observed_result": "done",
-                "applicability": "applicable", "match": "matched",
-                "comparisons": [{ "source": "implementer", "observed_result": "done", "match": "matched" }]
-            }
-        ]);
-
         let result = run_step(
             &compiled.source_bundle,
             "test",
             serde_json::json!({
-                "request": "Render typed proof records",
-                "prev": { "step": "implement", "action": "agent", "status": "implemented", "fields": fields }
+                "request": "request sentinel",
+                "user_inputs": [{ "sequence": 0, "kind": "initial", "content": "input sentinel", "submitted_at": "2026-01-01T00:00:00.000Z" }],
+                "prev": {
+                    "step": "implement",
+                    "action": "agent",
+                    "status": "implemented",
+                    "fields": {
+                        "implementation_commands": [],
+                        "implementation_evidence": [{
+                            "subject_kind": "todo",
+                            "subject_id": "TODO-01",
+                            "subject": "Inspect manually",
+                            "source": "implementer",
+                            "procedure": { "kind": "manual", "steps": ["Inspect the result"] },
+                            "expected_result": "The result is correct",
+                            "observed_result": "The result was correct",
+                            "applicability": "applicable",
+                            "match": "matched",
+                            "comparisons": []
+                        }]
+                    }
+                }
             }),
         )
         .unwrap();
         let StepAction::Agent(action) = result.action else {
             panic!("test should request an agent action")
         };
-        for expected in [
-            "Command: boolean(false)",
-            "Command: string(\"false\")",
-            "Exit status: number(0)",
-            "Exit status: string(\"0\")",
-            "Step 1: boolean(false)",
-            "Step 2: string(\"false\")",
-            "Observed result: boolean(false)",
-            "Observed result: string(\"false\")",
-            "Comparisons: array(empty)",
-            "Comparisons: <missing-array>",
-            "Comparisons: <invalid-array:type=string value=string(\"invalid\")>",
-            "Comparisons: <invalid-array:table-non-array-key>",
-            "Comparisons: array(nonempty,length=1)",
-            "Subject: string(\"Typed: [proof] \\\"value\\\"; user_feedback: raw\")",
+        assert!(
+            action
+                .prompt
+                .contains("Implementation command records: array(empty)")
+        );
+        assert!(
+            action
+                .prompt
+                .contains("Implementation evidence records: array(nonempty,length=1)")
+        );
+        for absent in [
+            "Tester command records:",
+            "Validator command records:",
+            "Reviewer command records:",
+            "Reviewer soundness assessments:",
+            "request sentinel",
+            "input sentinel",
+            "<missing-array>",
+            "<invalid-array:",
         ] {
-            assert!(
-                action.prompt.contains(expected),
-                "missing typed rendering {expected:?}"
-            );
+            assert!(!action.prompt.contains(absent), "unexpected {absent:?}");
         }
-        assert!(!action.prompt.contains("User feedback history:"));
 
-        let top_level_fields = serde_json::json!({
-            "implementation_commands": false,
-            "implementation_evidence": { "unexpected": "record" },
-            "tester_commands": [],
-            "validator_commands": [
-                { "subject_kind": "validation_criterion", "subject_id": "VAL-01", "procedure_index": 1, "command": "cargo test", "exit_status": 0 }
-            ],
-            "validator_evidence": { "2": "gap" },
-            "reviewer_commands": "invalid",
-            "reviewer_evidence": [],
-            "reviewer_assessments": false
-        });
-        let top_level_result = run_step(
+        let invalid = run_step(
             &compiled.source_bundle,
             "test",
             serde_json::json!({
-                "request": "Render every required top-level state",
-                "prev": { "step": "implement", "action": "agent", "status": "implemented", "fields": top_level_fields }
+                "prev": {
+                    "step": "implement",
+                    "action": "agent",
+                    "status": "implemented",
+                    "fields": {
+                        "implementation_commands": [],
+                        "implementation_evidence": [{
+                            "subject_kind": "todo",
+                            "subject_id": "TODO-01",
+                            "subject": "Malformed evidence",
+                            "source": "implementer",
+                            "procedure": { "kind": "manual", "steps": ["Inspect"] },
+                            "expected_result": "Inspection succeeds",
+                            "observed_result": "Inspection succeeded",
+                            "applicability": "applicable",
+                            "match": "matched",
+                            "comparisons": "not-an-array"
+                        }]
+                    }
+                }
             }),
         )
         .unwrap();
-        let StepAction::Agent(top_level_action) = top_level_result.action else {
-            panic!("test should request an agent action")
+        let StepAction::Status(invalid) = invalid.action else {
+            panic!("malformed required context should skip agent dispatch")
         };
-        for expected in [
-            "Implementation command records: <invalid-array:type=boolean value=boolean(false)>",
-            "Implementation evidence records: <invalid-array:table-non-array-key>",
-            "Tester command records: array(empty)",
-            "Tester evidence records: <missing-array>",
-            "Validator command records: array(nonempty,length=1)",
-            "Validator evidence records: <invalid-array:table-non-array-key>",
-            "Reviewer command records: <invalid-array:type=string value=string(\"invalid\")>",
-            "Reviewer evidence records: array(empty)",
-            "Reviewer soundness assessments: <invalid-array:type=boolean value=boolean(false)>",
-        ] {
-            assert!(
-                top_level_action.prompt.contains(expected),
-                "missing top-level rendering {expected:?}"
-            );
-        }
+        assert_eq!(invalid.status, "failed");
+        assert!(
+            invalid.fields["failures"][0]
+                .as_str()
+                .unwrap()
+                .contains("implementation_evidence[1].comparisons")
+        );
 
         let malformed = serde_json::json!({
             "implementation_commands": false,
@@ -1140,6 +1103,69 @@ mod tests {
             serde_json::json!([])
         );
         assert!(missing_confirmation.fields.get("tester_commands").is_none());
+
+        let paired_empty = run_step(
+            &compiled.source_bundle,
+            "review_result_feedback",
+            serde_json::json!({
+                "prev": {
+                    "step": "confirm_result_answer",
+                    "action": "status",
+                    "status": "changes_requested",
+                    "fields": {
+                        "user_feedback": ["Keep paired evidence explicit"],
+                        "implementation_commands": [],
+                        "implementation_evidence": []
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Agent(paired_empty) = paired_empty.action else {
+            panic!("paired empty evidence should remain valid")
+        };
+        for expected in [
+            "Implementation command records: array(empty)",
+            "Implementation evidence records: array(empty)",
+        ] {
+            assert!(
+                paired_empty.prompt.contains(expected),
+                "missing {expected:?}"
+            );
+        }
+
+        for (present_field, missing_field) in [
+            ("implementation_commands", "implementation_evidence"),
+            ("implementation_evidence", "implementation_commands"),
+        ] {
+            let mut fields = serde_json::json!({
+                "user_feedback": ["Reject one-sided selected evidence"]
+            });
+            fields[present_field] = serde_json::json!([]);
+            let one_sided = run_step(
+                &compiled.source_bundle,
+                "review_result_feedback",
+                serde_json::json!({
+                    "prev": {
+                        "step": "confirm_result_answer",
+                        "action": "status",
+                        "status": "changes_requested",
+                        "fields": fields
+                    }
+                }),
+            )
+            .unwrap();
+            let StepAction::Status(rejected) = one_sided.action else {
+                panic!("one-sided evidence must prevent agent dispatch")
+            };
+            assert_eq!(rejected.status, "changes_requested");
+            assert_eq!(
+                rejected.fields["failures"],
+                serde_json::json!([format!(
+                    "prev.fields.{missing_field}: expected array paired with present prev.fields.{present_field}, got missing"
+                )])
+            );
+        }
     }
 
     #[test]
@@ -1294,6 +1320,45 @@ mod tests {
                 .matches("Initial request remains raw")
                 .count(),
             1
+        );
+
+        let mut duplicate_assessments = sample_evidence_fields();
+        let mut duplicate = duplicate_assessments["reviewer_assessments"][0].clone();
+        duplicate["subject"] = serde_json::json!("Different non-key subject text");
+        let original = duplicate_assessments["reviewer_assessments"][0].clone();
+        assert_eq!(duplicate["source"], original["source"]);
+        assert_eq!(duplicate["subject_kind"], original["subject_kind"]);
+        assert_eq!(duplicate["subject_id"], original["subject_id"]);
+        assert_ne!(duplicate["subject"], original["subject"]);
+        duplicate_assessments["reviewer_assessments"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        duplicate_assessments["user_feedback"] =
+            serde_json::json!(["Reject duplicate reviewer assessments"]);
+        let duplicate_result = run_step(
+            &compiled.source_bundle,
+            "review_result_feedback",
+            serde_json::json!({
+                "request": "Reject duplicate reviewer assessments",
+                "prev": {
+                    "step": "confirm_result_answer",
+                    "action": "status",
+                    "status": "changes_requested",
+                    "fields": duplicate_assessments
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(rejected) = duplicate_result.action else {
+            panic!("duplicate reviewer assessments must prevent agent dispatch")
+        };
+        assert_eq!(rejected.status, "changes_requested");
+        assert_eq!(
+            rejected.fields["failures"],
+            serde_json::json!([
+                "reviewer_assessments[5]: expected unique (source, subject_kind, subject_id), got duplicate of reviewer_assessments[1]"
+            ])
         );
     }
 
@@ -1787,6 +1852,191 @@ mod tests {
     }
 
     #[test]
+    fn examples_workflows_prompt_matrix_uses_only_stage_context() {
+        type StepExpectation<'a> = (&'a str, &'a [&'a str]);
+        type WorkflowExpectation<'a> = (&'a str, &'a [StepExpectation<'a>]);
+        let cases: [WorkflowExpectation<'_>; 3] = [
+            (
+                "feature",
+                &[
+                    ("plan", &[]),
+                    ("review_plan", &[]),
+                    ("implement", &[]),
+                    ("test", &["Implementation"]),
+                    ("review", &["Implementation", "Tester"]),
+                    (
+                        "review_result_feedback",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("revise", &["Implementation"]),
+                    (
+                        "review_blocker",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("commit", &[]),
+                ],
+            ),
+            (
+                "bugfix",
+                &[
+                    ("investigate", &[]),
+                    ("review_rca", &[]),
+                    ("plan", &[]),
+                    ("review_plan", &[]),
+                    ("implement", &[]),
+                    ("test", &["Implementation"]),
+                    ("review", &["Implementation", "Tester"]),
+                    (
+                        "review_result_feedback",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("revise", &["Implementation"]),
+                    (
+                        "review_blocker",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("commit", &[]),
+                ],
+            ),
+            (
+                "dev-loop",
+                &[
+                    ("plan", &[]),
+                    ("review_plan", &[]),
+                    ("implement", &[]),
+                    ("test", &["Implementation"]),
+                    ("validate", &["Implementation", "Tester"]),
+                    ("review", &["Implementation", "Tester", "Validator"]),
+                    (
+                        "review_result_feedback",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("revise", &["Implementation"]),
+                    (
+                        "review_blocker",
+                        &["Implementation", "Tester", "Validator", "Reviewer"],
+                    ),
+                    ("commit", &[]),
+                ],
+            ),
+        ];
+
+        for (workflow_name, steps) in cases {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            for (step_id, selected_sources) in steps {
+                let mut fields = sample_evidence_fields();
+                let object = fields.as_object_mut().unwrap();
+                object.insert(
+                    "user_feedback".into(),
+                    serde_json::json!(["raw feedback one", "raw feedback two"]),
+                );
+                object.insert("summary".into(), serde_json::json!("approved summary"));
+                object.insert("feedback".into(), serde_json::json!("stage feedback"));
+                object.insert("goal".into(), serde_json::json!("goal value"));
+                object.insert("validation".into(), serde_json::json!("validation value"));
+                object.insert("work_dir".into(), serde_json::json!("docs/plans/example"));
+                object.insert(
+                    "plan_doc".into(),
+                    serde_json::json!("docs/plans/example/plan.md"),
+                );
+                object.insert(
+                    "validation_doc".into(),
+                    serde_json::json!("docs/plans/example/validation.md"),
+                );
+                object.insert(
+                    "rca_doc".into(),
+                    serde_json::json!("docs/plans/example/rca.md"),
+                );
+                object.insert("repro_test".into(), serde_json::json!("src/lib.rs::repro"));
+                object.insert(
+                    "files".into(),
+                    serde_json::json!([
+                        "docs/plans/example/plan.md",
+                        "docs/plans/example/validation.md"
+                    ]),
+                );
+                object.insert(
+                    "blocker_statement".into(),
+                    serde_json::json!("external permission is unavailable"),
+                );
+
+                let result = run_step(
+                    &compiled.source_bundle,
+                    step_id,
+                    serde_json::json!({
+                        "request": "REQUEST_SENTINEL_UNIQUE",
+                        "user_inputs": [
+                            {
+                                "sequence": 0,
+                                "kind": "initial",
+                                "content": "INPUT_SENTINEL_INITIAL",
+                                "submitted_at": "2026-01-01T00:00:00.000Z"
+                            },
+                            {
+                                "sequence": 1,
+                                "kind": "follow_up",
+                                "content": "INPUT_SENTINEL_FOLLOW_UP",
+                                "submitted_at": "2026-01-01T00:01:00.000Z"
+                            }
+                        ],
+                        "prev": {
+                            "step": "handoff",
+                            "action": "agent",
+                            "status": "ready",
+                            "fields": fields,
+                            "body": "selected body"
+                        }
+                    }),
+                )
+                .unwrap();
+                let StepAction::Agent(action) = result.action else {
+                    panic!("{workflow_name} {step_id} should request an agent action")
+                };
+
+                for forbidden in [
+                    "REQUEST_SENTINEL_UNIQUE",
+                    "INPUT_SENTINEL_INITIAL",
+                    "INPUT_SENTINEL_FOLLOW_UP",
+                    "## User Inputs",
+                    "All entries below are cumulative user direction",
+                    "<missing-array>",
+                    "<invalid-array:",
+                ] {
+                    assert!(
+                        !action.prompt.contains(forbidden),
+                        "{workflow_name} {step_id} unexpectedly contains {forbidden:?}"
+                    );
+                }
+
+                for source in ["Implementation", "Tester", "Validator", "Reviewer"] {
+                    let expected = selected_sources.contains(&source);
+                    assert_eq!(
+                        action
+                            .prompt
+                            .contains(&format!("{source} evidence records:")),
+                        expected,
+                        "{workflow_name} {step_id} source {source}"
+                    );
+                }
+                assert_eq!(
+                    action.prompt.contains("Reviewer soundness assessments:"),
+                    matches!(*step_id, "review_result_feedback" | "review_blocker")
+                );
+                for guidance in [
+                    "Preserve `user_feedback` exactly",
+                    "Use exactly one complete evidence record",
+                    "Preserve every incoming source-specific command/evidence array",
+                ] {
+                    assert!(
+                        action.prompt.matches(guidance).count() <= 1,
+                        "{workflow_name} {step_id} duplicated guidance {guidance:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn examples_workflows_capture_cumulative_confirmation_feedback() {
         fn assert_common_context(fields: &serde_json::Value) {
             assert_eq!(fields["goal"], "Keep command behavior stable");
@@ -2103,6 +2353,55 @@ mod tests {
         for (workflow_name, step_ids) in cases {
             let compiled = load_example_compiled_workflow(workflow_name);
             for step_id in step_ids {
+                let mut fields = sample_evidence_fields();
+                let object = fields.as_object_mut().unwrap();
+                object.insert(
+                    "user_feedback".into(),
+                    serde_json::json!([
+                        "Plan confirmation: Preserve the public API",
+                        "Result confirmation: Include the TUI path",
+                        {
+                            "sequence": 0,
+                            "kind": "initial",
+                            "content": "Preserve structured raw user direction",
+                            "submitted_at": "2026-07-23T09:21:45.530Z"
+                        }
+                    ]),
+                );
+                object.insert(
+                    "goal".into(),
+                    serde_json::json!("Preserve cumulative feedback"),
+                );
+                object.insert("validation".into(), serde_json::json!("cargo test"));
+                object.insert(
+                    "plan_doc".into(),
+                    serde_json::json!("docs/plans/example/plan.md"),
+                );
+                object.insert(
+                    "validation_doc".into(),
+                    serde_json::json!("docs/plans/example/validation.md"),
+                );
+                object.insert("work_dir".into(), serde_json::json!("docs/plans/example"));
+                object.insert(
+                    "rca_doc".into(),
+                    serde_json::json!("docs/plans/example/rca.md"),
+                );
+                object.insert(
+                    "repro_test".into(),
+                    serde_json::json!("crates/workflow/lua/src/loader.rs::confirmation_repro"),
+                );
+                object.insert("commands".into(), serde_json::json!(["cargo test"]));
+                object.insert(
+                    "files".into(),
+                    serde_json::json!([
+                        "docs/plans/example/plan.md",
+                        "docs/plans/example/validation.md"
+                    ]),
+                );
+                object.insert(
+                    "blocker_statement".into(),
+                    serde_json::json!("A required external permission is unavailable"),
+                );
                 let result = run_step(
                     &compiled.source_bundle,
                     step_id,
@@ -2111,21 +2410,7 @@ mod tests {
                         "prev": {
                             "step": "handoff",
                             "status": "ready",
-                            "fields": {
-                                "user_feedback": [
-                                    "Plan confirmation: Preserve the public API",
-                                    "Result confirmation: Include the TUI path"
-                                ],
-                                "goal": "Preserve cumulative feedback",
-                                "validation": "cargo test",
-                                "plan_doc": "docs/plans/example/plan.md",
-                                "validation_doc": "docs/plans/example/validation.md",
-                                "work_dir": "docs/plans/example",
-                                "rca_doc": "docs/plans/example/rca.md",
-                                "repro_test": "crates/workflow/lua/src/loader.rs::confirmation_repro",
-                                "commands": ["cargo test"],
-                                "files": ["docs/plans/example/plan.md", "docs/plans/example/validation.md"]
-                            }
+                            "fields": fields
                         }
                     }),
                 )
@@ -2150,12 +2435,14 @@ mod tests {
                     );
                 }
 
-                assert!(
-                    action
-                        .prompt
-                        .contains("Validation doc: docs/plans/example/validation.md"),
-                    "{workflow_name} {step_id} should render validation_doc"
-                );
+                if !matches!(*step_id, "investigate" | "review_rca") {
+                    assert!(
+                        action
+                            .prompt
+                            .contains("Validation doc: docs/plans/example/validation.md"),
+                        "{workflow_name} {step_id} should render validation_doc"
+                    );
+                }
                 if *step_id == "commit" {
                     for field in [
                         "work_dir",
@@ -2203,10 +2490,30 @@ mod tests {
                     .unwrap_or_else(|| {
                         panic!("{workflow_name} {step_id} should render result feedback")
                     });
+                let structured = action
+                    .prompt
+                    .find("content: string(\"Preserve structured raw user direction\")")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{workflow_name} {step_id} should render structured feedback content"
+                        )
+                    });
 
                 assert!(
-                    first < second,
-                    "{workflow_name} {step_id} should preserve feedback order"
+                    first < second && second < structured,
+                    "{workflow_name} {step_id} should preserve scalar and structured feedback order"
+                );
+                assert!(
+                    action.prompt.contains("sequence: number(0)")
+                        && action.prompt.contains("kind: string(\"initial\")")
+                        && action
+                            .prompt
+                            .contains("submitted_at: string(\"2026-07-23T09:21:45.530Z\")"),
+                    "{workflow_name} {step_id} should render structured feedback metadata"
+                );
+                assert!(
+                    !action.prompt.contains("table: 0x"),
+                    "{workflow_name} {step_id} should never stringify feedback tables"
                 );
 
                 if matches!(
@@ -2343,6 +2650,29 @@ mod tests {
     fn examples_workflows_review_agent_output_distinguishes_replanning() {
         for workflow_name in ["feature", "bugfix"] {
             let compiled = load_example_compiled_workflow(workflow_name);
+            let mut fields = sample_evidence_fields();
+            let object = fields.as_object_mut().unwrap();
+            object.insert("summary".into(), serde_json::json!("Focused tests passed"));
+            object.insert(
+                "work_dir".into(),
+                serde_json::json!("docs/plans/fix_approval_routing"),
+            );
+            object.insert(
+                "plan_doc".into(),
+                serde_json::json!("docs/plans/fix_approval_routing/plan.md"),
+            );
+            object.insert(
+                "rca_doc".into(),
+                serde_json::json!("docs/plans/fix_approval_routing/rca.md"),
+            );
+            object.insert(
+                "repro_test".into(),
+                serde_json::json!("crates/workflow/lua/src/loader.rs::examples_workflows_review_agent_output_distinguishes_replanning"),
+            );
+            object.insert(
+                "commands".into(),
+                serde_json::json!(["cargo test -p cowboy-workflow-lua examples_workflows"]),
+            );
             let result = run_step(
                 &compiled.source_bundle,
                 "review",
@@ -2351,14 +2681,7 @@ mod tests {
                     "prev": {
                         "step": "test",
                         "status": "passed",
-                        "fields": {
-                            "summary": "Focused tests passed",
-                            "work_dir": "docs/plans/fix_approval_routing",
-                            "plan_doc": "docs/plans/fix_approval_routing/plan.md",
-                            "rca_doc": "docs/plans/fix_approval_routing/rca.md",
-                            "repro_test": "crates/workflow/lua/src/loader.rs::examples_workflows_review_agent_output_distinguishes_replanning",
-                            "commands": ["cargo test -p cowboy-workflow-lua examples_workflows"]
-                        }
+                        "fields": fields
                     }
                 }),
             )
@@ -2453,6 +2776,7 @@ mod tests {
                         "status": "changes_requested",
                         "fields": {
                             "feedback": "User says the implementation missed the CLI flag",
+                            "user_feedback": ["User says the implementation missed the CLI flag"],
                             "work_dir": "docs/plans/fix_result_feedback_gate",
                             "plan_doc": "docs/plans/fix_result_feedback_gate/plan.md",
                             "rca_doc": "docs/plans/fix_result_feedback_gate/rca.md",
@@ -2500,6 +2824,7 @@ mod tests {
                     "status": "changes_requested",
                     "fields": {
                         "feedback": "Inspect the approved artifacts",
+                        "user_feedback": ["Inspect the approved artifacts"],
                         "work_dir": "docs/plans/document_path_handoff",
                         "plan_doc": "docs/plans/document_path_handoff/plan.md",
                         "rca_doc": "docs/plans/document_path_handoff/rca.md",
@@ -2779,6 +3104,70 @@ mod tests {
         ] {
             assert!(prompt.message.contains(expected), "missing {expected:?}");
         }
+
+        let mut malformed_fields = sample_evidence_fields();
+        let mut duplicate = malformed_fields["reviewer_assessments"][0].clone();
+        duplicate["subject"] = serde_json::json!("Different non-key subject text");
+        malformed_fields["reviewer_assessments"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        malformed_fields["blocker_statement"] =
+            serde_json::json!("Production deployment approval is unavailable");
+        malformed_fields["blocked_from_step"] = serde_json::json!("implement");
+        malformed_fields["blocked_from_status"] = serde_json::json!("blocked");
+        let malformed_review = run_step(
+            &compiled.source_bundle,
+            "review_blocker",
+            serde_json::json!({
+                "prev": {
+                    "step": "capture_blocker",
+                    "action": "status",
+                    "status": "captured",
+                    "fields": malformed_fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(malformed) = malformed_review.action else {
+            panic!("malformed blocker context must prevent agent dispatch")
+        };
+        assert_eq!(malformed.status, "user_required");
+        assert_eq!(
+            malformed.fields["blocker_statement"],
+            "Production deployment approval is unavailable"
+        );
+        assert_eq!(malformed.fields["blocked_from_step"], "implement");
+        assert_eq!(malformed.fields["blocked_from_status"], "blocked");
+        let expected_reason = "Agent dispatch was skipped because required workflow context was invalid: reviewer_assessments[5]: expected unique (source, subject_kind, subject_id), got duplicate of reviewer_assessments[1]";
+        let expected_resolution = "Correct the malformed workflow context and retry the blocked step. Required corrections: reviewer_assessments[5]: expected unique (source, subject_kind, subject_id), got duplicate of reviewer_assessments[1]";
+        assert_eq!(malformed.fields["blocker_reason"], expected_reason);
+        assert_eq!(malformed.fields["blocker_resolution"], expected_resolution);
+
+        let malformed_blocked = run_step(
+            &compiled.source_bundle,
+            "blocked",
+            serde_json::json!({
+                "steps_executed": 9,
+                "prev": {
+                    "step": "review_blocker",
+                    "action": "status",
+                    "status": "user_required",
+                    "fields": malformed.fields
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::AskUser(malformed_prompt) = malformed_blocked.action else {
+            panic!("malformed blocker context should produce an actionable user prompt")
+        };
+        assert!(
+            malformed_prompt
+                .message
+                .contains("Production deployment approval is unavailable")
+        );
+        assert!(malformed_prompt.message.contains(expected_reason));
+        assert!(malformed_prompt.message.contains(expected_resolution));
 
         let mut answered_fields = prompt.fields;
         answered_fields["answer"] = serde_json::json!("Access granted; retry the original step");
@@ -3137,6 +3526,13 @@ mod tests {
             assert!(review.prompt.contains(expected), "missing {expected:?}");
         }
 
+        let mut validation_fields = sample_evidence_fields();
+        let object = validation_fields.as_object_mut().unwrap();
+        object.insert("goal".into(), serde_json::json!(goal));
+        object.insert("validation".into(), serde_json::json!(validation));
+        object.insert("work_dir".into(), serde_json::json!(work_dir));
+        object.insert("plan_doc".into(), serde_json::json!(plan_doc));
+        object.insert("validation_doc".into(), serde_json::json!(validation_doc));
         let validate_result = run_step(
             &compiled.source_bundle,
             "validate",
@@ -3146,13 +3542,7 @@ mod tests {
                     "step": "test",
                     "action": "agent",
                     "status": "passed",
-                    "fields": {
-                        "goal": goal,
-                        "validation": validation,
-                        "work_dir": work_dir,
-                        "plan_doc": plan_doc,
-                        "validation_doc": validation_doc
-                    }
+                    "fields": validation_fields
                 }
             }),
         )
@@ -3503,6 +3893,23 @@ mod tests {
         assert!(plan_action.prompt.contains(validation));
         assert!(plan_action.prompt.contains("do not replace it"));
 
+        let mut validation_fields = sample_evidence_fields();
+        let object = validation_fields.as_object_mut().unwrap();
+        object.insert("summary".into(), serde_json::json!("focused tests passed"));
+        object.insert("goal".into(), serde_json::json!(goal));
+        object.insert("validation".into(), serde_json::json!(validation));
+        object.insert(
+            "work_dir".into(),
+            serde_json::json!("docs/plans/deterministic_cache_invalidation"),
+        );
+        object.insert(
+            "plan_doc".into(),
+            serde_json::json!("docs/plans/deterministic_cache_invalidation/plan.md"),
+        );
+        object.insert(
+            "validation_doc".into(),
+            serde_json::json!("docs/plans/deterministic_cache_invalidation/validation.md"),
+        );
         let validate_result = run_step(
             &compiled.source_bundle,
             "validate",
@@ -3512,14 +3919,7 @@ mod tests {
                     "step": "test",
                     "action": "agent",
                     "status": "passed",
-                    "fields": {
-                        "summary": "focused tests passed",
-                        "goal": goal,
-                        "validation": validation,
-                        "work_dir": "docs/plans/deterministic_cache_invalidation",
-                        "plan_doc": "docs/plans/deterministic_cache_invalidation/plan.md",
-                        "validation_doc": "docs/plans/deterministic_cache_invalidation/validation.md"
-                    }
+                    "fields": validation_fields
                 }
             }),
         )
@@ -3877,9 +4277,8 @@ mod tests {
         // Investigator role: ordered RCA section list plus the evidence wording.
         let instructions = &compiled.definition.roles["investigator"].instructions;
         assert!(
-            instructions.contains(
-                "Bug behavior, Root cause, Root cause evidence, Reproduction steps"
-            ),
+            instructions
+                .contains("Bug behavior, Root cause, Root cause evidence, Reproduction steps"),
             "investigator role should list Root cause evidence in order\n{instructions}"
         );
         assert!(
@@ -3930,8 +4329,9 @@ mod tests {
             prompt.contains("Do not assert the root cause without this traceable evidence"),
             "investigate prompt should forbid unsupported root causes\n{prompt}"
         );
-        let investigate_output =
-            investigate.output.expect("investigate should declare output");
+        let investigate_output = investigate
+            .output
+            .expect("investigate should declare output");
         assert_eq!(
             investigate_output.statuses,
             ["documented", "unclear", "blocked"]
@@ -3962,7 +4362,19 @@ mod tests {
         let review = run_step(
             &compiled.source_bundle,
             "review_rca",
-            serde_json::json!({ "request": "review the RCA" }),
+            serde_json::json!({
+                "request": "review the RCA",
+                "prev": {
+                    "step": "investigate",
+                    "action": "agent",
+                    "status": "documented",
+                    "fields": {
+                        "work_dir": "docs/plans/example",
+                        "rca_doc": "docs/plans/example/rca.md",
+                        "repro_test": "src/lib.rs::repro"
+                    }
+                }
+            }),
         )
         .unwrap();
         let StepAction::Agent(review) = review.action else {

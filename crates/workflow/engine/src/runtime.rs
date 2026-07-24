@@ -6069,6 +6069,8 @@ exit 0
                         "summary": "Changed code",
                         "plan_doc": plan_doc,
                         "files": ["src/main.rs"],
+                        "implementation_commands": [],
+                        "implementation_evidence": [],
                     },
                 },
             }),
@@ -6098,6 +6100,10 @@ exit 0
                         "plan_doc": plan_doc,
                         "commands": ["cargo test"],
                         "failures": [],
+                        "implementation_commands": [],
+                        "implementation_evidence": [],
+                        "tester_commands": [],
+                        "tester_evidence": [],
                     },
                 },
             }),
@@ -6132,7 +6138,12 @@ exit 0
                 "prev": {
                     "step": "review",
                     "status": "changes_requested",
-                    "fields": { "feedback": "Fix one TODO", "plan_doc": plan_doc },
+                    "fields": {
+                        "feedback": "Fix one TODO",
+                        "plan_doc": plan_doc,
+                        "implementation_commands": [],
+                        "implementation_evidence": [],
+                    },
                 },
             }),
         )
@@ -6294,6 +6305,8 @@ goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
 files: [src/main.rs]
+implementation_commands: []
+implementation_evidence: []
 ---
 Initial implementation body"#
                 .to_string(),
@@ -6319,6 +6332,10 @@ user_feedback: []
 goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 ---
 Initial implementation review"#
                 .to_string(),
@@ -6330,6 +6347,10 @@ user_feedback:
 goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 ---
 Result feedback review"#
                 .to_string(),
@@ -6342,6 +6363,8 @@ goal: Preserve reviewer feedback context
 validation: cargo test -p cowboy-workflow-engine
 plan_doc: docs/plans/example.md
 files: [src/main.rs]
+implementation_commands: []
+implementation_evidence: []
 ---
 Revised implementation"#
                 .to_string(),
@@ -6372,6 +6395,10 @@ plan_doc: docs/plans/example.md
 work_dir: docs/plans/example
 rca_doc: docs/plans/example/rca.md
 repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 ---
 Revised implementation review"#
                 .to_string(),
@@ -6419,6 +6446,8 @@ work_dir: docs/plans/example
 rca_doc: docs/plans/example/rca.md
 repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
 files: [src/main.rs]
+implementation_commands: []
+implementation_evidence: []
 ---
 Recovered implementation"#
                 .to_string(),
@@ -6452,6 +6481,10 @@ plan_doc: docs/plans/example.md
 work_dir: docs/plans/example
 rca_doc: docs/plans/example/rca.md
 repro_test: crates/workflow/engine/src/runtime.rs::workflow_runtime_preserves_result_feedback_through_commit_recovery
+implementation_commands: []
+implementation_evidence: []
+tester_commands: []
+tester_evidence: []
 ---
 Recovery implementation review"#
                 .to_string(),
@@ -6574,7 +6607,7 @@ Recovery implementation review"#
         assert!(
             result_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
         );
-        assert!(result_review_prompt.contains("Commands:\n- cargo test -p cowboy"));
+        assert!(result_review_prompt.contains("Tester command records: array(empty)"));
         assert!(result_review_prompt.contains("Plan doc: docs/plans/example.md"));
         assert!(result_review_prompt.contains("Goal: Preserve reviewer feedback context"));
         assert!(result_review_prompt.contains("Validation: cargo test -p cowboy-workflow-engine"));
@@ -6583,7 +6616,7 @@ Recovery implementation review"#
         assert!(
             recovery_review_prompt.contains(&format!("- Result confirmation: {result_feedback}"))
         );
-        assert!(recovery_review_prompt.contains("Commands:\n- cargo test -p cowboy"));
+        assert!(recovery_review_prompt.contains("Tester command records: array(empty)"));
         assert!(recovery_review_prompt.contains("Goal: Preserve reviewer feedback context"));
         assert!(
             recovery_review_prompt.contains("Validation: cargo test -p cowboy-workflow-engine")
