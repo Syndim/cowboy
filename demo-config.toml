@@ -41,6 +41,11 @@ command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 
 [[agents]]
+name = "investigator"
+command = "omp"
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
+
+[[agents]]
 name = "reviewer"
 command = "omp"
 args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]

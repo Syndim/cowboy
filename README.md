@@ -207,6 +207,11 @@ command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 
 [[agents]]
+name = "investigator"
+command = "omp"
+args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
+
+[[agents]]
 name = "reviewer"
 command = "omp"
 args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
@@ -232,9 +237,9 @@ change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
 
-The workflow roles select dedicated `planner`, `reviewer`, `implementer`,
-`tester`, and `committer` agents. Their backend launch arguments set thinking
-to `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;
+The workflow roles select dedicated `planner`, `investigator`, `reviewer`,
+`implementer`, `tester`, and `committer` agents. Their backend launch arguments
+set thinking to `xhigh`, `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;
 `[agents.model]` does not control it.
 
 <!-- cowboy-agent-watchdog-contract:start -->
