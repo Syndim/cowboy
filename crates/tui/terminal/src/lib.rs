@@ -197,7 +197,7 @@ impl Drop for TerminalModeGuard {
 }
 
 pub fn tui_input_cursor_style() -> SetCursorStyle {
-    SetCursorStyle::BlinkingBlock
+    SetCursorStyle::SteadyBlock
 }
 
 fn enter_terminal_screen(stdout: &mut impl io::Write) -> io::Result<()> {
@@ -261,8 +261,8 @@ mod tests {
     }
 
     #[test]
-    fn tui_input_cursor_style_uses_unix_block_cursor() {
-        assert_eq!(tui_input_cursor_style(), SetCursorStyle::BlinkingBlock);
+    fn tui_input_cursor_style_uses_steady_block_cursor() {
+        assert_eq!(tui_input_cursor_style(), SetCursorStyle::SteadyBlock);
     }
 
     #[test]
@@ -277,6 +277,8 @@ mod tests {
         assert!(commands.contains("?1000l"), "{commands:?}");
         assert!(commands.contains("?2004h"), "{commands:?}");
         assert!(commands.contains("?2004l"), "{commands:?}");
+        assert!(commands.contains("\u{1b}[0 q"), "{commands:?}");
+        assert!(commands.contains("\u{1b}[?25h"), "{commands:?}");
     }
 
     #[test]

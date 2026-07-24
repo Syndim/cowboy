@@ -91,6 +91,7 @@ fn composer_border_fg_for_title(
 struct CursorVisibilityProbeBackend {
     size: Size,
     cursor_visible: bool,
+    cursor_position: Position,
     draw_calls: usize,
     visible_redraw_painted_cells: usize,
     cursor_show_calls: usize,
@@ -109,6 +110,7 @@ impl CursorVisibilityProbeBackend {
         Self {
             size: Size::new(width, height),
             cursor_visible: false,
+            cursor_position: Position::ORIGIN,
             draw_calls: 0,
             visible_redraw_painted_cells: 0,
             cursor_show_calls: 0,
@@ -149,10 +151,11 @@ impl Backend for CursorVisibilityProbeBackend {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        Ok(Position::ORIGIN)
+        Ok(self.cursor_position)
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        self.cursor_position = position.into();
         Ok(())
     }
 
@@ -392,6 +395,33 @@ fn draw_places_cursor_at_input_end() {
 }
 
 #[test]
+fn running_animation_keeps_composer_cursor_visible() {
+    let mut state = test_state();
+    state.push_input("abc");
+    state.apply_workflow_event(WorkflowEvent::new(
+        "run-1",
+        WorkflowEventKind::RunStarted {
+            workflow_name: "default".to_string(),
+            current_step: "implement".to_string(),
+            request_topic: None,
+        },
+    ));
+    assert!(
+        state.status_animation_active(),
+        "precondition: the running status animation must be active"
+    );
+    let backend = ratatui::backend::TestBackend::new(40, 10);
+    let mut terminal = Terminal::new(backend).unwrap();
+
+    terminal.draw(|frame| draw(frame, &state)).unwrap();
+
+    assert!(
+        terminal.backend().cursor_visible(),
+        "the composer cursor must remain visible while the running status animation is active"
+    );
+}
+
+#[test]
 fn status_animation_redraw_hides_cursor_before_painting_changed_cell() {
     let mut state = test_state();
     state.push_input("abc");
@@ -420,7 +450,7 @@ fn status_animation_redraw_hides_cursor_before_painting_changed_cell() {
 }
 
 #[test]
-fn running_state_does_not_toggle_cursor_visibility_across_animation_frames() {
+fn running_animation_redraws_restore_visible_cursor_after_safe_paint() {
     let mut state = test_state();
     state.push_input("abc");
     state.apply_workflow_event(WorkflowEvent::new(
@@ -440,11 +470,13 @@ fn running_state_does_not_toggle_cursor_visibility_across_animation_frames() {
     let mut terminal = Terminal::new(backend).unwrap();
     let mut scheduler = DrawScheduler::new();
     let mut layout = AppLayout::new(Rect::default(), &state);
+    let mut completed_frame_cursor_positions = Vec::new();
 
     // Mirror the production run_loop: render an initial frame, then repeatedly
     // advance the running status animation and redraw exactly as the 100 ms idle
     // poll path does. Each pass is one animation-driven production frame.
     layout = draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+    completed_frame_cursor_positions.push(terminal.backend().cursor_position);
     scheduler.mark_clean();
     for _ in 0..3 {
         tick_status_animation(&mut state, &mut scheduler);
@@ -453,15 +485,10 @@ fn running_state_does_not_toggle_cursor_visibility_across_animation_frames() {
             "the running status animation must dirty every tick so the frame is redrawn"
         );
         layout = draw_cursor_safe_production_frame(&mut terminal, &mut state, layout).unwrap();
+        completed_frame_cursor_positions.push(terminal.backend().cursor_position);
         scheduler.mark_clean();
     }
 
-    // The reported blink is the application repeatedly hiding then re-showing the
-    // blinking-block cursor on every animation redraw. Detect that toggle
-    // directly: while running, no production frame may re-show the cursor, so
-    // there must be zero Hidden->Shown transitions and zero show calls across
-    // all four frames. A final-state-only check would be satisfied by a sham
-    // `hide -> paint -> show -> position -> hide` sequence that still blinks.
     let backend = terminal.backend();
     let shown_after_hidden = backend
         .visibility_transitions
@@ -469,22 +496,35 @@ fn running_state_does_not_toggle_cursor_visibility_across_animation_frames() {
         .filter(|pair| pair == &[CursorVisibility::Hidden, CursorVisibility::Shown])
         .count();
     assert_eq!(
-        backend.cursor_show_calls, 0,
-        "running-state frames re-showed the cursor {} time(s) across 4 animation-driven redraws (transitions: {:?}); each show after the pre-draw hide is one blink cycle, so the blinking-block cursor blinks rapidly. Running-state frames must keep the composer cursor hidden throughout the animation.",
-        backend.cursor_show_calls, backend.visibility_transitions
+        backend.visible_redraw_painted_cells, 0,
+        "animation redraws painted {} changed cells while the cursor was visible",
+        backend.visible_redraw_painted_cells
     );
     assert_eq!(
-        shown_after_hidden, 0,
-        "running-state frames toggled the cursor Hidden->Shown {} time(s) (transitions: {:?}); that repeated visibility toggle IS the reported rapid blink. The cursor must stay hidden across running animation frames.",
-        shown_after_hidden, backend.visibility_transitions
+        backend.cursor_show_calls, 4,
+        "each running-animation frame must restore the cursor after safe painting (transitions: {:?})",
+        backend.visibility_transitions
+    );
+    assert_eq!(
+        shown_after_hidden, 4,
+        "each running-animation frame must transition Hidden->Shown after painting (transitions: {:?})",
+        backend.visibility_transitions
+    );
+    assert_eq!(
+        completed_frame_cursor_positions,
+        vec![Position::new(6, 10); 4],
+        "each running-animation frame must restore the cursor at the composer input",
+    );
+    assert!(
+        backend.cursor_visible,
+        "the completed running-animation frame must leave the cursor visible"
     );
 }
 
 #[tokio::test]
-async fn draw_hides_composer_cursor_during_active_run_animation() {
-    // Draft typing stays enabled while a run is active, but the visible cursor
-    // is suppressed during the running status animation so the blinking-block
-    // cursor does not blink rapidly.
+async fn draw_shows_composer_cursor_during_active_run_animation() {
+    // Draft typing and its visible cursor remain available while a run is active.
+    // The terminal uses a steady block so animation redraws do not restart a blink.
     let mut state = test_state();
     state.push_input("abc");
     state.spawn_test_card_report_task("pending".to_string(), async {
@@ -497,9 +537,12 @@ async fn draw_hides_composer_cursor_during_active_run_animation() {
     terminal.draw(|frame| draw(frame, &state)).unwrap();
 
     assert!(
-        !terminal.backend().cursor_visible(),
-        "running-animation frames must hide the composer cursor"
+        terminal.backend().cursor_visible(),
+        "running-animation frames must show the composer cursor"
     );
+    terminal
+        .backend_mut()
+        .assert_cursor_position(Position::new(6, 8));
     state.cancel_background_tasks();
 }
 
@@ -1255,7 +1298,10 @@ fn finish_tui_restores_before_writing_hint() {
     let line = "Run r1 is not complete. Resume with: cowboy resume r1";
     finish_tui(Ok(Some(line.to_string())), &mut guard, &mut writer).unwrap();
 
-    assert_eq!(*log.borrow(), vec!["restore".to_string(), "write".to_string()]);
+    assert_eq!(
+        *log.borrow(),
+        vec!["restore".to_string(), "write".to_string()]
+    );
     assert_eq!(writer.bytes, format!("{line}\n").into_bytes());
 }
 
@@ -1289,12 +1335,7 @@ fn finish_tui_returns_loop_error_and_suppresses_hint() {
         bytes: Vec::new(),
     };
 
-    let err = finish_tui(
-        Err(anyhow::anyhow!("loop boom")),
-        &mut guard,
-        &mut writer,
-    )
-    .unwrap_err();
+    let err = finish_tui(Err(anyhow::anyhow!("loop boom")), &mut guard, &mut writer).unwrap_err();
 
     assert_eq!(err.to_string(), "loop boom");
     assert_eq!(*log.borrow(), vec!["restore".to_string()]);

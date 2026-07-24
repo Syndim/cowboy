@@ -579,7 +579,7 @@ impl AppState {
     }
 
     pub(in crate::app) fn composer_shows_cursor(&self) -> bool {
-        self.composer_accepts_edits() && !self.status_animation_active()
+        self.composer_accepts_edits()
     }
 
     pub(in crate::app) fn display_state(&self) -> String {
@@ -1618,7 +1618,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_hides_cursor_only_during_running_animation() {
+    fn composer_shows_cursor_while_editable_during_running_animation() {
         let mut state = test_state();
         assert!(state.composer_shows_cursor());
 
@@ -1631,7 +1631,7 @@ mod tests {
             },
         ));
         assert!(state.status_animation_active());
-        assert!(!state.composer_shows_cursor());
+        assert!(state.composer_shows_cursor());
 
         state.apply_workflow_event(WorkflowEvent::new(
             "run-1",
