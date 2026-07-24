@@ -7526,7 +7526,33 @@ Recovery implementation review"#
                     "status": "answered",
                     "fields": {
                         "blocked_response": "The dependency is fixed; continue.",
-                        "blocked_from_step": "revise"
+                        "blocked_from_step": "revise",
+                        "implementation_commands": [
+                            {
+                                "subject_kind": "todo",
+                                "subject_id": "TODO-01",
+                                "procedure_index": 1,
+                                "command": "cargo test -p sample focused_contract",
+                                "exit_status": 0
+                            }
+                        ],
+                        "implementation_evidence": [
+                            {
+                                "subject_kind": "todo",
+                                "subject_id": "TODO-01",
+                                "subject": "Implement the focused contract",
+                                "source": "implementer",
+                                "procedure": {
+                                    "kind": "command",
+                                    "steps": ["cargo test -p sample focused_contract"]
+                                },
+                                "expected_result": "The focused contract passes",
+                                "observed_result": "The focused contract passed",
+                                "applicability": "applicable",
+                                "match": "matched",
+                                "comparisons": []
+                            }
+                        ]
                     },
                 },
             }),
@@ -7536,6 +7562,51 @@ Recovery implementation review"#
             panic!("expected triage to route back to revision")
         };
         assert_eq!(action.status, "revise");
+    }
+
+    #[tokio::test]
+    async fn example_triage_blocked_reconstructs_implementation_when_revise_evidence_is_missing() {
+        let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows")
+            .canonicalize()
+            .unwrap();
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(&examples_root)
+            .load_catalog()
+            .unwrap();
+        let source_ref = catalog.workflows.get("workflows/feature").unwrap();
+        let compiled = cowboy_workflow_lua::load(source_ref).unwrap();
+
+        // A route request to "revise" without reconstructed implementation
+        // evidence must be rejected and sent back to "implement" instead,
+        // preventing a blocker recovery loop that skips re-validation.
+        let result = cowboy_workflow_lua::run_step(
+            &compiled.source_bundle,
+            "triage_blocked",
+            serde_json::json!({
+                "prev": {
+                    "step": "blocked",
+                    "status": "answered",
+                    "fields": {
+                        "blocked_response": "The dependency is fixed; continue.",
+                        "blocked_from_step": "revise"
+                    },
+                },
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(action) = result.action else {
+            panic!("expected triage to route to implementation reconstruction")
+        };
+        assert_eq!(action.status, "implement");
+        assert!(
+            action.fields["feedback"]
+                .as_str()
+                .unwrap()
+                .contains("Implementation context must be reconstructed before revision")
+        );
     }
 
     #[tokio::test]
