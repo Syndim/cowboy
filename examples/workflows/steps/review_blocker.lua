@@ -26,7 +26,7 @@ return function(roles, opts)
 
 For both statuses, set `blocker_reason` to the evidence-based recoverability analysis. Do not infer facts from generic feedback or body prose beyond the named `blocker_statement`. Preserve every source-specific command and evidence array with semantic deep equality and unchanged array order. Preserve `blocker_statement`, `blocked_from_step`, `blocked_from_status`, `goal`, `validation`, `work_dir`, `plan_doc`, `validation_doc`, `rca_doc`, `repro_test`, and `files` exactly in output fields when present.]],
     })
-    if not prompt then return context.invalid_context_action(ctx, "user_required", errors) end
+    if not prompt then return context.invalid_context_action(ctx, "recoverable", errors) end
     return action.agent {
       role = roles.blocker_reviewer,
       prompt = prompt,

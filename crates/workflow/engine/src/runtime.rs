@@ -7601,12 +7601,9 @@ Recovery implementation review"#
             panic!("expected triage to route to implementation reconstruction")
         };
         assert_eq!(action.status, "implement");
-        assert!(
-            action.fields["feedback"]
-                .as_str()
-                .unwrap()
-                .contains("Implementation context must be reconstructed before revision")
-        );
+        assert!(action.fields["feedback"].as_str().unwrap().contains(
+            "Implementation context must be reconstructed before evidence-dependent recovery",
+        ));
     }
 
     #[tokio::test]

@@ -37,12 +37,12 @@ return function(id)
       next_step = user_requested_step(user_response) or next_step
     end
 
-    if next_step == "revise" then
+    if next_step == "test" or next_step == "validate" or next_step == "revise" then
       local valid, errors = context.validate_evidence_source(fields, "implementation", true)
       if not valid then
         local diagnostics = table.concat(context.format_validation_errors(errors), "; ")
         next_step = "implement"
-        local reconstruction = "Implementation context must be reconstructed before revision: "
+        local reconstruction = "Implementation context must be reconstructed before evidence-dependent recovery: "
           .. diagnostics
         recovery = recovery ~= "" and (recovery .. "\n\n" .. reconstruction) or reconstruction
       end

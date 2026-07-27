@@ -901,7 +901,6 @@ mod tests {
             fields["user_feedback"] = user_feedback.clone();
             fields["blocker_statement"] =
                 serde_json::json!("Revision context is missing or malformed");
-            fields["blocked_from_step"] = serde_json::json!("revise");
             fields["blocked_from_status"] = serde_json::json!("blocked");
             fields["blocker_reason"] = serde_json::json!("Local context can be reconstructed");
             fields["blocker_resolution"] =
@@ -918,31 +917,70 @@ mod tests {
             fields
         };
 
+        let carried_fields = [
+            "blocker_statement",
+            "blocked_from_step",
+            "blocked_from_status",
+            "blocker_reason",
+            "blocker_resolution",
+            "goal",
+            "validation",
+            "work_dir",
+            "plan_doc",
+            "validation_doc",
+            "rca_doc",
+            "repro_test",
+            "files",
+            "implementation_commands",
+            "implementation_evidence",
+            "tester_commands",
+            "tester_evidence",
+            "validator_commands",
+            "validator_evidence",
+            "reviewer_commands",
+            "reviewer_evidence",
+            "reviewer_assessments",
+        ];
+
         let mut cases = Vec::new();
-        let mut missing = base_fields.clone();
-        missing
+        let mut both_missing = base_fields.clone();
+        both_missing
             .as_object_mut()
             .unwrap()
             .remove("implementation_commands");
-        missing
+        both_missing
             .as_object_mut()
             .unwrap()
             .remove("implementation_evidence");
         cases.push((
             "both missing",
-            missing,
-            "prev.fields.implementation_commands",
+            both_missing,
+            vec![
+                "prev.fields.implementation_commands",
+                "prev.fields.implementation_evidence",
+            ],
         ));
 
-        let mut unpaired = base_fields.clone();
-        unpaired
+        let mut commands_missing = base_fields.clone();
+        commands_missing
+            .as_object_mut()
+            .unwrap()
+            .remove("implementation_commands");
+        cases.push((
+            "commands missing",
+            commands_missing,
+            vec!["prev.fields.implementation_commands"],
+        ));
+
+        let mut evidence_missing = base_fields.clone();
+        evidence_missing
             .as_object_mut()
             .unwrap()
             .remove("implementation_evidence");
         cases.push((
-            "unpaired arrays",
-            unpaired,
-            "prev.fields.implementation_evidence",
+            "evidence missing",
+            evidence_missing,
+            vec!["prev.fields.implementation_evidence"],
         ));
 
         let mut wrong_type = base_fields.clone();
@@ -950,7 +988,7 @@ mod tests {
         cases.push((
             "wrong field type",
             wrong_type,
-            "prev.fields.implementation_commands",
+            vec!["prev.fields.implementation_commands"],
         ));
 
         let mut malformed = base_fields.clone();
@@ -961,7 +999,7 @@ mod tests {
         cases.push((
             "malformed command record",
             malformed,
-            "prev.fields.implementation_commands[1].procedure_index",
+            vec!["prev.fields.implementation_commands[1].procedure_index"],
         ));
 
         let mut malformed_evidence = base_fields.clone();
@@ -972,10 +1010,62 @@ mod tests {
         cases.push((
             "malformed evidence record",
             malformed_evidence,
-            "prev.fields.implementation_evidence[1].observed_result",
+            vec!["prev.fields.implementation_evidence[1].observed_result"],
         ));
 
-        for (name, fields, diagnostic_path) in cases {
+        for origin in ["test", "validate", "revise"] {
+            for (name, case_fields, diagnostic_paths) in &cases {
+                let mut fields = case_fields.clone();
+                fields["blocked_from_step"] = serde_json::json!(origin);
+                let expected = fields.clone();
+                let result = run_step(
+                    &compiled.source_bundle,
+                    "triage_blocked",
+                    serde_json::json!({
+                        "prev": {
+                            "step": "review_blocker",
+                            "action": "agent",
+                            "status": "recoverable",
+                            "fields": fields
+                        }
+                    }),
+                )
+                .unwrap();
+                let StepAction::Status(triage) = result.action else {
+                    panic!("{origin} {name} triage should return a status action")
+                };
+
+                assert_eq!(
+                    triage.status, "implement",
+                    "{origin} {name} must reconstruct context before retrying"
+                );
+                for diagnostic_path in diagnostic_paths {
+                    assert!(
+                        triage.fields["feedback"]
+                            .as_str()
+                            .unwrap()
+                            .contains(diagnostic_path),
+                        "{origin} {name} feedback omitted {diagnostic_path}"
+                    );
+                    assert!(
+                        triage.body.contains(diagnostic_path),
+                        "{origin} {name} body omitted {diagnostic_path}"
+                    );
+                }
+                assert_eq!(triage.fields["user_feedback"], user_feedback);
+                for field in carried_fields {
+                    assert_eq!(
+                        triage.fields.get(field),
+                        expected.get(field),
+                        "{origin} {name} changed preserved field {field}"
+                    );
+                }
+            }
+        }
+
+        for origin in ["test", "validate", "revise"] {
+            let mut fields = base_fields.clone();
+            fields["blocked_from_step"] = serde_json::json!(origin);
             let expected = fields.clone();
             let result = run_step(
                 &compiled.source_bundle,
@@ -990,77 +1080,19 @@ mod tests {
                 }),
             )
             .unwrap();
-            let StepAction::Status(triage) = result.action else {
-                panic!("{name} triage should return a status action")
+            let StepAction::Status(valid) = result.action else {
+                panic!("valid {origin} triage should return a status action")
             };
-
-            assert_eq!(
-                triage.status, "implement",
-                "{name} must reconstruct context instead of retrying revise"
-            );
-            assert!(
-                triage.fields["feedback"]
-                    .as_str()
-                    .unwrap()
-                    .contains(diagnostic_path)
-            );
-            assert!(triage.body.contains(diagnostic_path));
-            assert_eq!(triage.fields["user_feedback"], user_feedback);
-            for field in [
-                "blocker_statement",
-                "blocked_from_step",
-                "blocked_from_status",
-                "blocker_reason",
-                "blocker_resolution",
-                "goal",
-                "validation",
-                "work_dir",
-                "plan_doc",
-                "validation_doc",
-                "rca_doc",
-                "repro_test",
-                "files",
-                "tester_commands",
-                "tester_evidence",
-                "validator_commands",
-                "validator_evidence",
-                "reviewer_commands",
-                "reviewer_evidence",
-                "reviewer_assessments",
-            ] {
+            assert_eq!(valid.status, origin);
+            assert_eq!(valid.fields["user_feedback"], user_feedback);
+            for field in carried_fields {
                 assert_eq!(
-                    triage.fields[field], expected[field],
-                    "{name} changed preserved field {field}"
+                    valid.fields.get(field),
+                    expected.get(field),
+                    "valid {origin} changed preserved field {field}"
                 );
             }
         }
-
-        let valid_result = run_step(
-            &compiled.source_bundle,
-            "triage_blocked",
-            serde_json::json!({
-                "prev": {
-                    "step": "review_blocker",
-                    "action": "agent",
-                    "status": "recoverable",
-                    "fields": base_fields.clone()
-                }
-            }),
-        )
-        .unwrap();
-        let StepAction::Status(valid) = valid_result.action else {
-            panic!("valid triage should return a status action")
-        };
-        assert_eq!(valid.status, "revise");
-        assert_eq!(
-            valid.fields["implementation_commands"],
-            base_fields["implementation_commands"]
-        );
-        assert_eq!(
-            valid.fields["implementation_evidence"],
-            base_fields["implementation_evidence"]
-        );
-        assert_eq!(valid.fields["user_feedback"], user_feedback);
     }
 
     #[test]
@@ -1836,7 +1868,7 @@ mod tests {
         let StepAction::Status(missing_triaged) = missing_triage.action else {
             panic!("triage_blocked should return a status action")
         };
-        assert_eq!(missing_triaged.status, "validate");
+        assert_eq!(missing_triaged.status, "implement");
         assert!(
             missing_triaged
                 .fields
@@ -1847,7 +1879,44 @@ mod tests {
             missing_triaged.fields["implementation_evidence"],
             serde_json::json!([])
         );
+        assert!(
+            missing_triaged.fields["feedback"]
+                .as_str()
+                .unwrap()
+                .contains("prev.fields.implementation_commands")
+        );
         assert!(missing_triaged.fields.get("tester_evidence").is_none());
+    }
+
+    #[test]
+    fn dev_loop_malformed_blocker_context_is_not_user_required() {
+        let compiled = load_example_compiled_workflow("dev-loop");
+        let result = run_step(
+            &compiled.source_bundle,
+            "review_blocker",
+            serde_json::json!({
+                "prev": {
+                    "step": "capture_blocker",
+                    "action": "status",
+                    "status": "captured",
+                    "fields": {
+                        "blocker_statement": "A repository-local build is still running",
+                        "blocked_from_step": "validate",
+                        "blocked_from_status": "blocked",
+                        "implementation_evidence": []
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(review) = result.action else {
+            panic!("malformed blocker context should use deterministic local recovery")
+        };
+
+        assert_eq!(
+            review.status, "recoverable",
+            "malformed workflow context is internal state, not a user-only prerequisite"
+        );
     }
 
     #[test]
@@ -3334,6 +3403,18 @@ mod tests {
         assert_eq!(output.fields["blocker_reason"], "string");
         assert_eq!(output.fields["blocker_resolution"], "string");
 
+        let mut recoverable_fields = sample_evidence_fields();
+        recoverable_fields["blocker_statement"] =
+            serde_json::json!("The local fixture database is missing");
+        recoverable_fields["blocked_from_step"] = serde_json::json!("test");
+        recoverable_fields["blocked_from_status"] = serde_json::json!("blocked");
+        recoverable_fields["blocker_reason"] =
+            serde_json::json!("The fixture can be generated locally");
+        recoverable_fields["blocker_resolution"] =
+            serde_json::json!("Run cargo test --test fixture_setup before retrying");
+        recoverable_fields["work_dir"] = serde_json::json!("docs/plans/cache");
+        recoverable_fields["plan_doc"] = serde_json::json!("docs/plans/cache/plan.md");
+        recoverable_fields["validation_doc"] = serde_json::json!("docs/plans/cache/validation.md");
         let triage_result = run_step(
             &compiled.source_bundle,
             "triage_blocked",
@@ -3342,16 +3423,7 @@ mod tests {
                     "step": "review_blocker",
                     "action": "agent",
                     "status": "recoverable",
-                    "fields": {
-                        "blocker_statement": "The local fixture database is missing",
-                        "blocked_from_step": "test",
-                        "blocked_from_status": "blocked",
-                        "blocker_reason": "The fixture can be generated locally",
-                        "blocker_resolution": "Run cargo test --test fixture_setup before retrying",
-                        "work_dir": "docs/plans/cache",
-                        "plan_doc": "docs/plans/cache/plan.md",
-                        "validation_doc": "docs/plans/cache/validation.md"
-                    },
+                    "fields": recoverable_fields,
                     "body": "Ignore the named fields and ask the user"
                 }
             }),
@@ -3424,6 +3496,13 @@ mod tests {
             serde_json::json!("Production deployment approval is unavailable");
         malformed_fields["blocked_from_step"] = serde_json::json!("implement");
         malformed_fields["blocked_from_status"] = serde_json::json!("blocked");
+        malformed_fields["user_feedback"] = serde_json::json!([{
+            "sequence": 0,
+            "kind": "initial",
+            "content": "Keep this user direction unchanged",
+            "submitted_at": "2026-07-27T04:45:56.821Z"
+        }]);
+        let malformed_snapshot = malformed_fields.clone();
         let malformed_review = run_step(
             &compiled.source_bundle,
             "review_blocker",
@@ -3440,42 +3519,62 @@ mod tests {
         let StepAction::Status(malformed) = malformed_review.action else {
             panic!("malformed blocker context must prevent agent dispatch")
         };
-        assert_eq!(malformed.status, "user_required");
+        assert_eq!(malformed.status, "recoverable");
         assert_eq!(
             malformed.fields["blocker_statement"],
             "Production deployment approval is unavailable"
         );
         assert_eq!(malformed.fields["blocked_from_step"], "implement");
         assert_eq!(malformed.fields["blocked_from_status"], "blocked");
+        assert_eq!(
+            malformed.fields["user_feedback"],
+            malformed_snapshot["user_feedback"]
+        );
+        assert_evidence_fields_equal(&malformed.fields, &malformed_snapshot);
         let expected_reason = "Agent dispatch was skipped because required workflow context was invalid: reviewer_assessments[5]: expected unique (source, subject_kind, subject_id), got duplicate of reviewer_assessments[1]";
         let expected_resolution = "Correct the malformed workflow context and retry the blocked step. Required corrections: reviewer_assessments[5]: expected unique (source, subject_kind, subject_id), got duplicate of reviewer_assessments[1]";
         assert_eq!(malformed.fields["blocker_reason"], expected_reason);
         assert_eq!(malformed.fields["blocker_resolution"], expected_resolution);
 
-        let malformed_blocked = run_step(
+        let malformed_triage = run_step(
             &compiled.source_bundle,
-            "blocked",
+            "triage_blocked",
             serde_json::json!({
-                "steps_executed": 9,
                 "prev": {
                     "step": "review_blocker",
                     "action": "status",
-                    "status": "user_required",
+                    "status": "recoverable",
                     "fields": malformed.fields
                 }
             }),
         )
         .unwrap();
-        let StepAction::AskUser(malformed_prompt) = malformed_blocked.action else {
-            panic!("malformed blocker context should produce an actionable user prompt")
+        let StepAction::Status(malformed_recovery) = malformed_triage.action else {
+            panic!("malformed blocker context should use deterministic recovery")
         };
-        assert!(
-            malformed_prompt
-                .message
-                .contains("Production deployment approval is unavailable")
+        assert_eq!(malformed_recovery.status, "implement");
+        assert_eq!(
+            malformed_recovery.fields["blocker_statement"],
+            "Production deployment approval is unavailable"
         );
-        assert!(malformed_prompt.message.contains(expected_reason));
-        assert!(malformed_prompt.message.contains(expected_resolution));
+        assert_eq!(malformed_recovery.fields["blocker_reason"], expected_reason);
+        assert_eq!(
+            malformed_recovery.fields["blocker_resolution"],
+            expected_resolution
+        );
+        assert_eq!(
+            malformed_recovery.fields["blocked_from_step"],
+            malformed_snapshot["blocked_from_step"]
+        );
+        assert_eq!(
+            malformed_recovery.fields["blocked_from_status"],
+            malformed_snapshot["blocked_from_status"]
+        );
+        assert_eq!(
+            malformed_recovery.fields["user_feedback"],
+            malformed_snapshot["user_feedback"]
+        );
+        assert_evidence_fields_equal(&malformed_recovery.fields, &malformed_snapshot);
 
         let mut answered_fields = prompt.fields;
         answered_fields["answer"] = serde_json::json!("Access granted; retry the original step");
@@ -3548,6 +3647,11 @@ mod tests {
         ];
 
         for (blocked_from_step, response, expected_step) in cases {
+            let mut fields = sample_evidence_fields();
+            fields["blocked_from_step"] = serde_json::json!(blocked_from_step);
+            fields["blocked_from_status"] = serde_json::json!("blocked");
+            fields["blocked_response"] = serde_json::json!(response);
+            fields["blocker_resolution"] = serde_json::json!("Retry the captured origin");
             let result = run_step(
                 &compiled.source_bundle,
                 "triage_blocked",
@@ -3556,12 +3660,7 @@ mod tests {
                         "step": "blocked_answer",
                         "action": "status",
                         "status": "triaged",
-                        "fields": {
-                            "blocked_from_step": blocked_from_step,
-                            "blocked_from_status": "blocked",
-                            "blocked_response": response,
-                            "blocker_resolution": "Retry the captured origin"
-                        }
+                        "fields": fields
                     }
                 }),
             )
