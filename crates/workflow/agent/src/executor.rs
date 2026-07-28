@@ -501,7 +501,11 @@ where
         let prompt = if context.attempt > 1 {
             format!(
                 "{base_prompt}\n\n{}",
-                crate::prompt::build_retry_nudge(&action, context.retry_reason.as_deref())
+                crate::prompt::build_retry_nudge(
+                    &action,
+                    context.attempt,
+                    context.retry_reason.as_deref(),
+                )
             )
         } else {
             base_prompt
@@ -1981,6 +1985,45 @@ mod tests {
         assert!(prompt.contains("without repeating actions or side effects already completed"));
         // Does NOT select the malformed-frontmatter branch.
         assert!(!prompt.contains("Do not redo the work"));
+    }
+
+    #[tokio::test]
+    async fn repeated_no_result_retry_prompt_uses_attempt_to_escalate() {
+        let reason = "recoverable action failure: agent reply did not contain a workflow result";
+        let mut first_retry = context("run", "record");
+        first_retry.attempt = 2;
+        first_retry.retry_reason = Some(reason.to_string());
+        let mut repeated_retry = first_retry.clone();
+        repeated_retry.attempt = 17;
+
+        let first_execution = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(action("developer"), first_retry)
+        .await
+        .unwrap();
+        let repeated_execution = AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(action("developer"), repeated_retry)
+        .await
+        .unwrap();
+
+        let first_prompt = first_execution.record.input.prompt.unwrap();
+        let repeated_prompt = repeated_execution.record.input.prompt.unwrap();
+        assert_ne!(
+            repeated_prompt, first_prompt,
+            "a seventeenth attempt must escalate the no-result recovery prompt instead of \
+resending the same instruction as attempt two"
+        );
+        assert!(
+            repeated_prompt.contains("attempt 17"),
+            "the escalated prompt must tell the agent that this is repeated no-result attempt 17"
+        );
     }
 
     #[tokio::test]

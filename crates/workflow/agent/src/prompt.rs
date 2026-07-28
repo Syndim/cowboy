@@ -81,11 +81,11 @@ fn is_no_result_reason(reason: Option<&str>) -> bool {
 ///
 /// For a no-result reason (`Error::NoWorkflowResult`) the previous reply carried
 /// no parseable workflow result, and Cowboy cannot tell a stalled/interrupted
-/// turn from a completed turn whose final prose omitted frontmatter. The nudge is
-/// therefore best-effort and side-effect-safe: inspect existing work, continue or
-/// complete only what remains without repeating completed side effects, then
-/// return a complete workflow result.
-pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
+/// turn from a completed turn whose final prose omitted frontmatter. The first
+/// retry is therefore best-effort and side-effect-safe, while later retries
+/// identify the current attempt and prioritize immediate result emission without
+/// restarting work or repeating completed side effects.
+pub fn build_retry_nudge(action: &AgentAction, attempt: u64, reason: Option<&str>) -> String {
     let mut nudge = if is_no_result_reason(reason) {
         let mut nudge = String::from(
             "## Retry\n\nYour previous turn did not produce a parseable workflow result",
@@ -93,13 +93,25 @@ pub fn build_retry_nudge(action: &AgentAction, reason: Option<&str>) -> String {
         if let Some(reason) = reason {
             nudge.push_str(&format!(" ({reason})"));
         }
-        nudge.push_str(
-            ".\n\nInspect the existing work and conversation state. Continue or complete any \
+        if attempt == 2 {
+            nudge.push_str(
+                ".\n\nInspect the existing work and conversation state. Continue or complete any \
 unfinished work as needed, without repeating actions or side effects already completed (for \
 example edited files, run commands, or commits). Then return one complete workflow result: \
 begin the response with an opening `---` line, include the frontmatter fields (with a `status` \
 field), and end the frontmatter with a closing `---` line on its own before the Markdown body.",
-        );
+            );
+        } else {
+            nudge.push_str(&format!(
+                ".\n\nThis is repeated no-result attempt {attempt}. Producing a parseable workflow \
+result immediately is now the highest priority. Do not restart the task or repeat completed \
+edits, commands, commits, or other side effects. Avoid broad new investigation or implementation. \
+Inspect the existing work and conversation state, perform only work strictly necessary to finish, \
+and immediately emit the required result: begin the response with an opening `---` line, include \
+the frontmatter fields (with a `status` field), end the frontmatter with a closing `---` line on \
+its own, and then provide the Markdown body."
+            ));
+        }
         nudge
     } else {
         let mut nudge = String::from(
@@ -288,7 +300,7 @@ mod tests {
                 required_fields: vec![],
             }),
         };
-        let nudge = build_retry_nudge(&action, Some("missing YAML frontmatter"));
+        let nudge = build_retry_nudge(&action, 2, Some("missing YAML frontmatter"));
         assert!(nudge.contains("Retry"));
         assert!(nudge.contains("missing YAML frontmatter"));
         assert!(nudge.contains("YAML frontmatter"));
@@ -308,7 +320,7 @@ mod tests {
         };
         let reason =
             "agent response has an opening `---` but is missing the closing `---` delimiter";
-        let nudge = build_retry_nudge(&action, Some(reason));
+        let nudge = build_retry_nudge(&action, 2, Some(reason));
         assert!(nudge.contains(reason));
         assert!(nudge.contains("closing `---`"));
     }
@@ -326,7 +338,7 @@ mod tests {
         };
         // Full wrapped runner-style reason threaded through context.retry_reason.
         let reason = "recoverable action failure: agent reply did not contain a workflow result";
-        let nudge = build_retry_nudge(&action, Some(reason));
+        let nudge = build_retry_nudge(&action, 2, Some(reason));
         // (a) acknowledges no parseable result was received.
         assert!(nudge.contains("did not produce a parseable workflow result"));
         // (b) inspect / continue-or-complete-as-needed guidance.
@@ -344,13 +356,59 @@ mod tests {
     }
 
     #[test]
+    fn repeated_no_result_retry_nudge_escalates_with_attempt_and_contract() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: Some(OutputSpec {
+                statuses: vec!["success".into(), "blocked".into()],
+                fields: serde_json::json!({"summary": "string"}),
+                required_fields: vec![],
+            }),
+        };
+        let reason = "recoverable action failure: agent reply did not contain a workflow result";
+        let nudge = build_retry_nudge(&action, 17, Some(reason));
+
+        assert!(nudge.contains("attempt 17"));
+        assert!(
+            nudge.contains("parseable workflow result immediately is now the highest priority")
+        );
+        assert!(nudge.contains("Do not restart the task"));
+        assert!(nudge.contains("repeat completed edits, commands, commits, or other side effects"));
+        assert!(nudge.contains("Avoid broad new investigation or implementation"));
+        assert!(nudge.contains("perform only work strictly necessary to finish"));
+        assert!(nudge.contains("opening `---`"));
+        assert!(nudge.contains("closing `---`"));
+        assert!(nudge.contains("`status`"));
+        assert!(nudge.contains("Markdown body"));
+        assert!(nudge.contains(BLOCKED_STATUS_POLICY));
+    }
+
+    #[test]
+    fn later_malformed_frontmatter_retry_nudge_does_not_use_no_result_escalation() {
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "Do work".into(),
+            output: None,
+        };
+        let reason = "missing YAML frontmatter";
+        let nudge = build_retry_nudge(&action, 17, Some(reason));
+
+        assert!(nudge.contains("Do not redo the work"));
+        assert!(nudge.contains("Re-emit your result now as a complete replacement"));
+        assert!(!nudge.contains("attempt 17"));
+        assert!(!nudge.contains("highest priority"));
+        assert!(!nudge.contains("Do not restart the task"));
+    }
+
+    #[test]
     fn retry_nudge_none_reason_uses_frontmatter_wording() {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
             output: None,
         };
-        let nudge = build_retry_nudge(&action, None);
+        let nudge = build_retry_nudge(&action, 2, None);
         assert!(nudge.contains("Do not redo the work"));
         assert!(!nudge.contains("did not produce a parseable workflow result"));
     }
