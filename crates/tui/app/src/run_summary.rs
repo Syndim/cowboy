@@ -1,7 +1,17 @@
+use chrono::{DateTime, FixedOffset, Local};
 use cowboy_workflow_engine::{RunStatusDetail, RunSummaryLine};
+
+fn format_started_at(started_at: DateTime<FixedOffset>) -> String {
+    started_at.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+}
 
 pub fn render_run_summary_lines(run: &RunSummaryLine) -> Vec<String> {
     let mut lines = vec![run.run_id.clone()];
+    let started_at = run
+        .started_at
+        .map(|started_at| format_started_at(started_at.with_timezone(&Local).fixed_offset()))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    lines.push(format!("  started_at: {started_at}"));
     if let Some(topic) = &run.topic {
         lines.push(format!("  topic: {topic}"));
     }
@@ -55,6 +65,7 @@ mod tests {
         let status_detail = RunStatusDetail::from_status(&status);
         RunSummaryLine {
             run_id: "run-123".to_string(),
+            started_at: None,
             workflow_name: "deploy".to_string(),
             topic: topic.map(ToString::to_string),
             status,
@@ -83,6 +94,7 @@ mod tests {
             lines,
             vec![
                 "run-123",
+                "  started_at: <unknown>",
                 "  topic: Ship deployment",
                 "  workflow: deploy",
                 "  current_step: ship",
@@ -116,6 +128,7 @@ mod tests {
             lines,
             vec![
                 "run-123",
+                "  started_at: <unknown>",
                 "  topic: Approve release",
                 "  workflow: deploy",
                 "  current_step: ship",
@@ -145,6 +158,7 @@ mod tests {
             lines,
             vec![
                 "run-123",
+                "  started_at: <unknown>",
                 "  topic: Diagnose failure",
                 "  workflow: deploy",
                 "  current_step: ship",
@@ -154,5 +168,38 @@ mod tests {
             ]
         );
         assert_no_debug_status_payload(&lines.join("\n"));
+    }
+
+    #[test]
+    fn format_started_at_preserves_non_utc_wall_clock_and_offset() {
+        let offset = FixedOffset::east_opt(8 * 60 * 60).unwrap();
+        let started_at = DateTime::parse_from_rfc3339("2026-07-28T13:40:44+08:00").unwrap();
+
+        assert_eq!(
+            format_started_at(started_at.with_timezone(&offset)),
+            "2026-07-28 13:40:44 +08:00"
+        );
+        assert_ne!(
+            format_started_at(started_at.with_timezone(&offset)),
+            "2026-07-28 05:40:44 +00:00"
+        );
+    }
+
+    #[test]
+    fn render_run_summary_lines_converts_known_timestamp_to_local_time() {
+        let mut run = summary_with_status(RunStatus::Completed, None);
+        run.started_at = Some(
+            DateTime::parse_from_rfc3339("2026-07-28T05:40:44Z")
+                .unwrap()
+                .to_utc(),
+        );
+        let expected = format!(
+            "  started_at: {}",
+            format_started_at(run.started_at.unwrap().with_timezone(&Local).fixed_offset())
+        );
+
+        let lines = render_run_summary_lines(&run);
+
+        assert_eq!(lines[1], expected);
     }
 }

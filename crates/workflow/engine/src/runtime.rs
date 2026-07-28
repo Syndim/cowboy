@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
 use cowboy_agent_client::PromptTurnCancellation;
@@ -199,6 +199,7 @@ pub struct RunReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSummaryLine {
     pub run_id: String,
+    pub started_at: Option<DateTime<Utc>>,
     pub workflow_name: String,
     pub topic: Option<String>,
     pub status: RunStatus,
@@ -589,8 +590,13 @@ impl WorkflowRuntime {
             let status_detail = RunStatusDetail::from_status(&status);
 
             if let Some(summary) = summary {
+                let started_at = match summary.created_at {
+                    Some(created_at) => Some(created_at),
+                    None => store.load_run(&run_id).await.ok().map(|run| run.created_at),
+                };
                 runs.push(RunSummaryLine {
                     run_id,
+                    started_at,
                     workflow_name: summary.workflow_name,
                     topic: summary.request_topic,
                     status,
@@ -605,6 +611,7 @@ impl WorkflowRuntime {
                 let topic = self.summary_topic(&run);
                 runs.push(RunSummaryLine {
                     run_id: run.id,
+                    started_at: Some(run.created_at),
                     workflow_name: run.workflow_name,
                     topic,
                     status,
@@ -4252,6 +4259,10 @@ exit 0
         let filtered = runtime.list_runs(Some("wait")).await.unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].run_id, "alpha-wait-run");
+        assert_eq!(
+            filtered[0].started_at,
+            Some(store.load_run("alpha-wait-run").await.unwrap().created_at)
+        );
         assert_eq!(filtered[0].topic.as_deref(), Some("Approve release"));
         assert_eq!(filtered[0].workflow_name, "aaa");
         assert_eq!(
@@ -4270,13 +4281,21 @@ exit 0
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_empty_state(&dir).await;
         let store = runtime.store().unwrap();
+        let mut expected_started_at = None;
 
         for index in 0..100 {
-            let run = summary_test_run(
+            let mut run = summary_test_run(
                 &format!("run-bulk-{index:04}"),
                 RunStatus::Completed,
                 Some(&format!("Bulk run {index}")),
             );
+            run.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .to_utc()
+                + chrono::Duration::seconds(index.into());
+            if index == 42 {
+                expected_started_at = Some(run.created_at);
+            }
             let head = RunHead::from_run(&run);
             sqlx::query("INSERT INTO run_heads(run_id, data) VALUES(?, ?)")
                 .bind(&run.id)
@@ -4295,7 +4314,72 @@ exit 0
             .expect("persisted run-head summary");
         assert_eq!(summary.topic.as_deref(), Some("Bulk run 42"));
         assert_eq!(summary.workflow_name, "aaa");
+        assert_eq!(summary.started_at, expected_started_at);
         println!("EVIDENCE runtime-list source=heads full_run_loads=0");
+    }
+
+    #[tokio::test]
+    async fn list_runs_recovers_legacy_summary_timestamp_from_matching_full_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir).await;
+        let store = runtime.store().unwrap();
+        let run = summary_test_run(
+            "legacy-summary-run",
+            RunStatus::Completed,
+            Some("Legacy summary"),
+        );
+        let expected_started_at = run.created_at;
+        store.save_run(&run).await.unwrap();
+        let mut head = RunHead::from_run(&run);
+        head.summary.as_mut().unwrap().created_at = None;
+        sqlx::query("UPDATE run_heads SET data = ? WHERE run_id = ?")
+            .bind(serde_json::to_vec(&head).unwrap())
+            .bind(&run.id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .list_runs(Some("legacy-summary"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy summary");
+
+        assert_eq!(summary.started_at, Some(expected_started_at));
+        assert_eq!(summary.topic.as_deref(), Some("Legacy summary"));
+    }
+
+    #[tokio::test]
+    async fn list_runs_retains_legacy_summary_when_full_run_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_empty_state(&dir).await;
+        let store = runtime.store().unwrap();
+        let run = summary_test_run(
+            "missing-legacy-run",
+            RunStatus::Completed,
+            Some("Missing legacy run"),
+        );
+        let mut head = RunHead::from_run(&run);
+        head.summary.as_mut().unwrap().created_at = None;
+        sqlx::query("INSERT INTO run_heads(run_id, data) VALUES(?, ?)")
+            .bind(&run.id)
+            .bind(serde_json::to_vec(&head).unwrap())
+            .execute(store.pool())
+            .await
+            .unwrap();
+
+        let summary = runtime
+            .list_runs(Some("missing-legacy"))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("legacy summary without full run");
+
+        assert_eq!(summary.started_at, None);
+        assert_eq!(summary.topic.as_deref(), Some("Missing legacy run"));
     }
 
     #[tokio::test]

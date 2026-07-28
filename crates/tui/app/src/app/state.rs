@@ -1518,7 +1518,12 @@ impl AppState {
             self.push_card("Runs", [message]);
         } else {
             for run in runs {
-                self.push_card("Run", render_run_summary_lines(&run));
+                self.push_card(
+                    "Run",
+                    render_run_summary_lines(&run)
+                        .into_iter()
+                        .map(preserve_leading_spaces_in_markdown),
+                );
             }
         }
     }
@@ -1539,6 +1544,19 @@ impl AppState {
             self.apply_workflow_event(event);
         }
     }
+}
+
+fn preserve_leading_spaces_in_markdown(line: String) -> String {
+    let leading_spaces = line.bytes().take_while(|byte| *byte == b' ').count();
+    if leading_spaces == 0 {
+        return line;
+    }
+
+    format!(
+        "{}{}",
+        "&#32;".repeat(leading_spaces),
+        &line[leading_spaces..]
+    )
 }
 
 #[cfg(test)]

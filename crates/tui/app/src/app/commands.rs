@@ -515,7 +515,7 @@ pub(in crate::app) fn show_workflows(
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, AppConfig};
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use cowboy_workflow_core::{AgentPromptWindow, ResumeCallback, RunStatus, WorkflowRun};
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::SqliteWorkflowStore;
@@ -654,7 +654,9 @@ mod tests {
         current_step: &str,
         head: Option<&str>,
     ) -> WorkflowRun {
-        let now = Utc::now();
+        let now = DateTime::parse_from_rfc3339("2026-07-28T05:40:44Z")
+            .unwrap()
+            .to_utc();
         WorkflowRun {
             id: id.to_string(),
             workflow_name: "deploy".to_string(),
@@ -1516,6 +1518,21 @@ mod tests {
         }
 
         for card in [completed_card, waiting_card, failed_card] {
+            assert_eq!(
+                card.lines()
+                    .filter(|line| line.contains("started_at: "))
+                    .count(),
+                1,
+                "rendered /runs card should contain one start timestamp:\n{card}"
+            );
+            assert!(
+                !card.contains("started_at: <unknown>"),
+                "seeded run timestamp was not rendered:\n{card}"
+            );
+            assert!(
+                card.lines().any(|line| line.starts_with("│  started_at: ")),
+                "rendered /runs card did not preserve the shared two-space prefix:\n{card}"
+            );
             for debug_fragment in ["WaitingForInput {", "Failed {", "resume_callback:"] {
                 assert!(
                     !card.contains(debug_fragment),
@@ -1592,6 +1609,7 @@ mod tests {
         assert_eq!(matching_state.status(), "1 run(s)");
         let rendered = rendered_entries(&matching_state);
         assert_rendered_contains(&rendered, "run-waiting");
+        assert_eq!(rendered.matches("started_at: ").count(), 1, "{rendered}");
         assert_rendered_contains(&rendered, "topic: Approve release");
         assert!(
             !rendered.contains("run-completed"),

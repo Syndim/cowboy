@@ -105,4 +105,12 @@ fn cli_runs_filters_by_partial_run_id() {
         "filtered output included nonmatching run id {} for partial {partial:?}:\n{filtered_stdout}",
         run_ids[1]
     );
+    assert_eq!(
+        filtered_stdout
+            .lines()
+            .filter(|line| line.starts_with("  started_at: "))
+            .count(),
+        1,
+        "{filtered_stdout}"
+    );
 }

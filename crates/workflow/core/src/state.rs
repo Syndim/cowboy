@@ -447,6 +447,9 @@ pub struct WorkflowSourceSnapshot {
 /// Summary data denormalized into a run head for listing runs without loading full run records.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunHeadSummary {
+    /// Run creation timestamp shown in run listings when available.
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
     /// Workflow name/id shown in run listings.
     pub workflow_name: WorkflowId,
     /// Short generated topic shown in run listings when available.
@@ -459,6 +462,7 @@ impl RunHeadSummary {
     /// Build summary data from the mutable workflow run state.
     pub fn from_run(run: &WorkflowRun) -> Self {
         Self {
+            created_at: Some(run.created_at),
             workflow_name: run.workflow_name.clone(),
             request_topic: run.request_topic.clone(),
             current_step: run.current_step.clone(),
@@ -675,6 +679,24 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.summary, None);
 
+        let legacy_summary: RunHead = serde_json::from_value(serde_json::json!({
+            "run_id": "legacy-summary",
+            "workflow_hash": "hash",
+            "head_step": null,
+            "status": { "status": "running" },
+            "updated_at": "2026-01-01T00:00:00Z",
+            "summary": {
+                "workflow_name": "wf",
+                "request_topic": "legacy topic",
+                "current_step": "start"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy_summary.summary.expect("legacy summary").created_at,
+            None
+        );
+
         let run: WorkflowRun = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow_name": "wf",
@@ -699,6 +721,7 @@ mod tests {
         assert_eq!(summary.workflow_name, "wf");
         assert_eq!(summary.request_topic.as_deref(), Some("topic"));
         assert_eq!(summary.current_step, "start");
+        assert_eq!(summary.created_at, Some(run.created_at));
     }
 
     #[test]
