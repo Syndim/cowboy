@@ -31,18 +31,26 @@ Package name: `cowboy`.
 
 This crate owns config loading, logging setup, runtime dispatch, and terminal rendering. It should not own command grammar, workflow semantics, session persistence, runner state, selector/summarizer behavior, Lua execution, storage, or agent protocol details.
 
+The shared `cowboy export <run-id>` CLI command and `/export <run-id>` TUI
+command write `cowboy-export-<safe-run-id>.html` to the runtime working
+directory. The standalone document contains cards collapsed by default,
+per-card and global expansion controls, and case-insensitive search across
+complete card headers and bodies without external resources.
+
 | Module | Responsibility |
 | --- | --- |
 | `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. Runs on an explicit Tokio runtime whose final teardown is bounded, so returning from `main` always terminates the process. |
-| `lib.rs` | Public exports for the TUI app crate: config, `run_tui`, and the bounded process-exit helper. |
+| `lib.rs` | Public exports for the TUI app crate: config, `run_tui`, the bounded process-exit helper, and the application-level run export entry point. |
 | `process_exit.rs` | `run_with_bounded_shutdown`: builds a multi-thread Tokio runtime, `block_on`s the work so persistence completes, then bounds runtime teardown with `Runtime::shutdown_timeout`. |
 | `config.rs` | Load and validate TOML, including per-agent watchdog policy, materialize named config sets, and convert them into engine `RuntimeConfig`. |
+| `export.rs` | Load a canonical run and persisted event log, replay projected cards, and atomically replace a sanitized standalone searchable HTML export in the runtime cwd. |
 | `app.rs` | Terminal startup, event loop, and top-level vertical layout only. Awaits `WorkflowRuntime::shutdown` after the loop returns and before restoring the terminal. |
 | `app/commands.rs` | Slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
 | `app/history.rs` | TUI-owned persisted composer input history: locked append-only JSON-lines storage under `state_dir`. |
-| `app/state.rs` | TUI state projection: active run, current step, pending prompt, transcript entries, command history, scroll offset, and background tasks. |
-| `app/events.rs` | Converts typed workflow events into human-readable transcript text. |
+| `app/state.rs` | TUI state projection plus reusable workflow-event coalescing and descriptor snapshots for live ingestion and persisted replay. |
+| `app/events.rs` | Converts typed workflow events into shared untruncated semantic cards and terminal text. |
+| `app/card.rs` | Semantic card headers/sections plus width-aware ratatui borders, wrapping, and styling. |
 | `app/styles.rs` | Shared ratatui colors/styles and width-safe truncation helpers. |
 | `app/controls/header.rs` | Header view showing state, step, run, workflow, and task count. |
 | `app/controls/transcript.rs` | Transcript view and waiting-for-input cards. |

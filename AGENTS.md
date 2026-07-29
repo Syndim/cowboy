@@ -44,7 +44,14 @@ cowboy improve <run-id>                 # summarize and apply workflow-file impr
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
 cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
+cowboy export <run-id>                  # write a searchable HTML transcript
 ```
+
+Both `cowboy export <run-id>` and `/export <run-id>` write
+`cowboy-export-<safe-run-id>.html` in the runtime working directory. The
+self-contained HTML has cards collapsed by default, individual and global
+expansion controls, and case-insensitive search across complete card headers
+and bodies.
 
 Repeat `--field` for each output field. Field names are exact; quote names with
 spaces, `=`, or a leading `-`. Plain text stays a string, while valid JSON
@@ -78,6 +85,7 @@ Built-in slash commands:
 /resolve <run-id>
 /resolve <run-id> <status> [--field <name> <value>]... [--body <text>]
 /runs
+/export <run-id>
 /workflows
 /cancel
 /help
@@ -143,12 +151,14 @@ Runtime behavior and command grammar do **not** belong here. This crate should c
 Current modules:
 
 - `main.rs` — binary entrypoint; uses `cowboy-command-parser` for CLI parsing; default command and `tui` launch the TUI, other subcommands call `WorkflowRuntime`.
+- `export.rs` — loads a run and persisted events, replays semantic cards, and writes a self-contained searchable HTML transcript to `cowboy-export-<safe-run-id>.html` in the runtime cwd.
 - `app.rs` — terminal startup, event loop, and top-level layout.
 - `app/commands.rs` — slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback.
 - `app/input.rs` — keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys.
 - `app/history.rs` — locked append-only JSON-lines composer history under `state_dir`.
-- `app/state.rs` — active run, current step, pending prompt, transcript entries, command history, scroll offset, and background task state.
-- `app/events.rs` — workflow event projection into transcript text.
+- `app/state.rs` — active run, current step, pending prompt, reusable event-card coalescing, transcript entries, command history, scroll offset, and background task state.
+- `app/events.rs` — workflow event projection into shared semantic cards and terminal text.
+- `app/card.rs` — semantic card model plus width-aware ratatui rendering.
 - `app/markup.rs` — lightweight transcript markup parsing/rendering helpers.
 - `app/styles.rs` — shared ratatui colors/styles and width-safe truncation helpers.
 - `app/controls/*` — header, transcript, status strip, and composer widgets.

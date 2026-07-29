@@ -309,7 +309,16 @@ cowboy improve <run-id>                 # summarize and apply workflow-file impr
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
 cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
+cowboy export <run-id>                  # write a searchable HTML transcript
 ```
+
+`cowboy export` loads the canonical run and persisted workflow events, replays
+the same response/thought coalescing, tool-update replacement, and agent
+descriptor snapshots used by the live TUI, then writes
+`cowboy-export-<safe-run-id>.html` in the runtime working directory. The
+standalone document has collapsed `<details>` cards, complete untruncated
+headers and bodies, inline expand/collapse controls, and case-insensitive text
+search with no external resources.
 
 Each `--field` accepts an exact field name followed by its value. Names may
 include spaces, `=`, or a leading `-`; quote them when needed. Plain values
@@ -346,8 +355,8 @@ open agent prompt window, and the latest durable run status.
 | idle | absent | `Failed` | Normal idle behavior; `/step` and `/resume` retry the retained failed step, and read-only and mutating `/resolve` remain available. |
 | idle | absent | `Completed`/`Cancelled` | Normal new-request and command behavior. |
 
-While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`,
-and read-only `/resolve <run-id>` remain available. `/run`, `/step`, `/resume`,
+While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/export`,
+`/workflows`, and read-only `/resolve <run-id>` remain available. `/run`, `/step`, `/resume`,
 `/answer`, `/improve`, and mutating `/resolve` are rejected before dispatch and
 retain the draft. This conflict list is never applied merely because an active
 run id exists: stepwise `Running`, waiting, failed, and terminal runs are idle
@@ -372,6 +381,7 @@ Slash commands:
 /resume <run-id>
 /answer <run-id> <prompt-id> <answer>
 /runs
+/export <run-id>
 /workflows
 /improve <run-id>
 /resolve <run-id>

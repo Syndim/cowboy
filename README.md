@@ -68,6 +68,17 @@ List existing runs, optionally filtering by a literal partial run id:
 cowboy runs [partial-run-id]
 ```
 
+Export a run as a self-contained HTML transcript:
+
+```bash
+cowboy export <run-id>
+```
+
+The file is written to the current working directory as
+`cowboy-export-<safe-run-id>.html`. Cards are collapsed by default and can be
+expanded individually or globally. The embedded case-insensitive search finds
+text in complete card headers and bodies without network access.
+
 Execute one additional step for a run, or continue it until it blocks, fails, or completes:
 
 ```bash
@@ -128,7 +139,8 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /step <run-id>                                    execute exactly one more step
 /resume <run-id>                                  continue a run until blocked
 /answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly
-/runs [partial-run-id]                         list workflow runs
+/runs [partial-run-id]                            list workflow runs
+/export <run-id>                                  export searchable HTML transcript
 /workflows                                        list known workflows
 /improve <run-id>                                 improve workflow source from a run
 /resolve <run-id>                                 list statuses a failed run can resolve to

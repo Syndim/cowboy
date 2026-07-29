@@ -106,6 +106,10 @@ pub enum SharedCommand {
     #[command(about = "list workflow runs")]
     Runs(RunsArgs),
 
+    /// Export a workflow run as a searchable standalone HTML transcript.
+    #[command(about = "export a run as searchable HTML")]
+    Export(ExportArgs),
+
     /// Resolve a failed run. Without <status>, lists resolvable statuses.
     #[command(about = "list or resolve a failed step")]
     Resolve(ResolveArgs),
@@ -145,6 +149,13 @@ pub struct RunIdArgs {
 pub struct RunsArgs {
     #[arg(value_name = "partial-run-id")]
     pub partial_run_id: Option<String>,
+}
+
+/// Arguments for exporting one workflow run.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+pub struct ExportArgs {
+    #[arg(value_name = "run-id")]
+    pub run_id: String,
 }
 
 /// Arguments for answering a workflow prompt.
@@ -607,6 +618,56 @@ mod tests {
             slash_command_usage("runs").as_deref(),
             Some("/runs [partial-run-id]")
         );
+    }
+
+    #[test]
+    fn export_parses_identically_for_cli_and_slash_commands() {
+        let expected = SharedCommand::Export(ExportArgs {
+            run_id: "run-123".to_string(),
+        });
+
+        assert_eq!(
+            shared_cli_command(["cowboy", "export", "run-123"]),
+            expected
+        );
+        assert_eq!(shared_slash_command("/export run-123"), expected);
+        assert_eq!(
+            slash_command_usage("export").as_deref(),
+            Some("/export <run-id>")
+        );
+    }
+
+    #[test]
+    fn export_requires_run_id_for_cli_and_slash() {
+        assert_eq!(
+            Cli::try_parse_from(["cowboy", "export"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(matches!(
+            parse_slash_command("/export"),
+            Err(SlashParseError::Validation { .. })
+        ));
+    }
+
+    #[test]
+    fn export_is_advertised_in_generated_help_and_suggestions() {
+        let suggestions = slash_suggestions("/exp");
+        assert!(suggestions.iter().any(|command| {
+            command.name == "/export"
+                && command.usage == "/export <run-id>"
+                && command.description == "export a run as searchable HTML"
+                && command.takes_arguments
+        }));
+
+        let rows = slash_help_rows();
+        assert!(rows.iter().any(|command| {
+            command.name == "/export"
+                && command.usage == "/export <run-id>"
+                && command.description == "export a run as searchable HTML"
+                && command.takes_arguments
+        }));
     }
 
     #[test]

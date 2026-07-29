@@ -147,7 +147,8 @@ fn command_conflicts_with_execution(command: &SlashCommand) -> bool {
         | SlashCommand::Exit
         | SlashCommand::Help
         | SlashCommand::Workflows
-        | SlashCommand::Shared(SharedCommand::Runs(_)) => false,
+        | SlashCommand::Shared(SharedCommand::Runs(_))
+        | SlashCommand::Shared(SharedCommand::Export(_)) => false,
         SlashCommand::Shared(SharedCommand::Resolve(args)) => args.status.is_some(),
         _ => true,
     }
@@ -196,6 +197,7 @@ async fn dispatch_shared_command(
             spawn_answer_task(state, runtime, run_id, prompt_id, answer.join(" "));
         }
         SharedCommand::Runs(args) => spawn_runs_list(state, runtime, args.partial_run_id),
+        SharedCommand::Export(args) => spawn_export(state, runtime, args.run_id),
         SharedCommand::Improve(args) => improve_run(state, runtime, &args.run_id).await?,
         SharedCommand::Resolve(args) => {
             let cowboy_command_parser::ResolveArgs {
@@ -413,6 +415,16 @@ fn spawn_runs_list(
             .await
             .map_err(|err| err.to_string())?;
         Ok(runs)
+    });
+}
+
+fn spawn_export(state: &mut AppState, runtime: &WorkflowRuntime, run_id: String) {
+    let runtime = runtime.clone();
+    let status = format!("exporting run: {run_id}");
+    state.spawn_export_task(status, run_id.clone(), async move {
+        crate::export_run(&runtime, &run_id)
+            .await
+            .map_err(|err| err.to_string())
     });
 }
 
@@ -1624,6 +1636,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn export_runs_during_active_execution_and_preserves_run_prompt_state() {
+        let (dir, runtime, mut state) = test_runtime_state().await;
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
+        seed_run(
+            &store,
+            workflow_run(
+                "run-export",
+                Some("Export target"),
+                RunStatus::Completed,
+                "done",
+                None,
+            ),
+        )
+        .await;
+        state.apply_workflow_event(WorkflowEvent::new(
+            "active-run",
+            WorkflowEventKind::WaitingForInput {
+                step: "approval".to_string(),
+                prompt_id: "prompt-1".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec!["yes".to_string()],
+            },
+        ));
+        let expected_prompt = state.pending_prompt_answer_target();
+        state.spawn_test_card_report_task("workflow still running".to_string(), async {
+            std::future::pending::<std::result::Result<RunReport, String>>().await
+        });
+
+        state.push_input("/export run-export");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.background_task_count(), 2);
+        assert!(state.workflow_execution_running());
+        assert_eq!(state.active_run_id(), Some("active-run"));
+        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+
+        drain_finished_background_task(&mut state).await;
+
+        assert_eq!(state.background_task_count(), 1);
+        assert!(state.workflow_execution_running());
+        assert_eq!(state.active_run_id(), Some("active-run"));
+        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+        let rendered = rendered_entries(&state);
+        assert!(rendered.contains("✓ Export"), "{rendered}");
+        assert!(rendered.contains("run: run-export"), "{rendered}");
+        assert!(rendered.contains("cards: 1"), "{rendered}");
+        assert!(
+            rendered.contains("cowboy-export-run-export.html"),
+            "{rendered}"
+        );
+        state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn export_failure_uses_error_card_without_changing_active_state() {
+        let (_dir, runtime, mut state) = test_runtime_state().await;
+        state.apply_workflow_event(WorkflowEvent::new(
+            "active-run",
+            WorkflowEventKind::WaitingForInput {
+                step: "approval".to_string(),
+                prompt_id: "prompt-1".to_string(),
+                message: "Approve?".to_string(),
+                choices: vec![],
+            },
+        ));
+        let expected_prompt = state.pending_prompt_answer_target();
+        state.spawn_test_card_report_task("workflow still running".to_string(), async {
+            std::future::pending::<std::result::Result<RunReport, String>>().await
+        });
+
+        state.push_input("/export missing-run");
+        submit_input(&mut state, &runtime).await;
+        drain_finished_background_task(&mut state).await;
+
+        assert_eq!(state.background_task_count(), 1);
+        assert!(state.workflow_execution_running());
+        assert_eq!(state.active_run_id(), Some("active-run"));
+        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+        let rendered = rendered_entries(&state);
+        assert!(rendered.contains("✗ Error"), "{rendered}");
+        assert!(
+            rendered.contains("failed to load run missing-run"),
+            "{rendered}"
+        );
+        state.cancel_background_tasks();
     }
 
     #[tokio::test]

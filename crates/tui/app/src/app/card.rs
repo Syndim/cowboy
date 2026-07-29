@@ -89,6 +89,18 @@ impl CardSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticCardSection {
+    pub label: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticCard {
+    pub header: String,
+    pub sections: Vec<SemanticCardSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Card {
     status: &'static str,
     title: String,
@@ -181,6 +193,38 @@ impl Card {
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    pub(crate) fn semantic(&self) -> SemanticCard {
+        let marker = if self.tool_marker { " • " } else { " " };
+        let leading = format!("{}{}{}", self.status, marker, self.title);
+        let prefixes = self.title_prefix.clone();
+        let suffixes = self.title_suffix.clone();
+        let metadata = self
+            .metadata
+            .iter()
+            .map(|metadata| metadata.text.clone())
+            .collect::<Vec<_>>();
+        let header =
+            title_parts(&prefixes, &leading, &suffixes, &metadata).join(METADATA_SEPARATOR);
+        let sections = self
+            .sections
+            .iter()
+            .filter_map(|section| {
+                let text = section
+                    .lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.is_empty()).then(|| SemanticCardSection {
+                    label: section.label.clone(),
+                    text,
+                })
+            })
+            .collect();
+
+        SemanticCard { header, sections }
     }
 
     fn title_line(&self, width: usize) -> Line<'static> {
@@ -614,5 +658,36 @@ mod tests {
             rows.iter()
                 .all(|line| UnicodeWidthStr::width(line.to_string().as_str()) <= 80)
         );
+    }
+
+    #[test]
+    fn semantic_card_keeps_complete_header_sections_without_terminal_chrome() {
+        let card = Card::new("●", "A very long semantic title", CardTone::Accent)
+            .title_prefix("12:34")
+            .title_suffix("model/context/reasoning")
+            .metadata([
+                CardMetadata::step("implement"),
+                CardMetadata::run("run-123456789"),
+            ])
+            .section(CardSection::named(
+                "Output",
+                vec![Line::from("first line"), Line::from("second line")],
+            ));
+
+        let semantic = card.semantic();
+        assert_eq!(
+            semantic.header,
+            "12:34 · ● A very long semantic title · model/context/reasoning · ↳ implement · ▶ 123456789"
+        );
+        assert_eq!(
+            semantic.sections,
+            vec![SemanticCardSection {
+                label: Some("Output".to_string()),
+                text: "first line\nsecond line".to_string(),
+            }]
+        );
+        assert!(!semantic.header.contains('…'));
+        assert!(!semantic.sections[0].text.contains('╭'));
+        assert!(!semantic.sections[0].text.contains('│'));
     }
 }

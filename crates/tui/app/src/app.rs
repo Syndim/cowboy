@@ -12,14 +12,14 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 use crate::config::AppConfig;
 
-mod card;
+pub(crate) mod card;
 mod commands;
 mod controls;
-mod events;
+pub(crate) mod events;
 mod history;
 mod input;
 mod markup;
-mod state;
+pub(crate) mod state;
 mod styles;
 
 use controls::{composer, header, status, transcript};

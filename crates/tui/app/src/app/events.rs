@@ -2,7 +2,7 @@ use chrono::{DateTime, FixedOffset, Local};
 use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
 use ratatui::text::{Line, Span};
 
-use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH};
+use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH, SemanticCard};
 use super::controls::chrome::status_icon;
 use super::markup::render_content;
 use super::styles::{
@@ -36,6 +36,27 @@ pub(super) fn render_workflow_event_width(
     agent_descriptor: Option<&str>,
     width: usize,
 ) -> RenderedWorkflowEvent {
+    let card = workflow_event_card_with_descriptor(event, agent_descriptor);
+    let lines = card.render(width);
+    let text = lines
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    RenderedWorkflowEvent { lines, text }
+}
+
+pub(crate) fn semantic_workflow_event_card(
+    event: &WorkflowEvent,
+    agent_descriptor: Option<&str>,
+) -> SemanticCard {
+    workflow_event_card_with_descriptor(event, agent_descriptor).semantic()
+}
+
+fn workflow_event_card_with_descriptor(
+    event: &WorkflowEvent,
+    agent_descriptor: Option<&str>,
+) -> Card {
     let mut card = workflow_event_card(event);
     // The descriptor is a compact model/context/reasoning token surfaced only on
     // agent-run cards; non-agent cards ignore any snapshot.
@@ -44,14 +65,7 @@ pub(super) fn render_workflow_event_width(
     {
         card = card.title_suffix(descriptor);
     }
-
-    let lines = card.render(width);
-    let text = lines
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("\n");
-    RenderedWorkflowEvent { lines, text }
+    card
 }
 
 /// Step id for the nine agent-run card variants that surface a model descriptor;

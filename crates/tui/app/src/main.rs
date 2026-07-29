@@ -112,6 +112,16 @@ async fn run_shared_command(
             }
             Ok(())
         }
+        SharedCommand::Export(args) => {
+            let exported = cowboy::export_run(&runtime, &args.run_id).await?;
+            println!(
+                "run={} cards={} path={}",
+                exported.run_id,
+                exported.card_count,
+                exported.path.display()
+            );
+            Ok(())
+        }
         SharedCommand::Resolve(args) => {
             let cowboy_command_parser::ResolveArgs {
                 run_id,

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -676,6 +676,10 @@ impl WorkflowRuntime {
 
     pub async fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
         Ok(self.store()?.load_run(run_id).await?)
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.config.cwd
     }
 
     pub async fn submit_user_prompt(

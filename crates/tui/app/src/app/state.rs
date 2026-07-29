@@ -57,7 +57,7 @@ impl PendingPrompt {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum TranscriptEntry {
+pub(crate) enum TranscriptEntry {
     Workflow {
         event: WorkflowEvent,
         agent_descriptor: Option<String>,
@@ -208,7 +208,7 @@ fn app_card_status_and_tone(title: &str, title_suffix: &[String]) -> (&'static s
         "Error" => (status_icon("failed"), CardTone::Error),
         "Cancelled" => (status_icon("cancelled"), CardTone::Error),
         "Notice" => (status_icon("waiting"), CardTone::Warning),
-        "Exit" | "Improve" | "Resolve" => (status_icon("completed"), CardTone::Success),
+        "Exit" | "Improve" | "Resolve" | "Export" => (status_icon("completed"), CardTone::Success),
         "Run" => ("◌", CardTone::Neutral),
         "Usage" | "Help" | "Workflows" | "Runs" | "Transcript" => {
             (status_icon("idle"), CardTone::Neutral)
@@ -224,6 +224,7 @@ fn is_submitted_background_task_card(title: &str, title_suffix: &[String]) -> bo
         "Resume" => suffix == "submitted resume",
         "Answer" => suffix == "submitted answer",
         "Resolve" => suffix == "submitted resolve",
+        "Export" => suffix == "exporting run",
         _ => false,
     })
 }
@@ -315,6 +316,95 @@ fn active_event_status_text(event: &WorkflowEvent) -> String {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct WorkflowEventProjector {
+    agent_descriptors: HashMap<(String, String), Option<String>>,
+    active_event: Option<ActiveEvent>,
+}
+
+impl WorkflowEventProjector {
+    pub(crate) fn project(
+        &mut self,
+        event_log: &mut Vec<TranscriptEntry>,
+        event: WorkflowEvent,
+    ) -> bool {
+        if self.try_coalesce(event_log, &event) {
+            self.apply_descriptor_metadata(&event);
+            return true;
+        }
+
+        self.apply_descriptor_metadata(&event);
+        let agent_descriptor = self.snapshot_agent_descriptor(&event);
+        let is_active_event = is_active_event(&event.kind);
+        event_log.push(TranscriptEntry::Workflow {
+            event: event.clone(),
+            agent_descriptor,
+        });
+        self.active_event = is_active_event.then(|| ActiveEvent {
+            index: event_log.len().saturating_sub(1),
+            event,
+        });
+        false
+    }
+
+    pub(crate) fn clear_active(&mut self) {
+        self.active_event = None;
+    }
+
+    fn try_coalesce(&mut self, event_log: &mut [TranscriptEntry], event: &WorkflowEvent) -> bool {
+        let (index, active_event) = {
+            let Some(active) = self.active_event.as_mut() else {
+                return false;
+            };
+            if active.index + 1 != event_log.len() || !active.accepts(event) {
+                return false;
+            }
+            active.merge(event);
+            (active.index, active.event.clone())
+        };
+
+        let agent_descriptor = match &event_log[index] {
+            TranscriptEntry::Workflow {
+                agent_descriptor, ..
+            } => agent_descriptor.clone(),
+            _ => None,
+        };
+        event_log[index] = TranscriptEntry::Workflow {
+            event: active_event,
+            agent_descriptor,
+        };
+        true
+    }
+
+    fn snapshot_agent_descriptor(&self, event: &WorkflowEvent) -> Option<String> {
+        let step_id = agent_card_step_id(&event.kind)?;
+        self.agent_descriptors
+            .get(&(event.run_id.clone(), step_id.to_string()))
+            .cloned()
+            .flatten()
+    }
+
+    fn apply_descriptor_metadata(&mut self, event: &WorkflowEvent) {
+        let WorkflowEventKind::AgentSessionReady {
+            step_id,
+            descriptor,
+            ..
+        } = &event.kind
+        else {
+            return;
+        };
+        let key = (event.run_id.clone(), step_id.clone());
+        match descriptor {
+            Some(descriptor) => {
+                self.agent_descriptors.insert(key, Some(descriptor.clone()));
+            }
+            None => {
+                self.agent_descriptors.remove(&key);
+            }
+        }
+    }
+}
+
 struct DrainResult {
     events: Vec<WorkflowEvent>,
     lagged: bool,
@@ -384,6 +474,7 @@ pub(in crate::app) enum ComposerSubmissionMode {
 enum BackgroundTaskKind {
     WorkflowExecution,
     RunsList,
+    Export,
 }
 
 #[derive(Debug)]
@@ -393,6 +484,7 @@ enum BackgroundTaskResult {
         runs: Vec<RunSummaryLine>,
         partial_run_id: Option<String>,
     },
+    Export(crate::ExportResult),
 }
 
 #[derive(Debug)]
@@ -435,17 +527,13 @@ pub(super) struct AppState {
     workflow_name: Option<String>,
     current_topic_run_id: Option<String>,
     current_run_topic: Option<String>,
-    /// Ingestion-only latest agent descriptor per `(run_id, step_id)`. Updated
-    /// for every `AgentSessionReady`; `Some` stores the token, `None` clears it.
-    /// Render code never reads this map — entries carry their own snapshot.
-    agent_descriptors: HashMap<(String, String), Option<String>>,
+    workflow_projector: WorkflowEventProjector,
     pending_prompt: Option<PendingPrompt>,
     durable_run_status: Option<RunStatusState>,
     agent_prompt_window: Option<AgentPromptWindowState>,
     run_state: String,
     status: String,
     event_log: Vec<TranscriptEntry>,
-    active_event: Option<ActiveEvent>,
     scroll_offset: usize,
     transcript_scroll_limit: usize,
     mouse_scroll_lines: usize,
@@ -473,14 +561,13 @@ impl AppState {
             workflow_name: None,
             current_topic_run_id: None,
             current_run_topic: None,
-            agent_descriptors: HashMap::new(),
+            workflow_projector: WorkflowEventProjector::default(),
             pending_prompt: None,
             durable_run_status: None,
             agent_prompt_window: None,
             run_state: "idle".to_string(),
             status: "workflow runtime shell is ready".to_string(),
             event_log: Vec::new(),
-            active_event: None,
             scroll_offset: 0,
             transcript_scroll_limit: usize::MAX,
             mouse_scroll_lines: usize::from(config.mouse_scroll_lines),
@@ -1140,6 +1227,23 @@ impl AppState {
         );
     }
 
+    pub(in crate::app) fn spawn_export_task<F>(&mut self, status: String, run_id: String, future: F)
+    where
+        F: Future<Output = Result<crate::ExportResult, String>> + Send + 'static,
+    {
+        self.spawn_background_task(
+            BackgroundTaskKind::Export,
+            status,
+            TranscriptEntry::Card {
+                title: "Export".to_string(),
+                title_prefix: vec![current_wall_clock_prefix()],
+                title_suffix: vec!["exporting run".to_string()],
+                details: vec![run_id],
+            },
+            async move { future.await.map(BackgroundTaskResult::Export) },
+        );
+    }
+
     #[cfg(test)]
     pub(in crate::app) fn spawn_test_card_report_task<F>(&mut self, status: String, future: F)
     where
@@ -1192,7 +1296,7 @@ impl AppState {
         let result = drain_available_events(workflow_events);
         let changed = result.lagged || !result.events.is_empty();
         if result.lagged {
-            self.active_event = None;
+            self.workflow_projector.clear_active();
         }
         for event in result.events {
             self.apply_workflow_event(event);
@@ -1201,72 +1305,19 @@ impl AppState {
     }
 
     pub(in crate::app) fn apply_workflow_event(&mut self, event: WorkflowEvent) {
-        if self.try_coalesce_active_event(&event) {
-            return;
-        }
-
-        let rendered = render_workflow_event(&event);
-        self.status = rendered.text().to_string();
-        let is_active_event = is_active_event(&event.kind);
-        self.apply_workflow_event_metadata(&event);
-        let agent_descriptor = self.snapshot_agent_descriptor(&event);
-        self.push_event(TranscriptEntry::Workflow {
-            event: event.clone(),
-            agent_descriptor,
-        });
-        if is_active_event {
-            self.active_event = Some(ActiveEvent {
-                index: self.event_log.len().saturating_sub(1),
-                event,
-            });
+        let coalesced = self
+            .workflow_projector
+            .project(&mut self.event_log, event.clone());
+        self.status = if coalesced {
+            active_event_status_text(&event)
         } else {
-            self.active_event = None;
-        }
-    }
-
-    fn try_coalesce_active_event(&mut self, event: &WorkflowEvent) -> bool {
-        let (index, status, active_event) = {
-            let Some(active) = self.active_event.as_mut() else {
-                return false;
-            };
-            if active.index + 1 != self.event_log.len() || !active.accepts(event) {
-                return false;
-            }
-            active.merge(event);
-            let status = active_event_status_text(&active.event);
-            (active.index, status, active.event.clone())
+            render_workflow_event(&event).text().to_string()
         };
-
-        self.status = status;
-        // Coalescing merges streaming chunks into the original entry; preserve
-        // that entry's descriptor snapshot rather than resampling ingestion state.
-        let agent_descriptor = match &self.event_log[index] {
-            TranscriptEntry::Workflow {
-                agent_descriptor, ..
-            } => agent_descriptor.clone(),
-            _ => None,
-        };
-        self.event_log[index] = TranscriptEntry::Workflow {
-            event: active_event,
-            agent_descriptor,
-        };
+        self.apply_workflow_event_metadata(&event);
         self.clear_transcript_selection();
-        self.apply_workflow_event_metadata(event);
         if self.follow_events {
             self.scroll_offset = 0;
         }
-        true
-    }
-
-    /// Read the current ingestion descriptor snapshot for an agent-card event.
-    /// Non-agent events never carry a descriptor. Render code consults only the
-    /// per-entry snapshot this returns, never the live map.
-    fn snapshot_agent_descriptor(&self, event: &WorkflowEvent) -> Option<String> {
-        let step_id = agent_card_step_id(&event.kind)?;
-        self.agent_descriptors
-            .get(&(event.run_id.clone(), step_id.to_string()))
-            .cloned()
-            .flatten()
     }
 
     fn apply_workflow_event_metadata(&mut self, event: &WorkflowEvent) {
@@ -1323,25 +1374,9 @@ impl AppState {
                     self.agent_prompt_window = None;
                 }
             }
-            WorkflowEventKind::AgentSessionReady {
-                step_id,
-                descriptor,
-                ..
-            } => {
+            WorkflowEventKind::AgentSessionReady { step_id, .. } => {
                 self.current_step = Some(step_id.clone());
                 self.run_state = "running".to_string();
-                // Ingestion-only: update the latest descriptor for this
-                // (run, step). `Some` stores it; `None` clears any stale entry so
-                // a later visit reporting nothing shows no descriptor.
-                let key = (event.run_id.clone(), step_id.clone());
-                match descriptor {
-                    Some(descriptor) => {
-                        self.agent_descriptors.insert(key, Some(descriptor.clone()));
-                    }
-                    None => {
-                        self.agent_descriptors.remove(&key);
-                    }
-                }
             }
             WorkflowEventKind::StepProgress {
                 step_id: current_step,
@@ -1457,6 +1492,22 @@ impl AppState {
                         partial_run_id,
                     })) => {
                         self.apply_runs_list(runs, partial_run_id);
+                    }
+                    Ok(Ok(BackgroundTaskResult::Export(exported))) => {
+                        self.status = format!(
+                            "exported run={} cards={} path={}",
+                            exported.run_id,
+                            exported.card_count,
+                            exported.path.display()
+                        );
+                        self.push_card(
+                            "Export",
+                            [
+                                format!("run: {}", exported.run_id),
+                                format!("cards: {}", exported.card_count),
+                                format!("path: {}", exported.path.display()),
+                            ],
+                        );
                     }
                     Ok(Err(err)) => {
                         self.status = format!("error: {err}");
@@ -1957,6 +2008,119 @@ mod tests {
             "{}",
             entry.plain_text()
         );
+    }
+
+    #[test]
+    fn replay_projector_matches_incremental_state_projection() {
+        let events = vec![
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentSessionReady {
+                    step_id: "implement".to_string(),
+                    role: "developer".to_string(),
+                    session_id: "session-1".to_string(),
+                    descriptor: Some("model/context/reasoning".to_string()),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentResponse {
+                    step_id: "implement".to_string(),
+                    content: "first ".to_string(),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentResponse {
+                    step_id: "implement".to_string(),
+                    content: "second".to_string(),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentResponse {
+                    step_id: "review".to_string(),
+                    content: "different step".to_string(),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-2",
+                WorkflowEventKind::AgentToolCall {
+                    step_id: "inspect".to_string(),
+                    tool_call_id: "tool-1".to_string(),
+                    title: "Inspect".to_string(),
+                    tool_kind: "read".to_string(),
+                    status: "running".to_string(),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-2",
+                WorkflowEventKind::AgentToolCallUpdate {
+                    step_id: "inspect".to_string(),
+                    tool_call_id: "tool-1".to_string(),
+                    title: "Inspect".to_string(),
+                    status: "completed".to_string(),
+                    content: Some(serde_json::json!({"output": "done"})),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-2",
+                WorkflowEventKind::RunStatusChanged {
+                    status: "running".to_string(),
+                },
+            ),
+            WorkflowEvent::new(
+                "run-2",
+                WorkflowEventKind::AgentToolCallUpdate {
+                    step_id: "inspect".to_string(),
+                    tool_call_id: "tool-1".to_string(),
+                    title: "Inspect".to_string(),
+                    status: "completed".to_string(),
+                    content: Some(serde_json::json!({"output": "after boundary"})),
+                },
+            ),
+        ];
+
+        let mut state = test_state();
+        for event in events.iter().cloned() {
+            state.apply_workflow_event(event);
+        }
+
+        let mut replayed = Vec::new();
+        let mut projector = WorkflowEventProjector::default();
+        for event in events {
+            projector.project(&mut replayed, event);
+        }
+
+        let live = state
+            .event_entries()
+            .iter()
+            .map(|entry| {
+                entry
+                    .render_lines_for_width(DEFAULT_CARD_WIDTH)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        let replayed = replayed
+            .iter()
+            .map(|entry| {
+                entry
+                    .render_lines_for_width(DEFAULT_CARD_WIDTH)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, live);
+        assert_eq!(replayed.len(), 6);
+        assert!(replayed[1].contains("first second"));
+        assert!(replayed[1].contains("model/context/reasoning"));
+        assert!(replayed[3].contains("completed"));
+        assert!(replayed[5].contains("after boundary"));
     }
 
     #[test]
