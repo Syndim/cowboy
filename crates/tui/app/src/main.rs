@@ -1,9 +1,16 @@
 use anyhow::Result;
 use cowboy_command_parser::{Cli, CliCommand, SharedCommand, resolve_fields_object};
 
-#[tokio::main]
-async fn main() {
-    if let Err(err) = run_main().await {
+fn main() {
+    let result = cowboy::run_with_bounded_shutdown(
+        || async { run_main().await },
+        cowboy::DEFAULT_PROCESS_SHUTDOWN_TIMEOUT,
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(err) => Err(err.into()),
+    };
+    if let Err(err) = result {
         tracing::error!(error = ?err, "cowboy exited with error");
         eprintln!("cowboy error: {err:?}");
         std::process::exit(1);

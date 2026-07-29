@@ -968,15 +968,11 @@ impl AppState {
             return;
         }
 
-        let cancelled = self.background.len();
         let cancelled_workflow = self
             .background
             .iter()
             .any(|task| task.kind == BackgroundTaskKind::WorkflowExecution);
-        for task in &self.background {
-            task.handle.abort();
-        }
-        self.background.clear();
+        let cancelled = self.abort_background_tasks();
         if cancelled_workflow {
             self.agent_prompt_window = None;
             self.durable_run_status = Some(RunStatusState::Cancelled);
@@ -984,6 +980,25 @@ impl AppState {
         }
         self.status = format!("cancelled {cancelled} background task(s)");
         self.push_card("Cancelled", [self.status.clone()]);
+    }
+
+    /// Abort in-flight background work on `/exit` without adopting `/cancel`'s
+    /// user-facing card, status text, or durable "cancelled" run status, so the
+    /// resume hint printed after teardown still offers `cowboy resume`.
+    pub(in crate::app) fn abort_background_tasks_for_exit(&mut self) {
+        let aborted = self.abort_background_tasks();
+        if aborted > 0 {
+            tracing::debug!(aborted, "aborted background tasks on exit");
+        }
+    }
+
+    fn abort_background_tasks(&mut self) -> usize {
+        let aborted = self.background.len();
+        for task in &self.background {
+            task.handle.abort();
+        }
+        self.background.clear();
+        aborted
     }
 
     pub(in crate::app) fn scroll_events_up(&mut self) -> bool {

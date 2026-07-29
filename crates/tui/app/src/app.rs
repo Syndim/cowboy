@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use cowboy_tui_terminal::TerminalModeGuard;
-use cowboy_workflow_engine::{WorkflowEvent, WorkflowRuntime};
+use cowboy_workflow_engine::{DEFAULT_SHUTDOWN_TIMEOUT, WorkflowEvent, WorkflowRuntime};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -26,6 +26,10 @@ use controls::{composer, header, status, transcript};
 use input::KeyHandling;
 use state::AppState;
 
+/// Bound on runtime teardown after the TUI loop returns, so a stuck agent
+/// never keeps the process alive.
+const SHUTDOWN_TIMEOUT: Duration = DEFAULT_SHUTDOWN_TIMEOUT;
+
 /// Start the new workflow-first terminal shell.
 pub async fn run_tui(config: AppConfig) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -39,7 +43,7 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     tracing::debug!("TUI terminal session started");
 
     let result = run_loop(&mut terminal, state, &runtime, &mut workflow_events).await;
-    runtime.cancel_store_waits();
+    runtime.shutdown(SHUTDOWN_TIMEOUT).await;
     if let Err(err) = &result {
         tracing::error!(error = ?err, "TUI loop exited with error");
     }

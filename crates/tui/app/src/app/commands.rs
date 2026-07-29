@@ -166,6 +166,8 @@ async fn dispatch_slash_command(
             state.cancel_background_tasks();
         }
         SlashCommand::Exit => {
+            runtime.cancel_store_waits();
+            state.abort_background_tasks_for_exit();
             state.mark_exit_requested();
             state.set_status("exiting");
             state.push_card("Exit", ["exiting".to_string()]);
@@ -1057,6 +1059,88 @@ mod tests {
             .plain_text();
         assert_card_title_current_time(&rendered, before, after, "● Runs · loading runs");
         state.cancel_background_tasks();
+    }
+
+    #[tokio::test]
+    async fn exit_aborts_background_tasks() {
+        let (_dir, runtime, mut state) = test_runtime_state().await;
+        state.push_input("/runs");
+        submit_input(&mut state, &runtime).await;
+        assert_eq!(state.background_task_count(), 1);
+
+        state.push_input("/exit");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(state.background_task_count(), 0);
+        assert!(state.exit_requested());
+    }
+
+    #[tokio::test]
+    async fn exit_does_not_emit_cancel_card_or_cancel_status() {
+        let (_dir, runtime, mut state) = test_runtime_state().await;
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-exit",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        state.push_input("/runs");
+        submit_input(&mut state, &runtime).await;
+
+        state.push_input("/exit");
+        submit_input(&mut state, &runtime).await;
+
+        let rendered = rendered_entries(&state);
+        assert!(!rendered.contains("Cancelled"), "rendered: {rendered}");
+        assert_eq!(state.status(), "exiting");
+        assert_eq!(state.display_state(), "running");
+
+        let (_cancel_dir, cancel_runtime, mut cancel_state) = test_runtime_state().await;
+        cancel_state.apply_workflow_event(WorkflowEvent::new(
+            "run-cancel",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        cancel_state.push_input("/runs");
+        submit_input(&mut cancel_state, &cancel_runtime).await;
+
+        cancel_state.push_input("/cancel");
+        submit_input(&mut cancel_state, &cancel_runtime).await;
+
+        let cancel_rendered = rendered_entries(&cancel_state);
+        assert!(
+            cancel_rendered.contains("Cancelled"),
+            "rendered: {cancel_rendered}"
+        );
+        assert!(cancel_state.status().starts_with("cancelled "));
+    }
+
+    #[tokio::test]
+    async fn exit_preserves_resume_hint() {
+        let (_dir, runtime, mut state) = test_runtime_state().await;
+        state.apply_workflow_event(WorkflowEvent::new(
+            "run-hint",
+            WorkflowEventKind::RunStarted {
+                workflow_name: "default".to_string(),
+                current_step: "implement".to_string(),
+                request_topic: None,
+            },
+        ));
+        state.push_input("/runs");
+        submit_input(&mut state, &runtime).await;
+
+        state.push_input("/exit");
+        submit_input(&mut state, &runtime).await;
+
+        assert_eq!(
+            state.resume_hint().as_deref(),
+            Some("Run run-hint is not complete. Resume with: cowboy resume run-hint")
+        );
     }
 
     #[tokio::test]

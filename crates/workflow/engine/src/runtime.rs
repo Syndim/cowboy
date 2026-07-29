@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -48,6 +49,9 @@ use crate::{
 
 const WORKFLOW_CHILD_CALLBACK_KIND: &str = "workflow_child";
 const WORKFLOW_INVOCATION_NAMESPACE: Uuid = Uuid::from_u128(0xd31e45ed_1aac_578f_9314_765ee417df28);
+
+/// Default bound for [`WorkflowRuntime::shutdown`].
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Test-only instrumentation counting how many times the single shared workflow
 /// execution helper (`run_existing_with_events`) is entered per run id. It lets
@@ -540,6 +544,41 @@ impl WorkflowRuntime {
         let generation = *self.store_wait_generation.borrow() + 1;
         self.store_wait_generation.send_replace(generation);
         tracing::debug!(generation, "cancelled pending workflow store waits");
+    }
+
+    /// Tear the runtime down deterministically within `timeout`.
+    ///
+    /// Cancels store waits, terminates every live agent process tree (agent
+    /// descendants otherwise hold the transport's stdio pipes open and block
+    /// process exit), then closes the SQLite pool last so no in-flight
+    /// persistence is dropped. Bounded, idempotent, and never fails.
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.cancel_store_waits();
+
+        match tokio::time::timeout(timeout, self.acp_connector.terminate_all_agents(timeout)).await
+        {
+            Ok(terminated) => {
+                tracing::debug!(terminated, "runtime shutdown terminated agent processes");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis(),
+                    "runtime shutdown timed out terminating agent processes"
+                );
+            }
+        }
+
+        if tokio::time::timeout(timeout, self.store.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis(),
+                "runtime shutdown timed out closing workflow store"
+            );
+        }
+
+        tracing::debug!("workflow runtime shutdown complete");
     }
 
     #[cfg(all(test, feature = "test-support"))]
@@ -2140,11 +2179,16 @@ mod tests {
     #[derive(Clone, Default)]
     struct RecordingRuntimeAcpConnector {
         connections: Arc<SyncMutex<Vec<RecordedRuntimeAcpConnection>>>,
+        terminations: Arc<SyncMutex<Vec<Duration>>>,
     }
 
     impl RecordingRuntimeAcpConnector {
         fn connections(&self) -> Vec<RecordedRuntimeAcpConnection> {
             self.connections.lock().clone()
+        }
+
+        fn terminations(&self) -> Vec<Duration> {
+            self.terminations.lock().clone()
         }
     }
 
@@ -2163,6 +2207,32 @@ mod tests {
                 watchdog,
             });
             Err(anyhow::anyhow!("recording runtime connector"))
+        }
+
+        async fn terminate_all_agents(&self, timeout: Duration) -> usize {
+            self.terminations.lock().push(timeout);
+            1
+        }
+    }
+
+    /// Connector whose agent termination never finishes within the shutdown
+    /// bound, proving `shutdown` stays bounded.
+    #[derive(Clone, Default)]
+    struct HangingAcpConnector;
+
+    #[async_trait]
+    impl AcpConnector for HangingAcpConnector {
+        async fn connect(
+            &self,
+            _transport: TransportConfig,
+            _watchdog: AgentWatchdogOptions,
+        ) -> anyhow::Result<AcpClient> {
+            Err(anyhow::anyhow!("hanging connector"))
+        }
+
+        async fn terminate_all_agents(&self, _timeout: Duration) -> usize {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            0
         }
     }
 
@@ -2541,6 +2611,65 @@ mod tests {
             connector.connections(),
             [expected_default_runtime_connection()]
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_terminates_agents_and_closes_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let runtime = runtime_with_recording_connector(
+            production_connector_test_config(&dir),
+            connector.clone(),
+        )
+        .await;
+        assert!(!runtime.store().unwrap().pool().is_closed());
+
+        runtime.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(connector.terminations(), [Duration::from_secs(5)]);
+        assert!(runtime.store().unwrap().pool().is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_bounded_when_termination_hangs() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = WorkflowRuntime::with_dependencies_and_connector(
+            production_connector_test_config(&dir),
+            Arc::new(MockRuntimeDependencies::new()),
+            Arc::new(HangingAcpConnector),
+        )
+        .await
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        runtime.shutdown(Duration::from_millis(200)).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shutdown did not stay bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(runtime.store().unwrap().pool().is_closed());
+    }
+
+    #[tokio::test]
+    async fn shutdown_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let runtime = runtime_with_recording_connector(
+            production_connector_test_config(&dir),
+            connector.clone(),
+        )
+        .await;
+
+        runtime.shutdown(Duration::from_secs(5)).await;
+        runtime.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(
+            connector.terminations(),
+            [Duration::from_secs(5), Duration::from_secs(5)]
+        );
+        assert!(runtime.store().unwrap().pool().is_closed());
     }
 
     #[tokio::test]

@@ -1,6 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+use crate::agent_processes::{self, RegistrationId};
+use crate::process_tree::ProcessTreeScope;
 
 use super::{StdioConfig, Transport};
 
@@ -11,6 +16,10 @@ pub struct StdioTransport {
     child: Child,
     command: String,
     pid: Option<u32>,
+    /// Owns the agent's whole process tree; descendants inherit the stdout
+    /// pipe, so only tree termination lets the pending read reach EOF.
+    tree: Arc<ProcessTreeScope>,
+    registration: Option<RegistrationId>,
 }
 
 impl StdioTransport {
@@ -32,9 +41,23 @@ impl StdioTransport {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
+        let tree = Arc::new(ProcessTreeScope::new()?);
+        tree.configure(&mut cmd);
+
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!("Failed to spawn agent process '{}': {}", config.command, e)
         })?;
+
+        if let Err(err) = tree.attach(&child) {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!(
+                "Failed to take ownership of agent process tree for '{}': {}",
+                config.command,
+                err
+            ));
+        }
+
+        let registration = agent_processes::register(&tree);
 
         let pid = child.id();
         let stdin = child.stdin.take().expect("stdin piped");
@@ -62,6 +85,8 @@ impl StdioTransport {
             child,
             command: config.command.clone(),
             pid,
+            tree,
+            registration: Some(registration),
         })
     }
 
@@ -69,6 +94,34 @@ impl StdioTransport {
     #[allow(dead_code)]
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
+    }
+
+    /// Kill the agent's whole process tree and stop tracking it for shutdown.
+    fn terminate_tree(&mut self) -> bool {
+        if let Some(registration) = self.registration.take() {
+            agent_processes::deregister(registration);
+        }
+
+        match self.tree.terminate() {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    command = %self.command,
+                    pid = ?self.pid,
+                    error = %err,
+                    "Agent process tree termination failed"
+                );
+                false
+            }
+        }
+    }
+}
+
+impl Drop for StdioTransport {
+    fn drop(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            agent_processes::deregister(registration);
+        }
     }
 }
 
@@ -153,10 +206,12 @@ impl Transport for StdioTransport {
 
     async fn close(&mut self) -> anyhow::Result<()> {
         let status = self.child.try_wait().ok().flatten();
+        let tree_terminated = self.terminate_tree();
         tracing::debug!(
             command = %self.command,
             pid = ?self.pid,
             status = ?status,
+            tree_terminated,
             "Closing agent subprocess"
         );
         if status.is_none()
@@ -175,13 +230,17 @@ impl Transport for StdioTransport {
     async fn force_terminate(&mut self) -> anyhow::Result<()> {
         let status = self.child.try_wait()?;
         if status.is_none() {
+            let tree_terminated = self.terminate_tree();
             tracing::warn!(
                 command = %self.command,
                 pid = ?self.pid,
+                tree_terminated,
                 "Force terminating agent subprocess"
             );
             self.child.kill().await?;
             let _ = self.child.wait().await?;
+        } else {
+            self.terminate_tree();
         }
         Ok(())
     }

@@ -267,6 +267,32 @@ Workflow events are persisted separately for display/debugging under:
 Existing non-SQLite files are rejected without modification. There is no
 automatic conversion; preserve the old file and choose or clear a SQLite path.
 
+### Shutdown
+
+`cowboy-agent-acp` owns the *process tree* an agent creates, not just the
+directly spawned process. `StdioTransport::connect` builds a
+`ProcessTreeScope` (a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, or a Unix process group signalled with
+`killpg`), configures it before spawn, attaches the spawned child, and
+registers it in a process-wide registry of live agent trees. `force_terminate`,
+`close`, and drop terminate the whole tree and deregister it. Tree ownership is
+required for termination to release the agent's stdio pipes: descendants
+inherit the stdout write handle, so killing only the direct child leaves the
+transport's pending read without EOF and blocks process exit forever.
+
+The registry is exposed as
+`cowboy_agent_acp::terminate_all_agent_processes(timeout)` and reached through
+the engine's `AcpConnector` seam.
+
+`WorkflowRuntime::shutdown(timeout)` is the bounded, idempotent teardown
+sequence: cancel store waits, terminate every live agent process tree, then
+close the SQLite pool last so no in-flight persistence is dropped. Run state
+and event logs are already persisted per step. The TUI awaits `shutdown` after
+its event loop returns and before restoring the terminal, and the `cowboy`
+binary runs on an explicit Tokio runtime whose final teardown is bounded by
+`Runtime::shutdown_timeout`, so returning from `main` always terminates the
+process.
+
 ## CLI
 
 The `cowboy` binary parses argv through `cowboy-command-parser` and dispatches parsed commands in the app crate:

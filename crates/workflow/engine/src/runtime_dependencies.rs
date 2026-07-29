@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
@@ -17,6 +18,13 @@ pub(crate) trait AcpConnector: Send + Sync {
         transport: TransportConfig,
         watchdog: AgentWatchdogOptions,
     ) -> anyhow::Result<AcpClient>;
+
+    /// Terminate every live agent process tree, bounded by `timeout`, and
+    /// report how many were terminated. Connectors that never spawn real agent
+    /// processes keep the default no-op.
+    async fn terminate_all_agents(&self, _timeout: Duration) -> usize {
+        0
+    }
 }
 
 #[derive(Debug, Default)]
@@ -30,6 +38,10 @@ impl AcpConnector for ProductionAcpConnector {
         watchdog: AgentWatchdogOptions,
     ) -> anyhow::Result<AcpClient> {
         AcpClient::connect_with_options(transport, watchdog).await
+    }
+
+    async fn terminate_all_agents(&self, timeout: Duration) -> usize {
+        cowboy_agent_acp::terminate_all_agent_processes(timeout).await
     }
 }
 

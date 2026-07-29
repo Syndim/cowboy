@@ -33,10 +33,11 @@ This crate owns config loading, logging setup, runtime dispatch, and terminal re
 
 | Module | Responsibility |
 | --- | --- |
-| `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. |
-| `lib.rs` | Public exports for the TUI app crate: config and `run_tui`. |
+| `main.rs` | Shared binary entrypoint. Uses `cowboy-command-parser` for CLI parsing; the default command and `tui` subcommand launch the TUI, while other subcommands call `cowboy-workflow-engine::WorkflowRuntime`. Runs on an explicit Tokio runtime whose final teardown is bounded, so returning from `main` always terminates the process. |
+| `lib.rs` | Public exports for the TUI app crate: config, `run_tui`, and the bounded process-exit helper. |
+| `process_exit.rs` | `run_with_bounded_shutdown`: builds a multi-thread Tokio runtime, `block_on`s the work so persistence completes, then bounds runtime teardown with `Runtime::shutdown_timeout`. |
 | `config.rs` | Load and validate TOML, including per-agent watchdog policy, materialize named config sets, and convert them into engine `RuntimeConfig`. |
-| `app.rs` | Terminal startup, event loop, and top-level vertical layout only. |
+| `app.rs` | Terminal startup, event loop, and top-level vertical layout only. Awaits `WorkflowRuntime::shutdown` after the loop returns and before restoring the terminal. |
 | `app/commands.rs` | Slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback. |
 | `app/input.rs` | Keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys. |
 | `app/history.rs` | TUI-owned persisted composer input history: locked append-only JSON-lines storage under `state_dir`. |
@@ -82,7 +83,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, and persists `Failed` on give-up. Also `LuaStepActionProvider`. |
@@ -194,7 +195,9 @@ ACP backend implementation.
 | --- | --- |
 | `client.rs` | ACP client implementing `cowboy-agent-client::Client`, including inactivity reset, `session/cancel`, same-session `"Continue"`, and bounded restart/resume recovery. |
 | `messages.rs` | ACP JSON-RPC message types and parser. |
-| `transport/` | stdio and Zellij line transports, including recorded-PID force termination before replacement startup with `--resume=<session-id>`. |
+| `process_tree.rs` | `ProcessTreeScope`: platform ownership of an agent's whole process tree (Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; Unix `process_group(0)` + `killpg`), configured before spawn, attached after spawn, terminated idempotently and on drop. |
+| `agent_processes.rs` | Process-wide registry of live agent process trees, exposed as `terminate_all_agent_processes(timeout)` for bounded shutdown. |
+| `transport/` | stdio and Zellij line transports, including recorded-PID force termination before replacement startup with `--resume=<session-id>`. `StdioTransport` owns a `ProcessTreeScope` and terminates the whole tree on `force_terminate`/`close`/drop, so the agent's stdio pipes are actually released. |
 | `bin/acp-chat.rs` | Test app for chatting with an ACP agent. |
 | `bin/watchdog-fixture.rs` | Deterministic soft/hard watchdog smoke fixture and authenticated cleanup verifier. |
 

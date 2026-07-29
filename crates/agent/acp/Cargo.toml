@@ -24,6 +24,17 @@ tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "t
 tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 parking_lot.workspace = true
 tempfile.workspace = true
