@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -52,12 +54,45 @@ pub struct OutputSpec {
     /// Allowed status values for the resulting `StepOutput`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub statuses: Vec<Status>,
-    /// Field specification for the structured output body.
+    /// Declared structured output fields, keyed by field name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, Field>,
+}
+
+/// Declared type, requirement, and prompt guidance for one structured output field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Field {
+    /// Declared value type used to validate and describe the field.
+    #[serde(rename = "type")]
+    pub field_type: FieldType,
+    /// Whether the field must be present and non-null in the structured output.
     #[serde(default)]
-    pub fields: Value,
-    /// Fields that must be present and non-null in the structured output.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_fields: Vec<String>,
+    pub required: bool,
+    /// Prompt guidance describing what the agent should return for this field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// Supported declared value types for a structured output [`Field`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    Array,
+    Boolean,
+    Number,
+    String,
+}
+
+impl FieldType {
+    /// Human-readable/wire name for this type, e.g. for prompt guidance.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Array => "array",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::String => "string",
+        }
+    }
 }
 
 /// Request to execute one command-line program directly, without a shell.

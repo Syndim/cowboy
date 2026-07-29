@@ -34,8 +34,6 @@ pub enum Error {
         expected: String,
         actual: String,
     },
-    #[error("agent output field {field:?} uses unsupported descriptor {descriptor:?}")]
-    UnsupportedOutputFieldDescriptor { field: String, descriptor: String },
     #[error("agent action missing output for step record")]
     MissingOutput,
 }
@@ -62,7 +60,6 @@ impl Error {
             | Error::DisallowedStatus { .. }
             | Error::MissingOutputFields(_)
             | Error::InvalidOutputFieldType { .. }
-            | Error::UnsupportedOutputFieldDescriptor { .. }
             | Error::MissingOutput => true,
             Error::MissingClient(_) | Error::Json(_) => false,
             Error::Workflow(err) => err.recoverable(),
@@ -105,13 +102,6 @@ mod tests {
                 field: "files".to_string(),
                 expected: "array".to_string(),
                 actual: "string".to_string()
-            }
-            .recoverable()
-        );
-        assert!(
-            Error::UnsupportedOutputFieldDescriptor {
-                field: "files".to_string(),
-                descriptor: "map".to_string()
             }
             .recoverable()
         );

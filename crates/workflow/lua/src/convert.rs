@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AskUserAction, CommandAction, FailAction, OutputSpec, RoleDefinition,
-    StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowAction, WorkflowDefinition,
-    default_command_failure_status, default_command_success_status,
+    AgentAction, AskUserAction, CommandAction, FailAction, Field, FieldType, OutputSpec,
+    RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowAction,
+    WorkflowDefinition, default_command_failure_status, default_command_success_status,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -178,7 +178,6 @@ fn output_spec(value: Value) -> Result<Option<OutputSpec>> {
                     });
                 }
             };
-            let fields = lua_to_json(table.get::<Value>("fields")?)?;
             let required_fields = match table.get::<Value>("required_fields")? {
                 Value::Nil => Vec::new(),
                 Value::Table(t) => table_to_string_vec(&t)?,
@@ -190,16 +189,104 @@ fn output_spec(value: Value) -> Result<Option<OutputSpec>> {
                     });
                 }
             };
-            Ok(Some(OutputSpec {
-                statuses,
-                fields,
-                required_fields,
-            }))
+            let fields = output_fields(table.get::<Value>("fields")?, &required_fields)?;
+            Ok(Some(OutputSpec { statuses, fields }))
         }
         _ => Err(Error::InvalidActionField {
             action: "agent".to_string(),
             field: "output".to_string(),
             reason: "must be a table".to_string(),
+        }),
+    }
+}
+
+/// Parse the `output.fields` table into declared `Field`s keyed by name,
+/// applying `required_fields` membership as each field's `required` flag.
+///
+/// Each entry accepts either a plain type string (e.g. `"array"`) or a table
+/// `{ type = "...", description = "..." }` carrying prompt guidance for the
+/// agent about what to return in that field.
+fn output_fields(value: Value, required_fields: &[String]) -> Result<BTreeMap<String, Field>> {
+    let table = match value {
+        Value::Nil => return Ok(BTreeMap::new()),
+        Value::Table(table) => table,
+        _ => {
+            return Err(Error::InvalidActionField {
+                action: "agent".to_string(),
+                field: "output.fields".to_string(),
+                reason: "must be a table".to_string(),
+            });
+        }
+    };
+
+    let mut fields = BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, descriptor) = pair?;
+        let Value::String(key) = key else {
+            return Err(Error::InvalidActionField {
+                action: "agent".to_string(),
+                field: "output.fields".to_string(),
+                reason: "keys must be strings".to_string(),
+            });
+        };
+        let name = key.to_str()?.to_string();
+        let (field_type, description) = field_descriptor(&name, descriptor)?;
+        fields.insert(
+            name.clone(),
+            Field {
+                field_type,
+                required: required_fields.iter().any(|required| required == &name),
+                description,
+            },
+        );
+    }
+    Ok(fields)
+}
+
+/// Parse one `output.fields` entry into its declared type and description.
+fn field_descriptor(name: &str, value: Value) -> Result<(FieldType, String)> {
+    match value {
+        Value::String(s) => Ok((field_type(name, s.to_str()?.as_ref())?, String::new())),
+        Value::Table(table) => {
+            let type_str: String =
+                table
+                    .get("type")
+                    .map_err(|_| Error::InvalidActionField {
+                        action: "agent".to_string(),
+                        field: format!("output.fields.{name}.type"),
+                        reason: "must be a string".to_string(),
+                    })?;
+            let description = match table.get::<Value>("description")? {
+                Value::Nil => String::new(),
+                Value::String(s) => s.to_str()?.to_string(),
+                _ => {
+                    return Err(Error::InvalidActionField {
+                        action: "agent".to_string(),
+                        field: format!("output.fields.{name}.description"),
+                        reason: "must be a string".to_string(),
+                    });
+                }
+            };
+            Ok((field_type(name, &type_str)?, description))
+        }
+        _ => Err(Error::InvalidActionField {
+            action: "agent".to_string(),
+            field: format!("output.fields.{name}"),
+            reason: "must be a string or a table with type/description".to_string(),
+        }),
+    }
+}
+
+fn field_type(name: &str, value: &str) -> Result<FieldType> {
+    match value {
+        "array" => Ok(FieldType::Array),
+        "boolean" => Ok(FieldType::Boolean),
+        "number" => Ok(FieldType::Number),
+        "string" => Ok(FieldType::String),
+        _ => Err(Error::InvalidActionField {
+            action: "agent".to_string(),
+            field: format!("output.fields.{name}"),
+            reason: "must be one of \"array\", \"boolean\", \"number\", \"string\"".to_string(),
         }),
     }
 }

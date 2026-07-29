@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use cowboy_agent_client::PromptContent;
-use cowboy_workflow_core::{AgentAction, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt};
-use serde_json::Value;
+use cowboy_workflow_core::{
+    AgentAction, Field, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt,
+};
 
 const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
 `blocked` is a last resort. Before choosing it, exhaust reasonable, safe, in-scope actions available through the repository, supplied context, and tools: inspect relevant context, diagnose failures, try reasonable safe fixes, and try viable in-scope alternatives. A crash, failing command or test, unfamiliar code, or an unsuccessful first approach does not by itself justify `blocked`.\n\n\
@@ -141,7 +144,7 @@ fn build_output_instruction(output: &OutputSpec) -> String {
     } else {
         output.statuses.join(", ")
     };
-    let fields = describe_fields(&output.fields, &output.required_fields);
+    let fields = describe_fields(&output.fields);
     let mut instruction = format!(
         "## Deliverable Format\n\n\
 Your response MUST begin with valid YAML frontmatter followed by Markdown body. Quote frontmatter strings and list items that contain `: `, backticks, brackets, braces, or other YAML punctuation.\n\n\
@@ -158,37 +161,52 @@ Example:\n\n---\nstatus: success\nsummary: short summary\n---\n\nMarkdown detail
     instruction
 }
 
-fn describe_fields(fields: &Value, required_fields: &[String]) -> String {
-    let Some(object) = fields.as_object() else {
-        return "- status: routing status string".to_string();
-    };
+fn describe_fields(fields: &BTreeMap<String, Field>) -> String {
     let mut lines = vec!["- status: routing status string".to_string()];
-    for (key, value) in object {
-        let requirement = if required_fields.iter().any(|field| field == key) {
-            "required"
-        } else {
-            "optional"
-        };
-        lines.push(format!(
-            "- {key}: {} ({requirement})",
-            field_description(value)
-        ));
+    for (name, field) in fields {
+        let requirement = if field.required { "required" } else { "optional" };
+        let mut line = format!("- {name}: {} ({requirement})", field.field_type.as_str());
+        if !field.description.is_empty() {
+            line.push_str(" — ");
+            line.push_str(&field.description);
+        }
+        lines.push(line);
     }
     lines.join("\n")
-}
-
-fn field_description(value: &Value) -> String {
-    match value {
-        Value::String(value) => value.clone(),
-        other => other.to_string(),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use cowboy_workflow_core::RunUserInputKind;
+    use cowboy_workflow_core::{FieldType, RunUserInputKind};
+    use serde_json::Value;
+
+    fn summary_field(required: bool) -> BTreeMap<String, Field> {
+        BTreeMap::from([(
+            "summary".to_string(),
+            Field {
+                field_type: FieldType::String,
+                required,
+                description: String::new(),
+            },
+        )])
+    }
+
+    #[test]
+    fn describe_fields_includes_description_when_present() {
+        let fields = BTreeMap::from([(
+            "comments".to_string(),
+            Field {
+                field_type: FieldType::Array,
+                required: false,
+                description: "One bullet per required change.".to_string(),
+            },
+        )]);
+        let description = describe_fields(&fields);
+        assert!(description.contains("comments: array (optional)"));
+        assert!(description.contains("One bullet per required change."));
+    }
 
     #[test]
     fn prompt_includes_role_task_and_frontmatter_instruction() {
@@ -208,8 +226,7 @@ mod tests {
                     "needs_fix".into(),
                     "unblocked".into(),
                 ],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec!["summary".into()],
+                fields: summary_field(true),
             }),
         };
         let prompt = build_agent_prompt(&role, &action, &[], true);
@@ -234,8 +251,7 @@ mod tests {
             prompt: "Do work".into(),
             output: Some(OutputSpec {
                 statuses: vec!["implemented".into(), "blocked".into()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec![],
+                fields: summary_field(false),
             }),
         };
 
@@ -296,8 +312,7 @@ mod tests {
             prompt: "Do work".into(),
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec![],
+                fields: summary_field(false),
             }),
         };
         let nudge = build_retry_nudge(&action, 2, Some("missing YAML frontmatter"));
@@ -332,8 +347,7 @@ mod tests {
             prompt: "Do work".into(),
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec![],
+                fields: summary_field(false),
             }),
         };
         // Full wrapped runner-style reason threaded through context.retry_reason.
@@ -362,8 +376,7 @@ mod tests {
             prompt: "Do work".into(),
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec![],
+                fields: summary_field(false),
             }),
         };
         let reason = "recoverable action failure: agent reply did not contain a workflow result";
@@ -437,8 +450,7 @@ mod tests {
             prompt: "Do work".into(),
             output: Some(OutputSpec {
                 statuses: vec!["success".into()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec!["summary".into()],
+                fields: summary_field(true),
             }),
         };
         let prompt = build_agent_prompt(&role, &action, &[], false);

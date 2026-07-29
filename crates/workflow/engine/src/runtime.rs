@@ -2065,22 +2065,17 @@ fn ensure_resolvable(run: &WorkflowRun) -> Result<()> {
 fn action_output_shape(action: Option<&StepAction>) -> (Vec<String>, Vec<String>, bool) {
     match action {
         Some(StepAction::Agent(agent)) => {
-            let required_fields = agent
-                .output
-                .as_ref()
-                .map(|output| output.required_fields.clone())
-                .unwrap_or_default();
-            let optional_fields = agent
-                .output
-                .as_ref()
-                .and_then(|output| output.fields.as_object())
-                .map(|map| {
-                    map.keys()
-                        .filter(|field| !required_fields.iter().any(|required| required == *field))
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let mut required_fields = Vec::new();
+            let mut optional_fields = Vec::new();
+            if let Some(output) = agent.output.as_ref() {
+                for (name, field) in &output.fields {
+                    if field.required {
+                        required_fields.push(name.clone());
+                    } else {
+                        optional_fields.push(name.clone());
+                    }
+                }
+            }
             (required_fields, optional_fields, true)
         }
         _ => (Vec::new(), Vec::new(), true),
@@ -2166,7 +2161,8 @@ mod tests {
     use cowboy_workflow_agent::PromptWindowHandoffPoint;
     use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
     use cowboy_workflow_core::{
-        AgentPromptWindow, ResumeCallback, RoleDefinition, RunStatus, StepAction, StepRecord,
+        AgentPromptWindow, FieldType, ResumeCallback, RoleDefinition, RunStatus, StepAction,
+        StepRecord,
     };
     use parking_lot::Mutex as SyncMutex;
     use sqlx::Executor;
@@ -6731,19 +6727,19 @@ exit 0
                     assert!(action.prompt.contains("snake_case"));
                     assert!(action.prompt.contains("Create `docs/plans`"));
                     let fields = &action.output.as_ref().unwrap().fields;
-                    assert_eq!(fields["plan_doc"], "string");
+                    assert_eq!(fields["plan_doc"].field_type, FieldType::String);
                 }
                 "implement" => {
                     assert!(action.prompt.contains("mark each completed TODO item"));
                     assert!(action.prompt.contains("- [x]"));
                     let fields = &action.output.as_ref().unwrap().fields;
-                    assert_eq!(fields["plan_doc"], "string");
+                    assert_eq!(fields["plan_doc"].field_type, FieldType::String);
                 }
                 "review" => {
                     assert!(action.prompt.contains("Verify every checked TODO item"));
                     assert!(action.prompt.contains("unfinished work items"));
                     let fields = &action.output.as_ref().unwrap().fields;
-                    assert_eq!(fields["plan_doc"], "string");
+                    assert_eq!(fields["plan_doc"].field_type, FieldType::String);
                 }
                 "revise" => {
                     assert!(
@@ -6752,7 +6748,7 @@ exit 0
                             .contains("update the approved plan document's TODO list")
                     );
                     let fields = &action.output.as_ref().unwrap().fields;
-                    assert_eq!(fields["plan_doc"], "string");
+                    assert_eq!(fields["plan_doc"].field_type, FieldType::String);
                 }
                 _ => unreachable!(),
             }
@@ -6892,7 +6888,7 @@ exit 0
         assert!(plan_action.prompt.contains("Tests to be added/updated"));
         assert!(plan_action.prompt.contains("- [ ]"));
         let fields = &plan_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
         assert_eq!(fields.get("todo"), None);
 
         let result = cowboy_workflow_lua::run_step(
@@ -6927,7 +6923,7 @@ exit 0
                 .contains("docs/plans/<snake_case_summary>.md")
         );
         let fields = &review_plan_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
@@ -6982,7 +6978,7 @@ exit 0
                 .contains("changing each completed `- [ ] TODO-NN` item to `- [x] TODO-NN`")
         );
         let fields = &implement_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
@@ -7012,7 +7008,7 @@ exit 0
                 .contains("Plan doc: docs/plans/example.md")
         );
         let fields = &test_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
@@ -7055,7 +7051,7 @@ exit 0
                 .contains("An unchecked required TODO must remain visible")
         );
         let fields = &review_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
@@ -7084,7 +7080,7 @@ exit 0
                 .contains("Plan doc: docs/plans/example.md")
         );
         let fields = &revise_action.output.as_ref().unwrap().fields;
-        assert_eq!(fields["plan_doc"], "string");
+        assert_eq!(fields["plan_doc"].field_type, FieldType::String);
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,

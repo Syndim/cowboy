@@ -302,8 +302,12 @@ return action.agent {
     status = { "approved", "rejected" },
     fields = {
       summary = "string",
-      comments = "array"
-    }
+      comments = {
+        type = "array",
+        description = "One bullet per required change, in priority order."
+      }
+    },
+    required_fields = { "summary" }
   }
 }
 ```
@@ -314,7 +318,10 @@ Fields:
 - `prompt` (required): full task prompt sent to the agent.
 - `output` (optional): instructions for expected frontmatter output.
   - `output.status`: either one status string or an array of allowed status strings.
-  - `output.fields`: table describing expected fields; string values become human-readable field descriptions in the prompt.
+  - `output.fields`: table describing expected fields, keyed by field name. Each entry is either:
+    - a plain type string (`"array"`, `"boolean"`, `"number"`, or `"string"`), or
+    - a table `{ type = "...", description = "..." }`, where `description` is optional prompt guidance shown to the agent about what to return in that field.
+  - `output.required_fields`: array of field names that must be present and non-null in the returned output.
 
 The output spec is prompt guidance. The runtime parses frontmatter and then routes by the returned status; it does not currently enforce a JSON Schema for `fields`.
 

@@ -94,7 +94,7 @@ pub(crate) fn setup_lua(import_mode: ImportMode) -> Result<Lua> {
 mod tests {
     use super::*;
     use crate::runtime::run_step;
-    use cowboy_workflow_core::StepAction;
+    use cowboy_workflow_core::{Field, FieldType, StepAction};
     use std::collections::BTreeMap;
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
         WorkflowSourceSnapshot {
@@ -651,8 +651,14 @@ mod tests {
                 let output = action
                     .output
                     .expect("implementer action should declare output");
-                assert_eq!(output.fields["implementation_commands"], "array");
-                assert_eq!(output.fields["implementation_evidence"], "array");
+                assert_eq!(
+                    output.fields["implementation_commands"].field_type,
+                    FieldType::Array
+                );
+                assert_eq!(
+                    output.fields["implementation_evidence"].field_type,
+                    FieldType::Array
+                );
             }
 
             let test_result = run_step(
@@ -701,10 +707,16 @@ mod tests {
                 "tester_commands",
                 "tester_evidence",
             ] {
-                assert_eq!(test_output.fields[field], "array");
+                assert_eq!(test_output.fields[field].field_type, FieldType::Array);
             }
+            let required_field_names: Vec<String> = test_output
+                .fields
+                .iter()
+                .filter(|(_, field)| field.required)
+                .map(|(name, _)| name.clone())
+                .collect();
             assert_eq!(
-                test_output.required_fields,
+                required_field_names,
                 vec![
                     "implementation_commands".to_string(),
                     "implementation_evidence".to_string(),
@@ -752,7 +764,7 @@ mod tests {
             }
             let review_output = review.output.expect("reviewer should declare output");
             for field in EVIDENCE_FIELD_NAMES {
-                assert_eq!(review_output.fields[field], "array");
+                assert_eq!(review_output.fields[field].field_type, FieldType::Array);
             }
             for status in ["approved", "changes_requested", "replan_requested"] {
                 assert!(review_output.statuses.iter().any(|value| value == status));
@@ -785,10 +797,7 @@ mod tests {
 
             for field in ["implementation_commands", "implementation_evidence"] {
                 assert!(
-                    output
-                        .required_fields
-                        .iter()
-                        .any(|required| required == field),
+                    output.fields[field].required,
                     "{workflow_name} reviewer output must require {field} because a changes_requested result routes directly to revise"
                 );
             }
@@ -866,14 +875,11 @@ mod tests {
             .output
             .as_ref()
             .unwrap_or_else(|| panic!("{workflow_name} {step_id} should declare output"));
-        assert_eq!(output.fields["user_feedback"], "array");
+        assert_eq!(output.fields["user_feedback"].field_type, FieldType::Array);
         for field in ["implementation_commands", "implementation_evidence"] {
-            assert_eq!(output.fields[field], "array");
+            assert_eq!(output.fields[field].field_type, FieldType::Array);
             assert!(
-                output
-                    .required_fields
-                    .iter()
-                    .any(|required| required == field),
+                output.fields[field].required,
                 "{workflow_name} {step_id} must require {field}"
             );
         }
@@ -1242,7 +1248,7 @@ mod tests {
                 "tester_commands",
                 "tester_evidence",
             ] {
-                assert_eq!(output.fields[field], "array", "{name} {field}");
+                assert_eq!(output.fields[field].field_type, FieldType::Array, "{name} {field}");
             }
         }
     }
@@ -1528,9 +1534,9 @@ mod tests {
             panic!("review should request an agent action")
         };
         let output = action.output.expect("review should declare output");
-        assert_eq!(output.fields["reviewer_assessments"], "array");
-        assert_eq!(output.fields["reviewer_commands"], "array");
-        assert_eq!(output.fields["reviewer_evidence"], "array");
+        assert_eq!(output.fields["reviewer_assessments"].field_type, FieldType::Array);
+        assert_eq!(output.fields["reviewer_commands"].field_type, FieldType::Array);
+        assert_eq!(output.fields["reviewer_evidence"].field_type, FieldType::Array);
         for expected in [
             "globally gated two-pass process",
             "every required `TODO-NN` in plan order—whether checked or unchecked—followed by every required `VAL-NN`",
@@ -1754,7 +1760,7 @@ mod tests {
             .output
             .expect("blocker reviewer should declare output");
         for field in EVIDENCE_FIELD_NAMES {
-            assert_eq!(output.fields[field], "array");
+            assert_eq!(output.fields[field].field_type, FieldType::Array);
         }
 
         let mut reviewed_fields = expected.clone();
@@ -2043,7 +2049,7 @@ mod tests {
             "validator_commands",
             "validator_evidence",
         ] {
-            assert_eq!(validate_output.fields[field], "array");
+            assert_eq!(validate_output.fields[field].field_type, FieldType::Array);
         }
 
         let mut validator_fields = all_evidence.clone();
@@ -2222,7 +2228,7 @@ mod tests {
                     .output
                     .expect("result feedback reviewer should declare output");
                 for field in EVIDENCE_FIELD_NAMES {
-                    assert_eq!(output.fields[field], "array");
+                    assert_eq!(output.fields[field].field_type, FieldType::Array);
                 }
             }
         }
@@ -2802,12 +2808,14 @@ mod tests {
                 });
 
                 assert_eq!(
-                    output.fields["user_feedback"], "array",
+                    output.fields["user_feedback"].field_type,
+                    FieldType::Array,
                     "{workflow_name} {step_id} should declare user_feedback"
                 );
                 if !matches!(*step_id, "investigate" | "review_rca") {
                     assert_eq!(
-                        output.fields["validation_doc"], "string",
+                        output.fields["validation_doc"].field_type,
+                        FieldType::String,
                         "{workflow_name} {step_id} should declare validation_doc"
                     );
                 }
@@ -2829,7 +2837,8 @@ mod tests {
                         "repro_test",
                     ] {
                         assert_eq!(
-                            output.fields[field], "string",
+                            output.fields[field].field_type,
+                            FieldType::String,
                             "commit should declare {field}"
                         );
                     }
@@ -3400,8 +3409,8 @@ mod tests {
 
         let output = review.output.expect("blocker review should declare output");
         assert_eq!(output.statuses, ["recoverable", "user_required"]);
-        assert_eq!(output.fields["blocker_reason"], "string");
-        assert_eq!(output.fields["blocker_resolution"], "string");
+        assert_eq!(output.fields["blocker_reason"].field_type, FieldType::String);
+        assert_eq!(output.fields["blocker_resolution"].field_type, FieldType::String);
 
         let mut recoverable_fields = sample_evidence_fields();
         recoverable_fields["blocker_statement"] =
@@ -3774,13 +3783,13 @@ mod tests {
 
         let output = plan.output.expect("planner should declare output");
         for field in ["work_dir", "plan_doc", "validation_doc"] {
-            assert_eq!(output.fields[field], "string");
+            assert_eq!(output.fields[field].field_type, FieldType::String);
         }
         for field in ["prior_work_dir", "prior_plan_doc", "prior_validation_doc"] {
-            assert!(output.fields.get(field).is_none(), "unexpected {field}");
+            assert!(!output.fields.contains_key(field), "unexpected {field}");
             assert!(!plan.prompt.contains(field), "unexpected {field} guidance");
         }
-        assert_eq!(output.fields["files"], "array");
+        assert_eq!(output.fields["files"].field_type, FieldType::Array);
 
         let planner = compiled
             .definition
@@ -3967,8 +3976,9 @@ mod tests {
             validate
                 .output
                 .expect("validator should declare output")
-                .fields["validation_doc"],
-            "string"
+                .fields["validation_doc"]
+                .field_type,
+            FieldType::String
         );
 
         let commit_result = run_step(
@@ -4384,6 +4394,79 @@ mod tests {
     }
 
     #[test]
+    fn output_fields_accept_plain_string_and_table_form_with_description() {
+        let source = snapshot(
+            r#"
+            local dev = role("developer", "implement things")
+            local start = step("start", { role = dev })
+            start.run = function(ctx)
+                return action.agent {
+                    role = dev,
+                    prompt = "Do work",
+                    output = {
+                        status = { "success" },
+                        fields = {
+                            summary = "string",
+                            comments = {
+                                type = "array",
+                                description = "One bullet per required change."
+                            }
+                        },
+                        required_fields = { "summary" }
+                    }
+                }
+            end
+            return workflow("wf", start)
+            "#,
+        );
+        let result = run_step(&source, "start", serde_json::json!({ "request": "do it" })).unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("expected agent action")
+        };
+        let output = action.output.expect("should declare output");
+        assert_eq!(
+            output.fields["summary"],
+            Field {
+                field_type: FieldType::String,
+                required: true,
+                description: String::new(),
+            }
+        );
+        assert_eq!(
+            output.fields["comments"],
+            Field {
+                field_type: FieldType::Array,
+                required: false,
+                description: "One bullet per required change.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn output_fields_table_form_requires_a_valid_type() {
+        let source = snapshot(
+            r#"
+            local dev = role("developer", "implement things")
+            local start = step("start", { role = dev })
+            start.run = function(ctx)
+                return action.agent {
+                    role = dev,
+                    prompt = "Do work",
+                    output = {
+                        status = { "success" },
+                        fields = { summary = { type = "paragraph" } }
+                    }
+                }
+            end
+            return workflow("wf", start)
+            "#,
+        );
+        let err = run_step(&source, "start", serde_json::json!({ "request": "do it" }))
+            .unwrap_err();
+        assert!(err.to_string().contains("output.fields.summary"));
+    }
+
+    #[test]
     fn role_table_agent_becomes_typed_metadata() {
         let source = snapshot(
             r#"
@@ -4747,22 +4830,23 @@ mod tests {
             ["documented", "unclear", "blocked"]
         );
         for (field, ty) in [
-            ("summary", "string"),
-            ("user_feedback", "array"),
-            ("work_dir", "string"),
-            ("rca_doc", "string"),
-            ("repro_test", "string"),
-            ("files", "array"),
-            ("command", "string"),
-            ("failure", "string"),
+            ("summary", FieldType::String),
+            ("user_feedback", FieldType::Array),
+            ("work_dir", FieldType::String),
+            ("rca_doc", FieldType::String),
+            ("repro_test", FieldType::String),
+            ("files", FieldType::Array),
+            ("command", FieldType::String),
+            ("failure", FieldType::String),
         ] {
             assert_eq!(
-                investigate_output.fields[field], ty,
-                "investigate output field {field} should be {ty}"
+                investigate_output.fields[field].field_type,
+                ty,
+                "investigate output field {field} should be {ty:?}"
             );
         }
         assert_eq!(
-            investigate_output.fields.as_object().unwrap().len(),
+            investigate_output.fields.len(),
             8,
             "investigate output schema should be unchanged"
         );
@@ -4810,21 +4894,22 @@ mod tests {
         let review_output = review.output.expect("review_rca should declare output");
         assert_eq!(review_output.statuses, ["approved", "changes_requested"]);
         for (field, ty) in [
-            ("feedback", "string"),
-            ("user_feedback", "array"),
-            ("work_dir", "string"),
-            ("rca_doc", "string"),
-            ("repro_test", "string"),
-            ("commands", "array"),
-            ("failures", "array"),
+            ("feedback", FieldType::String),
+            ("user_feedback", FieldType::Array),
+            ("work_dir", FieldType::String),
+            ("rca_doc", FieldType::String),
+            ("repro_test", FieldType::String),
+            ("commands", FieldType::Array),
+            ("failures", FieldType::Array),
         ] {
             assert_eq!(
-                review_output.fields[field], ty,
-                "review_rca output field {field} should be {ty}"
+                review_output.fields[field].field_type,
+                ty,
+                "review_rca output field {field} should be {ty:?}"
             );
         }
         assert_eq!(
-            review_output.fields.as_object().unwrap().len(),
+            review_output.fields.len(),
             7,
             "review_rca output schema should be unchanged"
         );

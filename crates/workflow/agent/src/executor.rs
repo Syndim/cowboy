@@ -905,25 +905,18 @@ fn validate_output_spec(
         });
     }
 
-    let Some(fields) = spec.fields.as_object() else {
-        return Ok(());
-    };
-
-    for (field, descriptor) in fields {
-        validate_supported_descriptor(field, descriptor)?;
-    }
-
     let output_fields = output.fields.as_object();
     let missing = spec
-        .required_fields
+        .fields
         .iter()
-        .filter(|field| {
+        .filter(|(_, field)| field.required)
+        .filter(|(name, _)| {
             !output_fields
-                .and_then(|values| values.get(*field))
+                .and_then(|values| values.get(name.as_str()))
                 .map(|value| !value.is_null())
                 .unwrap_or(false)
         })
-        .cloned()
+        .map(|(name, _)| name.clone())
         .collect::<Vec<_>>();
 
     if !missing.is_empty() {
@@ -934,43 +927,27 @@ fn validate_output_spec(
         return Ok(());
     };
 
-    for (field, descriptor) in fields {
-        if let Some(value) = output_fields.get(field)
+    for (name, field) in &spec.fields {
+        if let Some(value) = output_fields.get(name)
             && !value.is_null()
         {
-            validate_output_field_type(field, descriptor, value)?;
+            validate_output_field_type(name, field.field_type, value)?;
         }
     }
 
     Ok(())
 }
 
-fn validate_supported_descriptor(field: &str, descriptor: &serde_json::Value) -> Result<()> {
-    match descriptor.as_str() {
-        Some("array" | "boolean" | "number" | "string") => Ok(()),
-        Some(value) => Err(Error::UnsupportedOutputFieldDescriptor {
-            field: field.to_string(),
-            descriptor: value.to_string(),
-        }),
-        None => Err(Error::UnsupportedOutputFieldDescriptor {
-            field: field.to_string(),
-            descriptor: descriptor.to_string(),
-        }),
-    }
-}
-
 fn validate_output_field_type(
     field: &str,
-    descriptor: &serde_json::Value,
+    field_type: cowboy_workflow_core::FieldType,
     value: &serde_json::Value,
 ) -> Result<()> {
-    let expected = descriptor.as_str().expect("descriptor validated first");
-    let valid = match expected {
-        "array" => value.is_array(),
-        "boolean" => value.is_boolean(),
-        "number" => value.is_number(),
-        "string" => value.is_string(),
-        _ => unreachable!("descriptor validated first"),
+    let valid = match field_type {
+        cowboy_workflow_core::FieldType::Array => value.is_array(),
+        cowboy_workflow_core::FieldType::Boolean => value.is_boolean(),
+        cowboy_workflow_core::FieldType::Number => value.is_number(),
+        cowboy_workflow_core::FieldType::String => value.is_string(),
     };
 
     if valid {
@@ -979,7 +956,7 @@ fn validate_output_field_type(
 
     Err(Error::InvalidOutputFieldType {
         field: field.to_string(),
-        expected: expected.to_string(),
+        expected: field_type.as_str().to_string(),
         actual: json_type_name(value).to_string(),
     })
 }
@@ -1288,6 +1265,24 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+
+    fn output_fields(
+        pairs: &[(&str, cowboy_workflow_core::FieldType, bool)],
+    ) -> std::collections::BTreeMap<String, cowboy_workflow_core::Field> {
+        pairs
+            .iter()
+            .map(|(name, field_type, required)| {
+                (
+                    name.to_string(),
+                    cowboy_workflow_core::Field {
+                        field_type: *field_type,
+                        required: *required,
+                        description: String::new(),
+                    },
+                )
+            })
+            .collect()
+    }
 
     #[derive(Debug)]
     enum FakePromptBehavior {
@@ -2036,19 +2031,29 @@ resending the same instruction as attempt two"
         let mut action = action("developer");
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["passed".to_string(), "failed".to_string()],
-            fields: serde_json::json!({
-                "summary": "string",
-                "implementation_commands": "array",
-                "implementation_evidence": "array",
-                "tester_commands": "array",
-                "tester_evidence": "array",
-            }),
-            required_fields: vec![
-                "implementation_commands".to_string(),
-                "implementation_evidence".to_string(),
-                "tester_commands".to_string(),
-                "tester_evidence".to_string(),
-            ],
+            fields: output_fields(&[
+                ("summary", cowboy_workflow_core::FieldType::String, false),
+                (
+                    "implementation_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "implementation_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "tester_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "tester_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+            ]),
         });
 
         let error = executor
@@ -2078,13 +2083,12 @@ resending the same instruction as attempt two"
         let mut action = action("developer");
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["ready".to_string()],
-            fields: serde_json::json!({
-                "summary": "string",
-                "validation_doc": "string",
-                "rca_doc": "string",
-                "repro_test": "string",
-            }),
-            required_fields: vec!["summary".to_string()],
+            fields: output_fields(&[
+                ("summary", cowboy_workflow_core::FieldType::String, true),
+                ("validation_doc", cowboy_workflow_core::FieldType::String, false),
+                ("rca_doc", cowboy_workflow_core::FieldType::String, false),
+                ("repro_test", cowboy_workflow_core::FieldType::String, false),
+            ]),
         });
 
         let execution = executor
@@ -2109,19 +2113,29 @@ resending the same instruction as attempt two"
         let mut action = action("developer");
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["passed".to_string(), "failed".to_string()],
-            fields: serde_json::json!({
-                "summary": "string",
-                "implementation_commands": "array",
-                "implementation_evidence": "array",
-                "tester_commands": "array",
-                "tester_evidence": "array",
-            }),
-            required_fields: vec![
-                "implementation_commands".to_string(),
-                "implementation_evidence".to_string(),
-                "tester_commands".to_string(),
-                "tester_evidence".to_string(),
-            ],
+            fields: output_fields(&[
+                ("summary", cowboy_workflow_core::FieldType::String, false),
+                (
+                    "implementation_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "implementation_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "tester_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+                (
+                    "tester_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    true,
+                ),
+            ]),
         });
 
         let error = executor
@@ -2148,16 +2162,31 @@ resending the same instruction as attempt two"
         let mut action = action("developer");
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["passed".to_string()],
-            fields: serde_json::json!({
-                "summary": "string",
-                "plan_doc": "string",
-                "files": "array",
-                "implementation_commands": "array",
-                "implementation_evidence": "array",
-                "tester_commands": "array",
-                "tester_evidence": "array",
-            }),
-            required_fields: vec![],
+            fields: output_fields(&[
+                ("summary", cowboy_workflow_core::FieldType::String, false),
+                ("plan_doc", cowboy_workflow_core::FieldType::String, false),
+                ("files", cowboy_workflow_core::FieldType::Array, false),
+                (
+                    "implementation_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    false,
+                ),
+                (
+                    "implementation_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    false,
+                ),
+                (
+                    "tester_commands",
+                    cowboy_workflow_core::FieldType::Array,
+                    false,
+                ),
+                (
+                    "tester_evidence",
+                    cowboy_workflow_core::FieldType::Array,
+                    false,
+                ),
+            ]),
         });
 
         let error = executor
@@ -2705,8 +2734,7 @@ resending the same instruction as attempt two"
         let mut action = action("developer");
         action.output = Some(cowboy_workflow_core::OutputSpec {
             statuses: vec!["success".to_string()],
-            fields: serde_json::json!({"summary": "string"}),
-            required_fields: vec!["summary".to_string()],
+            fields: output_fields(&[("summary", cowboy_workflow_core::FieldType::String, true)]),
         });
 
         let execution = executor.execute_agent(action, context).await.unwrap();
@@ -3326,8 +3354,7 @@ still applies, got non-recoverable: {error:?}"
             prompt: "Do work".into(),
             output: Some(cowboy_workflow_core::OutputSpec {
                 statuses: vec!["success".to_string()],
-                fields: serde_json::json!({"summary": "string"}),
-                required_fields: vec!["summary".to_string()],
+                fields: output_fields(&[("summary", cowboy_workflow_core::FieldType::String, true)]),
             }),
         }
     }
