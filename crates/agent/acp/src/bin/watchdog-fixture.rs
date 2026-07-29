@@ -23,11 +23,18 @@ use uuid::Uuid;
 const RECOVERY_TEXT: &str =
     "---\nstatus: success\nsummary: watchdog recovered\n---\nwatchdog recovered";
 const WORKSPACE_MARKER: &str = "cowboy-watchdog-smoke-v1\n";
+/// How long the `end-turn-cancel` stall keeps its scripted tool call in flight.
+///
+/// It must span at least one full `response_timeout_seconds` window (the
+/// generated smoke config uses 1 s) so the watchdog observes an in-flight tool
+/// call, restarts itself, and only cancels once the tool reports `completed`.
+const TOOL_CALL_IN_FLIGHT_DELAY: Duration = Duration::from_millis(2500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     AcknowledgeCancel,
     IgnoreCancel,
+    CancelEndsTurn,
 }
 
 impl Mode {
@@ -35,7 +42,16 @@ impl Mode {
         match value {
             "acknowledge-cancel" => Ok(Self::AcknowledgeCancel),
             "ignore-cancel" => Ok(Self::IgnoreCancel),
-            _ => bail!("--mode must be acknowledge-cancel or ignore-cancel"),
+            "end-turn-cancel" => Ok(Self::CancelEndsTurn),
+            _ => bail!("--mode must be acknowledge-cancel, ignore-cancel, or end-turn-cancel"),
+        }
+    }
+
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::AcknowledgeCancel => "acknowledge-cancel",
+            Self::IgnoreCancel => "ignore-cancel",
+            Self::CancelEndsTurn => "end-turn-cancel",
         }
     }
 }
@@ -101,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  watchdog-fixture serve --mode acknowledge-cancel|ignore-cancel --events FILE --invocation-token TOKEN --identity-dir DIR [--resume=SESSION]\n  watchdog-fixture verify --cowboy PATH --workspace DIR --response-timeout-seconds N --cancel-timeout-seconds N --recovery-operation-timeout-seconds N --soft-deadline-seconds N --hard-deadline-seconds N\n  watchdog-fixture cleanup --workspace DIR"
+        "Usage:\n  watchdog-fixture serve --mode acknowledge-cancel|ignore-cancel|end-turn-cancel --events FILE --invocation-token TOKEN --identity-dir DIR [--resume=SESSION]\n  watchdog-fixture verify --cowboy PATH --workspace DIR --response-timeout-seconds N --cancel-timeout-seconds N --recovery-operation-timeout-seconds N --soft-deadline-seconds N --hard-deadline-seconds N\n  watchdog-fixture cleanup --workspace DIR"
     );
 }
 
@@ -390,6 +406,47 @@ fn handle_request(
                 respond(output, id, json!({ "stopReason": "end_turn" }))?;
                 events.record("continue_completed", json!({ "session_id": current }))?;
             } else {
+                if mode == Mode::CancelEndsTurn {
+                    // Mirror the real failure: the agent is blocked inside a
+                    // long-running tool call, then blocked with no tool running.
+                    // The watchdog must restart itself for the first phase and
+                    // only cancel once the tool reports a terminal status.
+                    notify(
+                        output,
+                        "session/update",
+                        json!({
+                            "sessionId": current,
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": "watchdog-tool-1",
+                                "title": "Run long external work",
+                                "kind": "execute",
+                                "status": "in_progress"
+                            }
+                        }),
+                    )?;
+                    events.record(
+                        "tool_call_started",
+                        json!({ "session_id": current, "tool_call_id": "watchdog-tool-1" }),
+                    )?;
+                    thread::sleep(TOOL_CALL_IN_FLIGHT_DELAY);
+                    notify(
+                        output,
+                        "session/update",
+                        json!({
+                            "sessionId": current,
+                            "update": {
+                                "sessionUpdate": "tool_call_update",
+                                "toolCallId": "watchdog-tool-1",
+                                "status": "completed"
+                            }
+                        }),
+                    )?;
+                    events.record(
+                        "tool_call_completed",
+                        json!({ "session_id": current, "tool_call_id": "watchdog-tool-1" }),
+                    )?;
+                }
                 *pending_prompt = id;
             }
         }
@@ -414,6 +471,22 @@ fn handle_request(
                         Some(prompt_id),
                         json!({ "stopReason": "cancelled" }),
                     )?;
+                }
+                events.record("cancel_acknowledged", json!({ "session_id": current }))?;
+            } else if mode == Mode::CancelEndsTurn {
+                // The real backend acknowledges a cancel by ending the turn
+                // normally with a trailing notice instead of reporting
+                // `cancelled`.
+                if let Some(prompt_id) = pending_prompt.take() {
+                    notify(
+                        output,
+                        "session/update",
+                        json!({
+                            "sessionId": current,
+                            "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": "Info: Operation cancelled by user" } }
+                        }),
+                    )?;
+                    respond(output, Some(prompt_id), json!({ "stopReason": "end_turn" }))?;
                 }
                 events.record("cancel_acknowledged", json!({ "session_id": current }))?;
             }
@@ -527,6 +600,12 @@ fn verify_with_scenario_runner(
             args.soft_deadline_seconds,
         )?;
         scenario_runner(args, "hard", Mode::IgnoreCancel, args.hard_deadline_seconds)?;
+        scenario_runner(
+            args,
+            "end-turn-cancel",
+            Mode::CancelEndsTurn,
+            args.soft_deadline_seconds,
+        )?;
         Ok(())
     })();
     match result {
@@ -596,10 +675,7 @@ fn write_scenario_files(
     token: &str,
     mode: Mode,
 ) -> anyhow::Result<()> {
-    let mode = match mode {
-        Mode::AcknowledgeCancel => "acknowledge-cancel",
-        Mode::IgnoreCancel => "ignore-cancel",
-    };
+    let mode = mode.as_arg();
     let state = scenario.join("state");
     let store = scenario.join("workflow.redb");
     let workflows = scenario.join("workflows");
@@ -645,7 +721,7 @@ fn verify_scenario_events(scenario: &Path, mode: Mode) -> anyhow::Result<()> {
             .any(|event| event.event == "continue_completed"),
         "scenario recorded no recovery Continue"
     );
-    if mode == Mode::AcknowledgeCancel {
+    if mode != Mode::IgnoreCancel {
         let recovered_pid = events
             .iter()
             .find(|event| event.event == "cancel_received")
@@ -730,11 +806,27 @@ fn verify_scenario_logs(scenario: &Path, mode: Mode) -> anyhow::Result<()> {
     for event in ["agent_watchdog_timeout", "agent_watchdog_cancel_sent"] {
         ensure!(log.contains(event), "watchdog log omitted {event}");
     }
-    if mode == Mode::AcknowledgeCancel {
+    if mode != Mode::IgnoreCancel {
         ensure!(
             log.contains("agent_watchdog_soft_recovered"),
             "watchdog log omitted agent_watchdog_soft_recovered"
         );
+        ensure!(
+            !log.contains("agent_watchdog_force_terminated"),
+            "soft recovery force-terminated the transport"
+        );
+        if mode == Mode::CancelEndsTurn {
+            // The only reproducible observation point for the tool-wait restart
+            // and the last-activity diagnostics: unit tests install no tracing
+            // subscriber, so `tracing::warn!` emits nothing there.
+            for field in [
+                "agent_watchdog_tool_wait",
+                "last_tool_call_status",
+                "seconds_since_last_activity",
+            ] {
+                ensure!(log.contains(field), "watchdog log omitted {field}");
+            }
+        }
     } else {
         for event in [
             "agent_watchdog_force_terminated",
@@ -780,7 +872,7 @@ fn cleanup(workspace: &Path) -> anyhow::Result<()> {
 
 fn find_identity_files(workspace: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for scenario in ["soft", "hard"] {
+    for scenario in ["soft", "hard", "end-turn-cancel"] {
         let directory = workspace.join(scenario).join("identities");
         if !directory.exists() {
             continue;
@@ -1013,6 +1105,95 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_fixture_end_turn_cancel_mode_answers_prompt_with_end_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut events = EventWriter::new(&directory.path().join("events.jsonl")).unwrap();
+        let mut output = Vec::new();
+        let mut session_id = None;
+        let mut pending_prompt = None;
+
+        handle_request(
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            Mode::CancelEndsTurn,
+            &mut session_id,
+            &mut pending_prompt,
+            &mut output,
+            &mut events,
+        )
+        .unwrap();
+        handle_request(
+            &json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
+            Mode::CancelEndsTurn,
+            &mut session_id,
+            &mut pending_prompt,
+            &mut output,
+            &mut events,
+        )
+        .unwrap();
+        let new_response: Value =
+            serde_json::from_slice(output.split(|byte| *byte == b'\n').nth(1).unwrap()).unwrap();
+        let current = new_response["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        handle_request(
+            &json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":current,"prompt":[{"text":"watchdog smoke"}]}}),
+            Mode::CancelEndsTurn,
+            &mut session_id,
+            &mut pending_prompt,
+            &mut output,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(pending_prompt, Some(3));
+        handle_request(
+            &json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":current}}),
+            Mode::CancelEndsTurn,
+            &mut session_id,
+            &mut pending_prompt,
+            &mut output,
+            &mut events,
+        )
+        .unwrap();
+
+        let messages: Vec<Value> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let updates: Vec<&Value> = messages
+            .iter()
+            .filter(|message| message["method"] == "session/update")
+            .collect();
+        assert_eq!(updates[0]["params"]["update"]["sessionUpdate"], "tool_call");
+        assert_eq!(
+            updates[0]["params"]["update"]["toolCallId"],
+            "watchdog-tool-1"
+        );
+        assert_eq!(updates[0]["params"]["update"]["status"], "in_progress");
+        assert_eq!(
+            updates[1]["params"]["update"]["sessionUpdate"],
+            "tool_call_update"
+        );
+        assert_eq!(
+            updates[1]["params"]["update"]["toolCallId"],
+            "watchdog-tool-1"
+        );
+        assert_eq!(updates[1]["params"]["update"]["status"], "completed");
+        assert_eq!(
+            updates[2]["params"]["update"]["content"]["text"],
+            "Info: Operation cancelled by user"
+        );
+        let answer = messages
+            .iter()
+            .find(|message| message["id"] == 3 && message.get("result").is_some())
+            .expect("the pending prompt must be answered");
+        assert_eq!(answer["result"]["stopReason"], "end_turn");
+        assert_eq!(pending_prompt, None);
+    }
+
+    #[test]
     fn watchdog_fixture_rejects_zero_deadlines() {
         assert!(parse_seconds("--soft-deadline-seconds", "0").is_err());
         assert!(parse_seconds("--hard-deadline-seconds", "not-a-number").is_err());
@@ -1066,7 +1247,7 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(calls, ["soft", "hard"]);
+        assert_eq!(calls, ["soft", "hard", "end-turn-cancel"]);
         assert!(!workspace.exists());
     }
 

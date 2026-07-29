@@ -150,6 +150,133 @@ impl PromptTurnActivity {
     }
 }
 
+/// Most recent interesting ACP activity observed inside a single prompt turn.
+///
+/// Interpretation at a watchdog inactivity deadline: a tool call still in
+/// flight (`pending` / `in_progress`) means the agent is waiting on a
+/// long-running job, so the conversation is alive and must not be interrupted;
+/// no tool call at all, or one that already reached `completed` / `failed`
+/// followed by silence, means the conversation itself is likely stuck and is
+/// what the watchdog exists to recover.
+#[derive(Debug, Default, Clone)]
+struct LastObservedActivity {
+    event_kind: Option<&'static str>,
+    observed_at: Option<tokio::time::Instant>,
+    tool_call: Option<ObservedToolCall>,
+}
+
+#[derive(Debug, Clone)]
+struct ObservedToolCall {
+    tool_call_id: String,
+    title: String,
+    kind: String,
+    status: String,
+    in_flight_since: Option<tokio::time::Instant>,
+}
+
+fn tool_call_status_is_in_flight(status: &str) -> bool {
+    matches!(status, "pending" | "in_progress")
+}
+
+impl LastObservedActivity {
+    fn observe_event(&mut self, event: &Event) {
+        let now = tokio::time::Instant::now();
+        self.event_kind = Some(event_kind(event));
+        self.observed_at = Some(now);
+        match event {
+            Event::ToolCall {
+                tool_call_id,
+                title,
+                kind,
+                status,
+            } => {
+                let in_flight_since = self.carry_in_flight_since(tool_call_id, status, now);
+                self.tool_call = Some(ObservedToolCall {
+                    tool_call_id: tool_call_id.clone(),
+                    title: title.clone(),
+                    kind: kind.clone(),
+                    status: status.clone(),
+                    in_flight_since,
+                });
+            }
+            Event::ToolCallUpdate {
+                tool_call_id,
+                status,
+                ..
+            } => {
+                let in_flight_since = self.carry_in_flight_since(tool_call_id, status, now);
+                // An update carries no title/kind, so keep the ones reported by
+                // the originating tool call rather than degrading the
+                // diagnostic to a bare id while progress is streaming.
+                let (title, kind) = self
+                    .tool_call
+                    .as_ref()
+                    .filter(|previous| previous.tool_call_id == *tool_call_id)
+                    .map(|previous| (previous.title.clone(), previous.kind.clone()))
+                    .unwrap_or_default();
+                self.tool_call = Some(ObservedToolCall {
+                    tool_call_id: tool_call_id.clone(),
+                    title,
+                    kind,
+                    status: status.clone(),
+                    in_flight_since,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn carry_in_flight_since(
+        &self,
+        tool_call_id: &str,
+        status: &str,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        if !tool_call_status_is_in_flight(status) {
+            return None;
+        }
+        self.tool_call
+            .as_ref()
+            .filter(|previous| previous.tool_call_id == tool_call_id)
+            .and_then(|previous| previous.in_flight_since)
+            .or(Some(now))
+    }
+
+    fn tool_call_in_flight(&self) -> bool {
+        self.tool_call
+            .as_ref()
+            .is_some_and(|tool_call| tool_call_status_is_in_flight(&tool_call.status))
+    }
+
+    fn last_event_kind(&self) -> Option<&'static str> {
+        self.event_kind
+    }
+
+    fn last_tool_call_title(&self) -> Option<&str> {
+        self.tool_call.as_ref().map(|call| call.title.as_str())
+    }
+
+    fn last_tool_call_kind(&self) -> Option<&str> {
+        self.tool_call.as_ref().map(|call| call.kind.as_str())
+    }
+
+    fn last_tool_call_status(&self) -> Option<&str> {
+        self.tool_call.as_ref().map(|call| call.status.as_str())
+    }
+
+    fn seconds_since_last_activity(&self) -> Option<u64> {
+        self.observed_at
+            .map(|observed| observed.elapsed().as_secs())
+    }
+
+    fn tool_wait_seconds(&self) -> Option<u64> {
+        self.tool_call
+            .as_ref()
+            .and_then(|call| call.in_flight_since)
+            .map(|since| since.elapsed().as_secs())
+    }
+}
+
 fn prompt_content_stats(content: &[PromptContent]) -> (usize, usize) {
     let text_chars = content.iter().map(|part| part.text.chars().count()).sum();
     (content.len(), text_chars)
@@ -932,6 +1059,8 @@ impl Client {
         );
 
         let mut activity = PromptTurnActivity::Empty;
+        let mut last_activity = LastObservedActivity::default();
+        let mut watchdog_soft_recoveries: u32 = 0;
         let mut external_cancellation_sent = false;
         let mut deferred_updates_after_external_cancellation = 0usize;
         let mut replacement_continuation_active = false;
@@ -991,11 +1120,39 @@ impl Client {
                 }
                 WaitOutcome::WatchdogTimeout => {
                     replacement_continuation_active = false;
+                    if last_activity.tool_call_in_flight() {
+                        // A tool call is still running, so the conversation is
+                        // alive and the agent is waiting on it. Cancelling here
+                        // would kill real work and restart the same wait, so
+                        // restart the watchdog instead. Deciding that a tool
+                        // call is stuck, and aborting it, is the agent's
+                        // responsibility rather than Cowboy's.
+                        tracing::warn!(
+                            event = "agent_watchdog_tool_wait",
+                            session_id,
+                            id,
+                            timeout_seconds = self.watchdog.response_timeout_seconds,
+                            last_event_kind = last_activity.last_event_kind(),
+                            last_tool_call_title = last_activity.last_tool_call_title(),
+                            last_tool_call_kind = last_activity.last_tool_call_kind(),
+                            last_tool_call_status = last_activity.last_tool_call_status(),
+                            seconds_since_last_activity =
+                                last_activity.seconds_since_last_activity(),
+                            waited_seconds = last_activity.tool_wait_seconds(),
+                            "Agent watchdog restarted while a tool call is in flight"
+                        );
+                        continue 'monitor;
+                    }
                     tracing::warn!(
                         event = "agent_watchdog_timeout",
                         session_id,
                         id,
                         timeout_seconds = self.watchdog.response_timeout_seconds,
+                        last_event_kind = last_activity.last_event_kind(),
+                        last_tool_call_title = last_activity.last_tool_call_title(),
+                        last_tool_call_kind = last_activity.last_tool_call_kind(),
+                        last_tool_call_status = last_activity.last_tool_call_status(),
+                        seconds_since_last_activity = last_activity.seconds_since_last_activity(),
                         "Agent watchdog detected response inactivity"
                     );
                     if let Err(err) = self.send_prompt_turn_cancellation(session_id).await {
@@ -1065,6 +1222,7 @@ impl Client {
                         match message {
                             Message::SessionUpdate { update, .. } => {
                                 activity.observe_event(&update);
+                                last_activity.observe_event(&update);
                                 event_handler(update);
                             }
                             Message::PermissionRequest {
@@ -1099,19 +1257,32 @@ impl Client {
                                     serde_json::from_value(result.unwrap_or(Value::Null))
                                         .unwrap_or(SessionPromptResult { stop_reason: None });
                                 let stop_reason = result.stop_reason.unwrap_or(StopReason::EndTurn);
-                                if matches!(stop_reason, StopReason::Cancelled) {
-                                    if external_cancellation_sent {
-                                        break 'monitor StopReason::Cancelled;
-                                    }
-                                    tracing::warn!(
-                                        event = "agent_watchdog_soft_recovered",
-                                        session_id,
-                                        "Agent watchdog cancellation completed; continuing session"
-                                    );
-                                    id = self.dispatch_watchdog_continuation(session_id).await?;
-                                    continue 'monitor;
+                                // Any terminal prompt response observed inside
+                                // the grace window acknowledges the
+                                // `session/cancel` Cowboy just sent, whatever
+                                // stop reason the backend chose to report. It
+                                // is a truncated turn, not a completed reply,
+                                // so it must never be surfaced to the caller as
+                                // one.
+                                if external_cancellation_sent {
+                                    break 'monitor StopReason::Cancelled;
                                 }
-                                break 'monitor stop_reason;
+                                watchdog_soft_recoveries += 1;
+                                tracing::warn!(
+                                    event = "agent_watchdog_soft_recovered",
+                                    session_id,
+                                    stop_reason = ?stop_reason,
+                                    soft_recoveries = watchdog_soft_recoveries,
+                                    last_event_kind = last_activity.last_event_kind(),
+                                    last_tool_call_title = last_activity.last_tool_call_title(),
+                                    last_tool_call_kind = last_activity.last_tool_call_kind(),
+                                    last_tool_call_status = last_activity.last_tool_call_status(),
+                                    seconds_since_last_activity =
+                                        last_activity.seconds_since_last_activity(),
+                                    "Agent watchdog cancellation completed; continuing session"
+                                );
+                                id = self.dispatch_watchdog_continuation(session_id).await?;
+                                continue 'monitor;
                             }
                             _ => {}
                         }
@@ -1141,6 +1312,7 @@ impl Client {
             match msg {
                 Message::SessionUpdate { update, .. } => {
                     activity.observe_event(&update);
+                    last_activity.observe_event(&update);
                     event_handler(update);
                 }
                 Message::PermissionRequest {
@@ -1777,6 +1949,61 @@ mod tests {
             cancel_timeout_seconds: 2,
             recovery_operation_timeout_seconds: 3,
         }
+    }
+
+    fn tool_call_started(
+        session_id: &str,
+        tool_call_id: &str,
+        title: &str,
+        kind: &str,
+        status: &str,
+    ) -> String {
+        session_update(
+            session_id,
+            serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_call_id,
+                "title": title,
+                "kind": kind,
+                "status": status
+            }),
+        )
+    }
+
+    fn tool_call_progress(session_id: &str, tool_call_id: &str, status: &str) -> String {
+        session_update(
+            session_id,
+            serde_json::json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": status
+            }),
+        )
+    }
+
+    /// Connect a watchdog-configured client over a `ControlledTransport` and
+    /// drain the `initialize` request so tests start at the first prompt.
+    async fn controlled_watchdog_client() -> (
+        Client,
+        mpsc::UnboundedSender<String>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let client = Client::connect_with_transport_and_options(
+            Box::new(ControlledTransport {
+                incoming: incoming_rx,
+                outgoing: outgoing_tx,
+                counters: None,
+            }),
+            dummy_transport_config(),
+            test_watchdog(),
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+        (client, incoming_tx, outgoing_rx)
     }
 
     async fn scripted_client(
@@ -3382,6 +3609,85 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn watchdog_cancel_acknowledged_with_end_turn_recovers_instead_of_truncating() {
+        let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+        let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+        incoming_tx.send(init_response(0)).unwrap();
+        let transport = ControlledTransport {
+            incoming: incoming_rx,
+            outgoing: outgoing_tx,
+            counters: None,
+        };
+        let mut client = Client::connect_with_transport_and_options(
+            Box::new(transport),
+            dummy_transport_config(),
+            AgentWatchdogOptions {
+                response_timeout_seconds: 1,
+                cancel_timeout_seconds: 2,
+                recovery_operation_timeout_seconds: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let _initialize = next_outgoing(&mut outgoing_rx).await;
+
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let initial = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initial["id"], 1);
+
+        // The agent is busy waiting on long-running external work and streams
+        // nothing, so the watchdog fires and cancels the turn.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+
+        // The backend acknowledges the watchdog cancel by ending the turn with a
+        // truncated notice and `end_turn` rather than reporting `cancelled`.
+        incoming_tx
+            .send(text_chunk_update(
+                "sess_1",
+                "Info: Operation cancelled by user",
+            ))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+
+        // A turn that Cowboy itself cancelled must still be recovered on the
+        // same session. Surfacing the truncated reply as an ordinary completed
+        // turn makes it indistinguishable from a real reply, so the caller burns
+        // a retry without ever giving the agent more time.
+        let continuation = tokio::time::timeout(Duration::from_secs(5), outgoing_rx.recv()).await;
+        let Ok(Some(continuation)) = continuation else {
+            let (_client, result) = prompt.await.unwrap();
+            panic!(
+                "a watchdog-cancelled turn must be recovered on the same session, but the client \
+sent no continuation after cancelling and returned {result:?} with the truncated reply"
+            );
+        };
+        let continuation: Value = serde_json::from_str(&continuation).unwrap();
+        assert_eq!(continuation["method"], "session/prompt");
+        assert_eq!(continuation["params"]["sessionId"], "sess_1");
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn watchdog_hard_restart_resumes_same_session() {
         let initial_counters = Arc::new(ControlledTransportCounters::default());
         let replacement_counters = Arc::new(ControlledTransportCounters::default());
@@ -3691,7 +3997,16 @@ mod tests {
         tokio::time::advance(Duration::from_millis(100)).await;
         let cancel = next_outgoing(&mut outgoing_rx).await;
         assert_eq!(cancel["method"], "session/cancel");
+        // Acknowledging the watchdog cancel — with any stop reason — recovers
+        // the turn on the same session, so the continuation must be completed
+        // before the turn reports its own stop reason.
         incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["method"], "session/prompt");
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
 
         assert!(matches!(
             prompt.await.unwrap().unwrap(),
@@ -4309,6 +4624,9 @@ mod tests {
             .send(text_chunk_update("sess_1", "completed"))
             .unwrap();
         incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["method"], "session/prompt");
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
         assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
     }
 
@@ -4414,5 +4732,429 @@ mod tests {
             .send(prompt_response(4, "end_turn"))
             .unwrap();
         assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    fn chunk_text(event: &Event) -> Option<String> {
+        match event {
+            Event::MessageChunk { content } => content
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancel_acknowledged_with_end_turn_forwards_truncated_and_continued_text() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_texts = Arc::clone(&captured);
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |event| {
+                        if let Some(text) = chunk_text(&event) {
+                            handler_texts.lock().unwrap().push(text);
+                        }
+                    },
+                )
+                .await;
+            (client, result)
+        });
+        let initial = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(initial["id"], 1);
+
+        incoming_tx
+            .send(text_chunk_update("sess_1", "before stall"))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+
+        incoming_tx
+            .send(text_chunk_update(
+                "sess_1",
+                "Info: Operation cancelled by user",
+            ))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "after continuation"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [
+                "before stall".to_string(),
+                "Info: Operation cancelled by user".to_string(),
+                "after continuation".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancel_acknowledged_with_non_cancelled_stop_reason_recovers() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "max_tokens")).unwrap();
+
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["method"], "session/prompt");
+        assert_eq!(continuation["params"]["sessionId"], "sess_1");
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_external_cancellation_during_grace_with_end_turn_ack_returns_cancelled() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(async move {
+                        let _ = cancel_rx.await;
+                    }),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+
+        // The user cancels while the watchdog is still waiting for the backend
+        // to acknowledge, and the backend then answers with `end_turn`.
+        cancel_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::Cancelled));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_soft_recovery_count_increments_across_repeated_stalls() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first_cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(first_cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let first_continue = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(first_continue["params"]["sessionId"], "sess_1");
+        assert_eq!(
+            first_continue["params"]["prompt"][0]["text"],
+            CONTINUE_PROMPT
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second_cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(second_cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+        let second_continue = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(second_continue["params"]["sessionId"], "sess_1");
+        assert_eq!(
+            second_continue["params"]["prompt"][0]["text"],
+            CONTINUE_PROMPT
+        );
+
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(3, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn watchdog_last_activity_tracks_in_flight_tool_call() {
+        let mut activity = LastObservedActivity::default();
+        assert!(!activity.tool_call_in_flight());
+
+        activity.observe_event(&Event::ToolCall {
+            tool_call_id: "call_1".into(),
+            title: "Run integration suite".into(),
+            kind: "execute".into(),
+            status: "in_progress".into(),
+        });
+        assert_eq!(activity.last_event_kind(), Some("tool_call"));
+        assert_eq!(
+            activity.last_tool_call_title(),
+            Some("Run integration suite")
+        );
+        assert_eq!(activity.last_tool_call_kind(), Some("execute"));
+        assert_eq!(activity.last_tool_call_status(), Some("in_progress"));
+        assert!(activity.tool_call_in_flight());
+
+        activity.observe_event(&Event::ToolCallUpdate {
+            tool_call_id: "call_1".into(),
+            status: "completed".into(),
+            content: None,
+        });
+        assert_eq!(activity.last_event_kind(), Some("tool_call_update"));
+        assert_eq!(activity.last_tool_call_status(), Some("completed"));
+        assert_eq!(
+            activity.last_tool_call_title(),
+            Some("Run integration suite")
+        );
+        assert_eq!(activity.last_tool_call_kind(), Some("execute"));
+        assert!(!activity.tool_call_in_flight());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_defers_cancel_while_tool_call_in_flight() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        incoming_tx
+            .send(tool_call_started(
+                "sess_1",
+                "call_1",
+                "Run integration suite",
+                "execute",
+                "in_progress",
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        assert!(outgoing_rx.try_recv().is_err());
+        prompt.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_tool_wait_restarts_indefinitely_while_tool_in_flight() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        incoming_tx
+            .send(tool_call_started(
+                "sess_1",
+                "call_1",
+                "Run integration suite",
+                "execute",
+                "in_progress",
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(outgoing_rx.try_recv().is_err());
+        }
+
+        prompt.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancels_after_in_flight_tool_call_completes() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        incoming_tx
+            .send(tool_call_started(
+                "sess_1",
+                "call_1",
+                "Run integration suite",
+                "execute",
+                "in_progress",
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(outgoing_rx.try_recv().is_err());
+
+        incoming_tx
+            .send(tool_call_progress("sess_1", "call_1", "completed"))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_cancels_immediately_when_tool_call_completed() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        incoming_tx
+            .send(tool_call_started(
+                "sess_1",
+                "call_1",
+                "Run integration suite",
+                "execute",
+                "completed",
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(client.replacement_factory_calls(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_external_cancellation_during_tool_wait_returns_cancelled() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(tokio::time::sleep(Duration::from_millis(
+                        4500,
+                    ))),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        incoming_tx
+            .send(tool_call_started(
+                "sess_1",
+                "call_1",
+                "Run integration suite",
+                "execute",
+                "in_progress",
+            ))
+            .unwrap();
+        tokio::task::yield_now().await;
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(outgoing_rx.try_recv().is_err());
+        }
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let cancel = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(cancel["method"], "session/cancel");
+        incoming_tx.send(prompt_response(1, "cancelled")).unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::Cancelled));
+        assert_eq!(client.replacement_factory_calls(), 0);
+        assert!(outgoing_rx.try_recv().is_err());
     }
 }

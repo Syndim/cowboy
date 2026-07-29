@@ -217,14 +217,19 @@ cancel_timeout_seconds = 10
 recovery_operation_timeout_seconds = 30
 ```
 
-Parsed ACP activity resets the inactivity deadline. Recovery first sends exactly
-one `session/cancel` and, when cancellation is confirmed, sends `"Continue"` on
-the same session. If cancellation fails or times out, Cowboy kills the recorded
-PID, waits for exit, restarts the agent with `--resume=<session-id>`, initializes
-ACP, and sends `"Continue"`. The recovery-operation timeout separately bounds
-termination, restart, initialization, and continuation dispatch. This ACP
-recovery does not consume workflow retry budgets. All values must be greater
-than zero, and Cowboy must be restarted after watchdog configuration changes.
+Parsed ACP activity resets the inactivity deadline. An in-flight ACP tool call
+restarts the inactivity watchdog instead of triggering recovery, and that
+restart is unbounded because deciding a tool call is stuck and aborting it is
+the agent's responsibility rather than Cowboy's. Recovery first sends exactly
+one `session/cancel` and, when the agent acknowledges it with any stop reason,
+including `end_turn`, sends `"Continue"` on the same session. If cancellation
+fails or times out, Cowboy kills the recorded PID, waits for exit, restarts the
+agent with `--resume=<session-id>`, initializes ACP, and sends `"Continue"`.
+The recovery-operation timeout separately bounds termination, restart,
+initialization, and continuation dispatch.
+This ACP recovery does not consume workflow retry budgets. All values must be
+greater than zero, and Cowboy must be restarted after watchdog configuration
+changes.
 <!-- cowboy-agent-watchdog-contract:end -->
 
 ## Current flow
