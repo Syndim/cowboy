@@ -927,10 +927,54 @@ fn cleanup_identity(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 sends no signal; it only probes existence and
+    // permission for `pid`, which is valid for any pid value.
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        return true;
+    }
+    // A process we don't own (EPERM) still exists; only ESRCH means gone.
+    io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
 fn process_is_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
+#[cfg(target_os = "linux")]
+fn canonical_pid_executable(pid: u32) -> anyhow::Result<String> {
+    fs::canonicalize(Path::new("/proc").join(pid.to_string()).join("exe"))
+        .map(|path| path.to_string_lossy().into_owned())
+        .context("canonicalize recorded process executable")
+}
+
+#[cfg(target_os = "macos")]
+fn canonical_pid_executable(pid: u32) -> anyhow::Result<String> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buffer` is sized to `PROC_PIDPATHINFO_MAXSIZE`, the maximum
+    // path length `proc_pidpath` may write, per Apple's libproc contract.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    ensure!(
+        len > 0,
+        "resolve executable path for pid {pid}: {}",
+        io::Error::last_os_error()
+    );
+    let path = std::str::from_utf8(&buffer[..len as usize])
+        .context("process executable path was not valid UTF-8")?;
+    fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .context("canonicalize recorded process executable")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn canonical_pid_executable(pid: u32) -> anyhow::Result<String> {
     fs::canonicalize(Path::new("/proc").join(pid.to_string()).join("exe"))
         .map(|path| path.to_string_lossy().into_owned())

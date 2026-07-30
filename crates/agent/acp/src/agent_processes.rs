@@ -145,6 +145,11 @@ mod tests {
     use crate::transport::stdio::StdioTransport;
     use crate::transport::{StdioConfig, Transport};
 
+    /// Both descendants must be forked *before* the readiness line is
+    /// written: a reader that observes "ready" and kills the process group
+    /// immediately can otherwise race ahead of a fork that happens only
+    /// after the write, terminating the group before that descendant even
+    /// exists (and is therefore never a member of the killed group).
     fn agent_leaving_a_descendant() -> StdioConfig {
         #[cfg(windows)]
         let (command, args) = (
@@ -161,7 +166,7 @@ mod tests {
             "sh".to_string(),
             vec![
                 "-c".to_string(),
-                "sleep 30 & echo ready; sleep 30".to_string(),
+                "sleep 30 & sleep 30 & echo ready; wait".to_string(),
             ],
         );
 

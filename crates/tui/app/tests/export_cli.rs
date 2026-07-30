@@ -85,7 +85,10 @@ fn cli_exports_searchable_collapsed_html_and_rejects_missing_runs() {
         .map(Path::new)
         .unwrap();
     assert!(path.exists(), "{exported_stdout}");
-    assert_eq!(path.parent(), Some(dir.path()));
+    assert_eq!(
+        path.parent().map(|p| p.canonicalize().unwrap()),
+        Some(dir.path().canonicalize().unwrap())
+    );
 
     let html = std::fs::read_to_string(path).unwrap();
     assert!(html.contains("CLI export request"));

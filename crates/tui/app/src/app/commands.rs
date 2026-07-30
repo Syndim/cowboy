@@ -1687,9 +1687,15 @@ mod tests {
         assert!(rendered.contains("✓ Export"), "{rendered}");
         assert!(rendered.contains("run: run-export"), "{rendered}");
         assert!(rendered.contains("cards: 1"), "{rendered}");
+        assert!(rendered.contains("path: "), "{rendered}");
+        // The rendered card hard-wraps long lines at a fixed column width, so
+        // the exported path (which embeds the OS temp-dir path and varies in
+        // length across machines/CI) may split "cowboy-export-run-export.html"
+        // across two rendered lines. Verify the export side effect on disk
+        // instead of substring-matching the wrapped card text.
         assert!(
-            rendered.contains("cowboy-export-run-export.html"),
-            "{rendered}"
+            dir.path().join("cowboy-export-run-export.html").exists(),
+            "expected export file to be written to the run cwd; rendered:\n{rendered}"
         );
         state.cancel_background_tasks();
     }

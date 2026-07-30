@@ -2893,7 +2893,20 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     handoff_gate.to_string_lossy().to_string(),
                 ],
                 model: Some(ModelInfo::default()),
-                watchdog: AgentWatchdogRuntimeConfig::default(),
+                // Generous watchdog timeouts: this test drives a real
+                // subprocess (fork/exec + several JSON-RPC round trips)
+                // whose scheduling can be slow under heavy parallel-test CPU
+                // contention (many `#[tokio::test]`s each spawning their own
+                // subprocess/runtime at once). Production defaults are tuned
+                // to detect a genuinely stuck agent, not CI-level scheduling
+                // jitter; a spurious trigger here would also desync this
+                // script's bespoke one-shot handshake, which cannot tolerate
+                // a watchdog-issued reconnect/replacement.
+                watchdog: AgentWatchdogRuntimeConfig {
+                    response_timeout_seconds: 300,
+                    cancel_timeout_seconds: 60,
+                    recovery_operation_timeout_seconds: 240,
+                },
             }],
         )
         .await;
@@ -8386,7 +8399,20 @@ Recovery implementation review"#
         );
 
         // Resume after full runtime reconstruction reuses the same child.
-        drop(runtime);
+        // Close the store's SQLite pool directly (not `runtime.shutdown()`):
+        // `shutdown()` also calls `terminate_all_agent_processes`, which
+        // operates on a process-wide registry shared by every real-connector
+        // runtime in this test binary and would kill OTHER concurrently
+        // running tests' agent subprocesses. A bare `drop` only schedules
+        // async pool cleanup and can race the rebuilt runtime's pool open
+        // with "database is locked", so close the pool deterministically
+        // instead.
+        runtime.store().unwrap().close().await;
+        // A closed sqlx pool has released its own connections, but SQLite's
+        // WAL/shm file locks can lag the close by a few OS scheduler ticks
+        // under heavy contention. A short settle delay avoids racing the
+        // rebuilt runtime's pool open into "database is locked".
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let rebuilt = runtime_for_workflow_dir_with_config_sets(
             &dir,
             dir.path().join("workflows"),
@@ -8831,8 +8857,20 @@ Recovery implementation review"#
             RunStatus::WaitingForInput { .. }
         ));
 
-        // Drop the runtime entirely; a fresh one must resume from durable state.
-        drop(runtime);
+        // Close the store's SQLite pool directly (not `runtime.shutdown()`):
+        // `shutdown()` also calls `terminate_all_agent_processes`, which
+        // operates on a process-wide registry shared by every real-connector
+        // runtime in this test binary and would kill OTHER concurrently
+        // running tests' agent subprocesses. A bare `drop` only schedules
+        // async pool cleanup and can race the rebuilt runtime's pool open
+        // with "database is locked", so close the pool deterministically
+        // instead.
+        runtime.store().unwrap().close().await;
+        // A closed sqlx pool has released its own connections, but SQLite's
+        // WAL/shm file locks can lag the close by a few OS scheduler ticks
+        // under heavy contention. A short settle delay avoids racing the
+        // rebuilt runtime's pool open into "database is locked".
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let rebuilt = runtime_for_workflow_dir_with_config_sets(
             &dir,
             dir.path().join("workflows"),

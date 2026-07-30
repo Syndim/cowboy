@@ -244,6 +244,12 @@ mod tests {
 
     /// Command that spawns a longer-lived descendant inheriting stdout and
     /// then stays alive itself.
+    ///
+    /// Both descendants must be forked *before* the readiness line is
+    /// written: a reader that observes "ready" and kills the process group
+    /// immediately can otherwise race ahead of a fork that happens only
+    /// after the write, terminating the group before that descendant even
+    /// exists (and is therefore never a member of the killed group).
     fn command_leaving_a_descendant() -> Command {
         #[cfg(windows)]
         let mut command = {
@@ -259,7 +265,7 @@ mod tests {
         #[cfg(not(windows))]
         let mut command = {
             let mut command = Command::new("sh");
-            command.args(["-c", "sleep 30 & echo ready; sleep 30"]);
+            command.args(["-c", "sleep 30 & sleep 30 & echo ready; wait"]);
             command
         };
 
