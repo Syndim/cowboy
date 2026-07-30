@@ -390,7 +390,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionDispatcher, ActionResult, ObjectHash, RunHead, RunnerLimits, StatusAction,
+        ActionDispatcher, ActionResult, Fields, ObjectHash, RunHead, RunnerLimits, StatusAction,
         StepDetail, StepInput, StepOutput,
     };
     use parking_lot::Mutex;
@@ -529,7 +529,7 @@ mod tests {
                     "status".to_string(),
                     None,
                     action.status,
-                    action.fields,
+                    Value::Object(action.fields.into_iter().collect()),
                     action.body,
                 ),
                 StepAction::Command(action) => (
@@ -756,7 +756,7 @@ mod tests {
             StaticProvider(vec![
                 StepAction::Status(StatusAction {
                     status: "next".to_string(),
-                    fields: Value::Null,
+                    fields: Fields::new(),
                     body: "first".to_string(),
                 }),
                 StepAction::Agent(cowboy_workflow_core::AgentAction {
@@ -830,7 +830,7 @@ mod tests {
             StaticProvider(vec![
                 StepAction::Status(StatusAction {
                     status: "next".to_string(),
-                    fields: Value::Null,
+                    fields: Fields::new(),
                     body: "first".to_string(),
                 }),
                 StepAction::Agent(cowboy_workflow_core::AgentAction {
@@ -1028,7 +1028,7 @@ mod tests {
             panic!("expected status action")
         };
         assert_eq!(
-            action.fields,
+            serde_json::Value::Object(action.fields.into_iter().collect()),
             serde_json::json!({
                 "request": "do it",
                 "initial_sequence": 0,

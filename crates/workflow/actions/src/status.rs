@@ -21,7 +21,7 @@ impl StatusActionRunner {
             },
             output: Some(StepOutput {
                 status: action.status,
-                fields: action.fields,
+                fields: Value::Object(action.fields.into_iter().collect()),
                 body: action.body,
                 raw: Value::Null,
             }),

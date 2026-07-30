@@ -20,11 +20,11 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
-    Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead, RunStatus, RunUserPrompt,
-    RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail, StepInput, StepOutput,
-    StepRecord, WorkflowAction, WorkflowCatalog, WorkflowDefinition, WorkflowError, WorkflowRun,
-    WorkflowRunParent, WorkflowSelector, WorkflowSourceRef, WorkflowSourceSnapshot,
-    WorkflowSummarizer, apply_run_status, apply_step_record,
+    Fields, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead, RunStatus,
+    RunUserPrompt, RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail,
+    StepInput, StepOutput, StepRecord, WorkflowAction, WorkflowCatalog, WorkflowDefinition,
+    WorkflowError, WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSourceRef,
+    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -1569,7 +1569,10 @@ impl WorkflowRuntime {
             )));
         };
 
-        let fields_value = fields.unwrap_or(Value::Null);
+        let fields_value: Fields = fields
+            .and_then(|value| value.as_object().cloned())
+            .map(|map| map.into_iter().collect())
+            .unwrap_or_default();
         let missing: Vec<String> = chosen
             .required_fields
             .iter()
@@ -2083,10 +2086,9 @@ fn action_output_shape(action: Option<&StepAction>) -> (Vec<String>, Vec<String>
 }
 
 /// Whether `field` is present and non-null in supplied manual-resolution fields.
-fn field_present(fields: &Value, field: &str) -> bool {
+fn field_present(fields: &Fields, field: &str) -> bool {
     fields
-        .as_object()
-        .and_then(|map| map.get(field))
+        .get(field)
         .map(|value| !value.is_null())
         .unwrap_or(false)
 }

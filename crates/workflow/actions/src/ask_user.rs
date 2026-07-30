@@ -19,7 +19,7 @@ impl AskUserActionRunner {
             prev: context.prev,
             started_at: Utc::now(),
             output_status: action.status,
-            output_fields: action.fields,
+            output_fields: Value::Object(action.fields.into_iter().collect()),
         };
         let resume_callback = ResumeCallback::new(
             ASK_USER_CALLBACK_KIND,

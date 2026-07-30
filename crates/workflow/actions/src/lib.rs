@@ -153,8 +153,8 @@ mod tests {
     use chrono::Utc;
     use cowboy_workflow_core::{
         ActionDispatcher, AgentAction, AskUserAction, CommandAction, ExecutionContext, FailAction,
-        ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail,
-        StepInput, StepOutput, StepRecord, WorkflowAction,
+        Fields, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction,
+        StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction,
     };
     use serde_json::{Value, json};
 
@@ -191,7 +191,7 @@ mod tests {
         let result = StatusActionRunner.run(
             StatusAction {
                 status: "done".to_string(),
-                fields: json!({ "x": 1 }),
+                fields: Fields::from([("x".to_string(), json!(1))]),
                 body: "body".to_string(),
             },
             context(),
@@ -224,7 +224,7 @@ mod tests {
                 message: "Approve?".to_string(),
                 choices: vec!["yes".to_string()],
                 status: "accepted".to_string(),
-                fields: json!({ "plan": "p" }),
+                fields: Fields::from([("plan".to_string(), json!("p"))]),
             },
             context(),
         );
@@ -480,7 +480,7 @@ mod tests {
             .dispatch(
                 StepAction::Status(StatusAction {
                     status: "done".to_string(),
-                    fields: Value::Null,
+                    fields: Fields::new(),
                     body: String::new(),
                 }),
                 context(),
@@ -517,7 +517,7 @@ mod tests {
                     message: "Approve?".to_string(),
                     choices: Vec::new(),
                     status: "answered".to_string(),
-                    fields: Value::Null,
+                    fields: Fields::new(),
                 }),
                 context(),
             )

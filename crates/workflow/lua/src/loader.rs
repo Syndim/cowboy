@@ -94,7 +94,7 @@ pub(crate) fn setup_lua(import_mode: ImportMode) -> Result<Lua> {
 mod tests {
     use super::*;
     use crate::runtime::run_step;
-    use cowboy_workflow_core::{Field, FieldType, StepAction};
+    use cowboy_workflow_core::{Field, FieldType, Fields, StepAction};
     use std::collections::BTreeMap;
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
         WorkflowSourceSnapshot {
@@ -501,7 +501,7 @@ mod tests {
         })
     }
 
-    fn assert_evidence_fields_equal(actual: &serde_json::Value, expected: &serde_json::Value) {
+    fn assert_evidence_fields_equal(actual: &Fields, expected: &serde_json::Value) {
         for field in EVIDENCE_FIELD_NAMES {
             assert_eq!(
                 actual[field], expected[field],
@@ -1434,16 +1434,15 @@ mod tests {
             panic!("confirm_result should ask the user")
         };
         assert!(
-            missing_confirmation
+            !missing_confirmation
                 .fields
-                .get("implementation_commands")
-                .is_none()
+                .contains_key("implementation_commands")
         );
         assert_eq!(
             missing_confirmation.fields["implementation_evidence"],
             serde_json::json!([])
         );
-        assert!(missing_confirmation.fields.get("tester_commands").is_none());
+        assert!(!missing_confirmation.fields.contains_key("tester_commands"));
 
         let paired_empty = run_step(
             &compiled.source_bundle,
@@ -1791,7 +1790,10 @@ mod tests {
         assert_evidence_fields_equal(&blocked.fields, &expected);
 
         let mut answered_fields = blocked.fields;
-        answered_fields["answer"] = serde_json::json!("Fixture generated; retry");
+        answered_fields.insert(
+            "answer".to_string(),
+            serde_json::json!("Fixture generated; retry"),
+        );
         let answer_result = run_step(
             &compiled.source_bundle,
             "blocked_answer",
@@ -1847,17 +1849,18 @@ mod tests {
             panic!("capture_blocker should return a status action")
         };
         assert!(
-            missing_captured
+            !missing_captured
                 .fields
-                .get("implementation_commands")
-                .is_none()
+                .contains_key("implementation_commands")
         );
         assert_eq!(
             missing_captured.fields["implementation_evidence"],
             serde_json::json!([])
         );
-        missing_captured.fields["blocker_resolution"] =
-            serde_json::json!("Generate the fixture and retry validation");
+        missing_captured.fields.insert(
+            "blocker_resolution".to_string(),
+            serde_json::json!("Generate the fixture and retry validation"),
+        );
         let missing_triage = run_step(
             &compiled.source_bundle,
             "triage_blocked",
@@ -1876,10 +1879,9 @@ mod tests {
         };
         assert_eq!(missing_triaged.status, "implement");
         assert!(
-            missing_triaged
+            !missing_triaged
                 .fields
-                .get("implementation_commands")
-                .is_none()
+                .contains_key("implementation_commands")
         );
         assert_eq!(
             missing_triaged.fields["implementation_evidence"],
@@ -1891,7 +1893,7 @@ mod tests {
                 .unwrap()
                 .contains("prev.fields.implementation_commands")
         );
-        assert!(missing_triaged.fields.get("tester_evidence").is_none());
+        assert!(!missing_triaged.fields.contains_key("tester_evidence"));
     }
 
     #[test]
@@ -2160,7 +2162,7 @@ mod tests {
             ("Please include the manual screenshot", "changes_requested"),
         ] {
             let mut answered_fields = pending.fields.clone();
-            answered_fields["answer"] = serde_json::json!(answer);
+            answered_fields.insert("answer".to_string(), serde_json::json!(answer));
             let answer_result = run_step(
                 &compiled.source_bundle,
                 "confirm_result_answer",
@@ -2421,7 +2423,7 @@ mod tests {
 
     #[test]
     fn examples_workflows_capture_cumulative_confirmation_feedback() {
-        fn assert_common_context(fields: &serde_json::Value) {
+        fn assert_common_context(fields: &Fields) {
             assert_eq!(fields["goal"], "Keep command behavior stable");
             assert_eq!(fields["validation"], "cargo test -p cowboy");
             assert_eq!(fields["work_dir"], "docs/plans/example");
@@ -2433,7 +2435,7 @@ mod tests {
             );
         }
 
-        fn assert_rca_context(fields: &serde_json::Value) {
+        fn assert_rca_context(fields: &Fields) {
             assert_eq!(fields["summary"], "Race reproduced");
             assert_eq!(fields["work_dir"], "docs/plans/example");
             assert_eq!(fields["rca_doc"], "docs/plans/example/rca.md");
@@ -2919,7 +2921,7 @@ mod tests {
 
     #[test]
     fn examples_workflows_detours_preserve_user_feedback_without_relabeling_input() {
-        fn assert_artifact_context(fields: &serde_json::Value) {
+        fn assert_artifact_context(fields: &Fields) {
             assert_eq!(fields["goal"], "Preserve clarification context");
             assert_eq!(
                 fields["validation"],
@@ -2967,7 +2969,10 @@ mod tests {
         assert_eq!(action.fields["user_feedback"], existing);
         assert_artifact_context(&action.fields);
         let mut answered_fields = action.fields.clone();
-        answered_fields["answer"] = serde_json::json!("The entrypoint is the TUI composer");
+        answered_fields.insert(
+            "answer".to_string(),
+            serde_json::json!("The entrypoint is the TUI composer"),
+        );
 
         let result = run_step(
             &compiled.source_bundle,
@@ -3586,7 +3591,10 @@ mod tests {
         assert_evidence_fields_equal(&malformed_recovery.fields, &malformed_snapshot);
 
         let mut answered_fields = prompt.fields;
-        answered_fields["answer"] = serde_json::json!("Access granted; retry the original step");
+        answered_fields.insert(
+            "answer".to_string(),
+            serde_json::json!("Access granted; retry the original step"),
+        );
         let answer_result = run_step(
             &compiled.source_bundle,
             "blocked_answer",
@@ -4143,7 +4151,7 @@ mod tests {
                 "files",
             ] {
                 assert!(
-                    rejection.fields.get(untrusted).is_none(),
+                    !rejection.fields.contains_key(untrusted),
                     "{name} retained untrusted {untrusted}"
                 );
             }

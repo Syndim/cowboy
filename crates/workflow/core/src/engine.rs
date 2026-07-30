@@ -224,7 +224,7 @@ mod tests {
     use super::*;
     use crate::{
         ActionDispatcher, ActionResult, AgentAction, AskUserAction, CommandAction, FailAction,
-        ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput, StepOutput,
+        Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput, StepOutput,
         StepTransitions, WorkflowDefinition,
     };
 
@@ -336,7 +336,7 @@ mod tests {
                     },
                     output: Some(StepOutput {
                         status: action.status,
-                        fields: action.fields,
+                        fields: Value::Object(action.fields.into_iter().collect()),
                         body: action.body,
                         raw: Value::Null,
                     }),
@@ -703,12 +703,12 @@ mod tests {
         let provider = StaticProvider::new(vec![
             StepAction::Status(StatusAction {
                 status: "success".to_string(),
-                fields: Value::Null,
+                fields: Fields::new(),
                 body: String::new(),
             }),
             StepAction::Status(StatusAction {
                 status: "success".to_string(),
-                fields: Value::Null,
+                fields: Fields::new(),
                 body: String::new(),
             }),
         ]);
@@ -757,7 +757,7 @@ mod tests {
         let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "next".to_string(),
-            fields: Value::Null,
+            fields: Fields::new(),
             body: String::new(),
         })]);
         let mut run = run();
@@ -785,7 +785,7 @@ mod tests {
         let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "success".to_string(),
-            fields: Value::Null,
+            fields: Fields::new(),
             body: String::new(),
         })]);
         let mut run = run();
@@ -814,7 +814,7 @@ mod tests {
             message: "Approve?".to_string(),
             choices: vec!["yes".to_string(), "no".to_string()],
             status: "answered".to_string(),
-            fields: Value::Null,
+            fields: Fields::new(),
         })]);
         let mut run = run();
 
@@ -847,7 +847,10 @@ mod tests {
         assert_eq!(resume_callback.payload()["record_id"], "run-2");
         assert_eq!(resume_callback.payload()["prev"], Value::Null);
         assert_eq!(resume_callback.payload()["output_status"], "answered");
-        assert_eq!(resume_callback.payload()["output_fields"], Value::Null);
+        assert_eq!(
+            resume_callback.payload()["output_fields"],
+            serde_json::json!({})
+        );
     }
 
     #[tokio::test]
@@ -910,7 +913,7 @@ mod tests {
         let cases = vec![
             StepAction::Status(StatusAction {
                 status: "success".to_string(),
-                fields: Value::Null,
+                fields: Fields::new(),
                 body: String::new(),
             }),
             StepAction::Command(CommandAction {
@@ -925,7 +928,7 @@ mod tests {
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
                 status: "answered".to_string(),
-                fields: Value::Null,
+                fields: Fields::new(),
             }),
             StepAction::Fail(FailAction {
                 reason: "bad".to_string(),
@@ -1016,7 +1019,7 @@ mod tests {
         let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "success".to_string(),
-            fields: Value::Null,
+            fields: Fields::new(),
             body: String::new(),
         })]);
         let mut run = run();
@@ -1046,7 +1049,7 @@ mod tests {
         let executor = NoopDispatcher::default();
         let provider = StaticProvider::new(vec![StepAction::Status(StatusAction {
             status: "success".to_string(),
-            fields: Value::Null,
+            fields: Fields::new(),
             body: String::new(),
         })]);
         let mut run = run();

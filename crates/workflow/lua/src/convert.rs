@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AskUserAction, CommandAction, FailAction, Field, FieldType, OutputSpec,
+    AgentAction, AskUserAction, CommandAction, FailAction, Field, FieldType, Fields, OutputSpec,
     RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowAction,
     WorkflowDefinition, default_command_failure_status, default_command_success_status,
 };
@@ -141,7 +141,7 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
         })),
         "status" => Ok(StepAction::Status(StatusAction {
             status: required_string(&table, &action, "status")?,
-            fields: lua_to_json(table.get::<Value>("fields")?)?,
+            fields: action_fields(table.get::<Value>("fields")?, &action)?,
             body: optional_string(&table, "body")?.unwrap_or_default(),
         })),
         "ask_user" => Ok(StepAction::AskUser(AskUserAction {
@@ -149,7 +149,7 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             message: required_string(&table, &action, "message")?,
             choices: string_array(table.get::<Value>("choices")?)?,
             status: optional_string(&table, "status")?.unwrap_or_else(|| "answered".to_string()),
-            fields: lua_to_json(table.get::<Value>("fields")?)?,
+            fields: action_fields(table.get::<Value>("fields")?, &action)?,
         })),
         "workflow" => Ok(StepAction::Workflow(WorkflowAction {
             workflow: non_empty_required_string(&table, &action, "workflow")?,
@@ -159,6 +159,22 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             reason: required_string(&table, &action, "reason")?,
         })),
         other => Err(Error::UnknownAction(other.to_string())),
+    }
+}
+
+/// Parse a `fields` table into a name/value map, e.g. for `status`/`ask_user`
+/// actions. An absent or empty table yields an empty map; a non-empty
+/// non-object table (e.g. a plain array) is rejected.
+fn action_fields(value: Value, action: &str) -> Result<Fields> {
+    match lua_to_json(value)? {
+        serde_json::Value::Null => Ok(Fields::new()),
+        serde_json::Value::Object(map) => Ok(map.into_iter().collect()),
+        serde_json::Value::Array(items) if items.is_empty() => Ok(Fields::new()),
+        _ => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: "fields".to_string(),
+            reason: "must be a table of name/value pairs".to_string(),
+        }),
     }
 }
 

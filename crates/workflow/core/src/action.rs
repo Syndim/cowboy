@@ -5,6 +5,9 @@ use serde_json::Value;
 
 use crate::{RoleId, Status};
 
+/// Named field values exposed to later steps, e.g. as `ctx.prev.fields`.
+pub type Fields = BTreeMap<String, Value>;
+
 /// Declarative action returned by a Lua `step.run(ctx)` function.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -129,7 +132,7 @@ pub struct StatusAction {
     pub status: Status,
     /// Structured fields exposed to later steps as `ctx.prev.fields`.
     #[serde(default)]
-    pub fields: Value,
+    pub fields: Fields,
     /// Optional human-readable body exposed to later steps as `ctx.prev.body`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub body: String,
@@ -150,7 +153,7 @@ pub struct AskUserAction {
     pub status: Status,
     /// Structured fields carried into the eventual ask-user step output.
     #[serde(default)]
-    pub fields: Value,
+    pub fields: Fields,
 }
 
 fn default_ask_user_status() -> Status {
@@ -181,7 +184,7 @@ mod tests {
     fn serializes_as_tagged_action() {
         let action = StepAction::Status(StatusAction {
             status: "success".to_string(),
-            fields: serde_json::json!({"ok": true}),
+            fields: Fields::from([("ok".to_string(), serde_json::json!(true))]),
             body: "done".to_string(),
         });
 
@@ -283,7 +286,7 @@ mod tests {
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
                 status: "answered".to_string(),
-                fields: Value::Null,
+                fields: Fields::new(),
             })
             .action_name(),
             "ask_user"
