@@ -21,6 +21,7 @@ pub use cowboy_workflow_actions::{
     EngineActionDispatcher, FailActionRunner, PendingAskUser, ResumeCallbackRegistry,
     StatusActionRunner, WorkflowActionHandler,
 };
+pub use cowboy_workflow_core::Choice;
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::ResumeRouter;
 pub use runner::{LuaStepActionProvider, ResolvedRuntimePolicy, WorkflowRunner};

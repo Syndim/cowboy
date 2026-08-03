@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AskUserAction, CommandAction, FailAction, Field, FieldType, Fields, OutputSpec,
-    RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions, WorkflowAction,
-    WorkflowDefinition, default_command_failure_status, default_command_success_status,
+    AgentAction, AskUserAction, Choice, CommandAction, FailAction, Field, FieldType, Fields,
+    OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions,
+    WorkflowAction, WorkflowDefinition, default_command_failure_status,
+    default_command_success_status,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -147,7 +148,7 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
         "ask_user" => Ok(StepAction::AskUser(AskUserAction {
             id: required_string(&table, &action, "id")?,
             message: required_string(&table, &action, "message")?,
-            choices: string_array(table.get::<Value>("choices")?)?,
+            choices: choices_field(table.get::<Value>("choices")?)?,
             status: optional_string(&table, "status")?.unwrap_or_else(|| "answered".to_string()),
             fields: action_fields(table.get::<Value>("fields")?, &action)?,
         })),
@@ -264,14 +265,11 @@ fn field_descriptor(name: &str, value: Value) -> Result<(FieldType, String)> {
     match value {
         Value::String(s) => Ok((field_type(name, s.to_str()?.as_ref())?, String::new())),
         Value::Table(table) => {
-            let type_str: String =
-                table
-                    .get("type")
-                    .map_err(|_| Error::InvalidActionField {
-                        action: "agent".to_string(),
-                        field: format!("output.fields.{name}.type"),
-                        reason: "must be a string".to_string(),
-                    })?;
+            let type_str: String = table.get("type").map_err(|_| Error::InvalidActionField {
+                action: "agent".to_string(),
+                field: format!("output.fields.{name}.type"),
+                reason: "must be a string".to_string(),
+            })?;
             let description = match table.get::<Value>("description")? {
                 Value::Nil => String::new(),
                 Value::String(s) => s.to_str()?.to_string(),
@@ -378,16 +376,49 @@ fn optional_string(table: &Table, field: &str) -> Result<Option<String>> {
     }
 }
 
-fn string_array(value: Value) -> Result<Vec<String>> {
-    match value {
-        Value::Nil => Ok(Vec::new()),
-        Value::Table(table) => table_to_string_vec(&table),
-        _ => Err(Error::InvalidActionField {
-            action: "ask_user".to_string(),
-            field: "choices".to_string(),
-            reason: "must be an array of strings".to_string(),
-        }),
+/// Parse the `ask_user` `choices` table into `Choice`s keyed by answer key.
+///
+/// Accepts a table mapping each accepted answer key to a human-readable
+/// description string, e.g. `{ yes = "Approve the release", no = "Reject
+/// the release" }`. Choices are returned sorted by key for deterministic
+/// ordering. An absent table yields an empty (free-form) choice list.
+fn choices_field(value: Value) -> Result<Vec<Choice>> {
+    let table = match value {
+        Value::Nil => return Ok(Vec::new()),
+        Value::Table(table) => table,
+        _ => {
+            return Err(Error::InvalidActionField {
+                action: "ask_user".to_string(),
+                field: "choices".to_string(),
+                reason: "must be a table of choice key/description pairs".to_string(),
+            });
+        }
+    };
+
+    let mut choices = BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, description) = pair?;
+        let Value::String(key) = key else {
+            return Err(Error::InvalidActionField {
+                action: "ask_user".to_string(),
+                field: "choices".to_string(),
+                reason: "keys must be strings".to_string(),
+            });
+        };
+        let Value::String(description) = description else {
+            return Err(Error::InvalidActionField {
+                action: "ask_user".to_string(),
+                field: "choices".to_string(),
+                reason: "values must be strings".to_string(),
+            });
+        };
+        choices.insert(key.to_str()?.to_string(), description.to_str()?.to_string());
     }
+
+    Ok(choices
+        .into_iter()
+        .map(|(key, description)| Choice { key, description })
+        .collect())
 }
 
 fn string_array_field(table: &Table, action: &str, field: &str) -> Result<Vec<String>> {

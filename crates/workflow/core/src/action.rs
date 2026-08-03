@@ -147,13 +147,30 @@ pub struct AskUserAction {
     pub message: String,
     /// Optional finite set of accepted choices.
     #[serde(default)]
-    pub choices: Vec<String>,
+    pub choices: Vec<Choice>,
     /// Output status used when the user answers.
     #[serde(default = "default_ask_user_status")]
     pub status: Status,
     /// Structured fields carried into the eventual ask-user step output.
     #[serde(default)]
     pub fields: Fields,
+}
+
+/// One accepted answer for an [`AskUserAction`], with a stable key matched
+/// against the user's answer and a human-readable description shown to them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    /// Stable key matched against the user's answer text.
+    pub key: String,
+    /// Human-readable description of what this choice means.
+    pub description: String,
+}
+
+impl Choice {
+    /// Human-readable "key: description" label for UI/event display.
+    pub fn label(&self) -> String {
+        format!("{}: {}", self.key, self.description)
+    }
 }
 
 fn default_ask_user_status() -> Status {

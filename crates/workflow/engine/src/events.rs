@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use cowboy_workflow_core::{RunStatus, StepRecord, WorkflowRun};
+use cowboy_workflow_core::{Choice, RunStatus, StepRecord, WorkflowRun};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -197,7 +197,7 @@ pub enum WorkflowEventKind {
         step: String,
         prompt_id: String,
         message: String,
-        choices: Vec<String>,
+        choices: Vec<Choice>,
     },
     RunCompleted,
     RunFailed {
@@ -293,7 +293,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
                 resume_callback: cowboy_workflow_core::ResumeCallback::new(
                     "ask_user",
                     serde_json::json!({ "secret": "internal" }),
@@ -308,7 +317,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             }
         );
     }

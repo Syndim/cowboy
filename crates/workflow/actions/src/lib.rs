@@ -152,9 +152,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionDispatcher, AgentAction, AskUserAction, CommandAction, ExecutionContext, FailAction,
-        Fields, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction,
-        StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction,
+        ActionDispatcher, AgentAction, AskUserAction, Choice, CommandAction, ExecutionContext,
+        FailAction, Fields, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus,
+        StatusAction, StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction,
     };
     use serde_json::{Value, json};
 
@@ -180,7 +180,16 @@ mod tests {
             step: "confirm".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
-            choices: vec!["yes".to_string(), "no".to_string()],
+            choices: vec![
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
             answer: answer.to_string(),
             completed_at: Utc::now(),
         }
@@ -222,7 +231,10 @@ mod tests {
             AskUserAction {
                 id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string()],
+                choices: vec![Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                }],
                 status: "accepted".to_string(),
                 fields: Fields::from([("plan".to_string(), json!("p"))]),
             },
@@ -242,7 +254,13 @@ mod tests {
         assert_eq!(step, "step");
         assert_eq!(prompt_id, "approval");
         assert_eq!(message, "Approve?");
-        assert_eq!(choices, vec!["yes".to_string()]);
+        assert_eq!(
+            choices,
+            vec![Choice {
+                key: "yes".to_string(),
+                description: "Approve".to_string(),
+            }]
+        );
         assert_eq!(resume_callback.kind(), ASK_USER_CALLBACK_KIND);
         let pending = PendingAskUser::from_callback(&resume_callback).unwrap();
         assert_eq!(pending.record_id, "record");
@@ -346,7 +364,13 @@ mod tests {
         assert_eq!(record.step, "confirm");
         assert_eq!(record.input.prompt.as_deref(), Some("Approve?"));
         assert_eq!(record.input.context["prompt_id"], "approval");
-        assert_eq!(record.input.context["choices"], json!(["yes", "no"]));
+        assert_eq!(
+            record.input.context["choices"],
+            json!([
+                { "key": "yes", "description": "Approve" },
+                { "key": "no", "description": "Reject" },
+            ])
+        );
         assert_eq!(record.output.as_ref().unwrap().status, "accepted");
         assert_eq!(record.output.as_ref().unwrap().fields["answer"], "yes");
     }
@@ -403,7 +427,10 @@ mod tests {
                 step: "delegate".to_string(),
                 prompt_id: "child-prompt".to_string(),
                 message: "Continue?".to_string(),
-                choices: vec!["yes".to_string()],
+                choices: vec![Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                }],
                 resume_callback: ResumeCallback::new("test", Value::Null).unwrap(),
             }),
         ] {

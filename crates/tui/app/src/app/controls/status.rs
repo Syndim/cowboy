@@ -21,7 +21,7 @@ pub(in crate::app) fn line(state: &AppState, width: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
-    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use cowboy_workflow_engine::{Choice, WorkflowEvent, WorkflowEventKind};
 
     use super::*;
     use crate::config::AppConfig;
@@ -103,7 +103,16 @@ mod tests {
                 step: "confirm".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             },
         ));
 

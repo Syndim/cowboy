@@ -530,7 +530,7 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, AppConfig};
     use chrono::{DateTime, Utc};
-    use cowboy_workflow_core::{AgentPromptWindow, ResumeCallback, RunStatus, WorkflowRun};
+    use cowboy_workflow_core::{AgentPromptWindow, Choice, ResumeCallback, RunStatus, WorkflowRun};
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::SqliteWorkflowStore;
     use serde_json::Value;
@@ -1492,7 +1492,16 @@ mod tests {
                     step: "approval".to_string(),
                     prompt_id: "prompt-42".to_string(),
                     message: "Approve the deployment?".to_string(),
-                    choices: vec!["yes".to_string(), "no".to_string()],
+                    choices: vec![
+                        Choice {
+                            key: "yes".to_string(),
+                            description: "Approve".to_string(),
+                        },
+                        Choice {
+                            key: "no".to_string(),
+                            description: "Reject".to_string(),
+                        },
+                    ],
                     resume_callback: ResumeCallback::new(
                         "ask_user",
                         serde_json::json!({ "prompt_id": "prompt-42" }),
@@ -1582,7 +1591,7 @@ mod tests {
             "status.waiting_step: approval",
             "status.prompt_id: prompt-42",
             "status.message: Approve the deployment?",
-            "status.choices: yes, no",
+            "status.choices: yes: Approve, no: Reject",
         ] {
             assert_rendered_contains(waiting_card, expected);
         }
@@ -1661,7 +1670,10 @@ mod tests {
                 step: "approval".to_string(),
                 prompt_id: "prompt-1".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string()],
+                choices: vec![Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                }],
             },
         ));
         let expected_prompt = state.pending_prompt_answer_target();
@@ -1779,7 +1791,16 @@ mod tests {
                     step: "approval".to_string(),
                     prompt_id: "prompt-42".to_string(),
                     message: "Approve the deployment?".to_string(),
-                    choices: vec!["yes".to_string(), "no".to_string()],
+                    choices: vec![
+                        Choice {
+                            key: "yes".to_string(),
+                            description: "Approve".to_string(),
+                        },
+                        Choice {
+                            key: "no".to_string(),
+                            description: "Reject".to_string(),
+                        },
+                    ],
                     resume_callback: ResumeCallback::new(
                         "ask_user",
                         serde_json::json!({ "prompt_id": "prompt-42" }),

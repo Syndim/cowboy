@@ -1,5 +1,5 @@
 use chrono::{DateTime, FixedOffset, Local};
-use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+use cowboy_workflow_engine::{Choice, WorkflowEvent, WorkflowEventKind};
 use ratatui::text::{Line, Span};
 
 use super::card::{Card, CardMetadata, CardSection, CardTone, DEFAULT_CARD_WIDTH, SemanticCard};
@@ -515,11 +515,15 @@ fn run_state_tone(status: &str) -> CardTone {
     }
 }
 
-fn display_choices(choices: &[String]) -> String {
+fn display_choices(choices: &[Choice]) -> String {
     if choices.is_empty() {
         "<freeform>".to_string()
     } else {
-        choices.join(" · ")
+        choices
+            .iter()
+            .map(Choice::label)
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 fn display_tool_title(title: &str, kind: Option<&str>) -> String {
@@ -743,7 +747,16 @@ mod tests {
                 step: "review".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["approve".to_string(), "reject".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "approve".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "reject".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             },
         );
 
@@ -1014,7 +1027,16 @@ mod tests {
             step: "confirm_plan".to_string(),
             prompt_id: "plan_confirmation_9".to_string(),
             message: "Review `plan`\n- first item\n- second item".to_string(),
-            choices: vec!["approve".to_string(), "reject".to_string()],
+            choices: vec![
+                Choice {
+                    key: "approve".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "reject".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
         }));
         let completed = render_workflow_event(&event(WorkflowEventKind::StepCompleted {
             step_id: "review".to_string(),
@@ -1031,7 +1053,7 @@ mod tests {
         assert!(waiting_text.contains("◔ Waiting for input · ↳ confirm_plan · ▶ 170dc431"));
         assert!(waiting_text.contains("Review plan"));
         assert!(waiting_text.contains("├─── Choices "));
-        assert!(waiting_text.contains("approve · reject"));
+        assert!(waiting_text.contains("approve: Approve · reject: Reject"));
         assert!(!waiting_text.contains("prompt="), "{waiting_text}");
         assert!(waiting.lines()[1].to_string().starts_with('╭'));
         assert!(completed_text.contains("✓ Step completed · ↳ review · ▶ 170dc431"));

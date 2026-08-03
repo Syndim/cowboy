@@ -1,5 +1,5 @@
 use crate::{
-    AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome,
+    AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome, Choice,
     CompareAndSealPromptWindowOutcome, ObjectHash, OpenAgentPromptWindowOutcome, Result,
     ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
     StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
@@ -63,7 +63,7 @@ pub struct ResumeInput {
     /// Prompt message originally shown to the user.
     pub message: String,
     /// Accepted choices originally shown to the user.
-    pub choices: Vec<String>,
+    pub choices: Vec<Choice>,
     /// User-provided answer text.
     pub answer: String,
     /// Timestamp captured when the answer was accepted.

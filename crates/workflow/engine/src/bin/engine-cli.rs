@@ -264,7 +264,12 @@ fn print_run_summary(run: &RunSummaryLine) {
         let choices = if run.status_detail.choices.is_empty() {
             "<free-form>".to_string()
         } else {
-            run.status_detail.choices.join(", ")
+            run.status_detail
+                .choices
+                .iter()
+                .map(cowboy_workflow_core::Choice::label)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         println!("  status.choices: {choices}");
     }
@@ -443,7 +448,11 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
         } => format!(
             "{} waiting for input {prompt_id} at {step}: {message} [{}]",
             event.run_id,
-            choices.join(",")
+            choices
+                .iter()
+                .map(cowboy_workflow_core::Choice::label)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         WorkflowEventKind::RunCompleted => format!("{} completed", event.run_id),
         WorkflowEventKind::StepRetrying {

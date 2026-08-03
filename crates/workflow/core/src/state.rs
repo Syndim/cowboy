@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError, WorkflowId,
+    Choice, ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError,
+    WorkflowId,
 };
 
 /// Name used when a workflow does not explicitly select a config set.
@@ -324,7 +325,7 @@ pub enum RunStatus {
         /// Message shown to the user.
         message: String,
         /// Accepted choices, empty when free-form input is allowed.
-        choices: Vec<String>,
+        choices: Vec<Choice>,
         /// Durable descriptor used to resume the blocked action after answer.
         resume_callback: ResumeCallback,
     },
@@ -568,7 +569,16 @@ mod tests {
             step: "approve".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
-            choices: vec!["yes".to_string(), "no".to_string()],
+            choices: vec![
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
             resume_callback: ResumeCallback::new(
                 "ask_user",
                 serde_json::json!({

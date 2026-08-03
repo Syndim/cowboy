@@ -1,5 +1,5 @@
 use chrono::{DateTime, FixedOffset, Local};
-use cowboy_workflow_engine::{RunStatusDetail, RunSummaryLine};
+use cowboy_workflow_engine::{Choice, RunStatusDetail, RunSummaryLine};
 
 fn format_started_at(started_at: DateTime<FixedOffset>) -> String {
     started_at.format("%Y-%m-%d %H:%M:%S %:z").to_string()
@@ -48,7 +48,12 @@ pub fn render_status_detail_lines(prefix: &str, status: &RunStatusDetail) -> Vec
         let choices = if status.choices.is_empty() {
             "<free-form>".to_string()
         } else {
-            status.choices.join(", ")
+            status
+                .choices
+                .iter()
+                .map(Choice::label)
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         lines.push(format!("{prefix}status.choices: {choices}"));
     }
@@ -112,7 +117,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "prompt-42".to_string(),
                 message: "Approve release?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
                 resume_callback: ResumeCallback::new(
                     "ask_user",
                     serde_json::json!({ "prompt_id": "prompt-42" }),
@@ -137,7 +151,7 @@ mod tests {
                 "  status.waiting_step: approve",
                 "  status.prompt_id: prompt-42",
                 "  status.message: Approve release?",
-                "  status.choices: yes, no",
+                "  status.choices: yes: Approve, no: Reject",
             ]
         );
         assert_no_debug_status_payload(&lines.join("\n"));

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 use cowboy_tui_animation::FrameCycle;
 use cowboy_workflow_engine::{
-    RunReport, RunStatusDetail, RunStatusState, RunSummaryLine, WorkflowEvent, WorkflowEventKind,
+    Choice, RunReport, RunStatusDetail, RunStatusState, RunSummaryLine, WorkflowEvent,
+    WorkflowEventKind,
 };
 use tui_input::{Input, InputRequest};
 
@@ -26,7 +27,7 @@ pub(super) struct PendingPrompt {
     step: String,
     prompt_id: String,
     message: String,
-    choices: Vec<String>,
+    choices: Vec<Choice>,
     title_prefix: String,
 }
 
@@ -47,7 +48,7 @@ impl PendingPrompt {
         &self.message
     }
 
-    pub(in crate::app) fn choices(&self) -> &[String] {
+    pub(in crate::app) fn choices(&self) -> &[Choice] {
         &self.choices
     }
 
@@ -147,11 +148,15 @@ pub(in crate::app) fn render_pending_prompt_lines(
     card.render(width)
 }
 
-fn display_prompt_choices(choices: &[String]) -> String {
+fn display_prompt_choices(choices: &[Choice]) -> String {
     if choices.is_empty() {
         "<freeform>".to_string()
     } else {
-        choices.join(" · ")
+        choices
+            .iter()
+            .map(Choice::label)
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 }
 
@@ -1690,7 +1695,10 @@ mod tests {
                 step: "confirm".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string()],
+                choices: vec![Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                }],
             },
         ));
 
@@ -1723,7 +1731,10 @@ mod tests {
                 step: "confirm".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string()],
+                choices: vec![Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                }],
             },
         ));
         assert!(!state.status_animation_active());
@@ -1841,7 +1852,10 @@ mod tests {
             step: "confirm".to_string(),
             prompt_id: "approval".to_string(),
             message: "first line\nsecond **literal** `plan`?".to_string(),
-            choices: vec!["approve".to_string()],
+            choices: vec![Choice {
+                key: "approve".to_string(),
+                description: "Approve the plan".to_string(),
+            }],
             title_prefix: "12:00".to_string(),
         };
         let lines = render_pending_prompt_lines(&prompt, DEFAULT_CARD_WIDTH);
@@ -2414,7 +2428,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             },
         ));
 
@@ -2854,7 +2877,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: prompt_id.to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             },
         )
     }

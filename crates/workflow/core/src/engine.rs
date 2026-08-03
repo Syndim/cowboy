@@ -223,9 +223,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionDispatcher, ActionResult, AgentAction, AskUserAction, CommandAction, FailAction,
-        Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput, StepOutput,
-        StepTransitions, WorkflowDefinition,
+        ActionDispatcher, ActionResult, AgentAction, AskUserAction, Choice, CommandAction,
+        FailAction, Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput,
+        StepOutput, StepTransitions, WorkflowDefinition,
     };
 
     struct StaticProvider {
@@ -812,7 +812,16 @@ mod tests {
         let provider = StaticProvider::new(vec![StepAction::AskUser(AskUserAction {
             id: "approval".to_string(),
             message: "Approve?".to_string(),
-            choices: vec!["yes".to_string(), "no".to_string()],
+            choices: vec![
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
             status: "answered".to_string(),
             fields: Fields::new(),
         })]);
@@ -842,7 +851,19 @@ mod tests {
         assert_eq!(step, "start");
         assert_eq!(prompt_id, "approval");
         assert_eq!(message, "Approve?");
-        assert_eq!(choices, vec!["yes".to_string(), "no".to_string()]);
+        assert_eq!(
+            choices,
+            vec![
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ]
+        );
         assert_eq!(resume_callback.kind(), "ask_user");
         assert_eq!(resume_callback.payload()["record_id"], "run-2");
         assert_eq!(resume_callback.payload()["prev"], Value::Null);

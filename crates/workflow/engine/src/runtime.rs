@@ -19,12 +19,13 @@ use cowboy_workflow_catalog::{
     AppliedWorkflowImprovement, WorkflowCatalogLoader, apply_improvement, load_source_ref,
 };
 use cowboy_workflow_core::{
-    ActionResult, AppendUserPromptOutcome, ConfigSetRef, DEFAULT_CONFIG_SET_NAME, ExecutionContext,
-    Fields, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead, RunStatus,
-    RunUserPrompt, RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail,
-    StepInput, StepOutput, StepRecord, WorkflowAction, WorkflowCatalog, WorkflowDefinition,
-    WorkflowError, WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSourceRef,
-    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
+    ActionResult, AppendUserPromptOutcome, Choice, ConfigSetRef, DEFAULT_CONFIG_SET_NAME,
+    ExecutionContext, Fields, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead,
+    RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction, StepActionProvider,
+    StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction, WorkflowCatalog,
+    WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowRunParent, WorkflowSelector,
+    WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status,
+    apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -241,7 +242,7 @@ pub struct RunStatusDetail {
     pub waiting_step: Option<String>,
     pub prompt_id: Option<String>,
     pub message: Option<String>,
-    pub choices: Vec<String>,
+    pub choices: Vec<Choice>,
 }
 
 impl RunStatusDetail {
@@ -3971,7 +3972,7 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes" } }
+              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
             end
             local done = step("done")
             done.run = function(ctx) return action.status { status = "success" } end
@@ -4103,7 +4104,7 @@ exit 0
         r#"
         local ask = step("ask")
         ask.run = function(ctx)
-          return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, fields = { carried = "ok" } }
+          return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
         end
 
         local decide = step("decide")
@@ -4254,7 +4255,16 @@ exit 0
             step: "review".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve deployment?".to_string(),
-            choices: vec!["yes".to_string(), "no".to_string()],
+            choices: vec![
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
             resume_callback: ResumeCallback::new(
                 "ask_user",
                 serde_json::json!({ "prompt_id": "approval" }),
@@ -4321,7 +4331,10 @@ exit 0
                     "waiting_step": "review",
                     "prompt_id": "approval",
                     "message": "Approve deployment?",
-                    "choices": ["yes", "no"],
+                    "choices": [
+                        { "key": "yes", "description": "Approve" },
+                        { "key": "no", "description": "Reject" },
+                    ],
                 }),
             ),
         ];
@@ -5793,7 +5806,7 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes" } }
+              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
             end
             local done = step("done")
             done.run = function(ctx) return action.status { status = "success" } end
@@ -6501,7 +6514,7 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, fields = { carried = "ok" } }
+          return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
             end
 
             local decide = step("decide")
@@ -6602,7 +6615,7 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" } }
+              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" } }
             end
 
             local broken = step("broken")
@@ -8310,7 +8323,7 @@ Recovery implementation review"#
             end
             local confirm = step("confirm")
             confirm.run = function(ctx)
-              return action.ask_user {{ id = "confirm", message = "Go?", choices = {{ "yes" }} }}
+              return action.ask_user {{ id = "confirm", message = "Go?", choices = {{ yes = "Approve" }} }}
             end
             confirm:on("answered", finish)
             return workflow("{name}", confirm)
@@ -8764,12 +8777,12 @@ Recovery implementation review"#
                     end
                     local second = step("second")
                     second.run = function(ctx)
-                      return action.ask_user { id = "second-confirm", message = "Second?", choices = { "b1", "b2" } }
+                      return action.ask_user { id = "second-confirm", message = "Second?", choices = { b1 = "Option B1", b2 = "Option B2" } }
                     end
                     second:on("answered", finish)
                     local first = step("first")
                     first.run = function(ctx)
-                      return action.ask_user { id = "first-confirm", message = "First?", choices = { "a1", "a2" } }
+                    return action.ask_user { id = "first-confirm", message = "First?", choices = { a1 = "Option A1", a2 = "Option A2" } }
                     end
                     first:on("answered", second)
                     return workflow("child", first)
@@ -8797,7 +8810,19 @@ Recovery implementation review"#
             } => {
                 assert_eq!(prompt_id, "first-confirm");
                 assert_eq!(message, "First?");
-                assert_eq!(choices, &vec!["a1".to_string(), "a2".to_string()]);
+                assert_eq!(
+                    choices,
+                    &vec![
+                        Choice {
+                            key: "a1".to_string(),
+                            description: "Option A1".to_string(),
+                        },
+                        Choice {
+                            key: "a2".to_string(),
+                            description: "Option A2".to_string(),
+                        },
+                    ]
+                );
             }
             other => panic!("expected first prompt, got {other:?}"),
         }
@@ -8815,7 +8840,19 @@ Recovery implementation review"#
             } => {
                 assert_eq!(prompt_id, "second-confirm");
                 assert_eq!(message, "Second?");
-                assert_eq!(choices, &vec!["b1".to_string(), "b2".to_string()]);
+                assert_eq!(
+                    choices,
+                    &vec![
+                        Choice {
+                            key: "b1".to_string(),
+                            description: "Option B1".to_string(),
+                        },
+                        Choice {
+                            key: "b2".to_string(),
+                            description: "Option B2".to_string(),
+                        },
+                    ]
+                );
             }
             other => panic!("expected second prompt, got {other:?}"),
         }

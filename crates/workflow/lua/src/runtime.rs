@@ -45,6 +45,7 @@ pub fn run_step(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowboy_workflow_core::Choice;
     use std::collections::BTreeMap;
 
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
@@ -91,7 +92,7 @@ mod tests {
             r#"
             local step = step("approve")
             step.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { "yes", "no" }, status = "accepted", fields = { plan = "ship" } }
+              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve the release", no = "Reject the release" }, status = "accepted", fields = { plan = "ship" } }
             end
             return workflow("wf", step)
             "#,
@@ -101,7 +102,19 @@ mod tests {
             panic!("expected ask_user action")
         };
         assert_eq!(action.id, "approval");
-        assert_eq!(action.choices, vec!["yes", "no"]);
+        assert_eq!(
+            action.choices,
+            vec![
+                Choice {
+                    key: "no".to_string(),
+                    description: "Reject the release".to_string(),
+                },
+                Choice {
+                    key: "yes".to_string(),
+                    description: "Approve the release".to_string(),
+                },
+            ]
+        );
         assert_eq!(action.status, "accepted");
         assert_eq!(action.fields["plan"], "ship");
     }

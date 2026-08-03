@@ -1,6 +1,6 @@
 use chrono::Utc;
 use cowboy_workflow_core::{
-    ActionResult, ResumeCallback, ResumeInput, RunStatus, WorkflowError, WorkflowRun,
+    ActionResult, Choice, ResumeCallback, ResumeInput, RunStatus, WorkflowError, WorkflowRun,
 };
 
 use crate::ResumeCallbackRegistry;
@@ -21,7 +21,7 @@ pub struct ValidatedAnswer {
     step: String,
     prompt_id: String,
     message: String,
-    choices: Vec<String>,
+    choices: Vec<Choice>,
     answer: String,
 }
 
@@ -61,7 +61,7 @@ impl ResumeRouter {
             )));
         }
 
-        if !choices.is_empty() && !choices.iter().any(|choice| choice == &answer) {
+        if !choices.is_empty() && !choices.iter().any(|choice| choice.key == answer) {
             return Err(WorkflowError::InvalidAction(format!(
                 "answer {answer:?} is not one of the allowed choices"
             )));
@@ -120,7 +120,9 @@ mod tests {
 
     use async_trait::async_trait;
     use chrono::Utc;
-    use cowboy_workflow_core::{ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus};
+    use cowboy_workflow_core::{
+        Choice, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus,
+    };
     use serde_json::{Value, json};
 
     use super::*;
@@ -141,7 +143,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
                 resume_callback: ResumeCallback::new(
                     "ask_user",
                     json!({
@@ -265,7 +276,13 @@ mod tests {
         assert_eq!(record.step, "approve");
         assert_eq!(record.input.prompt.as_deref(), Some("Approve?"));
         assert_eq!(record.input.context["prompt_id"], "approval");
-        assert_eq!(record.input.context["choices"], json!(["yes", "no"]));
+        assert_eq!(
+            record.input.context["choices"],
+            json!([
+                { "key": "yes", "description": "Approve" },
+                { "key": "no", "description": "Reject" },
+            ])
+        );
         assert_eq!(record.output.as_ref().unwrap().fields["answer"], "yes");
 
         let err = ResumeRouter::default()

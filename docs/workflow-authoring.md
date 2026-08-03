@@ -407,7 +407,7 @@ ask_scope.run = function(ctx)
   return action.ask_user {
     id = "scope",
     message = "Should Cowboy update docs only or code and docs?",
-    choices = { "docs", "code-and-docs" },
+    choices = { docs = "Update only the docs", ["code-and-docs"] = "Update code and docs" },
     fields = { source = "triage" }
   }
 end
@@ -428,7 +428,7 @@ Fields:
 
 - `id` (required): stable prompt id used for validation and UI/event display.
 - `message` (required): text shown to the user.
-- `choices` (optional): finite allowed answers. If present, answers outside the list are rejected.
+- `choices` (optional): finite allowed answers, given as a table mapping each accepted answer key to a human-readable description (e.g. `{ yes = "Approve the release", no = "Reject the release" }`). If present, answers outside the key set are rejected; each accepted choice carries both its key and description to the UI/event display.
 - `status` (optional): output status for the completed ask-user record; defaults to `"answered"`.
 - `fields` (optional): structured fields copied into the completed ask-user output before `fields.answer` is merged.
 
@@ -694,7 +694,7 @@ triage.run = function(ctx)
   return action.ask_user {
     id = "intent",
     message = "What kind of work is this?",
-    choices = { "feature", "bug", "docs" }
+    choices = { feature = "New feature work", bug = "Bug fix", docs = "Documentation only" }
   }
 end
 

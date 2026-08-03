@@ -613,7 +613,7 @@ fn empty_lines() -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+    use cowboy_workflow_engine::{Choice, WorkflowEvent, WorkflowEventKind};
     use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
@@ -907,7 +907,16 @@ mod tests {
                 step: "approve".to_string(),
                 prompt_id: "approval".to_string(),
                 message: "Approve?".to_string(),
-                choices: vec!["yes".to_string(), "no".to_string()],
+                choices: vec![
+                    Choice {
+                        key: "yes".to_string(),
+                        description: "Approve".to_string(),
+                    },
+                    Choice {
+                        key: "no".to_string(),
+                        description: "Reject".to_string(),
+                    },
+                ],
             },
         ));
 
@@ -918,7 +927,7 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("├─── Choices "), "{rendered}");
-        assert!(rendered.contains("yes · no"), "{rendered}");
+        assert!(rendered.contains("yes: Approve · no: Reject"), "{rendered}");
         assert!(rendered.contains("Approve?"), "{rendered}");
         assert!(!rendered.contains("step="), "{rendered}");
         assert!(!rendered.contains("prompt="), "{rendered}");

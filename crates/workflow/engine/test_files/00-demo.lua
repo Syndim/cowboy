@@ -14,7 +14,7 @@ confirm.run = function(ctx)
   return action.ask_user {
     id = "proceed",
     message = "Apply the plan?",
-    choices = { "yes", "no" },
+    choices = { yes = "Apply the plan", no = "Cancel and leave things as they are" },
   }
 end
 

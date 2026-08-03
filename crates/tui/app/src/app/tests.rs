@@ -1,5 +1,5 @@
 use cowboy_tui_animation::RUNNING_STATUS_FRAMES;
-use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+use cowboy_workflow_engine::{Choice, WorkflowEvent, WorkflowEventKind};
 use std::io;
 
 use ratatui::Terminal;
@@ -825,7 +825,16 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
             step: "review".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
-            choices: vec!["approve".to_string(), "reject".to_string()],
+            choices: vec![
+                Choice {
+                    key: "approve".to_string(),
+                    description: "Approve".to_string(),
+                },
+                Choice {
+                    key: "reject".to_string(),
+                    description: "Reject".to_string(),
+                },
+            ],
         },
     ));
 
@@ -857,7 +866,7 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
         wide.contains("◔ Waiting for input · ↳ review · ▶ 170dc431"),
         "{wide}"
     );
-    assert!(wide.contains("approve · reject"), "{wide}");
+    assert!(wide.contains("approve: Approve · reject: Reject"), "{wide}");
     assert!(!wide.contains("step="), "{wide}");
     assert!(!wide.contains("run="), "{wide}");
     assert!(!wide.contains("workflow="), "{wide}");
@@ -1101,7 +1110,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
           return action.ask_user {
             id = "approval",
             message = "Approve?",
-            choices = { "yes", "no" },
+            choices = { yes = "Approve", no = "Reject" },
           }
         end
 
@@ -1244,7 +1253,10 @@ fn status_animation_tick_marks_dirty_only_while_running() {
             step: "confirm".to_string(),
             prompt_id: "approval".to_string(),
             message: "Approve?".to_string(),
-            choices: vec!["yes".to_string()],
+            choices: vec![Choice {
+                key: "yes".to_string(),
+                description: "Approve".to_string(),
+            }],
         },
     ));
 
