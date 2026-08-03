@@ -3,7 +3,7 @@ use crate::{
     CompareAndSealPromptWindowOutcome, ObjectHash, OpenAgentPromptWindowOutcome, Result,
     ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
     StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
-    WorkflowDefinition, WorkflowRun, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummary,
+    WorkflowDefinition, WorkflowRun, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummary,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -108,7 +108,7 @@ pub trait StepActionProvider: Send + Sync {
 
 #[async_trait]
 pub trait DefinitionLoader: Send + Sync {
-    async fn load(&self, source: &WorkflowSourceRef) -> Result<CompiledWorkflow>;
+    async fn load(&self, source: &WorkflowSource) -> Result<CompiledWorkflow>;
 }
 
 #[async_trait]

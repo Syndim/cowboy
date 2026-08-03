@@ -20,7 +20,7 @@ use cowboy_workflow_catalog::{
     apply_update, builtin_default_source_ref, builtin_default_workflow_source, load_source_ref,
     normalize_workflow_entry,
 };
-use cowboy_workflow_core::WorkflowSourceRef;
+use cowboy_workflow_core::{WorkflowLocation, WorkflowSource};
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -60,7 +60,7 @@ fn list(dirs: &[String]) -> CliResult {
     println!("workflows ({})", catalog.workflows.len());
     for (id, source_ref) in &catalog.workflows {
         println!("- {id}");
-        println!("    entry:       {}", source_ref.entry);
+        println!("    entry:       {}", source_ref.location.entry.display());
         println!("    root:        {}", root_label(source_ref));
         println!(
             "    description: {}",
@@ -77,7 +77,11 @@ fn sources(dirs: &[String]) -> CliResult {
     let sources = build_loader(dirs).load_sources()?;
     println!("sources ({})", sources.len());
     for LoadedWorkflowSource { source_ref, source } in &sources {
-        println!("- {} ({})", source_ref.id, source_ref.entry);
+        println!(
+            "- {} ({})",
+            source_ref.id,
+            source_ref.location.entry.display()
+        );
         println!("    root:       {}", root_label(source_ref));
         println!("    first line: {}", first_line(source));
     }
@@ -89,15 +93,17 @@ fn sources(dirs: &[String]) -> CliResult {
 /// rejected by `load_source_ref`.
 fn show(args: &[String]) -> CliResult {
     let [root, entry] = args else { usage() };
-    let source_ref = WorkflowSourceRef {
+    let source_ref = WorkflowSource {
         id: workflow_id_from_entry(entry),
-        entry: entry.clone(),
-        root: Some(root.clone()),
+        location: WorkflowLocation {
+            root: Some(root.into()),
+            entry: entry.into(),
+        },
         description: None,
     };
     let loaded = load_source_ref(&source_ref)?;
     println!("id:    {}", loaded.source_ref.id);
-    println!("entry: {}", loaded.source_ref.entry);
+    println!("entry: {}", loaded.source_ref.location.entry.display());
     println!("root:  {}", root_label(&loaded.source_ref));
     println!("---");
     print!("{}", loaded.source);
@@ -112,7 +118,7 @@ fn builtin() -> CliResult {
     let source_ref = builtin_default_source_ref();
     let loaded = builtin_default_workflow_source();
     println!("id:          {}", source_ref.id);
-    println!("entry:       {}", source_ref.entry);
+    println!("entry:       {}", source_ref.location.entry.display());
     println!(
         "description: {}",
         source_ref.description.as_deref().unwrap_or("<none>")
@@ -133,7 +139,7 @@ fn normalize(paths: &[String]) -> CliResult {
     }
     for path in paths {
         match normalize_workflow_entry(path) {
-            Ok(normalized) => println!("ok   {path:?} -> {normalized:?}"),
+            Ok(normalized) => println!("ok   {path:?} -> {:?}", normalized.display().to_string()),
             Err(err) => println!("err  {path:?} -> {err}"),
         }
     }
@@ -148,10 +154,12 @@ fn create(args: &[String]) -> CliResult {
         usage()
     };
     let replacement_source = fs::read_to_string(source_file)?;
-    let draft = WorkflowSourceRef {
+    let draft = WorkflowSource {
         id: workflow_id_from_entry(entry),
-        entry: entry.clone(),
-        root: None,
+        location: WorkflowLocation {
+            root: None,
+            entry: entry.into(),
+        },
         description: None,
     };
     let catalog = build_loader(std::slice::from_ref(root))
@@ -200,8 +208,13 @@ fn workflow_id_from_entry(entry: &str) -> String {
     entry.trim_end_matches(".lua").to_string()
 }
 
-fn root_label(source_ref: &WorkflowSourceRef) -> &str {
-    source_ref.root.as_deref().unwrap_or("<built-in>")
+fn root_label(source_ref: &WorkflowSource) -> String {
+    source_ref
+        .location
+        .root
+        .as_ref()
+        .map(|root| root.display().to_string())
+        .unwrap_or_else(|| "<built-in>".to_string())
 }
 
 fn first_line(text: &str) -> &str {

@@ -24,7 +24,7 @@ use cowboy_workflow_core::{
     ResumeCallbackHandler, ResumeInput, RoleSession, RunHead, RunStatus, RunUserPrompt,
     RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail, StepInput, StepOutput,
     StepRecord, StepState, WorkflowAction, WorkflowCatalog, WorkflowDefinition, WorkflowError,
-    WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSnapshot, WorkflowSourceRef,
+    WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSnapshot, WorkflowSource,
     WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
@@ -636,7 +636,7 @@ impl WorkflowRuntime {
         // only available after compiling the source. Compilation is non-fatal
         // here: an invalid workflow stays listed, just without a description.
         for source_ref in catalog.workflows.values_mut() {
-            if source_ref.description.is_some() || source_ref.root.is_none() {
+            if source_ref.description.is_some() || source_ref.location.root.is_none() {
                 continue;
             }
             if let Ok(compiled) = cowboy_workflow_lua::load(source_ref) {
@@ -993,8 +993,8 @@ impl WorkflowRuntime {
                 let config_set = self.resolve_config_set(&definition)?;
                 tracing::debug!(
                     workflow_id = %spec.workflow_id,
-                    source_entry = %source_ref.entry,
-                    source_root = ?source_ref.root,
+                    source_entry = %source_ref.location.entry.display(),
+                    source_root = ?source_ref.location.root,
                     workflow_hash = %workflow_hash,
                     "workflow source compiled"
                 );
@@ -1869,7 +1869,7 @@ impl WorkflowRuntime {
 
     async fn compile_source(
         &self,
-        source_ref: &WorkflowSourceRef,
+        source_ref: &WorkflowSource,
     ) -> Result<(
         cowboy_workflow_core::WorkflowDefinition,
         WorkflowSourceSnapshot,
@@ -1877,11 +1877,11 @@ impl WorkflowRuntime {
     )> {
         tracing::debug!(
             workflow_id = %source_ref.id,
-            source_entry = %source_ref.entry,
-            source_root = ?source_ref.root,
+            source_entry = %source_ref.location.entry.display(),
+            source_root = ?source_ref.location.root,
             "compiling workflow source"
         );
-        let (mut definition, snapshot, workflow_name) = if source_ref.root.is_some() {
+        let (mut definition, snapshot, workflow_name) = if source_ref.location.root.is_some() {
             let compiled = cowboy_workflow_lua::load(source_ref)
                 .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
             (
@@ -1892,10 +1892,21 @@ impl WorkflowRuntime {
         } else {
             let loaded = load_source_ref(source_ref)
                 .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+            let entry = loaded
+                .source_ref
+                .location
+                .entry
+                .to_string_lossy()
+                .to_string();
             let snapshot = WorkflowSourceSnapshot {
-                root: loaded.source_ref.root.clone(),
-                entry: loaded.source_ref.entry.clone(),
-                files: BTreeMap::from([(loaded.source_ref.entry.clone(), loaded.source)]),
+                root: loaded
+                    .source_ref
+                    .location
+                    .root
+                    .clone()
+                    .map(|root| root.to_string_lossy().to_string()),
+                entry: entry.clone(),
+                files: BTreeMap::from([(entry, loaded.source)]),
             };
             let definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
                 .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -3339,7 +3350,7 @@ implementation_evidence: []
     async fn workflow_runtime_implementation_retry_sends_only_retry_nudge() {
         let dir = tempfile::tempdir().unwrap();
         let factory = ScriptedAgentFactory::new(vec![
-            "malformed response without frontmatter".to_string(),
+            "---\nstatus: implemented\nsummary: valid\n  bad_indent: nope\n".to_string(),
             successful_implementation_response("retry succeeded"),
         ]);
         let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
@@ -5851,7 +5862,8 @@ exit 0
         )
         .await
         .unwrap()
-        .with_deterministic_selector();
+        .with_deterministic_selector()
+        .with_request_topic_generation();
 
         runtime.start_run("do it").await.unwrap_err();
         let run_id = runtime.list_runs(None).await.unwrap()[0].run_id.clone();
@@ -7297,7 +7309,8 @@ exit 0
         )
         .await
         .unwrap()
-        .with_deterministic_selector();
+        .with_deterministic_selector()
+        .with_request_topic_generation();
 
         let start = runtime.start_run("request").await.unwrap();
         assert!(matches!(

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use cowboy_workflow_core::{WorkflowCatalog, WorkflowId, WorkflowSourceRef};
+use cowboy_workflow_core::{WorkflowCatalog, WorkflowId, WorkflowLocation, WorkflowSource};
 use serde::{Deserialize, Serialize};
 
 use crate::builtin::builtin_default_workflow_source;
@@ -123,10 +123,12 @@ fn load_directory(root: &CatalogRoot) -> Result<Vec<LoadedWorkflowSource>> {
 
     let mut sources = Vec::new();
     for entry in files {
-        let source_ref = WorkflowSourceRef {
+        let source_ref = WorkflowSource {
             id: workflow_id_from_entry(&entry),
-            entry: entry.clone(),
-            root: Some(root_path.to_string_lossy().to_string()),
+            location: WorkflowLocation {
+                root: Some(root_path.clone()),
+                entry: entry.into(),
+            },
             description: None,
         };
         let loaded = load_source_ref(&source_ref)?;
@@ -171,7 +173,11 @@ fn collect_lua_files(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result
                 .to_str()
                 .ok_or_else(|| crate::Error::NonUtf8Path(path.display().to_string()))?;
             if relative.ends_with(".lua") {
-                files.push(normalize_workflow_entry(relative)?);
+                files.push(
+                    normalize_workflow_entry(relative)?
+                        .to_string_lossy()
+                        .to_string(),
+                );
             }
         }
     }
@@ -210,7 +216,10 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_ref.id, "workflows/review");
-        assert_eq!(sources[0].source_ref.entry, "workflows/review.lua");
+        assert_eq!(
+            sources[0].source_ref.location.entry,
+            std::path::Path::new("workflows/review.lua")
+        );
         assert!(sources[0].source.contains("return workflow"));
     }
 

@@ -1,5 +1,7 @@
 use cowboy_workflow_agent::build_agent_prompt;
-use cowboy_workflow_core::{RunUserInput, RunUserInputKind, StepAction, WorkflowSourceRef};
+use cowboy_workflow_core::{
+    RunUserInput, RunUserInputKind, StepAction, WorkflowLocation, WorkflowSource,
+};
 use cowboy_workflow_lua::{load, run_step};
 
 #[test]
@@ -7,10 +9,12 @@ fn actual_example_lua_prompt_includes_each_user_input_once() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
         .join("examples/workflows");
-    let compiled = load(&WorkflowSourceRef {
+    let compiled = load(&WorkflowSource {
         id: "feature".into(),
-        root: Some(root.to_string_lossy().into_owned()),
-        entry: "workflows/feature.lua".into(),
+        location: WorkflowLocation {
+            root: Some(root),
+            entry: "workflows/feature.lua".into(),
+        },
         description: None,
     })
     .unwrap();

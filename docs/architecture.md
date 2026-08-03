@@ -54,7 +54,7 @@ The built-in workflow is always available. Project/user workflow directories ext
 Workflow definitions are authored as Lua files. The Lua loader compiles them into core data:
 
 ```text
-WorkflowSourceRef
+WorkflowSource
   -> WorkflowSourceSnapshot
   -> WorkflowDefinition
        optional config_set selector

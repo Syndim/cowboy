@@ -252,21 +252,21 @@ Pure workflow domain model and execution rules.
 
 Owns:
 
-- `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition`
+- `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
 - `StepAction`: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`
 - `WorkflowRun`, durable name-only config-set pointer (`ConfigSetRef`) and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
 - `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, async typed store capabilities and composite `WorkflowStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
-- `execute_step`, step/visit budget enforcement, and step-record/status application helpers
+- `execute_step`, `next_step` routing, step/visit budget enforcement, and step-record/status application helpers
 
 Important modules:
 
 - `ids.rs` — workflow/run/role/step/record/turn/object id aliases.
-- `definition.rs` — workflow catalog, source refs, roles, steps, transitions, and graph validation.
+- `definition.rs` — workflow catalog, source descriptors, roles, steps, transitions, and graph validation.
 - `action.rs` — declarative `StepAction` variants.
 - `state.rs` — durable run, status, resume callback, record, output, head, session, and object state.
 - `traits.rs` — core traits for stores, dispatchers, providers, selectors, and summarizers.
-- `engine.rs` — pure `execute_step` semantics and budget checks.
+- `engine.rs` — pure `execute_step`/`next_step` semantics and budget checks.
 - `summary.rs` — workflow improvement/summary types.
 - `error.rs` — workflow errors.
 
@@ -384,7 +384,7 @@ Important modules:
 CLI argv or TUI composer input
   -> cowboy-command-parser parses CLI/slash command grammar
   -> cowboy app dispatches to cowboy-workflow-engine::WorkflowRuntime
-  -> catalog loads/selects WorkflowSourceRef
+  -> catalog loads/selects WorkflowSource
   -> workflow-lua compiles/snapshots Lua source
   -> engine resolves the workflow config_set name (or default); limits are resolved live per operation
   -> WorkflowRun is saved through async WorkflowStore capabilities

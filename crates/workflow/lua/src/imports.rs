@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
-use cowboy_workflow_core::{WorkflowSourceRef, WorkflowSourceSnapshot};
+use cowboy_workflow_core::{WorkflowSource, WorkflowSourceSnapshot};
 
 use crate::{Error, Result};
 
@@ -9,16 +9,16 @@ use crate::{Error, Result};
 pub struct SourceResolver;
 
 impl SourceResolver {
-    pub fn load(&self, source: &WorkflowSourceRef) -> Result<WorkflowSourceSnapshot> {
-        let root = source.root.as_ref().ok_or(Error::MissingRoot)?;
-        let root_path = PathBuf::from(root);
-        let canonical_root = root_path.canonicalize()?;
+    pub fn load(&self, source: &WorkflowSource) -> Result<WorkflowSourceSnapshot> {
+        let root = source.location.root.as_ref().ok_or(Error::MissingRoot)?;
+        let canonical_root = root.canonicalize()?;
         let mut files = BTreeMap::new();
         let mut loading = BTreeSet::new();
-        self.load_one(&canonical_root, &source.entry, &mut files, &mut loading)?;
+        let entry = source.location.entry.to_string_lossy();
+        self.load_one(&canonical_root, &entry, &mut files, &mut loading)?;
         Ok(WorkflowSourceSnapshot {
             root: Some(canonical_root.to_string_lossy().to_string()),
-            entry: normalize_relative_path(&source.entry)?,
+            entry: normalize_relative_path(&entry)?,
             files,
         })
     }
@@ -73,6 +73,7 @@ pub fn normalize_relative_path(path: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowboy_workflow_core::WorkflowLocation;
 
     #[test]
     fn rejects_parent_dir_imports() {
@@ -95,10 +96,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("main.lua");
         std::fs::write(&file, "return workflow('x', step('s'))").unwrap();
-        let source = WorkflowSourceRef {
+        let source = WorkflowSource {
             id: "x".into(),
-            entry: "main.lua".into(),
-            root: Some(dir.path().to_string_lossy().to_string()),
+            location: WorkflowLocation {
+                root: Some(dir.path().to_path_buf()),
+                entry: "main.lua".into(),
+            },
             description: None,
         };
         let bundle = SourceResolver.load(&source).unwrap();

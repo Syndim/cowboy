@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,7 +19,7 @@ pub type Status = String;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowCatalog {
     /// Workflow source descriptors available for selection.
-    pub workflows: BTreeMap<WorkflowId, WorkflowSourceRef>,
+    pub workflows: BTreeMap<WorkflowId, WorkflowSource>,
 }
 
 impl WorkflowCatalog {
@@ -35,15 +36,25 @@ impl Default for WorkflowCatalog {
     }
 }
 
+/// Filesystem location of a workflow's Lua entry file.
+///
+/// Filesystem-backed workflows resolve `entry` relative to `root`. Built-in
+/// workflows have no real root on disk and carry only a virtual `entry` name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowLocation {
+    /// Workflow root directory. `None` for built-in workflows.
+    pub root: Option<PathBuf>,
+    /// Entry Lua file path relative to `root` (or a virtual name when `root` is `None`).
+    pub entry: PathBuf,
+}
+
 /// Source location and metadata for a workflow definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowSourceRef {
+pub struct WorkflowSource {
     /// Stable workflow id used by selectors and catalog references.
     pub id: WorkflowId,
-    /// Entry Lua file path relative to the workflow root.
-    pub entry: String,
-    /// Optional workflow root directory. Built-ins may omit it.
-    pub root: Option<String>,
+    /// Filesystem location of the workflow's Lua entry file.
+    pub location: WorkflowLocation,
     /// Optional human-readable description used by selectors.
     pub description: Option<String>,
 }
@@ -206,33 +217,6 @@ pub fn validate_definition(definition: &WorkflowDefinition) -> Result<Validation
     })
 }
 
-pub fn next_step<'a>(
-    definition: &'a WorkflowDefinition,
-    step_id: &StepId,
-    status: &str,
-) -> Result<Option<&'a StepId>> {
-    let Some(step) = definition.steps.get(step_id) else {
-        return Err(WorkflowError::UnknownStep {
-            step: step_id.clone(),
-        });
-    };
-    if let Some(next) = step.transitions.next_for(status) {
-        return Ok(Some(next));
-    }
-    // A leaf step (one declaring no outgoing transitions) is terminal for any
-    // status it returns, so a workflow can complete with a domain status such as
-    // the custom status a child workflow reports back to its caller. Steps that
-    // declare transitions still only complete implicitly on `success`, so a typo
-    // in a routed status is caught rather than silently ending the run.
-    if status == "success" || step.transitions.by_status.is_empty() {
-        return Ok(None);
-    }
-    Err(WorkflowError::UnknownRuntimeTransition {
-        step: step_id.clone(),
-        status: status.to_string(),
-    })
-}
-
 fn unreachable_steps(definition: &WorkflowDefinition) -> Vec<StepId> {
     let mut seen = BTreeSet::new();
     let mut queue = VecDeque::from([definition.head.clone()]);
@@ -365,49 +349,6 @@ mod tests {
                 step: "plan".to_string(),
                 status: "failed".to_string(),
                 target: "missing".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn success_without_transition_is_terminal() {
-        let definition = definition();
-        let next = next_step(&definition, &"review".to_string(), "success").unwrap();
-        assert!(next.is_none());
-    }
-
-    #[test]
-    fn leaf_step_without_transition_is_terminal_for_any_status() {
-        let definition = definition();
-        // `review` declares no outgoing transitions, so it is terminal for any
-        // status it returns, not only `success`.
-        let next = next_step(&definition, &"review".to_string(), "needs_fix").unwrap();
-        assert!(next.is_none());
-    }
-
-    #[test]
-    fn non_success_without_matching_transition_fails() {
-        let definition = definition();
-        // `plan` declares a `success` transition, so an unmatched non-success
-        // status is a routing error rather than a silent completion.
-        let err = next_step(&definition, &"plan".to_string(), "needs_fix").unwrap_err();
-        assert_eq!(
-            err,
-            WorkflowError::UnknownRuntimeTransition {
-                step: "plan".to_string(),
-                status: "needs_fix".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn unknown_current_step_fails() {
-        let definition = definition();
-        let err = next_step(&definition, &"missing".to_string(), "success").unwrap_err();
-        assert_eq!(
-            err,
-            WorkflowError::UnknownStep {
-                step: "missing".to_string()
             }
         );
     }

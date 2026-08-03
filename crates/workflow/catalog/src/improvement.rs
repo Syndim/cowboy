@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use cowboy_workflow_core::{WorkflowCatalog, WorkflowId, WorkflowImprovement, WorkflowSourceRef};
+use cowboy_workflow_core::{WorkflowCatalog, WorkflowId, WorkflowImprovement, WorkflowSource};
 use serde::{Deserialize, Serialize};
 
 use crate::source::{load_source_ref, source_path_from_ref, write_source_ref};
@@ -15,7 +15,7 @@ pub enum WorkflowSourceUpdate {
         replacement_source: String,
     },
     CreateNew {
-        draft: WorkflowSourceRef,
+        draft: WorkflowSource,
         replacement_source: String,
     },
 }
@@ -26,11 +26,11 @@ pub enum WorkflowSourceUpdate {
 pub enum AppliedWorkflowImprovement {
     None,
     Updated {
-        source: WorkflowSourceRef,
+        source: WorkflowSource,
         path: String,
     },
     Created {
-        source: WorkflowSourceRef,
+        source: WorkflowSource,
         path: String,
     },
 }
@@ -66,7 +66,7 @@ pub fn apply_update(
             if catalog.workflows.contains_key(&draft.id) {
                 return Err(Error::AlreadyExists {
                     workflow_id: draft.id.clone(),
-                    path: draft.entry.clone(),
+                    path: draft.location.entry.display().to_string(),
                 });
             }
             let loaded = write_source_ref(root.as_ref(), draft, replacement_source, false)?;
@@ -122,7 +122,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
 
-    use cowboy_workflow_core::WorkflowPatch;
+    use cowboy_workflow_core::{WorkflowLocation, WorkflowPatch};
 
     use super::*;
     use crate::builtin::{DEFAULT_WORKFLOW_ENTRY, DEFAULT_WORKFLOW_ID, builtin_default_source_ref};
@@ -154,7 +154,7 @@ mod tests {
             panic!("expected update")
         };
         assert_eq!(source.id, DEFAULT_WORKFLOW_ID);
-        assert_eq!(source.entry, DEFAULT_WORKFLOW_ENTRY);
+        assert_eq!(source.location.entry, Path::new(DEFAULT_WORKFLOW_ENTRY));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "return workflow('default', step('start'))"
@@ -170,10 +170,12 @@ mod tests {
             "return workflow('custom', step('start'))",
         )
         .unwrap();
-        let draft = WorkflowSourceRef {
+        let draft = WorkflowSource {
             id: "custom".to_string(),
-            entry: "custom.lua".to_string(),
-            root: Some(draft_root.path().to_string_lossy().to_string()),
+            location: WorkflowLocation {
+                root: Some(draft_root.path().to_path_buf()),
+                entry: "custom.lua".into(),
+            },
             description: Some("custom workflow".to_string()),
         };
         let improvement = WorkflowImprovement::CreateNew {
@@ -187,7 +189,7 @@ mod tests {
             panic!("expected create")
         };
         assert_eq!(source.id, "custom");
-        assert_eq!(source.entry, "custom.lua");
+        assert_eq!(source.location.entry, Path::new("custom.lua"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "return workflow('custom', step('start'))"
@@ -197,10 +199,12 @@ mod tests {
     #[test]
     fn applies_create_update_to_chosen_root() {
         let root = tempfile::tempdir().unwrap();
-        let draft = WorkflowSourceRef {
+        let draft = WorkflowSource {
             id: "custom".to_string(),
-            entry: "nested/custom.lua".to_string(),
-            root: None,
+            location: WorkflowLocation {
+                root: None,
+                entry: "nested/custom.lua".into(),
+            },
             description: Some("custom workflow".to_string()),
         };
         let update = WorkflowSourceUpdate::CreateNew {
@@ -213,7 +217,7 @@ mod tests {
             panic!("expected create")
         };
         assert_eq!(source.id, "custom");
-        assert_eq!(source.entry, "nested/custom.lua");
+        assert_eq!(source.location.entry, Path::new("nested/custom.lua"));
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "return workflow('custom', step('start'))"

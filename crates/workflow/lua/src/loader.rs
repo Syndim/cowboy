@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    CompiledWorkflow, WorkflowDefinition, WorkflowSourceRef, WorkflowSourceSnapshot,
+    CompiledWorkflow, WorkflowDefinition, WorkflowSource, WorkflowSourceSnapshot,
     validate_definition,
 };
 use mlua::{Lua, Value};
@@ -15,11 +14,11 @@ use crate::imports::normalize_relative_path;
 use crate::sandbox::create_sandbox;
 use crate::{Error, Result};
 
-/// Load a workflow source ref from disk and compile it into a workflow definition.
-pub fn load(source: &WorkflowSourceRef) -> Result<CompiledWorkflow> {
-    let root = source.root.as_ref().ok_or(Error::MissingRoot)?;
-    let root = PathBuf::from(root).canonicalize()?;
-    let entry = normalize_relative_path(&source.entry)?;
+/// Load a workflow source and compile it into a workflow definition.
+pub fn load(source: &WorkflowSource) -> Result<CompiledWorkflow> {
+    let root = source.location.root.as_ref().ok_or(Error::MissingRoot)?;
+    let root = root.canonicalize()?;
+    let entry = normalize_relative_path(&source.location.entry.to_string_lossy())?;
     let sources: SharedSources = Arc::new(Mutex::new(BTreeMap::new()));
     let entry_content = std::fs::read_to_string(root.join(&entry))?;
     sources.lock().insert(entry.clone(), entry_content.clone());
@@ -66,7 +65,7 @@ pub struct Loader;
 impl cowboy_workflow_core::DefinitionLoader for Loader {
     async fn load(
         &self,
-        source: &WorkflowSourceRef,
+        source: &WorkflowSource,
     ) -> cowboy_workflow_core::Result<CompiledWorkflow> {
         load(source)
             .map_err(|err| cowboy_workflow_core::WorkflowError::InvalidAction(err.to_string()))
@@ -94,7 +93,7 @@ pub(crate) fn setup_lua(import_mode: ImportMode) -> Result<Lua> {
 mod tests {
     use super::*;
     use crate::runtime::run_step;
-    use cowboy_workflow_core::{Field, FieldType, Fields, StepAction};
+    use cowboy_workflow_core::{Field, FieldType, Fields, StepAction, WorkflowLocation};
     use std::collections::BTreeMap;
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
         WorkflowSourceSnapshot {
@@ -108,10 +107,12 @@ mod tests {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .join("examples/workflows");
-        let source = WorkflowSourceRef {
+        let source = WorkflowSource {
             id: name.into(),
-            root: Some(root.to_string_lossy().into_owned()),
-            entry: format!("workflows/{name}.lua"),
+            location: WorkflowLocation {
+                root: Some(root),
+                entry: format!("workflows/{name}.lua").into(),
+            },
             description: None,
         };
 
@@ -4769,10 +4770,12 @@ mod tests {
         )
         .unwrap();
 
-        let source = WorkflowSourceRef {
+        let source = WorkflowSource {
             id: "wf".into(),
-            root: Some(dir.path().to_string_lossy().to_string()),
-            entry: "main.lua".into(),
+            location: WorkflowLocation {
+                root: Some(dir.path().to_path_buf()),
+                entry: "main.lua".into(),
+            },
             description: None,
         };
         let compiled = load(&source).unwrap();

@@ -567,10 +567,14 @@ pub(in crate::app) fn show_workflows(
     let mut details = vec![format!("known workflows: {count}")];
     for (id, workflow) in catalog.workflows {
         let description = workflow.description.unwrap_or_else(|| "<none>".to_string());
-        let root = workflow.root.unwrap_or_else(|| "<built-in>".to_string());
+        let root = workflow
+            .location
+            .root
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "<built-in>".to_string());
         details.push(id);
         details.push(format!("  description: {description}"));
-        details.push(format!("  entry: {}", workflow.entry));
+        details.push(format!("  entry: {}", workflow.location.entry.display()));
         details.push(format!("  root: {root}"));
     }
     state.push_card("Workflows", details);

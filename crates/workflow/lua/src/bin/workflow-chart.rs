@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use cowboy_workflow_core::{StepId, WorkflowDefinition, WorkflowSourceRef};
+use cowboy_workflow_core::{StepId, WorkflowDefinition, WorkflowLocation, WorkflowSource};
 use cowboy_workflow_lua::load;
 
 fn main() {
@@ -32,10 +32,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("workflow path must have a file name")?
         .to_string_lossy()
         .to_string();
-    let source = WorkflowSourceRef {
+    let source = WorkflowSource {
         id: entry.trim_end_matches(".lua").to_string(),
-        entry,
-        root: Some(root.to_string_lossy().to_string()),
+        location: WorkflowLocation {
+            root: Some(root),
+            entry: entry.into(),
+        },
         description: None,
     };
     let compiled = load(&source)?;

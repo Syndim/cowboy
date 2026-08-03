@@ -2,9 +2,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionDispatcher, ActionResult, Result, RunStatus, StepAction, StepActionProvider, StepRecord,
-    UserPromptStore, WorkflowDefinition, WorkflowError, WorkflowObjectStore, WorkflowRun,
-    WorkflowStateStore, next_step,
+    ActionDispatcher, ActionResult, Result, RunStatus, StepAction, StepActionProvider, StepId,
+    StepRecord, UserPromptStore, WorkflowDefinition, WorkflowError, WorkflowObjectStore,
+    WorkflowRun, WorkflowStateStore,
 };
 
 /// Safety budgets enforced by the workflow runner.
@@ -210,6 +210,37 @@ pub async fn apply_run_status<S: WorkflowStateStore + ?Sized>(
 
 fn next_record_id(run: &WorkflowRun) -> String {
     format!("{}-{}", run.id, run.step.executed + 1)
+}
+
+/// Resolve the next step id for a step's reported output status, if any.
+///
+/// Returns `Ok(None)` when the step is terminal for that status: either it
+/// reports `success` with no matching transition, or it declares no outgoing
+/// transitions at all (a leaf step is terminal for any status it returns, so
+/// a workflow can complete with a domain status such as the custom status a
+/// child workflow reports back to its caller). A non-`success` status with no
+/// matching transition on a step that does declare transitions is a routing
+/// error rather than a silent completion, catching a typo in a routed status.
+pub fn next_step<'a>(
+    definition: &'a WorkflowDefinition,
+    step_id: &StepId,
+    status: &str,
+) -> Result<Option<&'a StepId>> {
+    let Some(step) = definition.steps.get(step_id) else {
+        return Err(WorkflowError::UnknownStep {
+            step: step_id.clone(),
+        });
+    };
+    if let Some(next) = step.transitions.next_for(status) {
+        return Ok(Some(next));
+    }
+    if status == "success" || step.transitions.by_status.is_empty() {
+        return Ok(None);
+    }
+    Err(WorkflowError::UnknownRuntimeTransition {
+        step: step_id.clone(),
+        status: status.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1099,5 +1130,48 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
+    }
+
+    #[test]
+    fn success_without_transition_is_terminal() {
+        let definition = definition();
+        let next = next_step(&definition, &"next".to_string(), "success").unwrap();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn leaf_step_without_transition_is_terminal_for_any_status() {
+        let definition = definition();
+        // `next` declares no outgoing transitions, so it is terminal for any
+        // status it returns, not only `success`.
+        let next = next_step(&definition, &"next".to_string(), "needs_fix").unwrap();
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn non_success_without_matching_transition_fails() {
+        let definition = definition();
+        // `start` declares a `next` transition, so an unmatched non-success
+        // status is a routing error rather than a silent completion.
+        let err = next_step(&definition, &"start".to_string(), "needs_fix").unwrap_err();
+        assert_eq!(
+            err,
+            WorkflowError::UnknownRuntimeTransition {
+                step: "start".to_string(),
+                status: "needs_fix".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_current_step_fails() {
+        let definition = definition();
+        let err = next_step(&definition, &"missing".to_string(), "success").unwrap_err();
+        assert_eq!(
+            err,
+            WorkflowError::UnknownStep {
+                step: "missing".to_string()
+            }
+        );
     }
 }

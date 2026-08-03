@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use cowboy_agent_client::{Client, Event, ModelInfo, PromptContent, PromptTurnCancellation};
 use cowboy_workflow_core::{
-    Result, WorkflowCatalog, WorkflowError, WorkflowSelection, WorkflowSourceRef,
-    WorkflowSummarizer, WorkflowSummary,
+    Result, WorkflowCatalog, WorkflowError, WorkflowSelection, WorkflowSource, WorkflowSummarizer,
+    WorkflowSummary,
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -46,7 +46,7 @@ impl cowboy_workflow_core::WorkflowSelector for DeterministicSelector {
     }
 }
 
-fn selection_rationale(request: &str, selected: &WorkflowSourceRef) -> String {
+fn selection_rationale(request: &str, selected: &WorkflowSource) -> String {
     match &selected.description {
         Some(description) if !description.trim().is_empty() => {
             format!(
@@ -506,8 +506,8 @@ mod tests {
     use chrono::Utc;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        RunStatus, StepState, WorkflowImprovement, WorkflowRun, WorkflowSelector, WorkflowSnapshot,
-        WorkflowSourceRef, WorkflowSummarizer,
+        RunStatus, StepState, WorkflowImprovement, WorkflowLocation, WorkflowRun, WorkflowSelector,
+        WorkflowSnapshot, WorkflowSource, WorkflowSummarizer,
     };
     use serde_json::Value;
 
@@ -518,19 +518,23 @@ mod tests {
             workflows: BTreeMap::from([
                 (
                     "default".to_string(),
-                    WorkflowSourceRef {
+                    WorkflowSource {
                         id: "default".to_string(),
-                        entry: "main.lua".to_string(),
-                        root: None,
+                        location: WorkflowLocation {
+                            root: None,
+                            entry: "main.lua".into(),
+                        },
                         description: Some("built-in default workflow".to_string()),
                     },
                 ),
                 (
                     "special".to_string(),
-                    WorkflowSourceRef {
+                    WorkflowSource {
                         id: "special".to_string(),
-                        entry: "special.lua".to_string(),
-                        root: None,
+                        location: WorkflowLocation {
+                            root: None,
+                            entry: "special.lua".into(),
+                        },
                         description: None,
                     },
                 ),

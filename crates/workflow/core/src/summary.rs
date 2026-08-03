@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{RecordId, StepId, WorkflowId, WorkflowSourceRef};
+use crate::{RecordId, StepId, WorkflowId, WorkflowSource};
 
 /// Post-run summary used to decide whether workflows should be improved.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub enum WorkflowImprovement {
     /// Create a new workflow source.
     CreateNew {
         /// Draft workflow source descriptor.
-        draft: WorkflowSourceRef,
+        draft: WorkflowSource,
         /// Explanation for why a new workflow is needed.
         rationale: String,
     },

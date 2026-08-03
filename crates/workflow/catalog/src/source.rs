@@ -1,40 +1,41 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use cowboy_workflow_core::WorkflowSourceRef;
+use cowboy_workflow_core::{WorkflowLocation, WorkflowSource};
 use serde::{Deserialize, Serialize};
 
 use crate::builtin::load_builtin_source_ref;
 use crate::{Error, Result};
 
-/// A workflow source ref paired with its loaded Lua source text.
+/// A workflow source paired with its loaded Lua source text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadedWorkflowSource {
-    pub source_ref: WorkflowSourceRef,
+    pub source_ref: WorkflowSource,
     pub source: String,
 }
 
-pub fn load_source_ref(source_ref: &WorkflowSourceRef) -> Result<LoadedWorkflowSource> {
-    if source_ref.root.is_none() {
+pub fn load_source_ref(source_ref: &WorkflowSource) -> Result<LoadedWorkflowSource> {
+    let Some(root) = source_ref.location.root.as_ref() else {
         return load_builtin_source_ref(source_ref);
-    }
+    };
 
-    let root = source_ref.root.as_ref().ok_or_else(|| Error::MissingRoot {
-        workflow_id: source_ref.id.clone(),
-    })?;
-    let entry = normalize_workflow_entry(&source_ref.entry)?;
-    let root_path = canonical_dir(Path::new(root))?;
+    let entry = normalize_workflow_entry(&source_ref.location.entry)?;
+    let root_path = canonical_dir(root)?;
     let path = root_path.join(&entry);
     let canonical = canonical_file(&path)?;
     if !canonical.starts_with(&root_path) {
-        return Err(Error::InvalidRelativePath(source_ref.entry.clone()));
+        return Err(Error::InvalidRelativePath(
+            source_ref.location.entry.display().to_string(),
+        ));
     }
     let source = read_to_string(&canonical)?;
     Ok(LoadedWorkflowSource {
-        source_ref: WorkflowSourceRef {
+        source_ref: WorkflowSource {
             id: source_ref.id.clone(),
-            entry,
-            root: Some(root_path.to_string_lossy().to_string()),
+            location: WorkflowLocation {
+                root: Some(root_path),
+                entry,
+            },
             description: source_ref.description.clone(),
         },
         source,
@@ -43,23 +44,23 @@ pub fn load_source_ref(source_ref: &WorkflowSourceRef) -> Result<LoadedWorkflowS
 
 pub fn materialize_source_ref(
     root: impl AsRef<Path>,
-    source_ref: &WorkflowSourceRef,
+    source_ref: &WorkflowSource,
     replacement_source: &str,
-) -> Result<WorkflowSourceRef> {
+) -> Result<WorkflowSource> {
     write_source_ref(root.as_ref(), source_ref, replacement_source, true)
         .map(|loaded| loaded.source_ref)
 }
 
 pub(crate) fn write_source_ref(
     root: &Path,
-    source_ref: &WorkflowSourceRef,
+    source_ref: &WorkflowSource,
     replacement_source: &str,
     overwrite: bool,
 ) -> Result<LoadedWorkflowSource> {
     if source_ref.id.trim().is_empty() {
         return Err(Error::EmptyWorkflowId);
     }
-    let entry = normalize_workflow_entry(&source_ref.entry)?;
+    let entry = normalize_workflow_entry(&source_ref.location.entry)?;
     fs::create_dir_all(root).map_err(|err| io_error(root, err))?;
     let root = canonical_dir(root)?;
     let path = source_path(&root, &entry)?;
@@ -74,10 +75,12 @@ pub(crate) fn write_source_ref(
     }
     fs::write(&path, replacement_source).map_err(|err| io_error(&path, err))?;
     Ok(LoadedWorkflowSource {
-        source_ref: WorkflowSourceRef {
+        source_ref: WorkflowSource {
             id: source_ref.id.clone(),
-            entry,
-            root: Some(root.to_string_lossy().to_string()),
+            location: WorkflowLocation {
+                root: Some(root),
+                entry,
+            },
             description: source_ref.description.clone(),
         },
         source: replacement_source.to_string(),
@@ -85,11 +88,11 @@ pub(crate) fn write_source_ref(
 }
 
 /// Validate and normalize a workflow entry path to a safe relative `.lua` path.
-pub fn normalize_workflow_entry(path: &str) -> Result<String> {
-    if path.trim().is_empty() {
-        return Err(Error::InvalidRelativePath(path.to_string()));
+pub fn normalize_workflow_entry(path: impl AsRef<Path>) -> Result<PathBuf> {
+    let path = path.as_ref();
+    if path.as_os_str().is_empty() {
+        return Err(Error::InvalidRelativePath(path.display().to_string()));
     }
-    let path = Path::new(path);
     if path.is_absolute() {
         return Err(Error::InvalidRelativePath(path.display().to_string()));
     }
@@ -108,26 +111,29 @@ pub fn normalize_workflow_entry(path: &str) -> Result<String> {
     if normalized.as_os_str().is_empty() {
         return Err(Error::InvalidRelativePath(path.display().to_string()));
     }
-    let normalized = normalized
+    let normalized_str = normalized
         .to_str()
-        .ok_or_else(|| Error::NonUtf8Path(path.display().to_string()))?
-        .replace('\\', "/");
-    if !normalized.ends_with(".lua") {
-        return Err(Error::NonLuaEntry(normalized));
+        .ok_or_else(|| Error::NonUtf8Path(normalized.display().to_string()))?;
+    if !normalized_str.ends_with(".lua") {
+        return Err(Error::NonLuaEntry(normalized_str.to_string()));
     }
     Ok(normalized)
 }
 
-pub(crate) fn source_path(root: &Path, entry: &str) -> Result<PathBuf> {
+pub(crate) fn source_path(root: &Path, entry: &Path) -> Result<PathBuf> {
     let entry = normalize_workflow_entry(entry)?;
     Ok(root.join(entry))
 }
 
-pub(crate) fn source_path_from_ref(source_ref: &WorkflowSourceRef) -> Result<String> {
-    let root = source_ref.root.as_ref().ok_or_else(|| Error::MissingRoot {
-        workflow_id: source_ref.id.clone(),
-    })?;
-    Ok(source_path(Path::new(root), &source_ref.entry)?
+pub(crate) fn source_path_from_ref(source_ref: &WorkflowSource) -> Result<String> {
+    let root = source_ref
+        .location
+        .root
+        .as_ref()
+        .ok_or_else(|| Error::MissingRoot {
+            workflow_id: source_ref.id.clone(),
+        })?;
+    Ok(source_path(root, &source_ref.location.entry)?
         .to_string_lossy()
         .to_string())
 }
