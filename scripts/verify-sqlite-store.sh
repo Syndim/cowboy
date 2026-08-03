@@ -73,8 +73,6 @@ hold.run = function(ctx)
   return action.command {
     program = "$barrier_script",
     args = { tostring(ctx.request), tostring(ctx.run_id) },
-    success_status = "success",
-    failure_status = "failed",
     timeout_ms = 15000,
   }
 end

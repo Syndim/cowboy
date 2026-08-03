@@ -3521,8 +3521,7 @@ exit 0
                   return action.command {{
                     program = {},
                     args = {{ ctx.request }},
-                    success_status = "command_ok",
-                    failure_status = "command_failed",
+                    status_map = {{ ["0"] = "command_ok", ["_"] = "command_failed" }},
                   }}
                 end
 

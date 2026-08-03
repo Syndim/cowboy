@@ -106,23 +106,36 @@ pub struct CommandAction {
     /// Exact argument vector passed to the program.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Output status used when the command exits with status code 0.
-    #[serde(default = "default_command_success_status")]
-    pub success_status: Status,
-    /// Output status used when the command fails, cannot spawn, or times out.
-    #[serde(default = "default_command_failure_status")]
-    pub failure_status: Status,
+    /// Maps an exit code (stringified, e.g. `"0"`) to the resulting output
+    /// status. The catch-all `"_"` key handles any exit code without an
+    /// exact match, plus spawn errors and timeouts, which have no exit code.
+    #[serde(default = "default_command_status_map")]
+    pub status_map: BTreeMap<String, Status>,
     /// Optional wall-clock timeout in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 }
 
-pub fn default_command_success_status() -> Status {
-    "success".to_string()
+impl CommandAction {
+    /// Resolves the output status for a finished command using
+    /// `status_map`. Exit-code lookup is skipped in favor of the catch-all
+    /// `"_"` entry for timeouts and spawn failures, which have no
+    /// meaningful exit code. A missing catch-all falls back to `"failed"`.
+    pub fn status_for(&self, exit_code: Option<i32>, timed_out: bool, spawn_error: bool) -> Status {
+        let code_key = (!timed_out && !spawn_error).then_some(exit_code).flatten();
+        code_key
+            .and_then(|code| self.status_map.get(&code.to_string()))
+            .or_else(|| self.status_map.get("_"))
+            .cloned()
+            .unwrap_or_else(|| "failed".to_string())
+    }
 }
 
-pub fn default_command_failure_status() -> Status {
-    "failed".to_string()
+pub fn default_command_status_map() -> BTreeMap<String, Status> {
+    BTreeMap::from([
+        ("0".to_string(), "success".to_string()),
+        ("_".to_string(), "failed".to_string()),
+    ])
 }
 
 /// Immediate non-agent step result.
@@ -216,8 +229,10 @@ mod tests {
         let action = StepAction::Command(CommandAction {
             program: "printf".to_string(),
             args: vec!["hello".to_string()],
-            success_status: "ok".to_string(),
-            failure_status: "nope".to_string(),
+            status_map: BTreeMap::from([
+                ("0".to_string(), "ok".to_string()),
+                ("_".to_string(), "nope".to_string()),
+            ]),
             timeout_ms: Some(250),
         });
 
@@ -225,8 +240,10 @@ mod tests {
         assert_eq!(json["action"], "command");
         assert_eq!(json["program"], "printf");
         assert_eq!(json["args"], serde_json::json!(["hello"]));
-        assert_eq!(json["success_status"], "ok");
-        assert_eq!(json["failure_status"], "nope");
+        assert_eq!(
+            json["status_map"],
+            serde_json::json!({"0": "ok", "_": "nope"})
+        );
         assert_eq!(json["timeout_ms"], 250);
         assert_eq!(action.action_name(), "command");
 
@@ -240,9 +257,36 @@ mod tests {
         };
         assert_eq!(defaulted.program, "true");
         assert!(defaulted.args.is_empty());
-        assert_eq!(defaulted.success_status, "success");
-        assert_eq!(defaulted.failure_status, "failed");
+        assert_eq!(defaulted.status_map, default_command_status_map());
         assert_eq!(defaulted.timeout_ms, None);
+    }
+
+    #[test]
+    fn command_action_status_for_resolves_exit_code_or_catch_all() {
+        let action = CommandAction {
+            program: "echo".to_string(),
+            args: Vec::new(),
+            status_map: BTreeMap::from([
+                ("0".to_string(), "clean".to_string()),
+                ("1".to_string(), "dirty".to_string()),
+                ("_".to_string(), "unknown".to_string()),
+            ]),
+            timeout_ms: None,
+        };
+
+        assert_eq!(action.status_for(Some(0), false, false), "clean");
+        assert_eq!(action.status_for(Some(1), false, false), "dirty");
+        assert_eq!(action.status_for(Some(2), false, false), "unknown");
+        assert_eq!(action.status_for(None, false, true), "unknown");
+        assert_eq!(action.status_for(Some(0), true, false), "unknown");
+
+        let no_catch_all = CommandAction {
+            program: "echo".to_string(),
+            args: Vec::new(),
+            status_map: BTreeMap::from([("0".to_string(), "clean".to_string())]),
+            timeout_ms: None,
+        };
+        assert_eq!(no_catch_all.status_for(Some(9), false, false), "failed");
     }
 
     #[test]
@@ -290,8 +334,7 @@ mod tests {
             StepAction::Command(CommandAction {
                 program: "echo".to_string(),
                 args: Vec::new(),
-                success_status: "success".to_string(),
-                failure_status: "failed".to_string(),
+                status_map: default_command_status_map(),
                 timeout_ms: None,
             })
             .action_name(),

@@ -157,11 +157,11 @@ impl CommandActionRunner {
         let completed_at = Utc::now();
         let success =
             !outcome.timed_out && outcome.spawn_error.is_none() && outcome.exit_code == Some(0);
-        let status = if success {
-            action.success_status.clone()
-        } else {
-            action.failure_status.clone()
-        };
+        let status = action.status_for(
+            outcome.exit_code,
+            outcome.timed_out,
+            outcome.spawn_error.is_some(),
+        );
         let fields = command_fields(&action, &outcome, success);
         let body = command_body(success, &outcome);
         let raw = Value::Null;
@@ -303,6 +303,7 @@ fn elapsed_ms(timer: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -350,8 +351,10 @@ mod tests {
         CommandAction {
             program: program.to_string_lossy().to_string(),
             args,
-            success_status: "ok".to_string(),
-            failure_status: "bad".to_string(),
+            status_map: BTreeMap::from([
+                ("0".to_string(), "ok".to_string()),
+                ("_".to_string(), "bad".to_string()),
+            ]),
             timeout_ms: None,
         }
     }

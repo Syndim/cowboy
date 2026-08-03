@@ -45,7 +45,7 @@ pub fn run_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowboy_workflow_core::Choice;
+    use cowboy_workflow_core::{Choice, default_command_status_map};
     use std::collections::BTreeMap;
 
     fn snapshot(source: &str) -> WorkflowSourceSnapshot {
@@ -190,8 +190,7 @@ mod tests {
               return action.command {
                 program = "printf",
                 args = { "hello", ctx.request },
-                success_status = "ok",
-                failure_status = "bad",
+                status_map = { ["0"] = "ok", ["_"] = "bad" },
                 timeout_ms = 1000,
               }
             end
@@ -209,8 +208,13 @@ mod tests {
         };
         assert_eq!(action.program, "printf");
         assert_eq!(action.args, vec!["hello", "world"]);
-        assert_eq!(action.success_status, "ok");
-        assert_eq!(action.failure_status, "bad");
+        assert_eq!(
+            action.status_map,
+            BTreeMap::from([
+                ("0".to_string(), "ok".to_string()),
+                ("_".to_string(), "bad".to_string())
+            ])
+        );
         assert_eq!(action.timeout_ms, Some(1000));
     }
 
@@ -231,8 +235,7 @@ mod tests {
         };
         assert_eq!(action.program, "true");
         assert!(action.args.is_empty());
-        assert_eq!(action.success_status, "success");
-        assert_eq!(action.failure_status, "failed");
+        assert_eq!(action.status_map, default_command_status_map());
         assert_eq!(action.timeout_ms, None);
     }
 
@@ -260,14 +263,19 @@ mod tests {
                 "args",
             ),
             (
-                "empty success status",
-                "return action.command { program = \"echo\", success_status = \"\" }",
-                "success_status",
+                "non-table status_map",
+                "return action.command { program = \"echo\", status_map = \"x\" }",
+                "status_map",
             ),
             (
-                "empty failure status",
-                "return action.command { program = \"echo\", failure_status = \"\" }",
-                "failure_status",
+                "invalid status_map key",
+                "return action.command { program = \"echo\", status_map = { foo = \"ok\" } }",
+                "status_map",
+            ),
+            (
+                "empty status_map value",
+                "return action.command { program = \"echo\", status_map = { [\"0\"] = \"\" } }",
+                "status_map",
             ),
             (
                 "zero timeout",

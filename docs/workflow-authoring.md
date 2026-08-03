@@ -325,7 +325,7 @@ Fields:
 
 The output spec is prompt guidance. The runtime parses frontmatter and then routes by the returned status; it does not currently enforce a JSON Schema for `fields`.
 
-### `action.command { program, args, success_status, failure_status, timeout_ms }`
+### `action.command { program, args, status_map, timeout_ms }`
 
 Runs one command-line program directly, without a shell. Cowboy passes `program` and `args` to the OS process spawner as an explicit argument vector; it does not interpret quotes, variables, pipes, redirects, globs, or command substitution.
 
@@ -333,8 +333,11 @@ Runs one command-line program directly, without a shell. Cowboy passes `program`
 return action.command {
   program = "git",
   args = { "status", "--short" },
-  success_status = "clean",
-  failure_status = "failed",
+  status_map = {
+    ["0"] = "clean",
+    ["1"] = "dirty",
+    ["_"] = "failed",
+  },
   timeout_ms = 5000
 }
 ```
@@ -343,9 +346,8 @@ Fields:
 
 - `program` (required): non-empty executable name or path.
 - `args` (optional): array of string arguments; defaults to `{}`.
-- `success_status` (optional): output status for exit code `0`; defaults to `"success"`.
-- `failure_status` (optional): output status for non-zero exit, spawn error, or timeout; defaults to `"failed"`.
-- `timeout_ms` (optional): positive integer wall-clock timeout. On timeout, Cowboy kills the child and completes the step with `failure_status`.
+- `status_map` (optional): table mapping an exit code (integer or numeric-string key) to the output status used for that code. The catch-all `"_"` key covers any exit code without an exact match, plus spawn errors and timeouts, which have no exit code. Defaults to `{ ["0"] = "success", ["_"] = "failed" }`. A `status_map` missing a `"_"` entry falls back to `"failed"` for unmatched codes.
+- `timeout_ms` (optional): positive integer wall-clock timeout. On timeout, Cowboy kills the child and completes the step with the `status_map`'s `"_"` status.
 
 The command runs from `RuntimeConfig.cwd`. Workflows cannot override cwd, environment, or stdin for this action; stdin is closed. Cowboy clears the child environment, then copies only `PATH`, `PATHEXT`, `SystemRoot`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`, `TEMP`, and `TMP` unchanged from Cowboy's process when each variable is present. Cowboy does not synthesize missing values, and every other ambient variable remains removed, including credentials and unrelated host configuration. There is no workflow-authored environment override, so commands must not rely on variables outside this allow-list.
 

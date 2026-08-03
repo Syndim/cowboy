@@ -535,7 +535,7 @@ mod tests {
                 StepAction::Command(action) => (
                     "command".to_string(),
                     None,
-                    action.success_status,
+                    action.status_for(Some(0), false, false),
                     Value::Null,
                     "command done".to_string(),
                 ),

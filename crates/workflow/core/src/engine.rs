@@ -225,7 +225,7 @@ mod tests {
     use crate::{
         ActionDispatcher, ActionResult, AgentAction, AskUserAction, Choice, CommandAction,
         FailAction, Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput,
-        StepOutput, StepTransitions, WorkflowDefinition,
+        StepOutput, StepTransitions, WorkflowDefinition, default_command_status_map,
     };
 
     struct StaticProvider {
@@ -310,7 +310,7 @@ mod tests {
                         context: Value::Null,
                     },
                     output: Some(StepOutput {
-                        status: action.success_status,
+                        status: action.status_for(Some(0), false, false),
                         fields: Value::Null,
                         body: String::new(),
                         raw: Value::Null,
@@ -940,8 +940,7 @@ mod tests {
             StepAction::Command(CommandAction {
                 program: "echo".to_string(),
                 args: vec!["ok".to_string()],
-                success_status: "success".to_string(),
-                failure_status: "failed".to_string(),
+                status_map: default_command_status_map(),
                 timeout_ms: None,
             }),
             StepAction::AskUser(AskUserAction {

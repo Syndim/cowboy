@@ -3,8 +3,7 @@ use std::collections::BTreeMap;
 use cowboy_workflow_core::{
     AgentAction, AskUserAction, Choice, CommandAction, FailAction, Field, FieldType, Fields,
     OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions,
-    WorkflowAction, WorkflowDefinition, default_command_failure_status,
-    default_command_success_status,
+    WorkflowAction, WorkflowDefinition, default_command_status_map,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -134,10 +133,7 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
         "command" => Ok(StepAction::Command(CommandAction {
             program: non_empty_required_string(&table, &action, "program")?,
             args: string_array_field(&table, &action, "args")?,
-            success_status: optional_non_empty_string(&table, &action, "success_status")?
-                .unwrap_or_else(default_command_success_status),
-            failure_status: optional_non_empty_string(&table, &action, "failure_status")?
-                .unwrap_or_else(default_command_failure_status),
+            status_map: status_map_field(&table, &action)?,
             timeout_ms: optional_positive_timeout_ms(&table, &action)?,
         })),
         "status" => Ok(StepAction::Status(StatusAction {
@@ -318,30 +314,6 @@ fn non_empty_required_string(table: &Table, action: &str, field: &str) -> Result
     Ok(value)
 }
 
-fn optional_non_empty_string(table: &Table, action: &str, field: &str) -> Result<Option<String>> {
-    let value = optional_string(table, field).map_err(|err| invalid_field_action(err, action))?;
-    if value.as_ref().is_some_and(|value| value.trim().is_empty()) {
-        return Err(Error::InvalidActionField {
-            action: action.to_string(),
-            field: field.to_string(),
-            reason: "must be a non-empty string".to_string(),
-        });
-    }
-
-    Ok(value)
-}
-
-fn invalid_field_action(err: Error, action: &str) -> Error {
-    match err {
-        Error::InvalidActionField { field, reason, .. } => Error::InvalidActionField {
-            action: action.to_string(),
-            field,
-            reason,
-        },
-        other => other,
-    }
-}
-
 fn required_string(table: &Table, action: &str, field: &str) -> Result<String> {
     optional_string(table, field)?.ok_or_else(|| Error::MissingActionField {
         action: action.to_string(),
@@ -484,6 +456,76 @@ fn optional_positive_timeout_ms(table: &Table, action: &str) -> Result<Option<u6
             action: action.to_string(),
             field: "timeout_ms".to_string(),
             reason: "must be a positive integer".to_string(),
+        }),
+    }
+}
+
+/// Parse the `status_map` table into exit-code (or `"_"` catch-all) keys
+/// mapped to output statuses. An absent table defaults to
+/// `{"0" => "success", "_" => "failed"}`.
+fn status_map_field(table: &Table, action: &str) -> Result<BTreeMap<String, String>> {
+    match table.get::<Value>("status_map")? {
+        Value::Nil => Ok(default_command_status_map()),
+        Value::Table(map) => {
+            let mut status_map = BTreeMap::new();
+            for pair in map.pairs::<Value, Value>() {
+                let (key, value) = pair?;
+                let key = status_map_key(key, action)?;
+                let Value::String(value) = value else {
+                    return Err(Error::InvalidActionField {
+                        action: action.to_string(),
+                        field: "status_map".to_string(),
+                        reason: "values must be non-empty strings".to_string(),
+                    });
+                };
+                let value = value.to_str()?.to_string();
+                if value.trim().is_empty() {
+                    return Err(Error::InvalidActionField {
+                        action: action.to_string(),
+                        field: "status_map".to_string(),
+                        reason: "values must be non-empty strings".to_string(),
+                    });
+                }
+                status_map.insert(key, value);
+            }
+            if status_map.is_empty() {
+                return Err(Error::InvalidActionField {
+                    action: action.to_string(),
+                    field: "status_map".to_string(),
+                    reason: "must not be empty".to_string(),
+                });
+            }
+            Ok(status_map)
+        }
+        _ => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: "status_map".to_string(),
+            reason: "must be a table".to_string(),
+        }),
+    }
+}
+
+/// Parse one `status_map` key: an exit code, as a Lua integer or numeric
+/// string, or the `"_"` catch-all.
+fn status_map_key(key: Value, action: &str) -> Result<String> {
+    match key {
+        Value::Integer(code) => Ok(code.to_string()),
+        Value::String(key) => {
+            let key = key.to_str()?.to_string();
+            if key == "_" || key.parse::<i64>().is_ok() {
+                Ok(key)
+            } else {
+                Err(Error::InvalidActionField {
+                    action: action.to_string(),
+                    field: "status_map".to_string(),
+                    reason: "keys must be exit code numbers or \"_\"".to_string(),
+                })
+            }
+        }
+        _ => Err(Error::InvalidActionField {
+            action: action.to_string(),
+            field: "status_map".to_string(),
+            reason: "keys must be exit code numbers or \"_\"".to_string(),
         }),
     }
 }
