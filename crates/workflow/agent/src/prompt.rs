@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use cowboy_agent_client::PromptContent;
 use cowboy_workflow_core::{
-    AgentAction, Field, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt,
+    AgentAction, AgentTaskContract, Field, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt,
 };
 
 const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
@@ -15,13 +15,82 @@ pub fn build_agent_prompt(
     user_inputs: &[RunUserInput],
     include_role: bool,
 ) -> String {
+    build_prompt_blocks(
+        role,
+        action,
+        user_inputs,
+        PromptBlockSelection {
+            include_role,
+            include_task: true,
+            include_recovery: true,
+            include_turn: true,
+        },
+    )
+    .prompt
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptBlockSelection {
+    pub include_role: bool,
+    pub include_task: bool,
+    pub include_recovery: bool,
+    pub include_turn: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptAssembly {
+    pub prompt: String,
+    pub included_blocks: Vec<&'static str>,
+}
+
+pub(crate) fn task_contract_fingerprint(
+    task: &AgentTaskContract,
+    output: Option<&OutputSpec>,
+) -> String {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "key": task.key,
+        "instructions": task.instructions,
+        "output": output,
+    }))
+    .expect("agent task contract serializes");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+pub fn build_prompt_blocks(
+    role: &RoleDefinition,
+    action: &AgentAction,
+    user_inputs: &[RunUserInput],
+    selection: PromptBlockSelection,
+) -> PromptAssembly {
     let mut parts = Vec::new();
-    if include_role && !role.instructions.trim().is_empty() {
+    let mut included_blocks = Vec::new();
+    if selection.include_role && !role.instructions.trim().is_empty() {
         parts.push(format!("## Role\n\n{}", role.instructions.trim()));
+        included_blocks.push("role");
     }
-    parts.push(format!("## Task\n\n{}", action.prompt.trim()));
+    if let Some(task) = &action.task {
+        if selection.include_task {
+            parts.push(format!("## Task\n\n{}", task.instructions.trim()));
+            included_blocks.push("task");
+        }
+        if selection.include_recovery && !task.recovery_context.trim().is_empty() {
+            parts.push(format!(
+                "## Recovery Context\n\n{}",
+                task.recovery_context.trim()
+            ));
+            included_blocks.push("recovery_context");
+        }
+        if selection.include_turn && !task.turn.trim().is_empty() {
+            parts.push(format!("## Current Turn\n\n{}", task.turn.trim()));
+            included_blocks.push("turn");
+        }
+    } else {
+        parts.push(format!("## Task\n\n{}", action.prompt.trim()));
+        included_blocks.push("legacy_task");
+    }
     if !user_inputs.is_empty() {
-        let header = if include_role {
+        let header = if selection.include_role {
             "All entries below are cumulative user direction. Apply them in sequence."
         } else {
             "New user direction not yet sent in this session. Apply in sequence."
@@ -30,11 +99,18 @@ pub fn build_agent_prompt(
             "## User Inputs\n\n{header}\n\n```json\n{}\n```",
             serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
         ));
+        included_blocks.push("user_inputs");
     }
-    if let Some(output) = &action.output {
+    if (action.task.is_none() || selection.include_task)
+        && let Some(output) = &action.output
+    {
         parts.push(build_output_instruction(output));
+        included_blocks.push("deliverable");
     }
-    parts.join("\n\n")
+    PromptAssembly {
+        prompt: parts.join("\n\n"),
+        included_blocks,
+    }
 }
 
 pub(crate) fn build_correction_prompt(
@@ -131,7 +207,9 @@ on its own before the Markdown body.",
         );
         nudge
     };
-    if let Some(output) = &action.output {
+    if action.task.is_none()
+        && let Some(output) = &action.output
+    {
         nudge.push_str("\n\n");
         nudge.push_str(&build_output_instruction(output));
     }
@@ -223,6 +301,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec![
                     "success".into(),
@@ -253,6 +332,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec!["implemented".into(), "blocked".into()],
                 fields: summary_field(false),
@@ -280,6 +360,7 @@ mod tests {
         let action = AgentAction {
             role: "planner".into(),
             prompt: "Create the implementation plan without repeating user inputs.".into(),
+            task: None,
             output: None,
         };
         let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
@@ -314,6 +395,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
@@ -335,6 +417,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         let reason =
@@ -349,6 +432,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
@@ -378,6 +462,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
@@ -406,6 +491,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         let reason = "missing YAML frontmatter";
@@ -423,6 +509,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         let nudge = build_retry_nudge(&action, 2, None);
@@ -452,6 +539,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(OutputSpec {
                 statuses: vec!["success".into()],
                 fields: summary_field(true),
@@ -476,6 +564,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         let empty = build_agent_prompt(&role, &action, &[], false);
@@ -501,6 +590,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         let inputs = vec![user_input(0, RunUserInputKind::Initial, "initial request")];
@@ -520,6 +610,7 @@ mod tests {
         let action = AgentAction {
             role: "dev".into(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         };
         for include_role in [true, false] {
@@ -528,5 +619,92 @@ mod tests {
             assert!(prompt.contains("Do work"));
             assert!(!prompt.contains("## Deliverable Format"));
         }
+    }
+
+    #[test]
+    fn structured_prompt_block_matrix() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "STATIC_ROLE_SENTINEL".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: "FULL_SPEC_SENTINEL".into(),
+            task: Some(AgentTaskContract {
+                key: "implementation".into(),
+                instructions: "STATIC_TASK_SENTINEL".into(),
+                recovery_context: "RECOVERY_CONTEXT_SENTINEL".into(),
+                turn: "Changes needed:\n- fix retry\n\nContext:\nkeep behavior".into(),
+            }),
+            output: Some(OutputSpec {
+                statuses: vec!["success".into()],
+                fields: summary_field(true),
+            }),
+        };
+
+        let fresh = build_prompt_blocks(
+            &role,
+            &action,
+            &[],
+            PromptBlockSelection {
+                include_role: true,
+                include_task: true,
+                include_recovery: true,
+                include_turn: true,
+            },
+        );
+        assert_eq!(
+            fresh.included_blocks,
+            ["role", "task", "recovery_context", "turn", "deliverable"]
+        );
+        for expected in [
+            "STATIC_ROLE_SENTINEL",
+            "STATIC_TASK_SENTINEL",
+            "RECOVERY_CONTEXT_SENTINEL",
+            "Changes needed:",
+            "## Deliverable Format",
+        ] {
+            assert!(fresh.prompt.contains(expected), "missing {expected}");
+        }
+        assert!(!fresh.prompt.contains("FULL_SPEC_SENTINEL"));
+
+        let reused = build_prompt_blocks(
+            &role,
+            &action,
+            &[],
+            PromptBlockSelection {
+                include_role: false,
+                include_task: false,
+                include_recovery: false,
+                include_turn: true,
+            },
+        );
+        assert_eq!(reused.included_blocks, ["turn"]);
+        assert!(reused.prompt.contains("Changes needed:"));
+        for omitted in [
+            "STATIC_ROLE_SENTINEL",
+            "STATIC_TASK_SENTINEL",
+            "RECOVERY_CONTEXT_SENTINEL",
+            "## Deliverable Format",
+            "FULL_SPEC_SENTINEL",
+        ] {
+            assert!(!reused.prompt.contains(omitted), "contained {omitted}");
+        }
+
+        let retry = build_prompt_blocks(
+            &role,
+            &action,
+            &[],
+            PromptBlockSelection {
+                include_role: false,
+                include_task: false,
+                include_recovery: false,
+                include_turn: false,
+            },
+        );
+        assert!(retry.prompt.is_empty());
+        assert!(retry.included_blocks.is_empty());
     }
 }

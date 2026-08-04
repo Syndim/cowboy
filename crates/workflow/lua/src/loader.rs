@@ -179,6 +179,171 @@ mod tests {
         );
     }
 
+    #[test]
+    fn examples_workflows_use_shared_agent_task_keys() {
+        for workflow_name in ["feature", "bugfix", "dev-loop"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let sources = compiled.source_bundle.files;
+            assert!(sources["steps/plan.lua"].contains("\"planning\""));
+            assert!(sources["contracts/implementation.lua"].contains("\"implementation\""));
+            assert!(sources["steps/implement.lua"].contains("contracts/implementation.lua"));
+            assert!(sources["steps/revise.lua"].contains("contracts/implementation.lua"));
+            assert!(sources["steps/test.lua"].contains("\"testing\""));
+            assert!(sources["steps/review_plan.lua"].contains("\"plan_review\""));
+            assert!(
+                sources["steps/review_implementation.lua"].contains("\"implementation_review\"")
+            );
+            if workflow_name == "bugfix" {
+                assert!(sources["steps/investigate_bug.lua"].contains("\"investigation\""));
+                assert!(sources["steps/review_rca.lua"].contains("\"rca_review\""));
+            }
+            if workflow_name == "dev-loop" {
+                assert!(sources["steps/validate_goal.lua"].contains("\"validation\""));
+            }
+        }
+    }
+
+    #[test]
+    fn examples_workflows_implementation_steps_share_identical_contract() {
+        for workflow_name in ["feature", "bugfix", "dev-loop"] {
+            let compiled = load_example_compiled_workflow(workflow_name);
+            let base = serde_json::json!({
+                "request": "implement the requested change",
+                "run_id": "run",
+                "workflow": { "name": workflow_name, "head": "implement" },
+                "steps_executed": 1
+            });
+            let implement = run_step(
+                &compiled.source_bundle,
+                "implement",
+                serde_json::json!({
+                    "request": base["request"],
+                    "run_id": base["run_id"],
+                    "workflow": base["workflow"],
+                    "current_step": "implement",
+                    "step": { "id": "implement", "role": "implementer", "properties": {} },
+                    "prev": {
+                        "record_id": "plan-record",
+                        "step": "confirm_plan",
+                        "action": "ask_user",
+                        "output": {
+                            "status": "confirmed",
+                            "fields": {
+                                "plan_doc": "docs/plans/example.md",
+                                "user_feedback": []
+                            },
+                            "body": "Approved plan"
+                        }
+                    },
+                    "steps_executed": base["steps_executed"]
+                }),
+            )
+            .unwrap()
+            .action;
+            let revise = run_step(
+                &compiled.source_bundle,
+                "revise",
+                serde_json::json!({
+                    "request": base["request"],
+                    "run_id": base["run_id"],
+                    "workflow": base["workflow"],
+                    "current_step": "revise",
+                    "step": { "id": "revise", "role": "implementer", "properties": {} },
+                    "prev": {
+                        "record_id": "review-record",
+                        "step": "review",
+                        "action": "agent",
+                        "output": {
+                            "status": "changes_requested",
+                            "fields": {
+                                "changes_needed": ["fix the regression"],
+                                "change_context": "the retry path still repeats static instructions",
+                                "plan_doc": "docs/plans/example.md",
+                                "implementation_commands": [],
+                                "implementation_evidence": []
+                            },
+                            "body": "Please revise"
+                        }
+                    },
+                    "steps_executed": 3
+                }),
+            )
+            .unwrap()
+            .action;
+
+            let (StepAction::Agent(implement), StepAction::Agent(revise)) = (implement, revise)
+            else {
+                panic!("{workflow_name} implementation steps should produce agent actions");
+            };
+            let implement_task = implement.task.expect("implement task contract");
+            let revise_task = revise.task.expect("revise task contract");
+            assert_eq!(implement_task.key, revise_task.key, "{workflow_name}");
+            assert_eq!(
+                implement_task.instructions, revise_task.instructions,
+                "{workflow_name}"
+            );
+            assert_eq!(implement.output, revise.output, "{workflow_name}");
+            assert_ne!(implement_task.turn, revise_task.turn, "{workflow_name}");
+        }
+    }
+
+    #[test]
+    fn examples_workflows_emit_structured_revision_handoffs() {
+        let compiled = load_example_compiled_workflow("feature");
+        for path in [
+            "steps/review_plan.lua",
+            "steps/test.lua",
+            "steps/review_implementation.lua",
+            "steps/review_result_feedback.lua",
+            "steps/review_blocker.lua",
+        ] {
+            let source = &compiled.source_bundle.files[path];
+            assert!(source.contains("changes_needed"), "{path}");
+            assert!(source.contains("change_context"), "{path}");
+        }
+
+        let action = run_step(
+            &compiled.source_bundle,
+            "plan",
+            serde_json::json!({
+                "request": "request",
+                "run_id": "run",
+                "workflow": { "name": "feature", "head": "plan" },
+                "current_step": "plan",
+                "step": { "id": "plan", "role": "planner", "properties": {} },
+                "prev": {
+                    "record_id": "record",
+                    "step": "review_plan",
+                    "action": "agent",
+                    "output": {
+                        "status": "changes_requested",
+                        "fields": {
+                            "changes_needed": ["Add a deterministic retry assertion."],
+                            "change_context": "The current plan does not cover session reload.",
+                            "plan_doc": "docs/plans/retry.md"
+                        },
+                        "body": "FULL_PREVIOUS_BODY_SENTINEL",
+                        "raw": { "unrelated": "RAW_SENTINEL" }
+                    }
+                },
+                "steps_executed": 2
+            }),
+        )
+        .unwrap()
+        .action;
+        let StepAction::Agent(action) = action else {
+            panic!("plan should produce an agent action")
+        };
+        let task = action.task.expect("plan should use a structured task");
+        assert_eq!(
+            task.turn,
+            "Changes needed:\n- Add a deterministic retry assertion.\n\nContext:\nThe current plan does not cover session reload."
+        );
+        assert!(!task.turn.contains("FULL_PREVIOUS_BODY_SENTINEL"));
+        assert!(!task.turn.contains("RAW_SENTINEL"));
+        assert!(!task.turn.contains("docs/plans/retry.md"));
+    }
+
     fn result_feedback_review_step<'a>(
         workflow_name: &str,
         definition: &'a WorkflowDefinition,
@@ -4921,6 +5086,8 @@ mod tests {
         assert_eq!(review_output.statuses, ["approved", "changes_requested"]);
         for (field, ty) in [
             ("feedback", FieldType::String),
+            ("changes_needed", FieldType::Array),
+            ("change_context", FieldType::String),
             ("user_feedback", FieldType::Array),
             ("work_dir", FieldType::String),
             ("rca_doc", FieldType::String),
@@ -4935,8 +5102,8 @@ mod tests {
         }
         assert_eq!(
             review_output.fields.len(),
-            7,
-            "review_rca output schema should be unchanged"
+            9,
+            "review_rca output schema should include structured revision fields"
         );
     }
 }

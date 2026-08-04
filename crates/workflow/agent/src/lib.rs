@@ -13,4 +13,4 @@ pub use executor::{
 #[cfg(feature = "test-support")]
 pub use executor::{PromptWindowHandoffObserver, PromptWindowHandoffPoint};
 pub use frontmatter::{FrontmatterOutput, parse_frontmatter_output};
-pub use prompt::build_agent_prompt;
+pub use prompt::{PromptAssembly, PromptBlockSelection, build_agent_prompt, build_prompt_blocks};

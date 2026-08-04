@@ -4,7 +4,7 @@ return function(roles, opts)
   opts = opts or {}
   local investigate = step(opts.id or "investigate", { role = roles.investigator })
   investigate.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "investigation", {
       objective = "Investigate this bug report before any fix planning.",
       heading = "Investigation feedback:",
       include_step = true,
@@ -35,6 +35,7 @@ Return "documented" when the RCA and failing test are ready, "unclear" when more
     return action.agent {
       role = roles.investigator,
       prompt = prompt,
+      task = task,
       output = {
         status = { "documented", "unclear", "blocked" },
         fields = { summary = "string", user_feedback = "array", work_dir = "string", rca_doc = "string", repro_test = "string", files = "array", command = "string", failure = "string" },

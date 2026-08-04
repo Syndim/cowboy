@@ -19,7 +19,19 @@ return function(id)
 
         return action.status {
           status = "changes_requested",
-          fields = { feedback = tostring(answer), user_feedback = context.append_user_feedback(fields, "Plan confirmation", answer), goal = fields.goal, validation = fields.validation, work_dir = fields.work_dir, plan_doc = fields.plan_doc, validation_doc = fields.validation_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },
+          fields = {
+            feedback = tostring(answer),
+            changes_needed = { tostring(answer) },
+            change_context = "The user requested these plan changes during confirmation.",
+            user_feedback = context.append_user_feedback(fields, "Plan confirmation", answer),
+            goal = fields.goal,
+            validation = fields.validation,
+            work_dir = fields.work_dir,
+            plan_doc = fields.plan_doc,
+            validation_doc = fields.validation_doc,
+            rca_doc = fields.rca_doc,
+            repro_test = fields.repro_test,
+          },
           body = "user requested plan changes",
         }
       end

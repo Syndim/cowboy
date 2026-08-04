@@ -144,6 +144,7 @@ pub(crate) mod tests {
             updated_at: Utc::now(),
             role_instructions_sent: true,
             last_sent_input_sequence: Some(3),
+            delivered_task_contracts: Default::default(),
         };
         store.save_role_session(session.clone()).await.unwrap();
         assert_eq!(

@@ -19,7 +19,7 @@ The validator result above must preserve the implementation and tester evidence 
     if opts.require_user_validation then
       table.insert(evidence, { name = "validator", required = true })
     end
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "implementation_review", {
       objective = "Review the " .. review_subject .. ".",
       heading = evidence_heading,
       require_previous = true,
@@ -61,15 +61,16 @@ Use "replan_requested" when any proof procedure makes the plan or validation gui
 
 Only when every assessment is `sound` and `valid` may Pass 2 begin. Then independently reproduce every subject's sole complete procedure in the same order. Emit exactly one reviewer evidence record per subject and mapped reviewer command records. Reviewer TODO evidence compares against exactly the matching implementer and tester observations; reviewer validation evidence compares against exactly the matching validator observation. Approval requires every rerun to match. Missing, duplicate, stale, reordered, non-reproducible, contradictory, falsely relabeled, unmapped, not-run, or mismatched evidence cannot be approved.
 
-For bug fixes, also inspect the bug-fix work folder at `Work dir: ...`, the RCA document at `RCA doc: ...`, and the investigator-added regression test identified by `Repro test: ...`; verify that test still validates the original issue and passes because product code was fixed. Preserve all incoming structured arrays with semantic deep equality and preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly. Return `approved` only after both passes succeed; otherwise use the global routing rules above.]],
+For bug fixes, also inspect the bug-fix work folder at `Work dir: ...`, the RCA document at `RCA doc: ...`, and the investigator-added regression test identified by `Repro test: ...`; verify that test still validates the original issue and passes because product code was fixed. Preserve all incoming structured arrays with semantic deep equality and preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly. For `changes_requested` or `replan_requested`, return a non-empty `changes_needed` array and non-empty `change_context` containing only the actionable changes, necessary reason, and artifact references. Return `approved` only after both passes succeed; otherwise use the global routing rules above.]],
     })
     if not prompt then return context.invalid_context_action(ctx, "changes_requested", errors) end
     return action.agent {
       role = roles.reviewer,
       prompt = prompt,
+      task = task,
       output = {
         status = { "approved", "changes_requested", "replan_requested" },
-        fields = { feedback = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", validator_commands = "array", validator_evidence = "array", reviewer_commands = "array", reviewer_evidence = "array", reviewer_assessments = "array" },
+        fields = { feedback = "string", changes_needed = "array", change_context = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", validator_commands = "array", validator_evidence = "array", reviewer_commands = "array", reviewer_evidence = "array", reviewer_assessments = "array" },
         required_fields = { "implementation_commands", "implementation_evidence" },
       },
     }

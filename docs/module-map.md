@@ -94,7 +94,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 | `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
-| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, and persists `Failed` on give-up. Also `LuaStepActionProvider`. |
+| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, persists `Failed` on give-up, and exposes canonical `ctx.prev.output` plus compatibility aliases through `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
 
@@ -135,8 +135,8 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSourceRef`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`. |
-| `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession`, object kinds. |
+| `action.rs` | Declarative `StepAction` variants, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
+| `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, and `RoleSession` delivery fingerprints/watermarks. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
 | `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, and step/visit budget enforcement. |
@@ -180,8 +180,8 @@ Owns execution of `StepAction::Agent`.
 
 | Module | Responsibility |
 | --- | --- |
-| `executor.rs` | `AgentExecutor`, `ClientFactory`, per-`(run_id, role_id)` client/session reuse, turn capture. |
-| `prompt.rs` | Builds role/action prompt with output instructions. |
+| `executor.rs` | `AgentExecutor`, `ClientFactory`, per-`(run_id, role_id)` client/session reuse, equal-key-and-fingerprint delivery checks, durable role/task/input state, fresh-session fallback, prompt-block metadata, and turn capture. Runtime tests persist client-boundary captures and matching `StepRecord`/session metadata for reuse, retry, load, and recreation paths. |
+| `prompt.rs` | Composes role, task, recovery, turn, user-input, deliverable, and retry blocks; fingerprints static task instructions plus the output specification while excluding recovery and turn deltas. |
 | `frontmatter.rs` | Parses YAML frontmatter + Markdown body into normalized `StepOutput`. |
 | `error.rs` | Agent execution errors. |
 | `bin/execute-agent.rs` | Test app for executing one agent step through an ACP command. |

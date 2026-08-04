@@ -4,7 +4,7 @@ return function(roles, opts)
   opts = opts or {}
   local validate = step(opts.id or "validate", { role = roles.validator })
   validate.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "validation", {
       objective = "Validate whether the current implementation has achieved the user's Goal.",
       heading = "Current test result:",
       require_previous = true,
@@ -25,17 +25,20 @@ return function(roles, opts)
 
 For every ordered validation step and exit criterion, require the guide's stable `VAL-NN` identifier and exact criterion text. Emit ordered `validator_commands` plus exactly one `validator_evidence` record per criterion using `subject_kind: validation_criterion`, `source: validator`, the complete ordered procedure, expected and observed results, applicability, match outcome, and an explicitly rendered `comparisons: []`. Reject duplicate `(validator, validation_criterion, VAL-NN)` records, missing steps, or command records whose `procedure_index` does not map to the sole criterion record. A future validator record may contain comparisons only when its prompt explicitly names that source. Missing, duplicate, renumbered, vague, non-executable, unmapped, not-run, or mismatched criteria cannot achieve the Goal.
 
-Return "achieved" only when the exact user Validation method, all ordered checks, and every exit criterion pass with the required evidence. Return "not_achieved" with actionable feedback, exact evidence, and failed continue/revise criteria when the procedure runs but any criterion fails. Return "blocked" with the concrete blocker when the procedure cannot be performed. Preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly in output fields when present.]],
+Return "achieved" only when the exact user Validation method, all ordered checks, and every exit criterion pass with the required evidence. Return "not_achieved" with actionable feedback, exact evidence, and failed continue/revise criteria when the procedure runs but any criterion fails. For `not_achieved`, return a non-empty `changes_needed` array and non-empty `change_context` containing only the failed criteria, necessary reason, and artifact references. Return "blocked" with the concrete blocker when the procedure cannot be performed. Preserve the `Goal`, `Validation`, `Work dir`, `Plan doc`, `Validation doc`, `RCA doc`, and `Repro test` values exactly in output fields when present.]],
     })
     if not prompt then return context.invalid_context_action(ctx, "not_achieved", errors) end
     return action.agent {
       role = roles.validator,
       prompt = prompt,
+      task = task,
       output = {
         status = { "achieved", "not_achieved", "blocked" },
         fields = {
           summary = "string",
           feedback = "string",
+          changes_needed = "array",
+          change_context = "string",
           user_feedback = "array",
           goal = "string",
           validation = "string",

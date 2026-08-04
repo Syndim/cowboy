@@ -4,7 +4,7 @@ return function(roles, opts)
   opts = opts or {}
   local review_rca = step(opts.id or "review_rca", { role = roles.reviewer })
   review_rca.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "rca_review", {
       objective = "Review this bug Root Cause Analysis before fix planning.",
       heading = "RCA output:",
       require_previous = true,
@@ -18,15 +18,16 @@ return function(roles, opts)
 
 Verify the RCA document does not include sensitive user data; require redaction or generalization of secrets, credentials, personal data, private paths, and proprietary customer content.
 
-Return "approved" only when the RCA is repository-grounded and the failing test correctly demonstrates the issue. Return "changes_requested" with actionable feedback otherwise. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly from the RCA output.]],
+Return "approved" only when the RCA is repository-grounded and the failing test correctly demonstrates the issue. Return "changes_requested" with actionable feedback otherwise. For `changes_requested`, also return a non-empty `changes_needed` array and a non-empty `change_context` containing only the necessary reason and artifact references. Preserve `work_dir`, `rca_doc`, and `repro_test` exactly from the RCA output.]],
     })
     if not prompt then return context.invalid_context_action(ctx, "changes_requested", errors) end
     return action.agent {
       role = roles.reviewer,
       prompt = prompt,
+      task = task,
       output = {
         status = { "approved", "changes_requested" },
-        fields = { feedback = "string", user_feedback = "array", work_dir = "string", rca_doc = "string", repro_test = "string", commands = "array", failures = "array" },
+        fields = { feedback = "string", changes_needed = "array", change_context = "string", user_feedback = "array", work_dir = "string", rca_doc = "string", repro_test = "string", commands = "array", failures = "array" },
       },
     }
   end

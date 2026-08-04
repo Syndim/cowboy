@@ -64,6 +64,8 @@ Reject credentials, secrets, personal data, private paths, or proprietary conten
           status = "changes_requested",
           fields = {
             feedback = "Create the required dev-loop tuple: docs/plans/<snake_case_summary>/plan.md and validation.md in the same work_dir, with both paths listed in files.",
+            changes_needed = { "Create the required nested dev-loop planning artifact tuple and list both document paths in files." },
+            change_context = "The plan cannot be reviewed until work_dir, plan_doc, and validation_doc use the required shared layout.",
             user_feedback = context.copy_user_feedback(fields),
             goal = fields.goal,
             validation = fields.validation,
@@ -75,7 +77,7 @@ Reject credentials, secrets, personal data, private paths, or proprietary conten
     end
 
     local layout_context = opts.require_validation_guide and ("\nArtifact layout check: " .. layout) or ""
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "plan_review", {
       objective = "Review this plan before implementation.",
       heading = "Plan output:",
       require_previous = true,
@@ -98,15 +100,16 @@ Reject credentials, secrets, personal data, private paths, or proprietary conten
 
 Require every plan TODO to use a stable, unique `TODO-NN` identifier and retain its exact task text. Each TODO must define an executable command or ordered manual procedure and an observable expected result. During replanning, reject renumbered or reused IDs; new work must receive the next unused ID. Reject missing, duplicate, vague, unsafe, non-executable, or non-reproducible TODO subjects.
 
-Return "approved" only if the plan is specific, scoped, verifiable, and the plan document path is correct. For ordinary feature work, the plan path is `docs/plans/<snake_case_summary>.md`; for dev-loop work requiring a validation guide, every planning pass must use `docs/plans/<snake_case_summary>/` as `work_dir`, `<work_dir>/plan.md` as `plan_doc`, and `<work_dir>/validation.md` as `validation_doc`; for bug fixes with `Work dir: ...`, the plan path is `<work_dir>/plan.md` in the same `docs/plans/<snake_case_bug_summary>/` folder as the RCA. Verify the plan document contains the required Plan, Changes, Tests to be added/updated, How to verify, and TODO sections with Markdown task-list items. For bug fix plans, verify the plan references the reviewed RCA doc and treats the investigator-added repro test as an unchanged regression guard. Return "changes_requested" with feedback otherwise. In both cases, include a concise `plan` field containing the plan content that should be shown to the user for confirmation, preserve `plan_doc` exactly from the plan output, and preserve `work_dir`, `validation_doc`, `rca_doc`, and `repro_test` when present.]],
+Return "approved" only if the plan is specific, scoped, verifiable, and the plan document path is correct. For ordinary feature work, the plan path is `docs/plans/<snake_case_summary>.md`; for dev-loop work requiring a validation guide, every planning pass must use `docs/plans/<snake_case_summary>/` as `work_dir`, `<work_dir>/plan.md` as `plan_doc`, and `<work_dir>/validation.md` as `validation_doc`; for bug fixes with `Work dir: ...`, the plan path is `<work_dir>/plan.md` in the same `docs/plans/<snake_case_bug_summary>/` folder as the RCA. Verify the plan document contains the required Plan, Changes, Tests to be added/updated, How to verify, and TODO sections with Markdown task-list items. For bug fix plans, verify the plan references the reviewed RCA doc and treats the investigator-added repro test as an unchanged regression guard. Return "changes_requested" with feedback otherwise. For `changes_requested`, also return a non-empty `changes_needed` array containing only actionable plan changes and a non-empty `change_context` containing the necessary reason and artifact references. In both cases, include a concise `plan` field containing the plan content that should be shown to the user for confirmation, preserve `plan_doc` exactly from the plan output, and preserve `work_dir`, `validation_doc`, `rca_doc`, and `repro_test` when present.]],
     })
     if not prompt then return context.invalid_context_action(ctx, "changes_requested", errors) end
     return action.agent {
       role = roles.reviewer,
       prompt = prompt,
+      task = task,
       output = {
         status = { "approved", "changes_requested" },
-        fields = { feedback = "string", plan = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string" },
+        fields = { feedback = "string", changes_needed = "array", change_context = "string", plan = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string" },
       },
     }
   end

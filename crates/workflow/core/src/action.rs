@@ -44,11 +44,29 @@ impl StepAction {
 pub struct AgentAction {
     /// Role id whose instructions/persona should be used for the agent run.
     pub role: RoleId,
-    /// Fully rendered prompt sent to the agent.
+    /// Current turn payload. For legacy actions this remains the full task prompt.
     pub prompt: String,
+    /// Optional durable task contract used for minimal reused-session prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<AgentTaskContract>,
     /// Optional expected output shape used to instruct/validate the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputSpec>,
+}
+
+/// Stable task definition and recovery state for one agent responsibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTaskContract {
+    /// Stable key scoped to one run and role.
+    pub key: String,
+    /// Static instructions sent once for each distinct task contract.
+    pub instructions: String,
+    /// Durable current state needed when a backend session must be recreated.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recovery_context: String,
+    /// Minimal payload for the current dispatch. Excluded from the static fingerprint.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub turn: String,
 }
 
 /// Expected structured output from an agent action.
@@ -325,6 +343,7 @@ mod tests {
             StepAction::Agent(AgentAction {
                 role: "developer".to_string(),
                 prompt: "do it".to_string(),
+                task: None,
                 output: None,
             })
             .action_name(),
@@ -358,5 +377,32 @@ mod tests {
             .action_name(),
             "fail"
         );
+    }
+
+    #[test]
+    fn structured_agent_task_contract_round_trips() {
+        let action = StepAction::Agent(AgentAction {
+            role: "developer".to_string(),
+            prompt: "Changes needed:\n- fix retry".to_string(),
+            task: Some(AgentTaskContract {
+                key: "implementation".to_string(),
+                instructions: "Implement the approved plan.".to_string(),
+                recovery_context: "Plan doc: docs/plans/retry.md".to_string(),
+                turn: "Changes needed:\n- fix retry".to_string(),
+            }),
+            output: Some(OutputSpec {
+                statuses: vec!["implemented".to_string()],
+                fields: BTreeMap::new(),
+            }),
+        });
+
+        let json = serde_json::to_value(&action).unwrap();
+        assert_eq!(json["task"]["key"], "implementation");
+        assert_eq!(serde_json::from_value::<StepAction>(json).unwrap(), action);
+    }
+
+    #[test]
+    fn agent_action_structured_contract_round_trips() {
+        structured_agent_task_contract_round_trips();
     }
 }

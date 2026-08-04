@@ -32,6 +32,8 @@ return function(id)
 
         local copied = result_fields(fields, context.append_user_feedback(fields, "Result confirmation", answer))
         copied.feedback = tostring(answer)
+        copied.changes_needed = { tostring(answer) }
+        copied.change_context = "The user requested these implementation changes during result confirmation."
         return action.status {
           status = "changes_requested",
           fields = copied,

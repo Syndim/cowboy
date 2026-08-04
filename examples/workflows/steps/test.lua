@@ -5,7 +5,7 @@ return function(roles, opts)
   local test = step(opts.id or "test", { role = roles.tester })
   local kind = opts.kind or "change"
   test.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "testing", {
       objective = "Run local tests for this " .. kind .. " request.",
       heading = "Implementation result:",
       require_previous = true,
@@ -22,15 +22,16 @@ return function(roles, opts)
 
 The output MUST include all four source-specific arrays: preserved `implementation_commands` and `implementation_evidence`, plus complete `tester_commands` and `tester_evidence`. A generic `commands` list or prose pass report does not satisfy this contract. For checked work, both evidence arrays must be nonempty and contain exactly one subject-keyed record per checked TODO. Command arrays may be empty only when every corresponding evidence record declares `procedure.kind: manual` and no procedure step is a command. When any checked record declares `procedure.kind: command`, the corresponding command array must contain every executed command mapped to that sole evidence record by `subject_kind`, `subject_id`, and `procedure_index`; mixed manual/command plans need command entries only for command procedures. Do not return `passed` when a mandatory array is missing or malformed, an evidence array is empty for checked work, a command array is empty despite a command procedure, or any checked TODO lacks its sole tester record.
 
-Run focused tests first and broader tests when needed. If a `Repro test: ...` path/name is present above, run that investigator-added regression test and require it to pass after the fix. Return `failed` for missing, duplicate, stale, unsafe, non-executable, reordered, unmapped, not-run, or mismatched evidence, with exact failures; never select or merge duplicate records. Preserve the `Goal: ...`, `Validation: ...`, `Work dir: ...`, `Plan doc: ...`, `Validation doc: ...`, `RCA doc: ...`, and `Repro test: ...` values exactly in your output fields when present. Return "passed" only if every required reproduction and relevant test passes, or "blocked" only when they cannot be run.]],
+Run focused tests first and broader tests when needed. If a `Repro test: ...` path/name is present above, run that investigator-added regression test and require it to pass after the fix. Return `failed` for missing, duplicate, stale, unsafe, non-executable, reordered, unmapped, not-run, or mismatched evidence, with exact failures; never select or merge duplicate records. For `failed`, return a non-empty `changes_needed` array and a non-empty `change_context` containing only the failing checks, necessary reason, and artifact references. Preserve the `Goal: ...`, `Validation: ...`, `Work dir: ...`, `Plan doc: ...`, `Validation doc: ...`, `RCA doc: ...`, and `Repro test: ...` values exactly in your output fields when present. Return "passed" only if every required reproduction and relevant test passes, or "blocked" only when they cannot be run.]],
     })
     if not prompt then return context.invalid_context_action(ctx, "failed", errors) end
     return action.agent {
       role = roles.tester,
       prompt = prompt,
+      task = task,
       output = {
         status = { "passed", "failed", "blocked" },
-        fields = { summary = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", failures = "array" },
+        fields = { summary = "string", changes_needed = "array", change_context = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", implementation_commands = "array", implementation_evidence = "array", tester_commands = "array", tester_evidence = "array", failures = "array" },
         required_fields = { "implementation_commands", "implementation_evidence", "tester_commands", "tester_evidence" },
       },
     }

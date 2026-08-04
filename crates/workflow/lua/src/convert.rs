@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AskUserAction, Choice, CommandAction, FailAction, Field, FieldType, Fields,
-    OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions,
-    WorkflowAction, WorkflowDefinition, default_command_status_map,
+    AgentAction, AgentTaskContract, AskUserAction, Choice, CommandAction, FailAction, Field,
+    FieldType, Fields, OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition,
+    StepTransitions, WorkflowAction, WorkflowDefinition, default_command_status_map,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -125,11 +125,15 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
     let table = expect_table(value, "action")?;
     let action: String = table.get("action").map_err(|_| Error::MissingActionKind)?;
     match action.as_str() {
-        "agent" => Ok(StepAction::Agent(AgentAction {
-            role: expect_role_id(table.get("role")?, "role")?,
-            prompt: required_string(&table, &action, "prompt")?,
-            output: output_spec(table.get::<Value>("output")?)?,
-        })),
+        "agent" => {
+            let prompt = required_string(&table, &action, "prompt")?;
+            Ok(StepAction::Agent(AgentAction {
+                role: expect_role_id(table.get("role")?, "role")?,
+                task: agent_task_contract(table.get::<Value>("task")?, &prompt)?,
+                prompt,
+                output: output_spec(table.get::<Value>("output")?)?,
+            }))
+        }
         "command" => Ok(StepAction::Command(CommandAction {
             program: non_empty_required_string(&table, &action, "program")?,
             args: string_array_field(&table, &action, "args")?,
@@ -156,6 +160,38 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             reason: required_string(&table, &action, "reason")?,
         })),
         other => Err(Error::UnknownAction(other.to_string())),
+    }
+}
+
+fn agent_task_contract(value: Value, default_turn: &str) -> Result<Option<AgentTaskContract>> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Table(table) => {
+            let key =
+                non_empty_required_string(&table, "agent", "key").map_err(|err| match err {
+                    Error::MissingActionField { action, .. } => Error::MissingActionField {
+                        action,
+                        field: "task.key".to_string(),
+                    },
+                    Error::InvalidActionField { action, reason, .. } => Error::InvalidActionField {
+                        action,
+                        field: "task.key".to_string(),
+                        reason,
+                    },
+                    other => other,
+                })?;
+            Ok(Some(AgentTaskContract {
+                key,
+                instructions: required_string(&table, "agent", "instructions")?,
+                recovery_context: optional_string(&table, "recovery_context")?.unwrap_or_default(),
+                turn: optional_string(&table, "turn")?.unwrap_or_else(|| default_turn.to_string()),
+            }))
+        }
+        _ => Err(Error::InvalidActionField {
+            action: "agent".to_string(),
+            field: "task".to_string(),
+            reason: "must be a table".to_string(),
+        }),
     }
 }
 
@@ -673,4 +709,63 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value>
             Value::Table(table)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_structured_agent_task_contract() {
+        let lua = Lua::new();
+        let value = lua
+            .load(
+                r#"return {
+                    action = "agent",
+                    role = "developer",
+                    prompt = "Full debug prompt",
+                    task = {
+                        key = "implementation",
+                        instructions = "Implement the plan.",
+                        recovery_context = "Plan doc: docs/plans/change.md",
+                        turn = "Changes needed:\n- fix retry\n\nContext:\nreview",
+                    },
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        let StepAction::Agent(action) = action_from_value(value).unwrap() else {
+            panic!("expected agent action")
+        };
+        let task = action.task.unwrap();
+        assert_eq!(task.key, "implementation");
+        assert_eq!(task.instructions, "Implement the plan.");
+        assert_eq!(task.recovery_context, "Plan doc: docs/plans/change.md");
+        assert!(task.turn.contains("Changes needed:"));
+    }
+
+    #[test]
+    fn legacy_agent_prompt_remains_supported() {
+        let lua = Lua::new();
+        let value = lua
+            .load(
+                r#"return {
+                    action = "agent",
+                    role = "developer",
+                    prompt = "Legacy full prompt",
+                }"#,
+            )
+            .eval()
+            .unwrap();
+        let StepAction::Agent(action) = action_from_value(value).unwrap() else {
+            panic!("expected agent action")
+        };
+        assert_eq!(action.prompt, "Legacy full prompt");
+        assert!(action.task.is_none());
+    }
+
+    #[test]
+    fn agent_action_structured_contract_converts() {
+        converts_structured_agent_task_contract();
+    }
 }

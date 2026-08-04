@@ -578,6 +578,7 @@ mod tests {
                 StepAction::Agent(AgentAction {
                     role: "developer".to_string(),
                     prompt: "do it".to_string(),
+                    task: None,
                     output: None,
                 }),
                 context(),

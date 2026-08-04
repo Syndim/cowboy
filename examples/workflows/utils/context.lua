@@ -203,6 +203,7 @@ local scalar_fields = {
   command = "Command",
   failure = "Failure",
   clarification = "Additional user context",
+  change_context = "Change context",
 }
 
 local array_fields = {
@@ -210,6 +211,7 @@ local array_fields = {
   commands = "Commands",
   failures = "Failures",
   user_feedback = "User feedback history",
+  changes_needed = "Changes needed",
 }
 
 local function add_error(errors, field, expected, actual)
@@ -649,10 +651,11 @@ local function render_context(ctx, spec)
   if spec.include_step and validate_scalar(errors, "prev.step", prev.step, false) then
     table.insert(lines, "Step: " .. tostring(prev.step))
   end
-  if spec.include_status and validate_scalar(errors, "prev.status", prev.status, false) then
-    table.insert(lines, "Status: " .. tostring(prev.status))
+  local output = prev.output or prev
+  if spec.include_status and validate_scalar(errors, "prev.output.status", output.status, false) then
+    table.insert(lines, "Status: " .. tostring(output.status))
   end
-  local fields = prev.fields or {}
+  local fields = output.fields or {}
   for _, name in ipairs(spec.fields or {}) do
     local required = field_is_required(spec.required_fields, name)
     local value = fields[name]
@@ -719,9 +722,9 @@ local function render_context(ctx, spec)
       end
     end
   end
-  if spec.include_body and prev.body and tostring(prev.body) ~= "" then
+  if spec.include_body and output.body and tostring(output.body) ~= "" then
     table.insert(lines, "Body:")
-    table.insert(lines, tostring(prev.body))
+    table.insert(lines, tostring(output.body))
   end
   return lines, errors
 end
@@ -757,8 +760,85 @@ function M.build_agent_prompt(ctx, spec)
   return table.concat(lines, "\n"), nil
 end
 
+local function build_static_task(spec)
+  local lines = {}
+  local objective = tostring(spec.objective or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if objective ~= "" then table.insert(lines, objective) end
+  for _, guidance in ipairs(spec.guidance or {}) do
+    local text = guidance
+    if guidance == "preserve_user_feedback" then text = M.preserve_user_feedback_guidance()
+    elseif guidance == "review_user_feedback" then text = M.review_user_feedback_guidance()
+    elseif guidance == "preserve_evidence" then text = M.preserve_evidence_guidance()
+    elseif guidance == "evidence_records" then text = M.evidence_record_guidance()
+    end
+    text = tostring(text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if text ~= "" then table.insert(lines, text) end
+  end
+  local instructions = tostring(spec.instructions or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if instructions ~= "" then table.insert(lines, instructions) end
+  return table.concat(lines, "\n\n")
+end
+
+function M.build_revision_turn(ctx)
+  local prev = ctx.prev
+  local output = prev and (prev.output or prev)
+  local fields = output and output.fields or {}
+  local changes = fields.changes_needed
+  local change_context = fields.change_context
+  local errors = {}
+  if not validate_array(errors, "prev.output.fields.changes_needed", changes, true) then
+    return nil, errors
+  end
+  local shape, count = array_shape(changes)
+  if shape ~= "nonempty" then
+    add_error(errors, "prev.output.fields.changes_needed", "nonempty array", shape)
+  else
+    validate_scalar_array_entries(errors, "prev.output.fields.changes_needed", changes)
+  end
+  if not validate_scalar(errors, "prev.output.fields.change_context", change_context, true)
+      or tostring(change_context):match("^%s*$") then
+    add_error(errors, "prev.output.fields.change_context", "nonempty string", "empty")
+  end
+  if #errors > 0 then return nil, errors end
+  local lines = { "Changes needed:" }
+  for index = 1, count do table.insert(lines, "- " .. tostring(changes[index])) end
+  table.insert(lines, "")
+  table.insert(lines, "Context:")
+  table.insert(lines, tostring(change_context))
+  return table.concat(lines, "\n"), nil
+end
+
+function M.build_agent_contract(ctx, contract, spec)
+  if type(contract) == "string" then
+    contract = {
+      key = contract,
+      instructions = build_static_task(spec),
+    }
+  end
+
+  local recovery_lines, errors = render_context(ctx, spec)
+  if #errors > 0 then return nil, nil, errors end
+  local prompt
+  prompt, errors = M.build_agent_prompt(ctx, spec)
+  if not prompt then return nil, nil, errors end
+  local turn = prompt
+  local output = ctx.prev and (ctx.prev.output or ctx.prev)
+  local fields = output and output.fields or {}
+  if fields.changes_needed ~= nil or fields.change_context ~= nil then
+    turn, errors = M.build_revision_turn(ctx)
+    if not turn then return nil, nil, errors end
+  end
+  return prompt, {
+    key = contract.key,
+    instructions = contract.instructions,
+    recovery_context = table.concat(recovery_lines, "\n"),
+    turn = turn,
+  }, nil
+end
+
 function M.previous_step_context(ctx, heading)
-  local fields = (ctx.prev and ctx.prev.fields) or {}
+  local output = ctx.prev and (ctx.prev.output or ctx.prev)
+  local fields = (output and output.fields) or {}
   local evidence = {}
   for _, source in ipairs(evidence_sources) do
     if fields[source.prefix .. "_commands"] ~= nil or fields[source.prefix .. "_evidence"] ~= nil then
@@ -783,7 +863,8 @@ function M.previous_step_context(ctx, heading)
 end
 
 function M.invalid_context_action(ctx, status, errors)
-  local fields = (ctx.prev and ctx.prev.fields) or {}
+  local output = ctx.prev and (ctx.prev.output or ctx.prev)
+  local fields = (output and output.fields) or {}
   local diagnostics = M.format_validation_errors(errors)
   local diagnostic_text = table.concat(diagnostics, "; ")
   local preserved = M.copy_evidence_fields(fields, {

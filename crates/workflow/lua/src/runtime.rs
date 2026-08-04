@@ -83,7 +83,89 @@ mod tests {
         };
         assert_eq!(action.role, "developer");
         assert_eq!(action.prompt, "Implement feature");
+        assert_eq!(action.task, None);
         assert_eq!(action.output.unwrap().statuses, vec!["success", "failed"]);
+    }
+
+    #[test]
+    fn converts_structured_agent_task_contract() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", "implement things")
+            local step = step("implement", { role = role })
+            step.run = function(ctx)
+              return action.agent {
+                role = role,
+                prompt = "Fix only the retry",
+                task = {
+                  key = "implementation",
+                  instructions = "Implement the approved plan.",
+                  recovery_context = "Plan doc: docs/plans/retry.md",
+                },
+              }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let result = run_step(&source, "implement", serde_json::json!({})).unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("expected agent action")
+        };
+        let task = action.task.unwrap();
+        assert_eq!(task.key, "implementation");
+        assert_eq!(task.instructions, "Implement the approved plan.");
+        assert_eq!(task.recovery_context, "Plan doc: docs/plans/retry.md");
+    }
+
+    #[test]
+    fn legacy_agent_prompt_remains_supported() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", "implement things")
+            local step = step("implement", { role = role })
+            step.run = function(ctx)
+              return action.agent { role = role, prompt = "Legacy full prompt" }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let result = run_step(&source, "implement", serde_json::json!({})).unwrap();
+        let StepAction::Agent(action) = result.action else {
+            panic!("expected agent action")
+        };
+        assert_eq!(action.prompt, "Legacy full prompt");
+        assert!(action.task.is_none());
+    }
+
+    #[test]
+    fn rejects_blank_structured_agent_task_key() {
+        let source = snapshot(
+            r#"
+            local role = role("developer", "implement things")
+            local step = step("implement", { role = role })
+            step.run = function(ctx)
+              return action.agent {
+                role = role,
+                prompt = "turn",
+                task = { key = " ", instructions = "task" },
+              }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let err = run_step(&source, "implement", serde_json::json!({})).unwrap_err();
+        assert!(err.to_string().contains("task.key"));
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn agent_action_rejects_blank_structured_task_key() {
+        rejects_blank_structured_agent_task_key();
+    }
+
+    #[test]
+    fn agent_action_legacy_prompt_remains_supported() {
+        legacy_agent_prompt_remains_supported();
     }
 
     #[test]

@@ -2272,8 +2272,13 @@ mod tests {
     struct ScriptedAgentState {
         responses: VecDeque<String>,
         prompts: Vec<String>,
+        prompt_sessions: Vec<String>,
         next_session: usize,
         created_roles: Vec<String>,
+        created_sessions: Vec<String>,
+        load_attempts: Vec<String>,
+        load_results: Vec<String>,
+        load_session_succeeds: bool,
     }
 
     #[derive(Clone, Debug)]
@@ -2287,8 +2292,13 @@ mod tests {
                 state: Arc::new(SyncMutex::new(ScriptedAgentState {
                     responses: responses.into(),
                     prompts: Vec::new(),
+                    prompt_sessions: Vec::new(),
                     next_session: 0,
                     created_roles: Vec::new(),
+                    created_sessions: Vec::new(),
+                    load_attempts: Vec::new(),
+                    load_results: Vec::new(),
+                    load_session_succeeds: true,
                 })),
             }
         }
@@ -2299,6 +2309,26 @@ mod tests {
 
         fn created_roles(&self) -> Vec<String> {
             self.state.lock().created_roles.clone()
+        }
+
+        fn prompt_sessions(&self) -> Vec<String> {
+            self.state.lock().prompt_sessions.clone()
+        }
+
+        fn created_sessions(&self) -> Vec<String> {
+            self.state.lock().created_sessions.clone()
+        }
+
+        fn load_attempts(&self) -> Vec<String> {
+            self.state.lock().load_attempts.clone()
+        }
+
+        fn load_results(&self) -> Vec<String> {
+            self.state.lock().load_results.clone()
+        }
+
+        fn set_load_session_succeeds(&self, succeeds: bool) {
+            self.state.lock().load_session_succeeds = succeeds;
         }
 
         fn assert_exhausted(&self) {
@@ -2342,6 +2372,7 @@ mod tests {
             let mut state = self.state.lock();
             state.next_session += 1;
             let session_id = format!("scripted-session-{}", state.next_session);
+            state.created_sessions.push(session_id.clone());
             self.session_id = Some(session_id.clone());
             Ok(session_id)
         }
@@ -2356,13 +2387,20 @@ mod tests {
             _cwd: &str,
             _mcp_servers: &[Value],
         ) -> anyhow::Result<Vec<Event>> {
+            let mut state = self.state.lock();
+            state.load_attempts.push(session_id.to_string());
+            if !state.load_session_succeeds {
+                state.load_results.push("failure".to_string());
+                return Err(anyhow::anyhow!("scripted load_session failure"));
+            }
+            state.load_results.push("success".to_string());
             self.session_id = Some(session_id.to_string());
             Ok(Vec::new())
         }
 
         async fn prompt(
             &mut self,
-            _session_id: &str,
+            session_id: &str,
             prompt_content: Vec<PromptContent>,
             _cancellation: PromptTurnCancellation,
             event_handler: &mut (dyn FnMut(Event) + Send),
@@ -2375,6 +2413,7 @@ mod tests {
             let response = {
                 let mut state = self.state.lock();
                 state.prompts.push(prompt);
+                state.prompt_sessions.push(session_id.to_string());
                 state
                     .responses
                     .pop_front()
@@ -2813,6 +2852,356 @@ mod tests {
             .await
             .unwrap()
             .with_deterministic_selector()
+    }
+
+    fn copy_directory(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory(&source_path, &destination_path);
+            } else {
+                fs::copy(source_path, destination_path).unwrap();
+            }
+        }
+    }
+
+    fn prompt_contract_workflow_dir(dir: &tempfile::TempDir) -> PathBuf {
+        let workflow_dir = dir.path().join("workflows");
+        if workflow_dir.exists() {
+            return workflow_dir;
+        }
+        let examples_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .join("examples/workflows")
+            .canonicalize()
+            .unwrap();
+        copy_directory(&examples_root, &workflow_dir);
+        fs::write(
+            workflow_dir.join("runtime-contract.lua"),
+            r#"
+local roles = {
+  implementer = require("roles/implementer.lua"),
+}
+
+local seed = step("seed")
+seed.run = function(ctx)
+  return action.status {
+    status = "ready",
+    fields = {
+      plan_doc = "docs/plans/runtime-contract.md",
+      user_feedback = {},
+    },
+    body = "Approved deterministic runtime plan",
+  }
+end
+
+local implement = require("steps/implement.lua")(roles, { kind = "runtime test" })
+
+local feedback = step("feedback")
+feedback.run = function(ctx)
+  return action.status {
+    status = "changes_requested",
+    fields = {
+      changes_needed = { "Send only the required revision delta." },
+      change_context = "The persisted implementation session already received the durable contract.",
+      plan_doc = ctx.prev.output.fields.plan_doc,
+      implementation_commands = ctx.prev.output.fields.implementation_commands,
+      implementation_evidence = ctx.prev.output.fields.implementation_evidence,
+    },
+    body = "Deterministic revision feedback",
+  }
+end
+
+local revise = require("steps/revise.lua")(roles)
+local done = step("done")
+done.run = function(ctx)
+  return action.status { status = "success", body = "done" }
+end
+
+seed:on("ready", implement)
+implement:on("implemented", feedback)
+feedback:on("changes_requested", revise)
+revise:on("implemented", done)
+return workflow("runtime-contract", seed)
+"#,
+        )
+        .unwrap();
+        workflow_dir
+    }
+
+    async fn runtime_for_prompt_contract(
+        dir: &tempfile::TempDir,
+        factory: ScriptedAgentFactory,
+    ) -> WorkflowRuntime {
+        let workflow_dir = prompt_contract_workflow_dir(dir);
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/data.db"),
+            workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
+            agents: Vec::new(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                RunnerLimitsConfig {
+                    max_steps_per_run: 10,
+                    max_visits_per_step: 5,
+                    max_retries_per_run: 10,
+                    max_retries_per_step: 2,
+                },
+            )]),
+        };
+        let mut dependencies = MockRuntimeDependencies::new();
+        dependencies
+            .expect_generate_request_topic()
+            .times(0..=1)
+            .returning(|_, _, _| None);
+        let shared = SharedClientFactory::new(factory);
+        dependencies
+            .expect_agent_factory()
+            .returning(move |_| Ok(shared.clone()));
+        WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
+            .await
+            .unwrap()
+            .with_deterministic_selector()
+    }
+
+    fn successful_implementation_response(summary: &str) -> String {
+        format!(
+            r#"---
+status: implemented
+summary: {summary}
+plan_doc: docs/plans/runtime-contract.md
+implementation_commands: []
+implementation_evidence: []
+---
+{summary}"#
+        )
+    }
+
+    fn persisted_agent_record(record: &StepRecord) -> Value {
+        serde_json::json!({
+            "task_key": record.input.context["task_key"],
+            "fingerprint": record.input.context["task_contract_fingerprint"],
+            "prompt_blocks": record.input.context["prompt_blocks"],
+            "session_id": record.detail.session_id,
+        })
+    }
+
+    fn scripted_client_record(factory: &ScriptedAgentFactory) -> Value {
+        serde_json::json!({
+            "prompt_sessions": factory.prompt_sessions(),
+            "load_attempts": factory.load_attempts(),
+            "load_results": factory.load_results(),
+            "created_session_ids": factory.created_sessions(),
+        })
+    }
+
+    fn write_prompt_capture(scenario: &str, files: &[(&str, &str)], records: Value) {
+        let Ok(root) = std::env::var("COWBOY_PROMPT_CAPTURE_DIR") else {
+            return;
+        };
+        let requested = PathBuf::from(root);
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let scenario_dir = if requested.is_absolute() {
+            requested
+        } else {
+            workspace.join(requested)
+        }
+        .join(scenario);
+        fs::create_dir_all(&scenario_dir).unwrap();
+        for (name, contents) in files {
+            fs::write(scenario_dir.join(name), contents).unwrap();
+        }
+        fs::write(
+            scenario_dir.join("records.json"),
+            serde_json::to_vec_pretty(&records).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn start_prompt_contract_run(runtime: &WorkflowRuntime) -> RunReport {
+        runtime
+            .start_run_with_workflow_stepwise(
+                "runtime-contract",
+                "exercise persisted implementation prompt delivery",
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_implementation_revision_reuses_delivered_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(vec![
+            successful_implementation_response("initial implementation"),
+            successful_implementation_response("revised implementation"),
+        ]);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let started = start_prompt_contract_run(&runtime).await;
+        let implemented = runtime.step_run(&started.run.id).await.unwrap();
+        let implement_record = command_output_record(&runtime, &implemented).await;
+        let feedback = runtime.step_run(&started.run.id).await.unwrap();
+        assert_eq!(feedback.run.current_step, "revise");
+        let revised = runtime.step_run(&started.run.id).await.unwrap();
+        let revise_record = command_output_record(&runtime, &revised).await;
+        let prompts = factory.prompts();
+
+        assert_eq!(
+            implement_record.input.context["task_contract_fingerprint"],
+            revise_record.input.context["task_contract_fingerprint"]
+        );
+        assert_eq!(
+            implement_record.detail.session_id,
+            revise_record.detail.session_id
+        );
+        assert_eq!(
+            revise_record.input.context["prompt_blocks"],
+            serde_json::json!(["turn"])
+        );
+        write_prompt_capture(
+            "same_runtime",
+            &[
+                ("implement.prompt.txt", &prompts[0]),
+                ("revise.prompt.txt", &prompts[1]),
+            ],
+            serde_json::json!({
+                "implement": persisted_agent_record(&implement_record),
+                "revise": persisted_agent_record(&revise_record),
+                "client": scripted_client_record(&factory),
+            }),
+        );
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_implementation_retry_sends_only_retry_nudge() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(vec![
+            "malformed response without frontmatter".to_string(),
+            successful_implementation_response("retry succeeded"),
+        ]);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let started = start_prompt_contract_run(&runtime).await;
+        let implemented = runtime.step_run(&started.run.id).await.unwrap();
+        let record = command_output_record(&runtime, &implemented).await;
+        let prompts = factory.prompts();
+
+        assert_eq!(
+            record.input.context["prompt_blocks"],
+            serde_json::json!(["retry"])
+        );
+        assert_eq!(factory.prompt_sessions()[0], factory.prompt_sessions()[1]);
+        write_prompt_capture(
+            "retry",
+            &[
+                ("initial.prompt.txt", &prompts[0]),
+                ("retry.prompt.txt", &prompts[1]),
+            ],
+            serde_json::json!({
+                "initial": persisted_agent_record(&record),
+                "retry": persisted_agent_record(&record),
+                "client": scripted_client_record(&factory),
+            }),
+        );
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_loaded_implementation_session_reuses_delivered_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(vec![
+            successful_implementation_response("initial implementation"),
+            successful_implementation_response("loaded revision"),
+        ]);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let started = start_prompt_contract_run(&runtime).await;
+        let implemented = runtime.step_run(&started.run.id).await.unwrap();
+        let implement_record = command_output_record(&runtime, &implemented).await;
+        runtime.store().unwrap().close().await;
+        drop(runtime);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let rebuilt = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        rebuilt.step_run(&started.run.id).await.unwrap();
+        let revised = rebuilt.step_run(&started.run.id).await.unwrap();
+        let revise_record = command_output_record(&rebuilt, &revised).await;
+        let prompts = factory.prompts();
+
+        assert_eq!(factory.load_results(), vec!["success"]);
+        assert_eq!(
+            revise_record.input.context["prompt_blocks"],
+            serde_json::json!(["turn"])
+        );
+        write_prompt_capture(
+            "loaded_session",
+            &[
+                ("implement.prompt.txt", &prompts[0]),
+                ("revise.prompt.txt", &prompts[1]),
+            ],
+            serde_json::json!({
+                "implement": persisted_agent_record(&implement_record),
+                "revise": persisted_agent_record(&revise_record),
+                "client": scripted_client_record(&factory),
+            }),
+        );
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn workflow_runtime_recreated_implementation_session_resends_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(vec![
+            successful_implementation_response("initial implementation"),
+            successful_implementation_response("recreated revision"),
+        ]);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let started = start_prompt_contract_run(&runtime).await;
+        let implemented = runtime.step_run(&started.run.id).await.unwrap();
+        let implement_record = command_output_record(&runtime, &implemented).await;
+        runtime.store().unwrap().close().await;
+        drop(runtime);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        factory.set_load_session_succeeds(false);
+
+        let rebuilt = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        rebuilt.step_run(&started.run.id).await.unwrap();
+        let revised = rebuilt.step_run(&started.run.id).await.unwrap();
+        let revise_record = command_output_record(&rebuilt, &revised).await;
+        let prompts = factory.prompts();
+
+        assert_eq!(factory.load_results(), vec!["failure"]);
+        assert_ne!(
+            implement_record.detail.session_id,
+            revise_record.detail.session_id
+        );
+        assert_eq!(
+            revise_record.input.context["prompt_blocks"],
+            serde_json::json!([
+                "role",
+                "task",
+                "recovery_context",
+                "turn",
+                "user_inputs",
+                "deliverable"
+            ])
+        );
+        write_prompt_capture(
+            "recreated_session",
+            &[
+                ("implement.prompt.txt", &prompts[0]),
+                ("revise.prompt.txt", &prompts[1]),
+            ],
+            serde_json::json!({
+                "implement": persisted_agent_record(&implement_record),
+                "revise": persisted_agent_record(&revise_record),
+                "client": scripted_client_record(&factory),
+            }),
+        );
+        factory.assert_exhausted();
     }
 
     fn waiting_prompt_id(report: &RunReport) -> &str {

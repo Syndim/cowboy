@@ -146,7 +146,17 @@ ceilings are exhausted.
 
 `cowboy-workflow-agent` handles `StepAction::Agent`:
 
-- builds the role prompt, including the complete ordered initial request and durable follow-ups
+- composes role, stable task, recovery-context, current-turn, user-input-delta,
+  deliverable, and retry blocks
+- fingerprints static task instructions plus the output contract and persists
+  the fingerprint by stable task key in `RoleSession`
+- reuses a delivered contract only when both its key and fingerprint match;
+  implementation and revision steps share one static contract, while their
+  initial/change-specific wording is carried only by the current turn
+- sends role/task/deliverable once per backend session/task fingerprint, while
+  reused-task dispatches send only the turn and new input sequences
+- resets delivery fingerprints after load failure creates a fresh session, so
+  role, task, recovery context, turn, inputs, and deliverable are self-contained
 - opens a durable prompt window identified by an opaque token and bound to the run, step record, step, and role
 - registers a process-local sequence watch at the window's durable baseline before publishing the open-window event
 - sends the initial prompt through `cowboy-agent-client::Client` with an awaitable turn-cancellation input
@@ -171,10 +181,23 @@ serialized after seal is rejected. Cancellation, failure, retry, dropped
 futures, and guarded process recovery abort or replace stale window tokens and
 remove their process-local controls.
 
-`StepInput.prompt` remains the exact initial composed prompt. Replay metadata
+`StepInput.prompt` remains the exact wire prompt. `StepInput.context` also
+records the included prompt-block names, task key, and task-contract
+fingerprint. Replay metadata
 under `StepInput.context.correction_turns` stores each correction's exact
 `PromptContent` blocks, sequences, role, and window token, plus the final
 applied sequence.
+
+Persisted prompt-delivery regression tests copy the real example workflow
+modules into a temporary catalog, add only deterministic routing, and execute
+them through `WorkflowRuntime`, SQLite, `EngineActionDispatcher`, and
+`AgentExecutor`. Prompts are captured inside the scripted client's `prompt`
+boundary. `records.json` is derived from persisted `StepRecord.input.context`,
+`StepDetail.session_id`, and scripted-client new/load-session events. The
+scenarios cover same-runtime reuse, retry-only correction, restart with
+successful session loading, and restart with load failure/new-session
+recreation. Optional captures are written below
+`target/prompt-captures/reduce_agent_step_prompt_payloads/`.
 
 `WorkflowRuntime` wires agent clients to ACP via `cowboy-agent-acp` using the
 configured command, args, and model.
@@ -215,8 +238,13 @@ accounting, or consume step, visit, or retry budgets.
 Every Lua dispatch reloads the full history and exposes it as
 `ctx.user_inputs`: sequence `0` is the original request at `run.created_at`,
 followed by durable `follow_up` entries. `ctx.request` remains the original
-request. Every agent base prompt includes the same ordered history. Explicit
+request. Fresh sessions receive the full ordered history; reused sessions
+receive only sequences above their durable delivery watermark. Explicit
 `ask_user` answers are excluded and remain in `ctx.prev.fields.answer`.
+
+The canonical previous-step view is `ctx.prev.output = { status, fields, body,
+raw }`. Flattened `ctx.prev.status`, `fields`, `body`, and `raw` aliases remain
+for snapshotted-workflow compatibility.
 
 `cowboy-workflow-engine::ResumeRouter` handles `action.ask_user` answers:
 

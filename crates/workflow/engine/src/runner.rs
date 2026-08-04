@@ -341,6 +341,12 @@ fn previous_step_context(prev: Option<&StepRecord>) -> Value {
         "record_id": record.id,
         "step": record.step,
         "action": record.action,
+        "output": {
+            "status": output.status,
+            "fields": output.fields,
+            "body": output.body,
+            "raw": output.raw,
+        },
         "status": output.status,
         "fields": output.fields,
         "body": output.body,
@@ -762,6 +768,7 @@ mod tests {
                 StepAction::Agent(cowboy_workflow_core::AgentAction {
                     role: "developer".to_string(),
                     prompt: "do it".to_string(),
+                    task: None,
                     output: None,
                 }),
             ]),
@@ -836,6 +843,7 @@ mod tests {
                 StepAction::Agent(cowboy_workflow_core::AgentAction {
                     role: "developer".to_string(),
                     prompt: "do it".to_string(),
+                    task: None,
                     output: None,
                 }),
             ]),
@@ -892,13 +900,19 @@ mod tests {
                 finish.run = function(ctx)
                   local prev = ctx.prev or {}
                   local fields = prev.fields or {}
+                  local output = prev.output or {}
+                  local output_fields = output.fields or {}
                   return action.status {
                     status = "success",
                     fields = {
                       previous_step = prev.step,
                       previous_status = prev.status,
+                      nested_status = output.status,
                       summary = fields.summary,
+                      nested_summary = output_fields.summary,
                       first_file = fields.files and fields.files[1] or nil,
+                      nested_body = output.body,
+                      nested_raw_matches = output.raw == prev.raw,
                     },
                     body = tostring(prev.body)
                   }
@@ -928,8 +942,12 @@ mod tests {
         assert_eq!(output.status, "success");
         assert_eq!(output.fields["previous_step"], "start");
         assert_eq!(output.fields["previous_status"], "next");
+        assert_eq!(output.fields["nested_status"], "next");
         assert_eq!(output.fields["summary"], "planned");
+        assert_eq!(output.fields["nested_summary"], "planned");
         assert_eq!(output.fields["first_file"], "AGENTS.md");
+        assert_eq!(output.fields["nested_body"], "plan body");
+        assert_eq!(output.fields["nested_raw_matches"], true);
         assert_eq!(output.body, "plan body");
         println!("EVIDENCE runner-prev output_exposed=true");
     }
@@ -1107,6 +1125,7 @@ mod tests {
         StepAction::Agent(cowboy_workflow_core::AgentAction {
             role: "developer".to_string(),
             prompt: "do it".to_string(),
+            task: None,
             output: None,
         })
     }

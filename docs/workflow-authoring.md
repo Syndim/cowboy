@@ -147,19 +147,36 @@ creation timestamp. Durable follow-ups start at `1`. Timestamps are UTC RFC
 every accepted string byte-for-byte, including leading/trailing whitespace and newlines.
 `ctx.request` remains the unchanged original request.
 
-Every agent action automatically receives the complete `ctx.user_inputs`
-history in its base prompt, regardless of the workflow-authored `prompt`.
+Every fresh agent session receives the complete `ctx.user_inputs` history.
+Reused sessions receive only entries whose sequence has not already been
+delivered, regardless of the workflow-authored `prompt`.
 Answers to `action.ask_user` are deliberately excluded: they remain available
 only through `ctx.prev.fields.answer` because they are workflow control-point
 answers rather than on-the-fly direction.
 
 ### Agent prompt layering
 
-The Rust agent layer is the canonical final prompt assembler. It adds the role
-instructions, workflow-authored task, complete ordered `User Inputs`, deliverable
-format, and blocked-status policy. A workflow-authored `action.agent.prompt`
-must therefore contain only the current stage objective, selected workflow
-context, and stage-specific instructions. Do not concatenate `ctx.request`,
+The Rust agent layer is the canonical final prompt assembler. Legacy
+prompt-only actions retain their existing full-prompt behavior. Structured
+actions separate a stable task contract from the current turn. The role block
+is sent once per backend session; task instructions and deliverable format are
+sent once per `(run, role, task.key, contract fingerprint)`; recovery context is
+sent with that contract and after fresh-session fallback; the current turn and
+new user-input sequences are sent per dispatch. A same-session retry sends only
+the retry correction and new user inputs.
+
+Reuse requires both an equal `task.key` and an equal fingerprint of
+`task.instructions` plus the `output` specification. Steps such as
+`implement` and `revise` therefore import one shared contract definition.
+Initial objectives and revision-specific wording belong only in `task.turn`;
+stage-specific durable state belongs in `task.recovery_context`. Do not derive
+fingerprinted instructions from a step-specific objective, heading, or change
+request.
+
+Task keys are scoped to one run and role. Reuse a key when work returns to the
+same responsibility (for example `implement` and `revise`), and use distinct
+keys for distinct responsibilities such as testing and implementation review.
+Do not concatenate `ctx.request`,
 `ctx.user_inputs`, a `## User Inputs` heading, or cumulative-input boilerplate
 into the Lua prompt; doing so duplicates user direction.
 
@@ -207,6 +224,13 @@ secrets that would otherwise leak into persisted run records and event logs.
   record_id = "run-...-2",
   step = "implement",
   action = "agent",       -- or "status"
+  output = {
+    status = "needs_fix",
+    fields = { summary = "...", files = { "src/lib.rs" } },
+    body = "Markdown details",
+    raw = "original parsed value"
+  },
+  -- Compatibility aliases for snapshotted workflows:
   status = "needs_fix",
   fields = { summary = "...", files = { "src/lib.rs" } },
   body = "Markdown details",
@@ -290,14 +314,20 @@ them under `[config_sets.default]`.
 
 Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.ask_user`, `action.workflow`, or `action.fail`.
 
-### `action.agent { role, prompt, output }`
+### `action.agent { role, prompt, task, output }`
 
 Runs an ACP-compatible coding agent and parses the agent's YAML-frontmatter response into a step output.
 
 ```lua
 return action.agent {
   role = developer,
-  prompt = "Review the implementation and classify the result.",
+  prompt = "Complete declarative prompt retained for debugging.",
+  task = {
+    key = "implementation_review",
+    instructions = "Review the implementation and classify the result.",
+    recovery_context = "Plan doc: docs/plans/change.md",
+    turn = "Changes needed:\n- Verify retry recovery.\n\nContext:\nThe prior test failed."
+  },
   output = {
     status = { "approved", "rejected" },
     fields = {
@@ -315,7 +345,16 @@ return action.agent {
 Fields:
 
 - `role` (required): role table or role id string.
-- `prompt` (required): full task prompt sent to the agent.
+- `prompt` (required): full declarative prompt retained for legacy behavior and
+  workflow debugging. For structured actions, the executor sends `task.turn`
+  instead.
+- `task` (optional): structured prompt-delivery contract.
+  - `task.key`: non-empty stable key scoped to the run and role.
+  - `task.instructions`: static task instructions.
+  - `task.recovery_context`: durable current state needed to recover a fresh
+    backend session.
+  - `task.turn`: minimal current dispatch, normally only
+    `Changes needed:` and `Context:` for backward routes.
 - `output` (optional): instructions for expected frontmatter output.
   - `output.status`: either one status string or an array of allowed status strings.
   - `output.fields`: table describing expected fields, keyed by field name. Each entry is either:
@@ -324,6 +363,16 @@ Fields:
   - `output.required_fields`: array of field names that must be present and non-null in the returned output.
 
 The output spec is prompt guidance. The runtime parses frontmatter and then routes by the returned status; it does not currently enforce a JSON Schema for `fields`.
+
+Backward-routing outputs should provide non-empty `changes_needed` and
+`change_context` fields. Revision turns must select those fields from
+`ctx.prev.output.fields`; do not include the full plan/specification, previous
+body/raw output, unrelated evidence, static role/task instructions, or the
+deliverable schema.
+
+The deterministic prompt regression target writes ten UTF-8 files under the
+directory named by `COWBOY_PROMPT_CAPTURE_DIR`. Each named file is atomically
+replaced so stale captures cannot satisfy comparisons.
 
 ### `action.command { program, args, status_map, timeout_ms }`
 

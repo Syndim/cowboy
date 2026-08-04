@@ -40,7 +40,7 @@ If previous feedback includes `Plan doc: ...`, update that existing plan documen
 If previous feedback includes a valid nested dev-loop `Work dir: ...`, `Plan doc: ...`, and `Validation doc: ...` tuple, update those exact documents and preserve all three values. If the prior tuple is flat, mismatched, or incomplete, replace it with the required nested tuple. Include both current document paths in `files`.]]
   end
   plan.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, "planning", {
       objective = "Create a concrete plan for this " .. kind .. " request.",
       heading = "Previous feedback:",
       include_step = true,
@@ -70,6 +70,7 @@ Return status "ready" when the request is specific enough to implement, or "uncl
     return action.agent {
       role = roles.planner,
       prompt = prompt,
+      task = task,
       output = {
         status = { "ready", "unclear" },
         fields = { summary = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", files = "array", risks = "array", verification = "array" },

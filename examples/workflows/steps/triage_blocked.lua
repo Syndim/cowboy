@@ -51,6 +51,8 @@ return function(id)
     local output_fields = context.copy_evidence_fields(fields, {
       summary = "Blocked workflow triaged to " .. next_step,
       feedback = recovery,
+      changes_needed = { recovery },
+      change_context = "Recover the workflow from the captured blocker and resume the selected responsibility.",
       user_feedback = context.copy_user_feedback(fields),
       blocker_statement = fields.blocker_statement,
       blocked_from_step = fields.blocked_from_step,

@@ -1,11 +1,12 @@
 local context = require("utils/context.lua")
+local implementation_contract = require("contracts/implementation.lua")
 
 return function(roles, opts)
   opts = opts or {}
   local revise = step(opts.id or "revise", { role = roles.implementer })
   local feedback_source = opts.feedback_source or "reviewer"
   revise.run = function(ctx)
-    local prompt, errors = context.build_agent_prompt(ctx, {
+    local prompt, task, errors = context.build_agent_contract(ctx, implementation_contract, {
       objective = "Address " .. feedback_source .. " feedback for this request.",
       heading = feedback_source .. " feedback:",
       require_previous = true,
@@ -26,10 +27,8 @@ If a `Repro test: ...` path/name is present above, do not edit that investigator
     return action.agent {
       role = roles.implementer,
       prompt = prompt,
-      output = {
-        status = { "implemented", "blocked" },
-        fields = { summary = "string", user_feedback = "array", goal = "string", validation = "string", work_dir = "string", plan_doc = "string", validation_doc = "string", rca_doc = "string", repro_test = "string", files = "array", implementation_commands = "array", implementation_evidence = "array" },
-      },
+      task = task,
+      output = implementation_contract.output,
 
     }
   end

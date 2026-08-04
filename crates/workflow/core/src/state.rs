@@ -529,6 +529,9 @@ pub struct RoleSession {
     /// (`None` = nothing sent yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sent_input_sequence: Option<u64>,
+    /// Canonical static-contract fingerprint delivered for each stable task key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delivered_task_contracts: BTreeMap<String, String>,
 }
 
 /// Type tag for content-addressed stored objects.
@@ -843,5 +846,27 @@ mod tests {
         let session: RoleSession = serde_json::from_value(value).unwrap();
         assert!(!session.role_instructions_sent);
         assert_eq!(session.last_sent_input_sequence, None);
+        assert!(session.delivered_task_contracts.is_empty());
+    }
+
+    #[test]
+    fn role_session_defaults_delivery_state() {
+        let value = serde_json::json!({
+            "run_id": "run-1",
+            "role_id": "dev",
+            "backend": "acp",
+            "session_id": "session-1",
+            "updated_at": "2026-01-02T03:04:05.000Z",
+        });
+        let session: RoleSession = serde_json::from_value(value).unwrap();
+        assert!(session.delivered_task_contracts.is_empty());
+
+        let mut updated = session;
+        updated
+            .delivered_task_contracts
+            .insert("implementation".into(), "fingerprint".into());
+        let round_trip: RoleSession =
+            serde_json::from_value(serde_json::to_value(&updated).unwrap()).unwrap();
+        assert_eq!(round_trip, updated);
     }
 }

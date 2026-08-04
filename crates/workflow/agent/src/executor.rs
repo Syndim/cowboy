@@ -19,7 +19,9 @@ use cowboy_workflow_core::{
 use tokio::sync::{Mutex, watch};
 
 use crate::frontmatter::parse_frontmatter_output;
-use crate::prompt::{build_agent_prompt, build_correction_prompt};
+use crate::prompt::{
+    PromptBlockSelection, build_correction_prompt, build_prompt_blocks, task_contract_fingerprint,
+};
 use crate::{Error, Result};
 
 type PromptTurnControls = HashMap<RunId, HashMap<String, watch::Sender<u64>>>;
@@ -474,19 +476,22 @@ where
                 .await
                 .map_err(Error::from)?
         };
-        let (role_instructions_sent, last_sent_input_sequence) = prior_session
-            .as_ref()
-            .map(|session| {
-                (
-                    session.role_instructions_sent,
-                    session.last_sent_input_sequence,
-                )
-            })
-            .unwrap_or((false, None));
+        let (role_instructions_sent, last_sent_input_sequence, mut delivered_task_contracts) =
+            prior_session
+                .as_ref()
+                .map(|session| {
+                    (
+                        session.role_instructions_sent,
+                        session.last_sent_input_sequence,
+                        session.delivered_task_contracts.clone(),
+                    )
+                })
+                .unwrap_or((false, None, Default::default()));
         // Preserve the persisted backend for a reused session; fall back to the
         // active backend for a fresh session with no prior row.
         let session_backend = prior_session
-            .map(|session| session.backend)
+            .as_ref()
+            .map(|session| session.backend.clone())
             .unwrap_or_else(|| active.backend.clone());
         let include_role = !role_instructions_sent;
         let delta_inputs: Vec<RunUserInput> = user_inputs
@@ -497,18 +502,55 @@ where
             })
             .cloned()
             .collect();
-        let base_prompt = build_agent_prompt(role, &action, &delta_inputs, include_role);
+        let task_fingerprint = action
+            .task
+            .as_ref()
+            .map(|task| task_contract_fingerprint(task, action.output.as_ref()));
+        let task_already_delivered = action
+            .task
+            .as_ref()
+            .zip(task_fingerprint.as_ref())
+            .is_some_and(|(task, fingerprint)| {
+                delivered_task_contracts.get(&task.key) == Some(fingerprint)
+            });
+        let include_task = action.task.is_none() || !task_already_delivered;
+        let include_turn = action.task.is_none()
+            || context.attempt == 1
+            || acquired.fresh
+            || !task_already_delivered;
+        let assembly = build_prompt_blocks(
+            role,
+            &action,
+            &delta_inputs,
+            PromptBlockSelection {
+                include_role,
+                include_task,
+                include_recovery: include_task,
+                include_turn,
+            },
+        );
+        let mut included_blocks = assembly.included_blocks;
         let prompt = if context.attempt > 1 {
-            format!(
-                "{base_prompt}\n\n{}",
+            included_blocks.push("retry");
+            if assembly.prompt.is_empty() {
                 crate::prompt::build_retry_nudge(
                     &action,
                     context.attempt,
                     context.retry_reason.as_deref(),
                 )
-            )
+            } else {
+                format!(
+                    "{}\n\n{}",
+                    assembly.prompt,
+                    crate::prompt::build_retry_nudge(
+                        &action,
+                        context.attempt,
+                        context.retry_reason.as_deref(),
+                    )
+                )
+            }
         } else {
-            base_prompt
+            assembly.prompt
         };
         let descriptor = active
             .client
@@ -730,6 +772,9 @@ where
             Some(prior) => applied_sequence.max(prior),
             None => applied_sequence,
         };
+        if let (Some(task), Some(fingerprint)) = (&action.task, task_fingerprint.as_ref()) {
+            delivered_task_contracts.insert(task.key.clone(), fingerprint.clone());
+        }
         self.store
             .save_role_session(RoleSession {
                 run_id: key.run_id.clone(),
@@ -739,6 +784,7 @@ where
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(advanced_sequence),
+                delivered_task_contracts,
             })
             .await
             .map_err(Error::from)?;
@@ -768,6 +814,9 @@ where
                 context: serde_json::json!({
                     "role": action.role,
                     "user_inputs": user_inputs,
+                    "prompt_blocks": included_blocks,
+                    "task_key": action.task.as_ref().map(|task| task.key.as_str()),
+                    "task_contract_fingerprint": task_fingerprint,
                     "correction_turns": correction_turns,
                     "final_applied_sequence": applied_sequence,
                 }),
@@ -873,6 +922,7 @@ where
                 updated_at: Utc::now(),
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
+                delivered_task_contracts: Default::default(),
             })
             .await
             .map_err(Error::from)?;
@@ -1887,6 +1937,7 @@ mod tests {
         AgentAction {
             role: role.to_string(),
             prompt: "Do work".into(),
+            task: None,
             output: None,
         }
     }
@@ -2679,6 +2730,7 @@ resending the same instruction as attempt two"
                 updated_at: Utc::now(),
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
+                delivered_task_contracts: Default::default(),
             })
             .await
             .unwrap();
@@ -3356,6 +3408,7 @@ still applies, got non-recoverable: {error:?}"
         AgentAction {
             role: role.to_string(),
             prompt: "Do work".into(),
+            task: None,
             output: Some(cowboy_workflow_core::OutputSpec {
                 statuses: vec!["success".to_string()],
                 fields: output_fields(&[(
@@ -3364,6 +3417,215 @@ still applies, got non-recoverable: {error:?}"
                     true,
                 )]),
             }),
+        }
+    }
+
+    fn structured_action(role: &str, instructions: &str, turn: &str) -> AgentAction {
+        let mut action = output_action(role);
+        action.prompt = "FULL_SPEC_SENTINEL".into();
+        action.task = Some(cowboy_workflow_core::AgentTaskContract {
+            key: "implementation".into(),
+            instructions: instructions.into(),
+            recovery_context: "RECOVERY_CONTEXT_SENTINEL".into(),
+            turn: turn.into(),
+        });
+        action
+    }
+
+    #[tokio::test]
+    async fn structured_task_contract_delivery_matrix() {
+        let client = FakeClient::new(vec![event(), event(), event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+
+        executor
+            .execute_agent(
+                structured_action("developer", "STATIC_TASK_SENTINEL", "initial turn"),
+                context("run", "record-1"),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute_agent(
+                structured_action(
+                    "developer",
+                    "STATIC_TASK_SENTINEL",
+                    "Changes needed:\n- fix retry\n\nContext:\nreview",
+                ),
+                context("run", "record-2"),
+            )
+            .await
+            .unwrap();
+        executor
+            .execute_agent(
+                structured_action("developer", "CHANGED_TASK_SENTINEL", "changed turn"),
+                context("run", "record-3"),
+            )
+            .await
+            .unwrap();
+
+        {
+            let calls = prompt_calls.lock();
+            assert_eq!(calls.len(), 3);
+            let first = &calls[0][0].text;
+            let reused = &calls[1][0].text;
+            let changed = &calls[2][0].text;
+            for expected in [
+                "Instructions for developer",
+                "STATIC_TASK_SENTINEL",
+                "RECOVERY_CONTEXT_SENTINEL",
+                "## Deliverable Format",
+            ] {
+                assert!(first.contains(expected));
+            }
+            assert!(reused.contains("Changes needed:"));
+            for omitted in [
+                "Instructions for developer",
+                "STATIC_TASK_SENTINEL",
+                "RECOVERY_CONTEXT_SENTINEL",
+                "## Deliverable Format",
+                "FULL_SPEC_SENTINEL",
+            ] {
+                assert!(!reused.contains(omitted));
+            }
+            assert!(changed.contains("CHANGED_TASK_SENTINEL"));
+            assert!(changed.contains("RECOVERY_CONTEXT_SENTINEL"));
+            assert!(changed.contains("## Deliverable Format"));
+        }
+
+        let stored = store_handle
+            .load_role_session("run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .delivered_task_contracts
+                .contains_key("implementation")
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_task_contract_survives_loaded_session() {
+        let store = SharedFakeStore::default();
+        AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            store.clone(),
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(
+            structured_action("developer", "STATIC_TASK_SENTINEL", "initial turn"),
+            context("run", "record-1"),
+        )
+        .await
+        .unwrap();
+
+        let client = FakeClient::with_load(vec![event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(
+            structured_action(
+                "developer",
+                "STATIC_TASK_SENTINEL",
+                "Changes needed:\n- loaded fix\n\nContext:\nloaded",
+            ),
+            context("run", "record-2"),
+        )
+        .await
+        .unwrap();
+
+        let calls = prompt_calls.lock();
+        let prompt = &calls[0][0].text;
+        assert!(prompt.contains("Changes needed:"));
+        assert!(!prompt.contains("STATIC_TASK_SENTINEL"));
+        assert!(!prompt.contains("RECOVERY_CONTEXT_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn fresh_session_fallback_resends_recovery_context() {
+        let store = SharedFakeStore::default();
+        AgentExecutor::new(
+            FakeFactory::new(vec![FakeClient::new(vec![event()])]),
+            store.clone(),
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(
+            structured_action("developer", "STATIC_TASK_SENTINEL", "initial turn"),
+            context("run", "record-1"),
+        )
+        .await
+        .unwrap();
+
+        let client = FakeClient::with_load_error(vec![event()], "load failed");
+        let prompt_calls = client.prompt_calls.clone();
+        AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        )
+        .execute_agent(
+            structured_action("developer", "STATIC_TASK_SENTINEL", "fallback turn"),
+            context("run", "record-2"),
+        )
+        .await
+        .unwrap();
+
+        let calls = prompt_calls.lock();
+        let prompt = &calls[0][0].text;
+        for expected in [
+            "Instructions for developer",
+            "STATIC_TASK_SENTINEL",
+            "RECOVERY_CONTEXT_SENTINEL",
+            "fallback turn",
+            "## Deliverable Format",
+        ] {
+            assert!(prompt.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_omits_already_delivered_task_and_turn() {
+        let malformed = Event::MessageChunk {
+            content: serde_json::json!({"text": "missing frontmatter"}),
+        };
+        let client = FakeClient::new(vec![malformed, event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            FakeStore::default(),
+            AgentExecutionConfig::default(),
+        );
+        let action = structured_action("developer", "STATIC_TASK_SENTINEL", "ORIGINAL_TURN");
+        let first = executor
+            .execute_agent(action.clone(), context("run", "record-1"))
+            .await;
+        assert!(matches!(first, Err(Error::NoWorkflowResult)));
+
+        let mut retry_context = context("run", "record-1");
+        retry_context.attempt = 2;
+        retry_context.retry_reason = Some("missing frontmatter".into());
+        executor.execute_agent(action, retry_context).await.unwrap();
+
+        let calls = prompt_calls.lock();
+        let retry = &calls[1][0].text;
+        assert!(retry.contains("## Retry"));
+        for omitted in [
+            "STATIC_TASK_SENTINEL",
+            "RECOVERY_CONTEXT_SENTINEL",
+            "ORIGINAL_TURN",
+            "## Deliverable Format",
+        ] {
+            assert!(!retry.contains(omitted), "retry contained {omitted}");
         }
     }
 
@@ -3405,6 +3667,7 @@ still applies, got non-recoverable: {error:?}"
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(3),
+                delivered_task_contracts: Default::default(),
             })
             .await
             .unwrap();
@@ -3509,6 +3772,7 @@ still applies, got non-recoverable: {error:?}"
                 updated_at: seeded_at,
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
+                delivered_task_contracts: Default::default(),
             })
             .await
             .unwrap();
@@ -3544,6 +3808,7 @@ still applies, got non-recoverable: {error:?}"
             updated_at: Utc::now(),
             role_instructions_sent: true,
             last_sent_input_sequence: Some(2),
+            delivered_task_contracts: Default::default(),
         };
         store.save_role_session(session.clone()).await.unwrap();
         let loaded = clone
@@ -3613,6 +3878,7 @@ still applies, got non-recoverable: {error:?}"
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(1),
+                delivered_task_contracts: Default::default(),
             })
             .await
             .unwrap();

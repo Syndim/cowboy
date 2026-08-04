@@ -29,6 +29,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let action = AgentAction {
         role: config.role.clone(),
         prompt: config.prompt.clone(),
+        task: None,
         output: None,
     };
     let context = execution_context(&config, &run_state, user_prompts);
