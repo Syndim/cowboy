@@ -349,9 +349,44 @@ Fields:
 - `status_map` (optional): table mapping an exit code (integer or numeric-string key) to the output status used for that code. The catch-all `"_"` key covers any exit code without an exact match, plus spawn errors and timeouts, which have no exit code. Defaults to `{ ["0"] = "success", ["_"] = "failed" }`. A `status_map` missing a `"_"` entry falls back to `"failed"` for unmatched codes.
 - `timeout_ms` (optional): positive integer wall-clock timeout. On timeout, Cowboy kills the child and completes the step with the `status_map`'s `"_"` status.
 
-The command runs from `RuntimeConfig.cwd`. Workflows cannot override cwd, environment, or stdin for this action; stdin is closed. Cowboy clears the child environment, then copies only `PATH`, `PATHEXT`, `SystemRoot`, `USERPROFILE`, `LOCALAPPDATA`, `APPDATA`, `TEMP`, and `TMP` unchanged from Cowboy's process when each variable is present. Cowboy does not synthesize missing values, and every other ambient variable remains removed, including credentials and unrelated host configuration. There is no workflow-authored environment override, so commands must not rely on variables outside this allow-list.
+The command runs from `RuntimeConfig.cwd`. Workflows cannot override cwd,
+environment, or stdin for this action; stdin is closed. Cowboy clears the child
+environment, then copies only names from top-level `allowed_env` that are
+present in Cowboy's process when the command starts. Omitting the key preserves
+the compatibility default (`PATH`, `PATHEXT`, `SystemRoot`, `USERPROFILE`,
+`LOCALAPPDATA`, `APPDATA`, `TEMP`, and `TMP`); explicit `allowed_env = []`
+forwards nothing. Cowboy does not synthesize missing values, and every other
+ambient variable remains removed. There is no workflow-authored environment
+override.
 
-Security warning: `action.command` is not a sandbox. Use it only for trusted workflows and trusted commands. The child process still runs as the Cowboy OS user from `RuntimeConfig.cwd`; it can read or write files and use any network resources available to the Cowboy process, even though Cowboy does not invoke a shell and sanitizes environment/stdin.
+ACP backend children use the same global list plus the selected
+`[[agents]].allowed_env` list. Per-agent names are additive and cannot remove a
+global name. Selection, request-topic generation, role turns, retries,
+reconnect/recovery, and workflow improvement all use this policy. Multiple
+roles selecting one named agent share that agent's policy; configure separate
+agent entries for distinct policies. For example:
+
+```toml
+allowed_env = ["PATH", "COWBOY_EXAMPLE_GLOBAL_CA"]
+
+[[agents]]
+name = "planner"
+command = "copilot"
+args = ["--acp"]
+allowed_env = ["COWBOY_EXAMPLE_PLANNER_TOKEN"]
+
+[agents.model]
+id = "planner-model"
+provider = "configured-provider"
+```
+
+Security warning: `action.command` is not a sandbox. Use it only for trusted
+workflows and trusted commands. The child process still runs as the Cowboy OS
+user from `RuntimeConfig.cwd`; it can read or write files and use any network
+resources available to the Cowboy process, even though Cowboy does not invoke
+a shell and sanitizes environment/stdin. Explicitly allow-list required
+authentication and tool variables; each allowed name exposes its current value
+to the selected child.
 
 The completed `StepOutput.fields` contains:
 

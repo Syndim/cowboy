@@ -2054,6 +2054,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             mouse_scroll_lines: crate::config::AppConfig::default().mouse_scroll_lines,
+            allowed_env: crate::config::AppConfig::default().allowed_env,
             config_sets: std::collections::BTreeMap::from([(
                 "default".to_string(),
                 crate::config::ConfigSetConfig {

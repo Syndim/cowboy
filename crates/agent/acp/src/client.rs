@@ -68,6 +68,39 @@ pub struct Client {
     reconnect_factory: ReplacementTransportFactory,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecordedTransportCreation {
+    clear_env: bool,
+    allowed_env: Vec<String>,
+    resume_session_id: Option<String>,
+}
+
+#[cfg(test)]
+fn transport_creation_records() -> &'static std::sync::Mutex<Vec<RecordedTransportCreation>> {
+    static RECORDS: std::sync::OnceLock<std::sync::Mutex<Vec<RecordedTransportCreation>>> =
+        std::sync::OnceLock::new();
+    RECORDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+fn record_transport_creation(config: &TransportConfig, resume_session_id: Option<&str>) {
+    let TransportConfig::Stdio(config) = config else {
+        return;
+    };
+    if config.command != "definitely-missing-acp-environment-test-command" {
+        return;
+    }
+    transport_creation_records()
+        .lock()
+        .expect("transport creation recorder poisoned")
+        .push(RecordedTransportCreation {
+            clear_env: config.clear_env,
+            allowed_env: config.allowed_env.clone(),
+            resume_session_id: resume_session_id.map(str::to_string),
+        });
+}
+
 impl Clone for Client {
     fn clone(&self) -> Self {
         Self {
@@ -423,6 +456,8 @@ impl Client {
         config: &TransportConfig,
         resume_session_id: Option<&str>,
     ) -> anyhow::Result<Box<dyn Transport>> {
+        #[cfg(test)]
+        record_transport_creation(config, resume_session_id);
         match config {
             TransportConfig::Stdio(cfg) => {
                 use super::transport::stdio::StdioTransport;
@@ -1781,8 +1816,88 @@ mod tests {
         TransportConfig::Stdio(crate::transport::StdioConfig {
             command: "mock".into(),
             args: vec![],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         })
+    }
+
+    fn sanitized_missing_transport_config() -> TransportConfig {
+        TransportConfig::Stdio(crate::transport::StdioConfig {
+            command: "definitely-missing-acp-environment-test-command".into(),
+            args: vec![],
+            clear_env: true,
+            allowed_env: vec!["GLOBAL".to_string(), "ROLE".to_string()],
+            env: vec![],
+        })
+    }
+
+    fn reset_transport_creation_records() {
+        transport_creation_records()
+            .lock()
+            .expect("transport creation recorder poisoned")
+            .clear();
+    }
+
+    fn transport_creation_test_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn lazy_reconnect_reuses_original_environment_policy() {
+        let _guard = transport_creation_test_lock().lock().await;
+        reset_transport_creation_records();
+        let config = sanitized_missing_transport_config();
+
+        assert!(Client::create_transport(&config, None).await.is_err());
+        assert!(
+            Client::create_transport(&config, Some("session-lazy"))
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            *transport_creation_records()
+                .lock()
+                .expect("transport creation recorder poisoned"),
+            [
+                RecordedTransportCreation {
+                    clear_env: true,
+                    allowed_env: vec!["GLOBAL".to_string(), "ROLE".to_string()],
+                    resume_session_id: None,
+                },
+                RecordedTransportCreation {
+                    clear_env: true,
+                    allowed_env: vec!["GLOBAL".to_string(), "ROLE".to_string()],
+                    resume_session_id: Some("session-lazy".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_recovery_reuses_original_environment_policy() {
+        let _guard = transport_creation_test_lock().lock().await;
+        reset_transport_creation_records();
+        let config = sanitized_missing_transport_config();
+
+        assert!(
+            Client::create_transport(&config, Some("session-hard"))
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            *transport_creation_records()
+                .lock()
+                .expect("transport creation recorder poisoned"),
+            [RecordedTransportCreation {
+                clear_env: true,
+                allowed_env: vec!["GLOBAL".to_string(), "ROLE".to_string()],
+                resume_session_id: Some("session-hard".to_string()),
+            }]
+        );
     }
 
     #[derive(Default)]

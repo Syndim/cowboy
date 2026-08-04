@@ -164,7 +164,11 @@ Example:\n\n---\nstatus: success\nsummary: short summary\n---\n\nMarkdown detail
 fn describe_fields(fields: &BTreeMap<String, Field>) -> String {
     let mut lines = vec!["- status: routing status string".to_string()];
     for (name, field) in fields {
-        let requirement = if field.required { "required" } else { "optional" };
+        let requirement = if field.required {
+            "required"
+        } else {
+            "optional"
+        };
         let mut line = format!("- {name}: {} ({requirement})", field.field_type.as_str());
         if !field.description.is_empty() {
             line.push_str(" — ");

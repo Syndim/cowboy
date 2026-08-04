@@ -94,6 +94,8 @@ pub struct RuntimeConfig {
     pub workflow_store: PathBuf,
     #[serde(default)]
     pub workflow_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    pub allowed_env: Vec<String>,
     pub agents: Vec<AgentRuntimeConfig>,
     pub config_sets: BTreeMap<String, RunnerLimitsConfig>,
 }
@@ -105,6 +107,8 @@ pub struct AgentRuntimeConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub model: Option<ModelInfo>,
+    #[serde(default)]
+    pub allowed_env: Vec<String>,
     #[serde(default)]
     pub watchdog: AgentWatchdogRuntimeConfig,
 }
@@ -159,6 +163,7 @@ impl AgentRuntimeConfig {
             command: command.into(),
             args,
             model,
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -170,6 +175,7 @@ impl RuntimeConfig {
         state_dir: PathBuf,
         workflow_store: PathBuf,
         workflow_dirs: Vec<PathBuf>,
+        allowed_env: Vec<String>,
         agents: Vec<AgentRuntimeConfig>,
         config_sets: BTreeMap<String, RunnerLimitsConfig>,
     ) -> Self {
@@ -178,6 +184,7 @@ impl RuntimeConfig {
             state_dir,
             workflow_store,
             workflow_dirs,
+            allowed_env,
             agents,
             config_sets,
         }
@@ -1326,7 +1333,10 @@ impl WorkflowRuntime {
                 let agent = resolver.resolve_default()?;
                 let client = self
                     .acp_connector
-                    .connect(transport_for(agent), watchdog_options_for(agent))
+                    .connect(
+                        transport_for(&self.config.allowed_env, agent),
+                        watchdog_options_for(agent),
+                    )
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
                 let selector = crate::AgentWorkflowSelector::new(
@@ -1672,7 +1682,10 @@ impl WorkflowRuntime {
         let agent = resolver.resolve_default()?;
         let client = self
             .acp_connector
-            .connect(transport_for(agent), watchdog_options_for(agent))
+            .connect(
+                transport_for(&self.config.allowed_env, agent),
+                watchdog_options_for(agent),
+            )
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         let summarizer = crate::AgentWorkflowSummarizer::new(
@@ -1804,6 +1817,7 @@ impl WorkflowRuntime {
             executor,
             self.clone(),
             self.config.cwd.clone(),
+            self.config.allowed_env.clone(),
         );
         let provider = LuaStepActionProvider::new(snapshot);
         let policy = self.resolve_limits(&run.config_set.name);
@@ -2176,6 +2190,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedRuntimeAcpConnection {
         command: String,
+        clear_env: bool,
+        allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
     }
 
@@ -2207,6 +2223,8 @@ mod tests {
             };
             self.connections.lock().push(RecordedRuntimeAcpConnection {
                 command: transport.command,
+                clear_env: transport.clear_env,
+                allowed_env: transport.allowed_env,
                 watchdog,
             });
             Err(anyhow::anyhow!("recording runtime connector"))
@@ -2245,6 +2263,7 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -2516,6 +2535,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "definitely-missing-topic-agent")],
             config_sets: BTreeMap::new(),
         };
@@ -2533,11 +2553,13 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "default-runtime-agent".to_string(),
                 args: Vec::new(),
                 model: None,
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig {
                     response_timeout_seconds: 31,
                     cancel_timeout_seconds: 32,
@@ -2564,6 +2586,8 @@ mod tests {
     fn expected_default_runtime_connection() -> RecordedRuntimeAcpConnection {
         RecordedRuntimeAcpConnection {
             command: "default-runtime-agent".to_string(),
+            clear_env: true,
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogOptions {
                 response_timeout_seconds: 31,
                 cancel_timeout_seconds: 32,
@@ -2614,6 +2638,45 @@ mod tests {
             connector.connections(),
             [expected_default_runtime_connection()]
         );
+    }
+
+    #[tokio::test]
+    async fn selector_and_improvement_clients_use_resolved_agent_allowed_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let mut config = production_connector_test_config(&dir);
+        config.allowed_env = vec!["GLOBAL".to_string(), "SHARED".to_string()];
+        config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string(), "SHARED".to_string()];
+        let runtime = runtime_with_recording_connector(config, connector.clone()).await;
+        let catalog = runtime.catalog().unwrap();
+
+        assert!(
+            runtime
+                .select_workflow("select a workflow", &catalog)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recording runtime connector")
+        );
+        let run = summary_test_run("improve-env-connector", RunStatus::Completed, None);
+        runtime.store().unwrap().save_run(&run).await.unwrap();
+        assert!(
+            runtime
+                .improve_run(&run.id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recording runtime connector")
+        );
+
+        assert_eq!(connector.connections().len(), 2);
+        for connection in connector.connections() {
+            assert!(connection.clear_env);
+            assert_eq!(
+                connection.allowed_env,
+                ["GLOBAL", "SHARED", "DEFAULT_AGENT"]
+            );
+        }
     }
 
     #[tokio::test]
@@ -2696,6 +2759,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -2733,6 +2797,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![examples_root],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -2790,6 +2855,7 @@ mod tests {
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents,
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -2896,6 +2962,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     handoff_gate.to_string_lossy().to_string(),
                 ],
                 model: Some(ModelInfo::default()),
+                allowed_env: Vec::new(),
                 // Generous watchdog timeouts: this test drives a real
                 // subprocess (fork/exec + several JSON-RPC round trips)
                 // whose scheduling can be slow under heavy parallel-test CPU
@@ -3025,6 +3092,7 @@ done
                 command: agent_script.to_string_lossy().to_string(),
                 args: Vec::new(),
                 model: None,
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
         )
@@ -3099,6 +3167,7 @@ done
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -3215,6 +3284,7 @@ done
             state_dir: dir.path().join("state-seal"),
             workflow_store: dir.path().join("state-seal/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -3279,6 +3349,7 @@ done
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
@@ -3293,6 +3364,7 @@ done
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -3459,6 +3531,7 @@ done
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -3789,6 +3862,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
@@ -4951,11 +5025,13 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -5106,6 +5182,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "definitely-missing-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5236,11 +5313,13 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -5420,6 +5499,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5575,6 +5655,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5679,6 +5760,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5975,6 +6057,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir.clone()],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6093,6 +6176,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: Vec::new(),
             config_sets,
         }
@@ -6360,6 +6444,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6409,6 +6494,7 @@ exit 0
             state_dir: state_dir.clone(),
             workflow_store: state_dir.join("data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6467,6 +6553,7 @@ exit 0
             state_dir: dir.path().join("state-a"),
             workflow_store: dir.path().join("shared/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6538,6 +6625,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -6632,6 +6720,7 @@ exit 0
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7865,11 +7954,13 @@ Recovery implementation review"#
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            allowed_env: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -7948,11 +8039,13 @@ Recovery implementation review"#
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(

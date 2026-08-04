@@ -15,19 +15,8 @@ use tokio::time;
 
 const CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
 
-const COMMAND_ENV_ALLOW_LIST: [&str; 8] = [
-    "PATH",
-    "PATHEXT",
-    "SystemRoot",
-    "USERPROFILE",
-    "LOCALAPPDATA",
-    "APPDATA",
-    "TEMP",
-    "TMP",
-];
-
-fn apply_command_environment(command: &mut Command) {
-    for name in COMMAND_ENV_ALLOW_LIST {
+fn apply_command_environment(command: &mut Command, allowed_env: &[String]) {
+    for name in allowed_env {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
@@ -37,21 +26,28 @@ fn apply_command_environment(command: &mut Command) {
 #[derive(Debug, Clone)]
 pub struct CommandActionRunner {
     cwd: PathBuf,
+    allowed_env: Vec<String>,
     capture_limit_bytes: usize,
 }
 
 impl CommandActionRunner {
-    pub fn new(cwd: impl Into<PathBuf>) -> Self {
+    pub fn new(cwd: impl Into<PathBuf>, allowed_env: Vec<String>) -> Self {
         Self {
             cwd: cwd.into(),
+            allowed_env,
             capture_limit_bytes: CAPTURE_LIMIT_BYTES,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_capture_limit(cwd: impl Into<PathBuf>, capture_limit_bytes: usize) -> Self {
+    pub(crate) fn with_capture_limit(
+        cwd: impl Into<PathBuf>,
+        allowed_env: Vec<String>,
+        capture_limit_bytes: usize,
+    ) -> Self {
         Self {
             cwd: cwd.into(),
+            allowed_env,
             capture_limit_bytes,
         }
     }
@@ -72,7 +68,7 @@ impl CommandActionRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        apply_command_environment(&mut command);
+        apply_command_environment(&mut command, &self.allowed_env);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -395,7 +391,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "success");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
 
         let output = command_output(
             runner
@@ -422,7 +418,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "env");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
 
         let output = command_output(
             runner
@@ -447,7 +443,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_runner_forwards_only_allowlisted_environment_variables() {
+    async fn command_runner_forwards_only_configured_environment_variables() {
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -478,7 +474,10 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "environment_allow_list");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(
+            dir.path(),
+            EXPECTED_COMMAND_ENV_ALLOW_LIST.map(str::to_string).to_vec(),
+        );
 
         let output = command_output(
             runner
@@ -532,7 +531,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "system_root");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), vec!["SystemRoot".to_string()]);
 
         let output = command_output(
             runner
@@ -557,7 +556,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "success");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
 
         let record = command_record(
             runner
@@ -582,7 +581,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "failure");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
 
         let output = command_output(
             runner
@@ -612,7 +611,7 @@ mod tests {
     #[tokio::test]
     async fn command_runner_records_spawn_error() {
         let dir = tempfile::tempdir().unwrap();
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
 
         let output = command_output(
             runner
@@ -641,7 +640,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "slow");
-        let runner = CommandActionRunner::new(dir.path());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
         let mut action = action(program, helper_args());
         action.timeout_ms = Some(50);
 
@@ -657,7 +656,7 @@ mod tests {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
         let stdout_program = helper_program(dir.path(), "large_stdout");
-        let runner = CommandActionRunner::with_capture_limit(dir.path(), 8);
+        let runner = CommandActionRunner::with_capture_limit(dir.path(), Vec::new(), 8);
 
         let stdout_output = command_output(
             runner
@@ -672,7 +671,7 @@ mod tests {
         assert_eq!(stdout_output.fields["stderr_truncated"], false);
 
         let stderr_program = helper_program(dir.path(), "large_stderr");
-        let stderr_runner = CommandActionRunner::with_capture_limit(dir.path(), 512);
+        let stderr_runner = CommandActionRunner::with_capture_limit(dir.path(), Vec::new(), 512);
         let stderr_output = command_output(
             stderr_runner
                 .run(action(stderr_program, helper_args()), context())
@@ -693,7 +692,7 @@ mod tests {
         let cwd = dir.path().join("cwd");
         fs::create_dir(&cwd).unwrap();
         let program = helper_program(dir.path(), "cwd");
-        let runner = CommandActionRunner::new(&cwd);
+        let runner = CommandActionRunner::new(&cwd, Vec::new());
 
         let output = command_output(
             runner

@@ -26,6 +26,10 @@ pub struct StdioConfig {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
+    pub clear_env: bool,
+    #[serde(default)]
+    pub allowed_env: Vec<String>,
+    #[serde(default)]
     pub env: Vec<(String, String)>,
 }
 

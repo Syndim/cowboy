@@ -1248,7 +1248,11 @@ mod tests {
                 "tester_commands",
                 "tester_evidence",
             ] {
-                assert_eq!(output.fields[field].field_type, FieldType::Array, "{name} {field}");
+                assert_eq!(
+                    output.fields[field].field_type,
+                    FieldType::Array,
+                    "{name} {field}"
+                );
             }
         }
     }
@@ -1533,9 +1537,18 @@ mod tests {
             panic!("review should request an agent action")
         };
         let output = action.output.expect("review should declare output");
-        assert_eq!(output.fields["reviewer_assessments"].field_type, FieldType::Array);
-        assert_eq!(output.fields["reviewer_commands"].field_type, FieldType::Array);
-        assert_eq!(output.fields["reviewer_evidence"].field_type, FieldType::Array);
+        assert_eq!(
+            output.fields["reviewer_assessments"].field_type,
+            FieldType::Array
+        );
+        assert_eq!(
+            output.fields["reviewer_commands"].field_type,
+            FieldType::Array
+        );
+        assert_eq!(
+            output.fields["reviewer_evidence"].field_type,
+            FieldType::Array
+        );
         for expected in [
             "globally gated two-pass process",
             "every required `TODO-NN` in plan order—whether checked or unchecked—followed by every required `VAL-NN`",
@@ -3414,8 +3427,14 @@ mod tests {
 
         let output = review.output.expect("blocker review should declare output");
         assert_eq!(output.statuses, ["recoverable", "user_required"]);
-        assert_eq!(output.fields["blocker_reason"].field_type, FieldType::String);
-        assert_eq!(output.fields["blocker_resolution"].field_type, FieldType::String);
+        assert_eq!(
+            output.fields["blocker_reason"].field_type,
+            FieldType::String
+        );
+        assert_eq!(
+            output.fields["blocker_resolution"].field_type,
+            FieldType::String
+        );
 
         let mut recoverable_fields = sample_evidence_fields();
         recoverable_fields["blocker_statement"] =
@@ -4469,8 +4488,8 @@ mod tests {
             return workflow("wf", start)
             "#,
         );
-        let err = run_step(&source, "start", serde_json::json!({ "request": "do it" }))
-            .unwrap_err();
+        let err =
+            run_step(&source, "start", serde_json::json!({ "request": "do it" })).unwrap_err();
         assert!(err.to_string().contains("output.fields.summary"));
     }
 
@@ -4848,8 +4867,7 @@ mod tests {
             ("failure", FieldType::String),
         ] {
             assert_eq!(
-                investigate_output.fields[field].field_type,
-                ty,
+                investigate_output.fields[field].field_type, ty,
                 "investigate output field {field} should be {ty:?}"
             );
         }
@@ -4911,8 +4929,7 @@ mod tests {
             ("failures", FieldType::Array),
         ] {
             assert_eq!(
-                review_output.fields[field].field_type,
-                ty,
+                review_output.fields[field].field_type, ty,
                 "review_rca output field {field} should be {ty:?}"
             );
         }

@@ -192,6 +192,7 @@ state_dir = "~/.local/state/cowboy"
 workflow_store = "~/.local/state/cowboy/data.db"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 mouse_scroll_lines = 3
+allowed_env = ["PATH", "PATHEXT", "SystemRoot", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"]
 
 [config_sets.default]
 max_steps_per_run = 100
@@ -208,6 +209,7 @@ max_retries_per_step = 4
 name = "default"
 command = "copilot"
 args = ["--acp"]
+allowed_env = ["COWBOY_EXAMPLE_DEFAULT_TOKEN"]
 
 [agents.model]
 id = "opus-4.8-1m"
@@ -217,6 +219,7 @@ provider = "github-copilot"
 name = "planner"
 command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
+allowed_env = ["COWBOY_EXAMPLE_PLANNER_TOKEN"]
 
 [[agents]]
 name = "investigator"
@@ -232,6 +235,7 @@ args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
 name = "implementer"
 command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=medium", "acp"]
+allowed_env = ["COWBOY_EXAMPLE_IMPLEMENTER_TOKEN"]
 
 [[agents]]
 name = "tester"
@@ -253,6 +257,22 @@ The workflow roles select dedicated `planner`, `investigator`, `reviewer`,
 `implementer`, `tester`, and `committer` agents. Their backend launch arguments
 set thinking to `xhigh`, `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;
 `[agents.model]` does not control it.
+
+Top-level `allowed_env` controls ambient variables forwarded to every workflow
+child process, including `action.command` children and ACP backends used for
+selection, request topics, role actions, retries, recovery, and workflow
+improvement. Each `[[agents]].allowed_env` is additive for that selected agent:
+the child receives the union of the global names and that agent's names.
+Multiple roles selecting the same named agent intentionally share its policy;
+use separate agent entries when roles need different policies.
+
+Omitting top-level `allowed_env` preserves the compatibility default shown
+above. Omitting an agent list adds nothing, while an explicit
+`allowed_env = []` forwards no names at that level. Cowboy clears child
+environments and copies only configured names that are present when the child
+starts; values are never stored in runtime configuration or workflow state.
+Explicitly allow-list every authentication or tool variable required by a
+child. Allowing a name exposes its current value to that child process.
 
 <!-- cowboy-agent-watchdog-contract:start -->
 ```toml

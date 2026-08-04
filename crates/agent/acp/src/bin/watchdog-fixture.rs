@@ -29,6 +29,29 @@ const WORKSPACE_MARKER: &str = "cowboy-watchdog-smoke-v1\n";
 /// generated smoke config uses 1 s) so the watchdog observes an in-flight tool
 /// call, restarts itself, and only cancels once the tool reports `completed`.
 const TOOL_CALL_IN_FLIGHT_DELAY: Duration = Duration::from_millis(2500);
+const SYNTHETIC_ENVIRONMENT_NAMES: [&str; 4] = [
+    "COWBOY_TEST_GLOBAL",
+    "COWBOY_TEST_PLANNER",
+    "COWBOY_TEST_IMPLEMENTER",
+    "COWBOY_TEST_UNAPPROVED",
+];
+const DEFAULT_ENVIRONMENT_NAMES: [&str; 9] = [
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "COWBOY_TEST_UNAPPROVED",
+];
+const SYNTHETIC_ENVIRONMENT_VALUES: [(&str, &str); 4] = [
+    ("COWBOY_TEST_GLOBAL", "cowboy-global-marker-7a2e"),
+    ("COWBOY_TEST_PLANNER", "cowboy-planner-marker-83bf"),
+    ("COWBOY_TEST_IMPLEMENTER", "cowboy-implementer-marker-19cd"),
+    ("COWBOY_TEST_UNAPPROVED", "cowboy-unapproved-marker-64ef"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -76,6 +99,73 @@ struct VerifyArgs {
     hard_deadline_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvironmentProfile {
+    Synthetic,
+    Default,
+}
+
+impl EnvironmentProfile {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "synthetic" => Ok(Self::Synthetic),
+            "default" => Ok(Self::Default),
+            _ => bail!("--environment-profile must be synthetic or default"),
+        }
+    }
+
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::Synthetic => &SYNTHETIC_ENVIRONMENT_NAMES,
+            Self::Default => &DEFAULT_ENVIRONMENT_NAMES,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProbeEnvironmentArgs {
+    output: PathBuf,
+    profile: EnvironmentProfile,
+}
+
+#[derive(Debug)]
+struct EnvironmentServeArgs {
+    events: PathBuf,
+    invocation_token: String,
+    identity_dir: PathBuf,
+    agent: String,
+    profile: EnvironmentProfile,
+    mode: Mode,
+    resume_session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct DefaultEnvironmentVerifyArgs {
+    cowboy: PathBuf,
+    workspace: PathBuf,
+    deadline_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct EnvironmentServe {
+    agent: String,
+    profile: EnvironmentProfile,
+}
+
+#[derive(Debug)]
+struct RequestState {
+    session_id: Option<String>,
+    pending_prompt: Option<u64>,
+    environment: Option<EnvironmentServe>,
+    environment_prompt_count: u64,
+}
+
+struct EnvironmentPrompt<'a> {
+    text: &'a str,
+    session_id: &'a str,
+    id: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Identity {
     endpoint: String,
@@ -105,6 +195,16 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("serve") => serve(parse_serve_args(args.collect())?),
+        Some("probe-environment") => {
+            probe_environment(parse_probe_environment_args(args.collect())?)
+        }
+        Some("serve-environment") => {
+            serve_environment(parse_environment_serve_args(args.collect())?)
+        }
+        Some("verify-environment") => verify_environment(parse_verify_args(args.collect())?),
+        Some("verify-default-allowed-env") => {
+            verify_default_allowed_env(parse_default_environment_verify_args(args.collect())?)
+        }
         Some("verify") => verify(parse_verify_args(args.collect())?),
         Some("cleanup") => cleanup(&parse_cleanup_args(args.collect())?),
         Some("-h" | "--help") | None => {
@@ -117,8 +217,73 @@ fn main() -> anyhow::Result<()> {
 
 fn print_usage() {
     println!(
-        "Usage:\n  watchdog-fixture serve --mode acknowledge-cancel|ignore-cancel|end-turn-cancel --events FILE --invocation-token TOKEN --identity-dir DIR [--resume=SESSION]\n  watchdog-fixture verify --cowboy PATH --workspace DIR --response-timeout-seconds N --cancel-timeout-seconds N --recovery-operation-timeout-seconds N --soft-deadline-seconds N --hard-deadline-seconds N\n  watchdog-fixture cleanup --workspace DIR"
+        "Usage:\n  watchdog-fixture serve --mode acknowledge-cancel|ignore-cancel|end-turn-cancel --events FILE --invocation-token TOKEN --identity-dir DIR [--resume=SESSION]\n  watchdog-fixture probe-environment --output FILE [--environment-profile synthetic|default]\n  watchdog-fixture serve-environment --agent NAME --events FILE --invocation-token TOKEN --identity-dir DIR [--environment-profile synthetic|default] [--resume=SESSION]\n  watchdog-fixture verify-environment --cowboy PATH --workspace DIR --response-timeout-seconds N --cancel-timeout-seconds N --recovery-operation-timeout-seconds N --soft-deadline-seconds N --hard-deadline-seconds N\n  watchdog-fixture verify-default-allowed-env --cowboy PATH --workspace DIR --deadline-seconds N\n  watchdog-fixture verify --cowboy PATH --workspace DIR --response-timeout-seconds N --cancel-timeout-seconds N --recovery-operation-timeout-seconds N --soft-deadline-seconds N --hard-deadline-seconds N\n  watchdog-fixture cleanup --workspace DIR"
     );
+}
+
+fn parse_probe_environment_args(args: Vec<String>) -> anyhow::Result<ProbeEnvironmentArgs> {
+    let mut output = None;
+    let mut profile = EnvironmentProfile::Synthetic;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--output" => output = Some(PathBuf::from(value)),
+            "--environment-profile" => profile = EnvironmentProfile::parse(value)?,
+            _ => bail!("unknown probe-environment option '{arg}'"),
+        }
+        index += 2;
+    }
+    Ok(ProbeEnvironmentArgs {
+        output: output.ok_or_else(|| anyhow!("--output is required"))?,
+        profile,
+    })
+}
+
+fn parse_environment_serve_args(args: Vec<String>) -> anyhow::Result<EnvironmentServeArgs> {
+    let mut events = None;
+    let mut invocation_token = None;
+    let mut identity_dir = None;
+    let mut agent = None;
+    let mut profile = EnvironmentProfile::Synthetic;
+    let mut mode = Mode::AcknowledgeCancel;
+    let mut resume_session_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if let Some(value) = arg.strip_prefix("--resume=") {
+            resume_session_id = Some(value.to_owned());
+            index += 1;
+            continue;
+        }
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--events" => events = Some(PathBuf::from(value)),
+            "--invocation-token" => invocation_token = Some(value.to_owned()),
+            "--identity-dir" => identity_dir = Some(PathBuf::from(value)),
+            "--agent" => agent = Some(value.to_owned()),
+            "--environment-profile" => profile = EnvironmentProfile::parse(value)?,
+            "--mode" => mode = Mode::parse(value)?,
+            "--resume" => resume_session_id = Some(value.to_owned()),
+            _ => bail!("unknown serve-environment option '{arg}'"),
+        }
+        index += 2;
+    }
+    Ok(EnvironmentServeArgs {
+        events: events.ok_or_else(|| anyhow!("--events is required"))?,
+        invocation_token: invocation_token
+            .ok_or_else(|| anyhow!("--invocation-token is required"))?,
+        identity_dir: identity_dir.ok_or_else(|| anyhow!("--identity-dir is required"))?,
+        agent: agent.ok_or_else(|| anyhow!("--agent is required"))?,
+        profile,
+        mode,
+        resume_session_id,
+    })
 }
 
 fn parse_serve_args(args: Vec<String>) -> anyhow::Result<ServeArgs> {
@@ -204,6 +369,34 @@ fn parse_verify_args(args: Vec<String>) -> anyhow::Result<VerifyArgs> {
     })
 }
 
+fn parse_default_environment_verify_args(
+    args: Vec<String>,
+) -> anyhow::Result<DefaultEnvironmentVerifyArgs> {
+    let mut cowboy = None;
+    let mut workspace = None;
+    let mut deadline_seconds = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+        match arg.as_str() {
+            "--cowboy" => cowboy = Some(PathBuf::from(value)),
+            "--workspace" => workspace = Some(PathBuf::from(value)),
+            "--deadline-seconds" => deadline_seconds = Some(parse_seconds(arg, value)?),
+            _ => bail!("unknown verify-default-allowed-env option '{arg}'"),
+        }
+        index += 2;
+    }
+    Ok(DefaultEnvironmentVerifyArgs {
+        cowboy: cowboy.ok_or_else(|| anyhow!("--cowboy is required"))?,
+        workspace: workspace.ok_or_else(|| anyhow!("--workspace is required"))?,
+        deadline_seconds: deadline_seconds
+            .ok_or_else(|| anyhow!("--deadline-seconds is required"))?,
+    })
+}
+
 fn parse_cleanup_args(args: Vec<String>) -> anyhow::Result<PathBuf> {
     match args.as_slice() {
         [flag, value] if flag == "--workspace" => Ok(PathBuf::from(value)),
@@ -220,7 +413,39 @@ fn parse_seconds(name: &str, value: &str) -> anyhow::Result<u64> {
 }
 
 fn serve(args: ServeArgs) -> anyhow::Result<()> {
-    fs::create_dir_all(&args.identity_dir)?;
+    serve_inner(
+        args.events,
+        args.invocation_token,
+        args.identity_dir,
+        args.resume_session_id,
+        args.mode,
+        None,
+    )
+}
+
+fn serve_environment(args: EnvironmentServeArgs) -> anyhow::Result<()> {
+    serve_inner(
+        args.events,
+        args.invocation_token,
+        args.identity_dir,
+        args.resume_session_id,
+        args.mode,
+        Some(EnvironmentServe {
+            agent: args.agent,
+            profile: args.profile,
+        }),
+    )
+}
+
+fn serve_inner(
+    events_path: PathBuf,
+    invocation_token: String,
+    identity_dir: PathBuf,
+    resume_session_id: Option<String>,
+    mode: Mode,
+    environment: Option<EnvironmentServe>,
+) -> anyhow::Result<()> {
+    fs::create_dir_all(&identity_dir)?;
     let executable = canonical_current_exe()?;
     let start_nonce = Uuid::new_v4().to_string();
     let pid = std::process::id();
@@ -228,12 +453,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     listener.set_nonblocking(true)?;
     let identity = Identity {
         endpoint: listener.local_addr()?.to_string(),
-        invocation_token: args.invocation_token.clone(),
+        invocation_token: invocation_token.clone(),
         start_nonce,
         pid,
         executable,
     };
-    let identity_path = args.identity_dir.join(format!("{pid}.json"));
+    let identity_path = identity_dir.join(format!("{pid}.json"));
     write_json(&identity_path, &identity)?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let endpoint_shutdown = Arc::clone(&shutdown);
@@ -246,16 +471,18 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     };
     thread::spawn(move || identity_server(listener, endpoint_identity, endpoint_shutdown));
 
-    let mut events = EventWriter::new(&args.events)?;
+    let mut events = EventWriter::new(&events_path)?;
     events.record(
         "process_started",
         json!({
             "pid": pid,
             "start_nonce": identity.start_nonce,
-            "invocation_token": args.invocation_token,
+            "invocation_token": invocation_token,
             "executable": identity.executable,
             "endpoint": identity.endpoint,
-            "resume_session_id": args.resume_session_id,
+            "resume_session_id": resume_session_id,
+            "agent": environment.as_ref().map(|environment| &environment.agent),
+            "environment": environment.as_ref().map(|environment| environment_state(environment.profile)),
         }),
     )?;
 
@@ -269,8 +496,12 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     });
     let stdout = io::stdout();
     let mut output = BufWriter::new(stdout.lock());
-    let mut pending_prompt = None;
-    let mut session_id = args.resume_session_id.clone();
+    let mut request_state = RequestState {
+        session_id: resume_session_id,
+        pending_prompt: None,
+        environment,
+        environment_prompt_count: 0,
+    };
     while !shutdown.load(Ordering::SeqCst) {
         let Ok(line) = line_rx.recv_timeout(Duration::from_millis(50)) else {
             continue;
@@ -295,11 +526,10 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
                 .pointer("/params/prompt/0/text")
                 .and_then(Value::as_str)
                 .is_some_and(|text| text.contains("Create a compact title-bar topic"));
-        handle_request(
+        handle_request_with_environment(
             &request,
-            args.mode,
-            &mut session_id,
-            &mut pending_prompt,
+            mode,
+            &mut request_state,
             &mut output,
             &mut events,
         )?;
@@ -315,11 +545,31 @@ fn serve(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn handle_request(
     request: &Value,
     mode: Mode,
     session_id: &mut Option<String>,
     pending_prompt: &mut Option<u64>,
+    output: &mut impl Write,
+    events: &mut EventWriter,
+) -> anyhow::Result<()> {
+    let mut state = RequestState {
+        session_id: session_id.clone(),
+        pending_prompt: *pending_prompt,
+        environment: None,
+        environment_prompt_count: 0,
+    };
+    handle_request_with_environment(request, mode, &mut state, output, events)?;
+    *session_id = state.session_id;
+    *pending_prompt = state.pending_prompt;
+    Ok(())
+}
+
+fn handle_request_with_environment(
+    request: &Value,
+    mode: Mode,
+    state: &mut RequestState,
     output: &mut impl Write,
     events: &mut EventWriter,
 ) -> anyhow::Result<()> {
@@ -344,7 +594,7 @@ fn handle_request(
         }
         "session/new" => {
             let new_id = format!("watchdog-{}", Uuid::new_v4());
-            *session_id = Some(new_id.clone());
+            state.session_id = Some(new_id.clone());
             events.record("session_created", json!({ "session_id": new_id }))?;
             respond(
                 output,
@@ -355,15 +605,18 @@ fn handle_request(
         "session/load" => {
             let loaded =
                 request_session.ok_or_else(|| anyhow!("session/load requires sessionId"))?;
-            *session_id = Some(loaded.clone());
-            events.record("session_loaded", json!({ "session_id": loaded }))?;
+            state.session_id = Some(loaded.clone());
+            events.record(
+                "session_loaded",
+                json!({ "session_id": loaded, "pid": std::process::id() }),
+            )?;
             respond(output, id, json!({ "configOptions": [] }))?;
         }
         "session/prompt" => {
             let current =
                 request_session.ok_or_else(|| anyhow!("session/prompt requires sessionId"))?;
             ensure!(
-                session_id.as_deref() == Some(current.as_str()),
+                state.session_id.as_deref() == Some(current.as_str()),
                 "session/prompt used an unknown session"
             );
             let text = request
@@ -383,6 +636,20 @@ fn handle_request(
                     "text": text,
                 }),
             )?;
+            if let Some(environment) = state.environment.clone() {
+                handle_environment_prompt(
+                    EnvironmentPrompt {
+                        text,
+                        session_id: &current,
+                        id,
+                    },
+                    &environment,
+                    state,
+                    output,
+                    events,
+                )?;
+                return Ok(());
+            }
             if text.contains("Create a compact title-bar topic") {
                 notify(
                     output,
@@ -447,14 +714,14 @@ fn handle_request(
                         json!({ "session_id": current, "tool_call_id": "watchdog-tool-1" }),
                     )?;
                 }
-                *pending_prompt = id;
+                state.pending_prompt = id;
             }
         }
         "session/cancel" => {
             let current =
                 request_session.ok_or_else(|| anyhow!("session/cancel requires sessionId"))?;
             ensure!(
-                session_id.as_deref() == Some(current.as_str()),
+                state.session_id.as_deref() == Some(current.as_str()),
                 "session/cancel used an unknown session"
             );
             events.record(
@@ -465,7 +732,7 @@ fn handle_request(
                 }),
             )?;
             if mode == Mode::AcknowledgeCancel {
-                if let Some(prompt_id) = pending_prompt.take() {
+                if let Some(prompt_id) = state.pending_prompt.take() {
                     respond(
                         output,
                         Some(prompt_id),
@@ -477,7 +744,7 @@ fn handle_request(
                 // The real backend acknowledges a cancel by ending the turn
                 // normally with a trailing notice instead of reporting
                 // `cancelled`.
-                if let Some(prompt_id) = pending_prompt.take() {
+                if let Some(prompt_id) = state.pending_prompt.take() {
                     notify(
                         output,
                         "session/update",
@@ -501,6 +768,138 @@ fn handle_request(
         }
     }
     Ok(())
+}
+
+fn handle_environment_prompt(
+    prompt: EnvironmentPrompt<'_>,
+    environment: &EnvironmentServe,
+    state: &mut RequestState,
+    output: &mut impl Write,
+    events: &mut EventWriter,
+) -> anyhow::Result<()> {
+    state.environment_prompt_count += 1;
+    if prompt.text == "Continue" {
+        notify(
+            output,
+            "session/update",
+            json!({
+                "sessionId": prompt.session_id,
+                "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": RECOVERY_TEXT } }
+            }),
+        )?;
+        respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+        events.record(
+            "environment_continue_completed",
+            json!({
+                "session_id": prompt.session_id,
+                "agent": environment.agent,
+                "pid": std::process::id(),
+            }),
+        )?;
+        return Ok(());
+    }
+    if environment.agent == "planner"
+        && prompt.text.contains("planner retry")
+        && state.environment_prompt_count == 1
+    {
+        notify(
+            output,
+            "session/update",
+            json!({
+                "sessionId": prompt.session_id,
+                "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": "retry without required frontmatter" } }
+            }),
+        )?;
+        respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+        events.record(
+            "environment_retry_requested",
+            json!({
+                "session_id": prompt.session_id,
+                "agent": environment.agent,
+                "pid": std::process::id(),
+            }),
+        )?;
+        return Ok(());
+    }
+    if environment.agent == "planner" && prompt.text.contains("planner watchdog") {
+        state.pending_prompt = prompt.id;
+        events.record(
+            "environment_watchdog_stalled",
+            json!({
+                "session_id": prompt.session_id,
+                "agent": environment.agent,
+                "pid": std::process::id(),
+            }),
+        )?;
+        return Ok(());
+    }
+    let body = format!(
+        "---\nstatus: success\nsummary: environment {} completed\n---\nenvironment {} completed",
+        environment.agent, environment.agent
+    );
+    notify(
+        output,
+        "session/update",
+        json!({
+            "sessionId": prompt.session_id,
+            "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": body } }
+        }),
+    )?;
+    respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+    events.record(
+        "environment_prompt_completed",
+        json!({
+            "session_id": prompt.session_id,
+            "agent": environment.agent,
+            "environment": environment_state(environment.profile),
+        }),
+    )?;
+    Ok(())
+}
+
+fn probe_environment(args: ProbeEnvironmentArgs) -> anyhow::Result<()> {
+    let state = environment_state(args.profile);
+    write_json(&args.output, &state)?;
+    println!("{}", environment_state_line(args.profile, &state));
+    Ok(())
+}
+
+fn environment_state(profile: EnvironmentProfile) -> serde_json::Map<String, Value> {
+    profile
+        .names()
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                Value::String(
+                    if std::env::var_os(name).is_some() {
+                        "set"
+                    } else {
+                        "missing"
+                    }
+                    .to_owned(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn environment_state_line(
+    profile: EnvironmentProfile,
+    state: &serde_json::Map<String, Value>,
+) -> String {
+    profile
+        .names()
+        .iter()
+        .map(|name| {
+            let state = state
+                .get(*name)
+                .and_then(Value::as_str)
+                .unwrap_or("missing");
+            format!("{name}={state}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn respond(output: &mut impl Write, id: Option<u64>, result: Value) -> anyhow::Result<()> {
@@ -573,6 +972,515 @@ fn verify(args: VerifyArgs) -> anyhow::Result<()> {
     verify_with_scenario_runner(&args, run_scenario)
 }
 
+fn verify_environment(args: VerifyArgs) -> anyhow::Result<()> {
+    prepare_environment_workspace(&args.workspace, &args.cowboy)?;
+    let result = (|| {
+        write_allowed_environment_files(&args)?;
+        let run = run_cowboy(
+            &args.cowboy,
+            &args.workspace,
+            ["run", "--workflow", "allowed_env", "allowed env smoke"],
+            "cowboy-run",
+            &SYNTHETIC_ENVIRONMENT_VALUES,
+            args.soft_deadline_seconds,
+        )?;
+        let run_id = run_id_from_stdout(&run.stdout)?;
+        run_cowboy(
+            &args.cowboy,
+            &args.workspace,
+            ["answer", &run_id, "continue", "continue"],
+            "cowboy-answer",
+            &SYNTHETIC_ENVIRONMENT_VALUES,
+            args.hard_deadline_seconds,
+        )?;
+        let export = Command::new(fs::canonicalize(&args.cowboy)?)
+            .current_dir(&args.workspace)
+            .args(["--config", "config.toml", "export", &run_id])
+            .envs(SYNTHETIC_ENVIRONMENT_VALUES)
+            .output()
+            .context("export allowed environment smoke run")?;
+        ensure!(export.status.success(), "allowed environment export failed");
+        let generated_export = fs::read_dir(&args.workspace)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("cowboy-export-") && name.ends_with(".html")
+                    })
+            })
+            .ok_or_else(|| anyhow!("allowed environment export was not written"))?;
+        fs::rename(generated_export, args.workspace.join("export.html"))?;
+
+        let command = read_environment_matrix(&args.workspace.join("command-matrix.json"))?;
+        assert_environment_matrix(
+            &command,
+            &[
+                ("COWBOY_TEST_GLOBAL", "set"),
+                ("COWBOY_TEST_PLANNER", "missing"),
+                ("COWBOY_TEST_IMPLEMENTER", "missing"),
+                ("COWBOY_TEST_UNAPPROVED", "missing"),
+            ],
+        )?;
+        let events = read_events(&args.workspace.join("fixture-events.jsonl"))?;
+        assert_agent_environment(&events, "planner", true, false)?;
+        assert_agent_environment(&events, "implementer", false, true)?;
+        assert_environment_lifecycle(&events)?;
+        assert_environment_artifacts_clean(&args.workspace)?;
+        println!("command global=set planner=missing implementer=missing unapproved=missing");
+        println!(
+            "planner.retry global=set planner=set implementer=missing unapproved=missing same_pid=true"
+        );
+        println!(
+            "planner.resume global=set planner=set implementer=missing unapproved=missing session_loaded=true"
+        );
+        println!(
+            "planner.replacement global=set planner=set implementer=missing unapproved=missing resumed_session=true old_pid_exited=true"
+        );
+        println!("implementer global=set planner=missing implementer=set unapproved=missing");
+        println!(
+            "artifacts sqlite=clean events=clean logs=clean fixture_jsonl=clean stdout_stderr=clean export=clean"
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => cleanup(&args.workspace),
+        Err(error) => Err(error.context(format!(
+            "allowed env evidence preserved at {}",
+            args.workspace.display()
+        ))),
+    }
+}
+
+fn verify_default_allowed_env(args: DefaultEnvironmentVerifyArgs) -> anyhow::Result<()> {
+    prepare_environment_workspace(&args.workspace, &args.cowboy)?;
+    let result = (|| {
+        let started = Instant::now();
+        write_default_environment_files(&args)?;
+        let values = default_environment_values(&args.workspace)?;
+        let value_refs: Vec<_> = values
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let output = run_cowboy(
+            &args.cowboy,
+            &args.workspace,
+            [
+                "run",
+                "--workflow",
+                "default_allowed_env",
+                "default allowed env smoke",
+            ],
+            "cowboy",
+            &value_refs,
+            args.deadline_seconds,
+        )?;
+        ensure!(
+            output.status.success(),
+            "default allowed environment smoke run failed"
+        );
+        ensure!(
+            started.elapsed() <= Duration::from_secs(args.deadline_seconds),
+            "default allowed environment smoke run exceeded {} seconds",
+            args.deadline_seconds
+        );
+        let command = read_environment_matrix(&args.workspace.join("command-matrix.json"))?;
+        assert_environment_matrix(
+            &command,
+            &[
+                ("PATH", "set"),
+                ("PATHEXT", "set"),
+                ("SystemRoot", "set"),
+                ("USERPROFILE", "set"),
+                ("LOCALAPPDATA", "set"),
+                ("APPDATA", "set"),
+                ("TEMP", "set"),
+                ("TMP", "set"),
+                ("COWBOY_TEST_UNAPPROVED", "missing"),
+            ],
+        )?;
+        let events = read_events(&args.workspace.join("fixture-events.jsonl"))?;
+        let agent = events
+            .iter()
+            .find(|event| event.event == "process_started")
+            .ok_or_else(|| anyhow!("default environment fixture did not start"))?;
+        let state = agent.details["environment"]
+            .as_object()
+            .ok_or_else(|| anyhow!("default environment fixture did not record its environment"))?;
+        assert_environment_matrix(
+            state,
+            &[
+                ("PATH", "set"),
+                ("PATHEXT", "set"),
+                ("SystemRoot", "set"),
+                ("USERPROFILE", "set"),
+                ("LOCALAPPDATA", "set"),
+                ("APPDATA", "set"),
+                ("TEMP", "set"),
+                ("TMP", "set"),
+                ("COWBOY_TEST_UNAPPROVED", "missing"),
+            ],
+        )?;
+        println!(
+            "omitted_allowed_env command=started default_agent=started defaults=8 unapproved=missing workflow=success"
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => cleanup(&args.workspace),
+        Err(error) => Err(error.context(format!(
+            "default allowed env evidence preserved at {}",
+            args.workspace.display()
+        ))),
+    }
+}
+
+fn prepare_environment_workspace(workspace: &Path, cowboy: &Path) -> anyhow::Result<()> {
+    ensure!(
+        !workspace.exists(),
+        "refusing to overwrite existing smoke workspace {}",
+        workspace.display()
+    );
+    ensure!(
+        cowboy.is_file(),
+        "Cowboy binary does not exist: {}",
+        cowboy.display()
+    );
+    fs::create_dir_all(workspace.join("identities"))?;
+    fs::create_dir_all(workspace.join("workflows"))?;
+    fs::create_dir_all(workspace.join("state"))?;
+    fs::write(workspace.join(".cowboy-watchdog-smoke"), WORKSPACE_MARKER)?;
+    Ok(())
+}
+
+fn write_allowed_environment_files(args: &VerifyArgs) -> anyhow::Result<()> {
+    let fixture = canonical_current_exe()?;
+    let workspace = &args.workspace;
+    let quote = |path: &Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    let fixture = serde_json::to_string(&fixture)?;
+    let events = quote(Path::new("fixture-events.jsonl"));
+    let identities = quote(Path::new("identities"));
+    let token = Uuid::new_v4().to_string();
+    let config = format!(
+        "state_dir = {state}\nworkflow_store = {store}\nworkflow_dirs = [{workflows}]\nallowed_env = [\"COWBOY_TEST_GLOBAL\"]\n\n[[agents]]\nname = \"default\"\ncommand = {fixture}\nargs = [\"serve-environment\", \"--agent\", \"default\", \"--events\", {events}, \"--invocation-token\", \"{token}\", \"--identity-dir\", {identities}]\n\n[agents.model]\nid = \"fixture\"\nprovider = \"fixture\"\n\n[[agents]]\nname = \"planner\"\ncommand = {fixture}\nargs = [\"serve-environment\", \"--agent\", \"planner\", \"--mode\", \"ignore-cancel\", \"--events\", {events}, \"--invocation-token\", \"{token}\", \"--identity-dir\", {identities}]\nallowed_env = [\"COWBOY_TEST_PLANNER\"]\n\n[agents.model]\nid = \"fixture\"\nprovider = \"fixture\"\n\n[agents.watchdog]\nresponse_timeout_seconds = {response}\ncancel_timeout_seconds = {cancel}\nrecovery_operation_timeout_seconds = {recovery}\n\n[[agents]]\nname = \"implementer\"\ncommand = {fixture}\nargs = [\"serve-environment\", \"--agent\", \"implementer\", \"--events\", {events}, \"--invocation-token\", \"{token}\", \"--identity-dir\", {identities}]\nallowed_env = [\"COWBOY_TEST_IMPLEMENTER\"]\n\n[agents.model]\nid = \"fixture\"\nprovider = \"fixture\"\n",
+        state = quote(Path::new("state")),
+        store = quote(Path::new("state/data.db")),
+        workflows = quote(Path::new("workflows")),
+        response = args.response_timeout_seconds,
+        cancel = args.cancel_timeout_seconds,
+        recovery = args.recovery_operation_timeout_seconds,
+    );
+    fs::write(workspace.join("config.toml"), config)?;
+    let probe = serde_json::to_string(&canonical_current_exe()?)?;
+    let matrix = serde_json::to_string("command-matrix.json")?;
+    fs::write(
+        workspace.join("workflows/allowed_env.lua"),
+        format!(
+            "local planner = role(\"planner\", {{ agent = \"planner\", instructions = \"Return the requested result.\" }})\nlocal implementer = role(\"implementer\", {{ agent = \"implementer\", instructions = \"Return the requested result.\" }})\nlocal command = step(\"command\", {{ run = function(ctx) return action.command {{ program = {probe}, args = {{ \"probe-environment\", \"--output\", {matrix} }} }} end }})\nlocal retry = step(\"retry\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner retry\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal ask = step(\"ask\", {{ run = function(ctx) return action.ask_user {{ id = \"continue\", message = \"Continue?\", choices = {{ continue = \"Continue\" }} }} end }})\nlocal resumed = step(\"resumed\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner resumed\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal watchdog = step(\"watchdog\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner watchdog\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal implement = step(\"implement\", {{ role = implementer, run = function(ctx) return action.agent {{ role = implementer, prompt = \"implement\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal done = step(\"done\", {{ run = function(ctx) return action.status {{ status = \"success\", fields = ctx.prev.fields, body = ctx.prev.body }} end }})\ncommand:on(\"success\", retry)\nretry:on(\"success\", ask)\nask:on(\"answered\", resumed)\nresumed:on(\"success\", watchdog)\nwatchdog:on(\"success\", implement)\nimplement:on(\"success\", done)\nreturn workflow(\"allowed_env\", command)\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn write_default_environment_files(args: &DefaultEnvironmentVerifyArgs) -> anyhow::Result<()> {
+    let fixture = serde_json::to_string(&canonical_current_exe()?)?;
+    let workspace = &args.workspace;
+    let quote = |path: &Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+    let events = quote(Path::new("fixture-events.jsonl"));
+    let identities = quote(Path::new("identities"));
+    let token = Uuid::new_v4().to_string();
+    fs::write(
+        workspace.join("config.toml"),
+        format!(
+            "state_dir = {state}\nworkflow_store = {store}\nworkflow_dirs = [{workflows}]\n\n[[agents]]\nname = \"default\"\ncommand = {fixture}\nargs = [\"serve-environment\", \"--agent\", \"default\", \"--environment-profile\", \"default\", \"--events\", {events}, \"--invocation-token\", \"{token}\", \"--identity-dir\", {identities}]\n\n[agents.model]\nid = \"fixture\"\nprovider = \"fixture\"\n",
+            state = quote(Path::new("state")),
+            store = quote(Path::new("state/data.db")),
+            workflows = quote(Path::new("workflows")),
+        ),
+    )?;
+    let probe = serde_json::to_string(&canonical_current_exe()?)?;
+    let matrix = serde_json::to_string("command-matrix.json")?;
+    fs::write(
+        workspace.join("workflows/default_allowed_env.lua"),
+        format!(
+            "local fixture = role(\"fixture\", {{ agent = \"default\", instructions = \"Return the requested result.\" }})\nlocal command = step(\"command\", {{ run = function(ctx) return action.command {{ program = {probe}, args = {{ \"probe-environment\", \"--environment-profile\", \"default\", \"--output\", {matrix} }} }} end }})\nlocal agent = step(\"agent\", {{ role = fixture, run = function(ctx) return action.agent {{ role = fixture, prompt = \"default environment\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal done = step(\"done\", {{ run = function(ctx) return action.status {{ status = \"success\", fields = ctx.prev.fields, body = ctx.prev.body }} end }})\ncommand:on(\"success\", agent)\nagent:on(\"success\", done)\nreturn workflow(\"default_allowed_env\", command)\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn run_cowboy<const N: usize>(
+    cowboy: &Path,
+    workspace: &Path,
+    args: [&str; N],
+    artifact_stem: &str,
+    environment: &[(&str, &str)],
+    deadline_seconds: u64,
+) -> anyhow::Result<std::process::Output> {
+    let mut child = Command::new(fs::canonicalize(cowboy)?)
+        .current_dir(workspace)
+        .arg("--config")
+        .arg("config.toml")
+        .args(args)
+        .envs(environment.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("run Cowboy {}", args.join(" ")))?;
+    let started = Instant::now();
+    while child.try_wait()?.is_none() {
+        if started.elapsed() > Duration::from_secs(deadline_seconds) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "Cowboy {} exceeded {} seconds",
+                args.join(" "),
+                deadline_seconds
+            );
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let output = child.wait_with_output()?;
+    fs::write(
+        workspace.join(format!("{artifact_stem}.stdout")),
+        &output.stdout,
+    )?;
+    fs::write(
+        workspace.join(format!("{artifact_stem}.stderr")),
+        &output.stderr,
+    )?;
+    ensure!(output.status.success(), "Cowboy {} failed", args.join(" "));
+    Ok(output)
+}
+
+fn run_id_from_stdout(stdout: &[u8]) -> anyhow::Result<String> {
+    let text = std::str::from_utf8(stdout).context("Cowboy run stdout was not UTF-8")?;
+    text.lines()
+        .map(str::trim)
+        .find_map(|line| {
+            line.strip_prefix("run=")
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| anyhow!("Cowboy run stdout did not contain a run id"))
+}
+
+fn default_environment_values(workspace: &Path) -> anyhow::Result<Vec<(&'static str, String)>> {
+    let mut values = Vec::new();
+    for name in &DEFAULT_ENVIRONMENT_NAMES[..8] {
+        let value = std::env::var(name).unwrap_or_else(|_| {
+            workspace
+                .join(format!("{name}-placeholder"))
+                .to_string_lossy()
+                .into_owned()
+        });
+        #[cfg(windows)]
+        ensure!(
+            *name != "SystemRoot" || std::env::var_os(name).is_some(),
+            "SystemRoot must be set for the default allowed-env verifier on Windows"
+        );
+        values.push((*name, value));
+    }
+    values.push((
+        "COWBOY_TEST_UNAPPROVED",
+        "cowboy-default-unapproved-marker".to_owned(),
+    ));
+    Ok(values)
+}
+
+fn read_environment_matrix(path: &Path) -> anyhow::Result<serde_json::Map<String, Value>> {
+    let value: Value = serde_json::from_reader(
+        File::open(path).with_context(|| format!("open command matrix {}", path.display()))?,
+    )?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow!("command matrix is not a JSON object"))
+}
+
+fn assert_environment_matrix(
+    state: &serde_json::Map<String, Value>,
+    expected: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    for (name, expected_state) in expected {
+        ensure!(
+            state.get(*name).and_then(Value::as_str) == Some(*expected_state),
+            "environment state for {name} was not {expected_state}"
+        );
+    }
+    Ok(())
+}
+
+fn assert_agent_environment(
+    events: &[FixtureEvent],
+    agent: &str,
+    planner_set: bool,
+    implementer_set: bool,
+) -> anyhow::Result<()> {
+    let starts: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.event == "process_started" && event.details["agent"].as_str() == Some(agent)
+        })
+        .collect();
+    ensure!(!starts.is_empty(), "{agent} fixture never started");
+    for event in starts {
+        let state = event.details["environment"]
+            .as_object()
+            .ok_or_else(|| anyhow!("{agent} fixture did not record environment state"))?;
+        assert_environment_matrix(
+            state,
+            &[
+                ("COWBOY_TEST_GLOBAL", "set"),
+                (
+                    "COWBOY_TEST_PLANNER",
+                    if planner_set { "set" } else { "missing" },
+                ),
+                (
+                    "COWBOY_TEST_IMPLEMENTER",
+                    if implementer_set { "set" } else { "missing" },
+                ),
+                ("COWBOY_TEST_UNAPPROVED", "missing"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn assert_environment_lifecycle(events: &[FixtureEvent]) -> anyhow::Result<()> {
+    let planner_pids: Vec<u32> = events
+        .iter()
+        .filter(|event| {
+            event.event == "process_started" && event.details["agent"].as_str() == Some("planner")
+        })
+        .filter_map(|event| event.details["pid"].as_u64().map(|pid| pid as u32))
+        .collect();
+    ensure!(
+        planner_pids.len() >= 3,
+        "planner did not start for initial, resumed, and replacement sessions"
+    );
+    let retry_pid = events
+        .iter()
+        .find(|event| event.event == "environment_retry_requested")
+        .and_then(|event| event.details["pid"].as_u64())
+        .ok_or_else(|| anyhow!("planner did not request the recoverable retry"))?
+        as u32;
+    let retry_prompts = events
+        .iter()
+        .filter(|event| {
+            event.event == "prompt_received"
+                && event.details["pid"].as_u64() == Some(retry_pid as u64)
+                && event.details["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("planner retry"))
+        })
+        .count();
+    ensure!(
+        retry_prompts >= 2,
+        "planner retry did not remain on the original fixture process"
+    );
+
+    let loaded_pid = events
+        .iter()
+        .find(|event| event.event == "session_loaded")
+        .and_then(|event| event.details["pid"].as_u64())
+        .ok_or_else(|| anyhow!("persisted resume did not load a planner session"))?
+        as u32;
+    ensure!(
+        loaded_pid != retry_pid,
+        "persisted CLI resume reused the original planner process"
+    );
+    let stalled_pid = events
+        .iter()
+        .find(|event| event.event == "environment_watchdog_stalled")
+        .and_then(|event| event.details["pid"].as_u64())
+        .ok_or_else(|| anyhow!("planner watchdog scenario did not stall"))?
+        as u32;
+    let replacement = events
+        .iter()
+        .filter(|event| {
+            event.event == "process_started"
+                && event.details["agent"].as_str() == Some("planner")
+                && event.details["resume_session_id"].is_string()
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        replacement.len() == 1,
+        "watchdog hard recovery did not start exactly one resumed planner replacement"
+    );
+    let replacement_pid = replacement[0].details["pid"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("replacement fixture had no PID"))? as u32;
+    ensure!(
+        replacement_pid != stalled_pid && !process_is_alive(stalled_pid),
+        "watchdog hard recovery did not terminate the stalled planner process"
+    );
+    Ok(())
+}
+
+fn assert_environment_artifacts_clean(workspace: &Path) -> anyhow::Result<()> {
+    let artifact_groups = [
+        (
+            "sqlite",
+            vec![
+                workspace.join("state/data.db"),
+                workspace.join("state/data.db-wal"),
+                workspace.join("state/data.db-shm"),
+            ],
+        ),
+        (
+            "events",
+            files_in_directory(&workspace.join("state/events"))?,
+        ),
+        ("logs", files_in_directory(&workspace.join("state/logs"))?),
+        (
+            "fixture_jsonl",
+            vec![
+                workspace.join("fixture-events.jsonl"),
+                workspace.join("command-matrix.json"),
+            ],
+        ),
+        (
+            "stdout_stderr",
+            vec![
+                workspace.join("cowboy-run.stdout"),
+                workspace.join("cowboy-run.stderr"),
+                workspace.join("cowboy-answer.stdout"),
+                workspace.join("cowboy-answer.stderr"),
+            ],
+        ),
+        ("export", vec![workspace.join("export.html")]),
+    ];
+    for (group, files) in artifact_groups {
+        for path in files {
+            if !path.exists() {
+                continue;
+            }
+            let contents = fs::read(&path)
+                .with_context(|| format!("read {group} artifact {}", path.display()))?;
+            for (_, marker) in SYNTHETIC_ENVIRONMENT_VALUES {
+                ensure!(
+                    !contents
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes()),
+                    "{group} artifact leaked an environment marker: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn files_in_directory(directory: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    fs::read_dir(directory)?
+        .map(|entry| Ok(entry?.path()))
+        .collect()
+}
 fn verify_with_scenario_runner(
     args: &VerifyArgs,
     mut scenario_runner: impl FnMut(&VerifyArgs, &str, Mode, u64) -> anyhow::Result<()>,
@@ -872,19 +1780,58 @@ fn cleanup(workspace: &Path) -> anyhow::Result<()> {
 
 fn find_identity_files(workspace: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
+    inspect_identity_directory(&workspace.join("identities"), &mut files)?;
     for scenario in ["soft", "hard", "end-turn-cancel"] {
-        let directory = workspace.join(scenario).join("identities");
-        if !directory.exists() {
+        let scenario_directory = workspace.join(scenario);
+        if !path_exists_without_following(&scenario_directory)? {
             continue;
         }
-        for entry in fs::read_dir(directory)? {
-            let path = entry?.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
-                files.push(path);
-            }
-        }
+        ensure_regular_directory(&scenario_directory)?;
+        inspect_identity_directory(&scenario_directory.join("identities"), &mut files)?;
     }
     Ok(files)
+}
+
+fn inspect_identity_directory(directory: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    if !path_exists_without_following(directory)? {
+        return Ok(());
+    }
+    ensure_regular_directory(directory)?;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("read identity metadata {}", path.display()))?;
+        ensure!(
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+            "identity entry must be a regular .json file: {}",
+            path.display()
+        );
+        files.push(path);
+    }
+    Ok(())
+}
+
+fn path_exists_without_following(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn ensure_regular_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("read identity directory metadata {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "identity directory must be a non-symlink directory: {}",
+        path.display()
+    );
+    Ok(())
 }
 
 fn cleanup_identity(path: &Path) -> anyhow::Result<()> {
@@ -932,15 +1879,53 @@ fn process_is_alive(pid: u32) -> bool {
     // SAFETY: signal 0 sends no signal; it only probes existence and
     // permission for `pid`, which is valid for any pid value.
     if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        #[cfg(target_os = "linux")]
+        {
+            return !linux_process_is_zombie(pid);
+        }
+        #[cfg(not(target_os = "linux"))]
         return true;
     }
     // A process we don't own (EPERM) still exists; only ESRCH means gone.
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "linux")]
+fn linux_process_is_zombie(pid: u32) -> bool {
+    fs::read_to_string(Path::new("/proc").join(pid.to_string()).join("stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .map(|(_, state)| state.starts_with('Z'))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
 fn process_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: The returned process handle is checked and closed, and the exit
+    // code pointer references a live local variable for the duration of the call.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let mut exit_code = 0;
+        let alive =
+            GetExitCodeProcess(process, &mut exit_code) != 0 && exit_code == STILL_ACTIVE as u32;
+        CloseHandle(process);
+        alive
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -974,11 +1959,34 @@ fn canonical_pid_executable(pid: u32) -> anyhow::Result<String> {
         .context("canonicalize recorded process executable")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
 fn canonical_pid_executable(pid: u32) -> anyhow::Result<String> {
-    fs::canonicalize(Path::new("/proc").join(pid.to_string()).join("exe"))
-        .map(|path| path.to_string_lossy().into_owned())
-        .context("canonicalize recorded process executable")
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+
+    // SAFETY: The process handle is checked and closed. The UTF-16 buffer and
+    // size pointer remain valid for the duration of QueryFullProcessImageNameW.
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        ensure!(!process.is_null(), "open recorded process {pid}");
+        let mut buffer = vec![0u16; 32_768];
+        let mut len = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut len);
+        CloseHandle(process);
+        ensure!(result != 0, "resolve executable path for pid {pid}");
+        let path = String::from_utf16(&buffer[..len as usize])
+            .context("process executable path was not valid UTF-16")?;
+        fs::canonicalize(path)
+            .map(|path| path.to_string_lossy().into_owned())
+            .context("canonicalize recorded process executable")
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn canonical_pid_executable(_pid: u32) -> anyhow::Result<String> {
+    bail!("process executable lookup is unsupported on this platform")
 }
 
 fn canonical_current_exe() -> anyhow::Result<String> {
@@ -1343,6 +2351,248 @@ mod tests {
         assert!(config.contains("\"serve\", \"--mode\", \"acknowledge-cancel\""));
         assert!(workflow.contains("status = { \"success\" }"));
         assert!(workflow.contains("required_fields = { \"summary\" }"));
+    }
+
+    #[test]
+    fn watchdog_fixture_generates_allowed_env_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("allowed-env");
+        fs::create_dir_all(workspace.join("identities")).unwrap();
+        fs::create_dir_all(workspace.join("workflows")).unwrap();
+        fs::create_dir_all(workspace.join("state")).unwrap();
+        fs::write(workspace.join(".cowboy-watchdog-smoke"), WORKSPACE_MARKER).unwrap();
+        let args = VerifyArgs {
+            workspace: workspace.clone(),
+            ..test_verify_args(workspace.clone())
+        };
+
+        write_allowed_environment_files(&args).unwrap();
+
+        let config = fs::read_to_string(workspace.join("config.toml")).unwrap();
+        let workflow = fs::read_to_string(workspace.join("workflows/allowed_env.lua")).unwrap();
+        assert!(config.contains("allowed_env = [\"COWBOY_TEST_GLOBAL\"]"));
+        assert!(config.contains("name = \"planner\""));
+        assert!(config.contains("allowed_env = [\"COWBOY_TEST_PLANNER\"]"));
+        assert!(config.contains("name = \"implementer\""));
+        assert!(config.contains("allowed_env = [\"COWBOY_TEST_IMPLEMENTER\"]"));
+        assert!(config.contains("--identity-dir"));
+        assert!(workflow.contains("probe-environment"));
+        assert!(workflow.contains("id = \"continue\""));
+        assert!(workflow.contains("planner watchdog"));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".cowboy-watchdog-smoke")).unwrap(),
+            WORKSPACE_MARKER
+        );
+        assert!(workspace.join("identities").is_dir());
+    }
+
+    #[test]
+    fn watchdog_fixture_environment_matrix_rejects_cross_role_leakage() {
+        let leaked = FixtureEvent {
+            event: "process_started".to_owned(),
+            details: json!({
+                "agent": "implementer",
+                "environment": {
+                    "COWBOY_TEST_GLOBAL": "set",
+                    "COWBOY_TEST_PLANNER": "set",
+                    "COWBOY_TEST_IMPLEMENTER": "set",
+                    "COWBOY_TEST_UNAPPROVED": "missing"
+                }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        assert!(assert_agent_environment(&[leaked], "implementer", false, true).is_err());
+    }
+
+    #[test]
+    fn watchdog_fixture_environment_artifact_scan_rejects_marker_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path();
+        fs::create_dir_all(workspace.join("state/events")).unwrap();
+        fs::write(
+            workspace.join("state/events/run.json"),
+            SYNTHETIC_ENVIRONMENT_VALUES[0].1,
+        )
+        .unwrap();
+
+        let error = assert_environment_artifacts_clean(workspace).unwrap_err();
+
+        assert!(error.to_string().contains("events artifact leaked"));
+    }
+
+    #[test]
+    fn watchdog_fixture_omitted_allowed_env_starts_command_and_default_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("default-allowed-env");
+        fs::create_dir_all(workspace.join("identities")).unwrap();
+        fs::create_dir_all(workspace.join("workflows")).unwrap();
+        fs::create_dir_all(workspace.join("state")).unwrap();
+        fs::write(workspace.join(".cowboy-watchdog-smoke"), WORKSPACE_MARKER).unwrap();
+        let args = DefaultEnvironmentVerifyArgs {
+            cowboy: std::env::current_exe().unwrap(),
+            workspace: workspace.clone(),
+            deadline_seconds: 20,
+        };
+
+        write_default_environment_files(&args).unwrap();
+
+        let config = fs::read_to_string(workspace.join("config.toml")).unwrap();
+        let workflow =
+            fs::read_to_string(workspace.join("workflows/default_allowed_env.lua")).unwrap();
+        assert!(!config.contains("allowed_env"));
+        assert!(config.contains("name = \"default\""));
+        assert!(workflow.contains("probe-environment"));
+        assert!(config.contains("serve-environment"));
+    }
+
+    #[test]
+    fn watchdog_fixture_cleanup_authenticates_allowed_env_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = marked_workspace(directory.path(), "allowed-env");
+        let mut child = launch_identity_fixture(&workspace);
+
+        cleanup(&workspace).unwrap();
+
+        assert!(child.wait().unwrap().success());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn watchdog_fixture_cleanup_authenticates_default_allowed_env_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = marked_workspace(directory.path(), "default-allowed-env");
+        let mut child = launch_identity_fixture(&workspace);
+
+        cleanup(&workspace).unwrap();
+
+        assert!(child.wait().unwrap().success());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn watchdog_fixture_cleanup_preserves_workspace_on_identity_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = marked_workspace(directory.path(), "mismatch");
+        let mut child = launch_identity_fixture(&workspace);
+        let identity_path = wait_for_identity(&workspace.join("identities"));
+        let original = fs::read_to_string(&identity_path).unwrap();
+        let mut altered: Identity = serde_json::from_str(&original).unwrap();
+        altered.start_nonce = "incorrect-nonce".to_owned();
+        write_json(&identity_path, &altered).unwrap();
+
+        assert!(cleanup(&workspace).is_err());
+        assert!(workspace.exists());
+        assert!(child.try_wait().unwrap().is_none());
+
+        fs::write(&identity_path, original).unwrap();
+        cleanup(&workspace).unwrap();
+        assert!(child.wait().unwrap().success());
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn watchdog_fixture_identity_discovery_rejects_symlink_and_non_regular_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = marked_workspace(directory.path(), "invalid-identities");
+        let identities = workspace.join("identities");
+        let outside = directory.path().join("outside.json");
+        fs::write(&outside, "{}").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, identities.join("linked.json")).unwrap();
+        #[cfg(not(unix))]
+        fs::create_dir(identities.join("linked.json")).unwrap();
+        fs::create_dir(identities.join("directory.json")).unwrap();
+
+        let error = find_identity_files(&workspace).unwrap_err();
+
+        assert!(error.to_string().contains("regular .json"));
+        assert!(workspace.exists());
+        assert!(outside.exists());
+    }
+
+    fn marked_workspace(parent: &Path, name: &str) -> PathBuf {
+        let workspace = parent.join(name);
+        fs::create_dir_all(workspace.join("identities")).unwrap();
+        fs::write(workspace.join(".cowboy-watchdog-smoke"), WORKSPACE_MARKER).unwrap();
+        workspace
+    }
+
+    fn launch_identity_fixture(workspace: &Path) -> std::process::Child {
+        let executable = fixture_executable_for_test();
+        let events = workspace
+            .join("fixture-events.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        let identities = workspace.join("identities").to_string_lossy().into_owned();
+        let child = Command::new(executable)
+            .args([
+                "serve",
+                "--mode",
+                "acknowledge-cancel",
+                "--events",
+                &events,
+                "--invocation-token",
+                "cleanup-test-token",
+                "--identity-dir",
+                &identities,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _ = wait_for_identity(&workspace.join("identities"));
+        child
+    }
+
+    fn fixture_executable_for_test() -> PathBuf {
+        if let Some(path) = std::env::var_os("CARGO_BIN_EXE_watchdog-fixture") {
+            return PathBuf::from(path);
+        }
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .unwrap();
+        let executable = workspace.join("target/debug/watchdog-fixture");
+        if executable.is_file() {
+            return executable;
+        }
+        let status = Command::new("cargo")
+            .current_dir(workspace)
+            .args([
+                "build",
+                "-p",
+                "cowboy-agent-acp",
+                "--bin",
+                "watchdog-fixture",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "build watchdog fixture for cleanup test");
+        executable
+    }
+
+    fn wait_for_identity(identities: &Path) -> PathBuf {
+        for _ in 0..200 {
+            if let Ok(entries) = fs::read_dir(identities)
+                && let Some(path) = entries
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                    })
+            {
+                return path;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "fixture did not write an identity record in {}",
+            identities.display()
+        );
     }
 
     #[test]

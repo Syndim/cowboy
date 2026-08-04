@@ -7,12 +7,12 @@
 
 pub mod app;
 pub mod config;
-pub mod process_exit;
 mod export;
+pub mod process_exit;
 pub mod resolution;
 pub mod run_summary;
 
 pub use app::run_tui;
 pub use config::{AppConfig, default_config_path, load_config};
-pub use process_exit::{DEFAULT_PROCESS_SHUTDOWN_TIMEOUT, run_with_bounded_shutdown};
 pub use export::{ExportResult, export_run};
+pub use process_exit::{DEFAULT_PROCESS_SHUTDOWN_TIMEOUT, run_with_bounded_shutdown};

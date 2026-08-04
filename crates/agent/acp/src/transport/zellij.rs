@@ -26,6 +26,7 @@ pub struct ZellijTransport {
     session: String,
     pane_id: String,
     zellij_command: String,
+    zellij_command_args: Vec<String>,
     /// Received JSON-RPC messages that have not been consumed yet.
     message_buffer: VecDeque<String>,
     /// Number of dump-screen lines already processed, used to avoid duplicate parsing.
@@ -39,19 +40,20 @@ impl ZellijTransport {
         config: &ZellijConfig,
         resume_session_id: Option<&str>,
     ) -> anyhow::Result<Self> {
-        Self::connect_with_command(config, resume_session_id, "zellij").await
+        Self::connect_with_command_args(config, resume_session_id, "zellij", Vec::new()).await
     }
 
-    async fn connect_with_command(
+    async fn connect_with_command_args(
         config: &ZellijConfig,
         resume_session_id: Option<&str>,
         zellij_command: impl Into<String>,
+        zellij_command_args: Vec<String>,
     ) -> anyhow::Result<Self> {
         let zellij_command = zellij_command.into();
 
         // 1. Attach to session (create if needed)
         if let Some(url) = &config.remote_url {
-            let mut attach_cmd = tokio::process::Command::new(&zellij_command);
+            let mut attach_cmd = zellij_process(&zellij_command, &zellij_command_args);
             attach_cmd.args(["attach", &format!("{url}/{}", config.session)]);
             if let Some(t) = &config.token {
                 attach_cmd.args(["--token", t]);
@@ -68,7 +70,8 @@ impl ZellijTransport {
             );
         } else {
             // Local: ensure session exists
-            let status = tokio::process::Command::new(&zellij_command)
+            let mut command = zellij_process(&zellij_command, &zellij_command_args);
+            let status = command
                 .args(["attach", "--create-background", &config.session])
                 .status()
                 .await?;
@@ -84,7 +87,8 @@ impl ZellijTransport {
             agent_cmd.push(format!("--resume={session_id}"));
         }
 
-        let pane_output = tokio::process::Command::new(&zellij_command)
+        let mut command = zellij_process(&zellij_command, &zellij_command_args);
+        let pane_output = command
             .args([
                 "--session",
                 &config.session,
@@ -119,6 +123,7 @@ impl ZellijTransport {
             session: config.session.clone(),
             pane_id,
             zellij_command,
+            zellij_command_args,
             message_buffer: VecDeque::new(),
             last_seen_line: 0,
         })
@@ -126,7 +131,8 @@ impl ZellijTransport {
 
     /// Dump the pane screen and extract new JSON-RPC lines
     async fn poll_screen(&mut self) -> anyhow::Result<()> {
-        let output = tokio::process::Command::new(&self.zellij_command)
+        let mut command = zellij_process(&self.zellij_command, &self.zellij_command_args);
+        let output = command
             .args([
                 "--session",
                 &self.session,
@@ -180,7 +186,8 @@ impl ZellijTransport {
 #[async_trait]
 impl Transport for ZellijTransport {
     async fn send(&mut self, message: &str) -> anyhow::Result<()> {
-        let status = tokio::process::Command::new(&self.zellij_command)
+        let mut command = zellij_process(&self.zellij_command, &self.zellij_command_args);
+        let status = command
             .args([
                 "--session",
                 &self.session,
@@ -231,7 +238,8 @@ impl Transport for ZellijTransport {
 
     async fn close(&mut self) -> anyhow::Result<()> {
         // Close the pane
-        let _ = tokio::process::Command::new(&self.zellij_command)
+        let mut command = zellij_process(&self.zellij_command, &self.zellij_command_args);
+        let _ = command
             .args([
                 "--session",
                 &self.session,
@@ -254,7 +262,8 @@ impl Transport for ZellijTransport {
     async fn force_terminate(&mut self) -> anyhow::Result<()> {
         let mut attempts = 0;
         let status = loop {
-            let result = tokio::process::Command::new(&self.zellij_command)
+            let mut command = zellij_process(&self.zellij_command, &self.zellij_command_args);
+            let result = command
                 .args([
                     "--session",
                     &self.session,
@@ -284,6 +293,12 @@ impl Transport for ZellijTransport {
     }
 }
 
+fn zellij_process(command: &str, command_args: &[String]) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new(command);
+    process.args(command_args);
+    process
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -291,6 +306,7 @@ impl Transport for ZellijTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::transport::TransportConfig;
 
     #[test]
@@ -328,6 +344,7 @@ mod tests {
             session: "test-session".into(),
             pane_id: "1".into(),
             zellij_command: "zellij".into(),
+            zellij_command_args: Vec::new(),
             message_buffer: VecDeque::new(),
             last_seen_line: 0,
         };
@@ -363,14 +380,6 @@ exit 0
             command_log.display()
         );
         std::fs::write(&fake_zellij, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_zellij).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_zellij, permissions).unwrap();
-        }
-
         let session_name = "test-zellij-session".to_string();
         let config = ZellijConfig {
             remote_url: None,
@@ -381,10 +390,14 @@ exit 0
             env: vec![],
         };
 
-        let mut transport =
-            ZellijTransport::connect_with_command(&config, None, fake_zellij.to_string_lossy())
-                .await
-                .unwrap();
+        let mut transport = ZellijTransport::connect_with_command_args(
+            &config,
+            None,
+            "sh",
+            vec![fake_zellij.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
         assert_eq!(transport.session(), &session_name);
         assert_eq!(transport.pane_id(), "pane-1");
 
@@ -408,17 +421,11 @@ exit 0
             command_log.display()
         );
         std::fs::write(&fake_zellij, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_zellij).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&fake_zellij, permissions).unwrap();
-        }
         let mut transport = ZellijTransport {
             session: "watchdog-session".to_string(),
             pane_id: "pane-1".to_string(),
-            zellij_command: fake_zellij.to_string_lossy().to_string(),
+            zellij_command: "sh".to_string(),
+            zellij_command_args: vec![fake_zellij.to_string_lossy().into_owned()],
             message_buffer: VecDeque::new(),
             last_seen_line: 0,
         };

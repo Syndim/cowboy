@@ -101,6 +101,7 @@ mod tests {
             command: format!("{name}-cmd"),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -134,6 +135,7 @@ mod tests {
                 "acp".to_string(),
             ],
             model: Some(ModelInfo::default()),
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
         };
         let resolver =

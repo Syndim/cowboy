@@ -68,6 +68,8 @@ impl BackendPreset {
         TransportConfig::Stdio(StdioConfig {
             command: self.command.to_string(),
             args: self.owned_args(),
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         })
     }

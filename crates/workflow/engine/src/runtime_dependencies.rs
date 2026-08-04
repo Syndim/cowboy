@@ -103,6 +103,7 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
         Ok(SharedClientFactory::new(AcpClientFactory {
             resolver: AgentResolver::new(config.agents.clone())?,
             connector: self.connector.clone(),
+            global_allowed_env: config.allowed_env.clone(),
         }))
     }
 
@@ -134,7 +135,10 @@ async fn generate_request_topic_result(
     let resolver = AgentResolver::new(config.agents.clone())?;
     let agent = resolver.resolve_default()?;
     let client = connector
-        .connect(transport_for(agent), watchdog_options_for(agent))
+        .connect(
+            transport_for(&config.allowed_env, agent),
+            watchdog_options_for(agent),
+        )
         .await
         .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
     let generator = AgentRequestTopicGenerator::new(
@@ -149,6 +153,7 @@ async fn generate_request_topic_result(
 struct AcpClientFactory {
     resolver: AgentResolver,
     connector: Arc<dyn AcpConnector>,
+    global_allowed_env: Vec<String>,
 }
 
 #[async_trait]
@@ -169,7 +174,10 @@ impl ClientFactory for AcpClientFactory {
         );
         let client = self
             .connector
-            .connect(transport_for(agent), watchdog_options_for(agent))
+            .connect(
+                transport_for(&self.global_allowed_env, agent),
+                watchdog_options_for(agent),
+            )
             .await?;
         Ok(ResolvedAgentClient {
             client: Box::new(client),
@@ -179,10 +187,21 @@ impl ClientFactory for AcpClientFactory {
     }
 }
 
-pub(crate) fn transport_for(agent: &AgentRuntimeConfig) -> TransportConfig {
+pub(crate) fn transport_for(
+    global_allowed_env: &[String],
+    agent: &AgentRuntimeConfig,
+) -> TransportConfig {
+    let mut allowed_env = Vec::new();
+    for name in global_allowed_env.iter().chain(&agent.allowed_env) {
+        if !allowed_env.contains(name) {
+            allowed_env.push(name.clone());
+        }
+    }
     TransportConfig::Stdio(StdioConfig {
         command: agent.command.clone(),
         args: agent.args.clone(),
+        clear_env: true,
+        allowed_env,
         env: Vec::new(),
     })
 }
@@ -205,6 +224,8 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedAcpConnection {
         command: String,
+        clear_env: bool,
+        allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
     }
 
@@ -231,6 +252,8 @@ mod tests {
             };
             self.connections.lock().push(RecordedAcpConnection {
                 command: transport.command,
+                clear_env: transport.clear_env,
+                allowed_env: transport.allowed_env,
                 watchdog,
             });
             Err(anyhow::anyhow!("recording connector"))
@@ -249,6 +272,7 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             model: None,
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds,
                 cancel_timeout_seconds,
@@ -263,6 +287,7 @@ mod tests {
             state_dir: "state".into(),
             workflow_store: "state/workflow.redb".into(),
             workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
             agents: vec![
                 agent("default", "default-agent-command", 11, 12, 13),
                 agent("named", "named-agent-command", 21, 22, 23),
@@ -278,6 +303,7 @@ mod tests {
             command: "agent".to_string(),
             args: vec![],
             model: None,
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds: 7,
                 cancel_timeout_seconds: 8,
@@ -317,6 +343,8 @@ mod tests {
             recording.connections(),
             [RecordedAcpConnection {
                 command: "named-agent-command".to_string(),
+                clear_env: true,
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogOptions {
                     response_timeout_seconds: 21,
                     cancel_timeout_seconds: 22,
@@ -340,6 +368,8 @@ mod tests {
             recording.connections(),
             [RecordedAcpConnection {
                 command: "default-agent-command".to_string(),
+                clear_env: true,
+                allowed_env: Vec::new(),
                 watchdog: AgentWatchdogOptions {
                     response_timeout_seconds: 11,
                     cancel_timeout_seconds: 12,
@@ -347,5 +377,91 @@ mod tests {
                 },
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn named_agent_client_uses_global_and_agent_allowed_env() {
+        let recording = Arc::new(RecordingAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
+        let mut config = config();
+        config.allowed_env = vec!["GLOBAL".to_string(), "SHARED".to_string()];
+        config.agents[1].name = "planner".to_string();
+        config.agents[1].allowed_env = vec!["PLANNER".to_string(), "SHARED".to_string()];
+        let factory = dependencies.agent_factory(&config).unwrap();
+
+        for id in ["planner-one", "planner-two"] {
+            let role = RoleDefinition {
+                id: id.to_string(),
+                instructions: "plan".to_string(),
+                agent: Some("planner".to_string()),
+                properties: serde_json::Value::Null,
+            };
+            assert!(factory.create_client(&role).await.is_err());
+        }
+
+        assert_eq!(recording.connections().len(), 2);
+        for connection in recording.connections() {
+            assert!(connection.clear_env);
+            assert_eq!(connection.allowed_env, ["GLOBAL", "SHARED", "PLANNER"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn different_agents_do_not_share_environment_additions() {
+        let recording = Arc::new(RecordingAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
+        let mut config = config();
+        config.allowed_env = vec!["GLOBAL".to_string()];
+        config.agents = vec![
+            agent("planner", "planner-command", 11, 12, 13),
+            agent("implementer", "implementer-command", 21, 22, 23),
+        ];
+        config.agents[0].allowed_env = vec!["PLANNER".to_string()];
+        config.agents[1].allowed_env = vec!["IMPLEMENTER".to_string()];
+        let factory = dependencies.agent_factory(&config).unwrap();
+
+        for agent_name in ["planner", "implementer"] {
+            let role = RoleDefinition {
+                id: agent_name.to_string(),
+                instructions: "work".to_string(),
+                agent: Some(agent_name.to_string()),
+                properties: serde_json::Value::Null,
+            };
+            assert!(factory.create_client(&role).await.is_err());
+        }
+
+        let connections = recording.connections();
+        assert_eq!(connections[0].allowed_env, ["GLOBAL", "PLANNER"]);
+        assert_eq!(connections[1].allowed_env, ["GLOBAL", "IMPLEMENTER"]);
+        assert!(!connections[1].allowed_env.contains(&"PLANNER".to_string()));
+    }
+
+    #[tokio::test]
+    async fn default_agent_clients_use_global_and_default_agent_allowed_env() {
+        let recording = Arc::new(RecordingAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
+        let mut config = config();
+        config.allowed_env = vec!["GLOBAL".to_string()];
+        config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string()];
+        let factory = dependencies.agent_factory(&config).unwrap();
+        let role = RoleDefinition {
+            id: "implicit".to_string(),
+            instructions: "work".to_string(),
+            agent: None,
+            properties: serde_json::Value::Null,
+        };
+
+        assert!(factory.create_client(&role).await.is_err());
+        assert!(
+            dependencies
+                .generate_request_topic(&config, SelectorMode::Agent, "topic")
+                .await
+                .is_none()
+        );
+
+        assert_eq!(recording.connections().len(), 2);
+        for connection in recording.connections() {
+            assert_eq!(connection.allowed_env, ["GLOBAL", "DEFAULT_AGENT"]);
+        }
     }
 }

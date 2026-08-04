@@ -41,6 +41,8 @@ fn agent_leaving_a_descendant() -> StdioConfig {
     StdioConfig {
         command,
         args,
+        clear_env: false,
+        allowed_env: vec![],
         env: vec![],
     }
 }

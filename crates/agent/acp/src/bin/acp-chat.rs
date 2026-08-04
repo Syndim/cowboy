@@ -26,6 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let transport_config = TransportConfig::Stdio(StdioConfig {
         command: config.command.clone(),
         args: config.args.clone(),
+        clear_env: false,
+        allowed_env: vec![],
         env: vec![],
     });
 

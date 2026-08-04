@@ -33,6 +33,14 @@ impl StdioTransport {
         for arg in additional_args {
             cmd.arg(arg);
         }
+        if config.clear_env {
+            cmd.env_clear();
+            for name in &config.allowed_env {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
         for (key, val) in &config.env {
             cmd.env(key, val);
         }
@@ -74,6 +82,8 @@ impl StdioTransport {
             command = %config.command,
             args = ?config.args,
             additional_args = ?additional_args,
+            clear_env = config.clear_env,
+            allowed_env = ?config.allowed_env,
             env_keys = ?env_keys,
             pid = ?pid,
             "Agent subprocess spawned"
@@ -250,12 +260,111 @@ impl Transport for StdioTransport {
 mod tests {
     use super::*;
     use crate::transport::{TransportConfig, ZellijConfig};
+    use tokio::process::Command;
+
+    const APPROVED_ENV: &str = "COWBOY_STDIO_TEST_APPROVED";
+    const UNAPPROVED_ENV: &str = "COWBOY_STDIO_TEST_UNAPPROVED";
+
+    async fn run_environment_probe(mode: &str) {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "transport::stdio::tests::stdio_environment_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("COWBOY_STDIO_TEST_MODE", mode)
+            .env(APPROVED_ENV, "ambient-approved")
+            .env(UNAPPROVED_ENV, "ambient-unapproved")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdio environment probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn sanitized_environment_forwards_only_allowlisted_variables() {
+        run_environment_probe("sanitized").await;
+    }
+
+    #[tokio::test]
+    async fn explicit_environment_overrides_allowlisted_ambient_value() {
+        run_environment_probe("override").await;
+    }
+
+    #[tokio::test]
+    async fn sanitized_environment_is_preserved_when_resume_argument_restarts_stdio_transport() {
+        run_environment_probe("resume").await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn stdio_environment_probe() {
+        let mode = std::env::var("COWBOY_STDIO_TEST_MODE").unwrap();
+        let explicit = (mode == "override")
+            .then(|| (APPROVED_ENV.to_string(), "explicit-approved".to_string()))
+            .into_iter()
+            .collect();
+        let config = StdioConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!(
+                    "printf '%s\\n' \"approved=${{{APPROVED_ENV}-missing}}\" \
+                     \"unapproved=${{{UNAPPROVED_ENV}-missing}}\" \"args=$*\"",
+                ),
+                "environment-probe".to_string(),
+            ],
+            clear_env: true,
+            allowed_env: vec![
+                APPROVED_ENV.to_string(),
+                "COWBOY_STDIO_TEST_MISSING".to_string(),
+            ],
+            env: explicit,
+        };
+        let additional_args = if mode == "resume" {
+            vec!["--resume=session-123"]
+        } else {
+            vec![]
+        };
+        let mut transport = StdioTransport::connect(&config, &additional_args)
+            .await
+            .unwrap();
+        let approved = transport.recv().await.unwrap().unwrap();
+        let unapproved = transport.recv().await.unwrap().unwrap();
+        let args = transport.recv().await.unwrap().unwrap();
+
+        assert_eq!(
+            approved,
+            if mode == "override" {
+                "approved=explicit-approved"
+            } else {
+                "approved=ambient-approved"
+            }
+        );
+        assert_eq!(unapproved, "unapproved=missing");
+        assert_eq!(
+            args,
+            if mode == "resume" {
+                "args=--resume=session-123"
+            } else {
+                "args="
+            }
+        );
+    }
 
     #[tokio::test]
     async fn test_connect_echo() {
         let config = StdioConfig {
             command: "cat".to_string(),
             args: vec![],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         };
 
@@ -275,6 +384,8 @@ mod tests {
         let config = StdioConfig {
             command: "echo".to_string(),
             args: vec!["configured".to_string()],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         };
         let additional_args = vec!["extra"];
@@ -292,6 +403,8 @@ mod tests {
         let config = StdioConfig {
             command: "nonexistent-binary-12345".to_string(),
             args: vec![],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         };
 
@@ -304,6 +417,8 @@ mod tests {
         let config = StdioConfig {
             command: "echo".to_string(),
             args: vec!["hello".to_string()],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         };
 
@@ -337,6 +452,8 @@ mod tests {
         let config = StdioConfig {
             command: "sh".to_string(),
             args: vec!["-c".to_string(), "sleep 60".to_string()],
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         };
         let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();

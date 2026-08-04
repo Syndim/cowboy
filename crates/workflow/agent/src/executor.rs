@@ -2085,7 +2085,11 @@ resending the same instruction as attempt two"
             statuses: vec!["ready".to_string()],
             fields: output_fields(&[
                 ("summary", cowboy_workflow_core::FieldType::String, true),
-                ("validation_doc", cowboy_workflow_core::FieldType::String, false),
+                (
+                    "validation_doc",
+                    cowboy_workflow_core::FieldType::String,
+                    false,
+                ),
                 ("rca_doc", cowboy_workflow_core::FieldType::String, false),
                 ("repro_test", cowboy_workflow_core::FieldType::String, false),
             ]),
@@ -3354,7 +3358,11 @@ still applies, got non-recoverable: {error:?}"
             prompt: "Do work".into(),
             output: Some(cowboy_workflow_core::OutputSpec {
                 statuses: vec!["success".to_string()],
-                fields: output_fields(&[("summary", cowboy_workflow_core::FieldType::String, true)]),
+                fields: output_fields(&[(
+                    "summary",
+                    cowboy_workflow_core::FieldType::String,
+                    true,
+                )]),
             }),
         }
     }

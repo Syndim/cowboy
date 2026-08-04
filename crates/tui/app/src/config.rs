@@ -41,6 +41,9 @@ pub struct AppConfig {
     /// Transcript mouse-wheel visual rows scrolled per wheel detent.
     #[serde(default = "default_mouse_scroll_lines")]
     pub mouse_scroll_lines: u16,
+    /// Ambient environment variables forwarded to every workflow child process.
+    #[serde(default = "default_allowed_env")]
+    pub allowed_env: Vec<String>,
     /// ACP-compatible agent commands used by workflow agent actions.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
@@ -99,6 +102,8 @@ pub struct AgentConfig {
     #[serde(default)]
     pub model: Option<ModelConfig>,
     #[serde(default)]
+    pub allowed_env: Vec<String>,
+    #[serde(default)]
     pub watchdog: AgentWatchdogConfig,
 }
 
@@ -128,6 +133,21 @@ fn default_agent_args() -> Vec<String> {
     vec!["--acp".to_string()]
 }
 
+fn default_allowed_env() -> Vec<String> {
+    [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+    ]
+    .map(str::to_string)
+    .to_vec()
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -135,6 +155,7 @@ impl Default for AgentConfig {
             command: default_agent_command(),
             args: default_agent_args(),
             model: None,
+            allowed_env: Vec::new(),
             watchdog: AgentWatchdogConfig::default(),
         }
     }
@@ -169,6 +190,7 @@ impl Default for AppConfig {
             config_sets: default_config_sets(),
             workflow_dirs: vec![config_root().join("workflows")],
             mouse_scroll_lines: default_mouse_scroll_lines(),
+            allowed_env: default_allowed_env(),
             agents: default_agents(),
         }
     }
@@ -213,6 +235,8 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("failed to parse config {}", path.display()))?;
     validate_agents(&config.agents)
         .with_context(|| format!("invalid agent config in {}", path.display()))?;
+    validate_allowed_env("allowed_env", &config.allowed_env)
+        .with_context(|| format!("invalid environment config in {}", path.display()))?;
     validate_config_sets(&config.config_sets)
         .with_context(|| format!("invalid config set in {}", path.display()))?;
     validate_mouse_scroll_lines(config.mouse_scroll_lines)
@@ -256,6 +280,10 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
         if !names.insert(agent.name.as_str()) {
             anyhow::bail!("agent names must be unique: {:?}", agent.name);
         }
+        validate_allowed_env(
+            &format!("agent {:?} allowed_env", agent.name),
+            &agent.allowed_env,
+        )?;
         for (field, value) in [
             (
                 "response_timeout_seconds",
@@ -273,6 +301,27 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
             if value == 0 {
                 anyhow::bail!("agent {:?} {field} must be greater than zero", agent.name);
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_allowed_env(field: &str, allowed_env: &[String]) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut names = BTreeSet::new();
+    for name in allowed_env {
+        if name.trim().is_empty() {
+            anyhow::bail!("{field} entries must not be empty");
+        }
+        if name.contains('=') {
+            anyhow::bail!("{field} entry {name:?} must not contain '='");
+        }
+        if name.contains('\0') {
+            anyhow::bail!("{field} entry must not contain NUL");
+        }
+        if !names.insert(name.as_str()) {
+            anyhow::bail!("{field} contains duplicate entry {name:?}");
         }
     }
     Ok(())
@@ -304,6 +353,7 @@ impl AppConfig {
             self.state_dir.clone(),
             self.workflow_store.clone(),
             self.workflow_dirs.clone(),
+            self.allowed_env.clone(),
             self.agents
                 .iter()
                 .map(|agent| {
@@ -323,6 +373,7 @@ impl AppConfig {
                             .watchdog
                             .recovery_operation_timeout_seconds,
                     };
+                    runtime.allowed_env = agent.allowed_env.clone();
                     runtime
                 })
                 .collect(),
@@ -357,6 +408,171 @@ fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn configurable_allowed_env_parses_and_reaches_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+allowed_env = ["COWBOY_TEST_GLOBAL", "PATH"]
+
+[[agents]]
+name = "default"
+allowed_env = ["COWBOY_TEST_DEFAULT"]
+command = "copilot"
+
+[[agents]]
+name = "planner"
+command = "copilot"
+allowed_env = ["COWBOY_TEST_PLANNER"]
+[agents.model]
+id = "planner-model"
+provider = "configured-provider"
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.allowed_env, ["COWBOY_TEST_GLOBAL", "PATH"]);
+        assert_eq!(config.agents[0].allowed_env, ["COWBOY_TEST_DEFAULT"]);
+        assert_eq!(config.agents[1].allowed_env, ["COWBOY_TEST_PLANNER"]);
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert_eq!(runtime.allowed_env, ["COWBOY_TEST_GLOBAL", "PATH"]);
+        assert_eq!(runtime.agents[0].allowed_env, ["COWBOY_TEST_DEFAULT"]);
+        assert_eq!(runtime.agents[1].allowed_env, ["COWBOY_TEST_PLANNER"]);
+    }
+
+    #[test]
+    fn allowed_env_omission_preserves_platform_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[[agents]]\nname = \"default\"\ncommand = \"copilot\"\n",
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.allowed_env, default_allowed_env());
+        assert!(config.agents[0].allowed_env.is_empty());
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert_eq!(runtime.allowed_env, default_allowed_env());
+        assert!(runtime.agents[0].allowed_env.is_empty());
+    }
+
+    #[test]
+    fn explicit_empty_allowed_env_is_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "allowed_env = []\n[[agents]]\nname = \"default\"\nallowed_env = []\n",
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert!(config.allowed_env.is_empty());
+        assert!(config.agents[0].allowed_env.is_empty());
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert!(runtime.allowed_env.is_empty());
+        assert!(runtime.agents[0].allowed_env.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_allowed_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "global-empty.toml",
+                "allowed_env = [\"\"]\n",
+                "allowed_env entries must not be empty",
+            ),
+            (
+                "global-equals.toml",
+                "allowed_env = [\"BAD=NAME\"]\n",
+                "allowed_env entry \"BAD=NAME\" must not contain '='",
+            ),
+            (
+                "global-duplicate.toml",
+                "allowed_env = [\"PATH\", \"PATH\"]\n",
+                "allowed_env contains duplicate entry \"PATH\"",
+            ),
+            (
+                "agent-empty.toml",
+                "[[agents]]\nname = \"default\"\nallowed_env = [\"   \"]\n",
+                "agent \"default\" allowed_env entries must not be empty",
+            ),
+            (
+                "agent-duplicate.toml",
+                "[[agents]]\nname = \"default\"\nallowed_env = [\"TOKEN\", \"TOKEN\"]\n",
+                "agent \"default\" allowed_env contains duplicate entry \"TOKEN\"",
+            ),
+        ];
+
+        for (name, raw, expected) in cases {
+            let path = dir.path().join(name);
+            fs::write(&path, raw).unwrap();
+            let error = load_config(&path).unwrap_err();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+
+        let error = validate_allowed_env("allowed_env", &["BAD\0NAME".to_string()]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("allowed_env entry must not contain NUL")
+        );
+    }
+
+    #[test]
+    fn runtime_config_serialization_contains_environment_names_not_values() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "config::tests::runtime_config_serialization_environment_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("COWBOY_TEST_GLOBAL", "global-secret-marker")
+            .env("COWBOY_TEST_ROLE", "role-secret-marker")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "serialization probe failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn runtime_config_serialization_environment_probe() {
+        let config = AppConfig {
+            allowed_env: vec!["COWBOY_TEST_GLOBAL".to_string()],
+            agents: vec![AgentConfig {
+                allowed_env: vec!["COWBOY_TEST_ROLE".to_string()],
+                ..AgentConfig::default()
+            }],
+            ..AppConfig::default()
+        };
+        let app_json = serde_json::to_string(&config).unwrap();
+        let runtime_json =
+            serde_json::to_string(&config.runtime_config(PathBuf::from("."))).unwrap();
+
+        for serialized in [&app_json, &runtime_json] {
+            assert!(serialized.contains("COWBOY_TEST_GLOBAL"));
+            assert!(serialized.contains("COWBOY_TEST_ROLE"));
+            assert!(!serialized.contains("global-secret-marker"));
+            assert!(!serialized.contains("role-secret-marker"));
+        }
+    }
 
     #[test]
     fn missing_config_uses_sqlite_store_default() {

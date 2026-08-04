@@ -5,6 +5,7 @@ state_dir = ".cowboy/demo-state"
 workflow_store = ".cowboy/demo-state/data.db"
 workflow_dirs = ["crates/workflow/engine/test_files"]
 mouse_scroll_lines = 3
+allowed_env = ["PATH", "PATHEXT", "SystemRoot", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"]
 
 [config_sets.default]
 max_steps_per_run = 100
@@ -22,6 +23,7 @@ name = "default"
 # Switch to "copilot" + ["--acp"] if you prefer GitHub Copilot's ACP backend.
 command = "omp"
 args = ["--thinking=auto", "acp"]
+allowed_env = ["COWBOY_EXAMPLE_DEFAULT_TOKEN"]
 
 [agents.model]
 id = "opus-4.8-1m"
@@ -39,6 +41,7 @@ recovery_operation_timeout_seconds = 30
 name = "planner"
 command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
+allowed_env = ["COWBOY_EXAMPLE_PLANNER_TOKEN"]
 
 [[agents]]
 name = "investigator"
@@ -54,6 +57,7 @@ args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
 name = "implementer"
 command = "omp"
 args = ["--model=github-copilot/claude-opus-4.8", "--thinking=medium", "acp"]
+allowed_env = ["COWBOY_EXAMPLE_IMPLEMENTER_TOKEN"]
 
 [[agents]]
 name = "tester"

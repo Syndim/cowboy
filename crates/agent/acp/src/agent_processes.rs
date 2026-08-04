@@ -173,6 +173,8 @@ mod tests {
         StdioConfig {
             command,
             args,
+            clear_env: false,
+            allowed_env: vec![],
             env: vec![],
         }
     }

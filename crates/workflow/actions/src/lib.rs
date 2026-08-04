@@ -33,11 +33,11 @@ pub struct EngineActionDispatcher<A, W = UnsupportedWorkflowActionHandler> {
 }
 
 impl<A> EngineActionDispatcher<A, UnsupportedWorkflowActionHandler> {
-    pub fn new(agent: A, cwd: impl Into<std::path::PathBuf>) -> Self {
+    pub fn new(agent: A, cwd: impl Into<std::path::PathBuf>, allowed_env: Vec<String>) -> Self {
         Self {
             agent: AgentActionRunner::new(agent),
             workflow: WorkflowActionRunner::new(UnsupportedWorkflowActionHandler),
-            command: CommandActionRunner::new(cwd),
+            command: CommandActionRunner::new(cwd, allowed_env),
             status: StatusActionRunner,
             fail: FailActionRunner,
             ask_user: AskUserActionRunner,
@@ -50,11 +50,12 @@ impl<A, W> EngineActionDispatcher<A, W> {
         agent: A,
         workflow: W,
         cwd: impl Into<std::path::PathBuf>,
+        allowed_env: Vec<String>,
     ) -> Self {
         Self {
             agent: AgentActionRunner::new(agent),
             workflow: WorkflowActionRunner::new(workflow),
-            command: CommandActionRunner::new(cwd),
+            command: CommandActionRunner::new(cwd, allowed_env),
             status: StatusActionRunner,
             fail: FailActionRunner,
             ask_user: AskUserActionRunner,
@@ -443,6 +444,7 @@ mod tests {
                 FakeAgent,
                 workflow,
                 std::env::current_dir().unwrap(),
+                Vec::new(),
             );
             let action = WorkflowAction {
                 workflow: "child".to_string(),
@@ -499,7 +501,8 @@ mod tests {
 
     #[tokio::test]
     async fn action_dispatcher_routes_each_remaining_variant() {
-        let dispatcher = EngineActionDispatcher::new(FakeAgent, std::env::current_dir().unwrap());
+        let dispatcher =
+            EngineActionDispatcher::new(FakeAgent, std::env::current_dir().unwrap(), Vec::new());
         let missing_command_dir = tempfile::tempdir().unwrap();
         let missing_command = missing_command_dir.path().join("missing-command");
 

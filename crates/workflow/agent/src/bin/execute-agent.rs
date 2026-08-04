@@ -36,6 +36,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         transport: TransportConfig::Stdio(StdioConfig {
             command: config.command,
             args: config.args,
+            clear_env: false,
+            allowed_env: Vec::new(),
             env: Vec::new(),
         }),
     };

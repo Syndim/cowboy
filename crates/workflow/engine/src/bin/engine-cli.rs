@@ -159,6 +159,7 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         state_dir,
         workflow_store,
         workflow_dirs,
+        default_allowed_env(),
         vec![agent],
         BTreeMap::from([("default".to_string(), limits)]),
     ))
@@ -171,6 +172,21 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         )
         .into()),
     }
+}
+
+fn default_allowed_env() -> Vec<String> {
+    [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "TEMP",
+        "TMP",
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 /// Resolve the ACP agent config from a backend preset selected by
