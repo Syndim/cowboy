@@ -312,7 +312,7 @@ mod tests {
 
     static COMMAND_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
-    const EXPECTED_COMMAND_ENV_ALLOW_LIST: [&str; 8] = [
+    const EXPECTED_COMMAND_ENV_ALLOW_LIST: [&str; 9] = [
         "PATH",
         "PATHEXT",
         "SystemRoot",
@@ -321,6 +321,7 @@ mod tests {
         "APPDATA",
         "TEMP",
         "TMP",
+        "HOME",
     ];
     const UNAPPROVED_COMMAND_ENV: &str = "COWBOY_COMMAND_UNAPPROVED";
 
@@ -453,7 +454,6 @@ mod tests {
             ])
             .env_clear()
             .envs(EXPECTED_COMMAND_ENV_ALLOW_LIST.map(|name| (name, "test-marker")))
-            .env("HOME", "test-marker")
             .env("CARGO", "test-marker")
             .env(UNAPPROVED_COMMAND_ENV, "test-marker")
             .output()
@@ -495,7 +495,7 @@ mod tests {
             );
         }
 
-        for name in ["HOME", "CARGO", UNAPPROVED_COMMAND_ENV] {
+        for name in ["CARGO", UNAPPROVED_COMMAND_ENV] {
             assert!(
                 stdout.contains(&format!("{name}=missing")),
                 "{name} was unexpectedly forwarded: {stdout}"
@@ -770,7 +770,7 @@ mod tests {
                     println!("{name}={state}");
                 }
 
-                for name in ["HOME", "CARGO", UNAPPROVED_COMMAND_ENV] {
+                for name in ["CARGO", UNAPPROVED_COMMAND_ENV] {
                     let state = if std::env::var_os(name).is_some() {
                         "set"
                     } else {

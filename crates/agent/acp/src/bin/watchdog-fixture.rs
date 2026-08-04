@@ -35,7 +35,7 @@ const SYNTHETIC_ENVIRONMENT_NAMES: [&str; 4] = [
     "COWBOY_TEST_IMPLEMENTER",
     "COWBOY_TEST_UNAPPROVED",
 ];
-const DEFAULT_ENVIRONMENT_NAMES: [&str; 9] = [
+const DEFAULT_ENVIRONMENT_NAMES: [&str; 10] = [
     "PATH",
     "PATHEXT",
     "SystemRoot",
@@ -44,6 +44,7 @@ const DEFAULT_ENVIRONMENT_NAMES: [&str; 9] = [
     "APPDATA",
     "TEMP",
     "TMP",
+    "HOME",
     "COWBOY_TEST_UNAPPROVED",
 ];
 const SYNTHETIC_ENVIRONMENT_VALUES: [(&str, &str); 4] = [
@@ -1097,6 +1098,7 @@ fn verify_default_allowed_env(args: DefaultEnvironmentVerifyArgs) -> anyhow::Res
                 ("APPDATA", "set"),
                 ("TEMP", "set"),
                 ("TMP", "set"),
+                ("HOME", "set"),
                 ("COWBOY_TEST_UNAPPROVED", "missing"),
             ],
         )?;
@@ -1119,11 +1121,12 @@ fn verify_default_allowed_env(args: DefaultEnvironmentVerifyArgs) -> anyhow::Res
                 ("APPDATA", "set"),
                 ("TEMP", "set"),
                 ("TMP", "set"),
+                ("HOME", "set"),
                 ("COWBOY_TEST_UNAPPROVED", "missing"),
             ],
         )?;
         println!(
-            "omitted_allowed_env command=started default_agent=started defaults=8 unapproved=missing workflow=success"
+            "omitted_allowed_env command=started default_agent=started defaults=9 unapproved=missing workflow=success"
         );
         Ok(())
     })();
@@ -1268,7 +1271,7 @@ fn run_id_from_stdout(stdout: &[u8]) -> anyhow::Result<String> {
 
 fn default_environment_values(workspace: &Path) -> anyhow::Result<Vec<(&'static str, String)>> {
     let mut values = Vec::new();
-    for name in &DEFAULT_ENVIRONMENT_NAMES[..8] {
+    for name in &DEFAULT_ENVIRONMENT_NAMES[..9] {
         let value = std::env::var(name).unwrap_or_else(|_| {
             workspace
                 .join(format!("{name}-placeholder"))

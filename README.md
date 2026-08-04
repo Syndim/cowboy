@@ -192,7 +192,7 @@ state_dir = "~/.local/state/cowboy"
 workflow_store = "~/.local/state/cowboy/data.db"
 workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 mouse_scroll_lines = 3
-allowed_env = ["PATH", "PATHEXT", "SystemRoot", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"]
+allowed_env = ["PATH", "PATHEXT", "SystemRoot", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP", "HOME"]
 
 [config_sets.default]
 max_steps_per_run = 100

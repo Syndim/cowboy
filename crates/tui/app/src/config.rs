@@ -143,6 +143,7 @@ fn default_allowed_env() -> Vec<String> {
         "APPDATA",
         "TEMP",
         "TMP",
+        "HOME",
     ]
     .map(str::to_string)
     .to_vec()

@@ -354,7 +354,7 @@ environment, or stdin for this action; stdin is closed. Cowboy clears the child
 environment, then copies only names from top-level `allowed_env` that are
 present in Cowboy's process when the command starts. Omitting the key preserves
 the compatibility default (`PATH`, `PATHEXT`, `SystemRoot`, `USERPROFILE`,
-`LOCALAPPDATA`, `APPDATA`, `TEMP`, and `TMP`); explicit `allowed_env = []`
+`LOCALAPPDATA`, `APPDATA`, `TEMP`, `TMP`, and `HOME`); explicit `allowed_env = []`
 forwards nothing. Cowboy does not synthesize missing values, and every other
 ambient variable remains removed. There is no workflow-authored environment
 override.
