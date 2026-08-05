@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,66 @@ fn apply_command_environment(command: &mut Command, allowed_env: &[String]) {
             command.env(name, value);
         }
     }
+}
+
+#[cfg(windows)]
+fn allowed_environment_value(allowed_env: &[String], name: &str) -> Option<std::ffi::OsString> {
+    allowed_env
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(name))
+        .then(|| std::env::var_os(name))
+        .flatten()
+}
+
+#[cfg(windows)]
+fn resolve_program(program: &str, allowed_env: &[String]) -> PathBuf {
+    let program_path = Path::new(program);
+    if program_path.components().count() > 1 {
+        return program_path.to_path_buf();
+    }
+
+    let Some(path) = allowed_environment_value(allowed_env, "PATH") else {
+        return program_path.to_path_buf();
+    };
+    let path_ext = allowed_environment_value(allowed_env, "PATHEXT");
+    resolve_program_in_path(program_path, &path, path_ext.as_deref())
+        .unwrap_or_else(|| program_path.to_path_buf())
+}
+
+#[cfg(windows)]
+fn resolve_program_in_path(
+    program: &Path,
+    path: &std::ffi::OsStr,
+    path_ext: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let extensions = path_ext
+        .and_then(|value| value.to_str())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .filter(|extension| !extension.is_empty());
+
+    for directory in std::env::split_paths(path) {
+        let candidate = directory.join(program);
+        if program.extension().is_none() {
+            for extension in extensions.clone() {
+                let candidate =
+                    directory.join(format!("{}{}", program.to_string_lossy(), extension));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_program(program: &str, _allowed_env: &[String]) -> PathBuf {
+    PathBuf::from(program)
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +119,8 @@ impl CommandActionRunner {
     ) -> Result<ActionResult> {
         let started_at = Utc::now();
         let timer = Instant::now();
-        let mut command = Command::new(&action.program);
+        let program = resolve_program(&action.program, &self.allowed_env);
+        let mut command = Command::new(program);
         command
             .args(&action.args)
             .current_dir(&self.cwd)
@@ -301,7 +362,6 @@ fn elapsed_ms(timer: Instant) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use tokio::sync::{Mutex, MutexGuard};
@@ -367,12 +427,39 @@ mod tests {
 
     fn helper_program(dir: &Path, mode: &str) -> PathBuf {
         let source = std::env::current_exe().unwrap();
-        let helper = dir.join(format!("cowboy-command-helper-{mode}"));
+        let helper = dir.join(format!(
+            "cowboy-command-helper-{mode}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
         fs::copy(source, &helper).unwrap();
-        let mut permissions = fs::metadata(&helper).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&helper, permissions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mut permissions = fs::metadata(&helper).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&helper, permissions).unwrap();
+        }
         helper
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_runner_resolves_pathext_scripts_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ado-tool"), "#!/bin/sh\n").unwrap();
+        let script = dir.path().join("ado-tool.CMD");
+        fs::write(&script, "@echo off\r\n").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        assert_eq!(
+            resolve_program_in_path(
+                Path::new("ado-tool"),
+                &path,
+                Some(std::ffi::OsStr::new(".EXE;.CMD"))
+            ),
+            Some(script)
+        );
     }
 
     fn command_record(result: ActionResult) -> StepRecord {
@@ -721,8 +808,11 @@ mod tests {
                     .map(|name| name.to_string_lossy().into_owned())
             })
             .and_then(|name| {
-                name.strip_prefix("cowboy-command-helper-")
-                    .map(str::to_string)
+                name.strip_prefix("cowboy-command-helper-").map(|mode| {
+                    mode.strip_suffix(std::env::consts::EXE_SUFFIX)
+                        .unwrap_or(mode)
+                        .to_string()
+                })
             })
             .expect("helper mode is encoded in argv[0]");
 
