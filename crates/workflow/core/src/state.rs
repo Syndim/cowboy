@@ -4,10 +4,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    Choice, ObjectHash, RecordId, Result, RoleId, RunId, Status, StepId, TurnId, WorkflowError,
-    WorkflowId,
-};
+use crate::{Choice, Result, RoleId, Status, StepId, WorkflowError, WorkflowId};
+
+/// Stable id for one workflow execution run.
+pub type RunId = String;
+/// Stable id for a persisted step record.
+pub type RecordId = String;
+/// Stable id for a persisted turn record.
+pub type TurnId = String;
+/// Content hash for immutable stored objects.
+pub type ObjectHash = String;
 
 /// Name used when a workflow does not explicitly select a config set.
 pub const DEFAULT_CONFIG_SET_NAME: &str = "default";

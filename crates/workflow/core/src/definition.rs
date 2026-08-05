@@ -3,7 +3,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Result, RoleId, Status, StepId, WorkflowError, WorkflowId};
+use crate::{Result, WorkflowError};
+
+/// Stable id for a workflow definition/source.
+pub type WorkflowId = String;
+/// Stable id for a reusable role/persona inside a workflow.
+pub type RoleId = String;
+/// Stable id for a step inside a workflow.
+pub type StepId = String;
+/// Step output status used for workflow routing.
+pub type Status = String;
 
 /// Available workflow sources indexed by workflow id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
