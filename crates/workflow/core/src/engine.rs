@@ -103,12 +103,12 @@ where
     let step =
         definition
             .steps
-            .get(&run.current_step)
+            .get(&run.step.current)
             .ok_or_else(|| WorkflowError::UnknownStep {
-                step: run.current_step.clone(),
+                step: run.step.current.clone(),
             })?;
 
-    let previous_head = run.head.clone();
+    let previous_head = run.step.head.clone();
     let prev_record = match previous_head {
         Some(head) => Some(store.load_step_record(&head).await?),
         None => None,
@@ -133,7 +133,7 @@ where
         run_id: run.id.clone(),
         step_id: step.id.clone(),
         step_record_id: next_record_id(run),
-        prev: run.head.clone(),
+        prev: run.step.head.clone(),
         role,
         attempt,
         retry_reason,
@@ -149,25 +149,25 @@ where
 }
 
 fn enforce_budget(run: &WorkflowRun, limits: &RunnerLimits) -> Result<()> {
-    if run.steps_executed >= limits.max_steps_per_run {
+    if run.step.executed >= limits.max_steps_per_run {
         return Err(WorkflowError::InvalidAction(format!(
             "run exceeded max step count ({})",
             limits.max_steps_per_run
         )));
     }
-    let visits = run.step_visits.get(&run.current_step).copied().unwrap_or(0);
+    let visits = run.step.visits.get(&run.step.current).copied().unwrap_or(0);
     if visits >= limits.max_visits_per_step {
         return Err(WorkflowError::InvalidAction(format!(
             "step {:?} exceeded max visits ({})",
-            run.current_step, limits.max_visits_per_step
+            run.step.current, limits.max_visits_per_step
         )));
     }
     Ok(())
 }
 
 fn increment_budget(run: &mut WorkflowRun) {
-    run.steps_executed += 1;
-    *run.step_visits.entry(run.current_step.clone()).or_default() += 1;
+    run.step.executed += 1;
+    *run.step.visits.entry(run.step.current.clone()).or_default() += 1;
 }
 
 /// Persist a completed step record, advance the run head, and route by output status.
@@ -185,14 +185,14 @@ pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
     run.updated_at = Utc::now();
 
     let status = if let Some(next) = next {
-        run.current_step = next;
+        run.step.current = next;
         RunStatus::Running
     } else {
         RunStatus::Completed
     };
     run.status = status.clone();
     let hash = store.commit_completed_step(run, &record).await?;
-    run.head = Some(hash);
+    run.step.head = Some(hash);
     Ok(status)
 }
 
@@ -209,7 +209,7 @@ pub async fn apply_run_status<S: WorkflowStateStore + ?Sized>(
 }
 
 fn next_record_id(run: &WorkflowRun) -> String {
-    format!("{}-{}", run.id, run.steps_executed + 1)
+    format!("{}-{}", run.id, run.step.executed + 1)
 }
 
 #[cfg(test)]
@@ -225,7 +225,8 @@ mod tests {
     use crate::{
         ActionDispatcher, ActionResult, AgentAction, AskUserAction, Choice, CommandAction,
         FailAction, Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput,
-        StepOutput, StepTransitions, WorkflowDefinition, default_command_status_map,
+        StepOutput, StepState, StepTransitions, WorkflowDefinition, WorkflowSnapshot,
+        default_command_status_map,
     };
 
     struct StaticProvider {
@@ -452,7 +453,7 @@ mod tests {
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
             self.objects.lock().insert(hash.clone(), bytes);
             let mut stored_run = run.clone();
-            stored_run.head = Some(hash.clone());
+            stored_run.step.head = Some(hash.clone());
             self.save_run(&stored_run).await?;
             Ok(hash)
         }
@@ -665,22 +666,26 @@ mod tests {
         let now = Utc::now();
         WorkflowRun {
             id: "run".to_string(),
-            workflow_name: "wf".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "source".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: WorkflowSnapshot {
+                name: "wf".to_string(),
+                api_version: 1,
+                hash: "source".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             status: RunStatus::Running,
-            current_step: "start".to_string(),
-            head: None,
+            step: StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: BTreeMap::new(),
+            },
             resume: Value::Null,
             config_set: crate::ConfigSetRef::default(),
             parent: None,
             retries_used: 0,
-            step_retries_used: BTreeMap::new(),
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -774,9 +779,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, RunStatus::Running);
-        assert_eq!(run.current_step, "next");
-        assert_eq!(run.steps_executed, 1);
-        assert!(run.head.is_some());
+        assert_eq!(run.step.current, "next");
+        assert_eq!(run.step.executed, 1);
+        assert!(run.step.head.is_some());
     }
 
     #[tokio::test]
@@ -789,7 +794,7 @@ mod tests {
             body: String::new(),
         })]);
         let mut run = run();
-        run.current_step = "next".to_string();
+        run.step.current = "next".to_string();
 
         let status = execute_step(
             &store,
@@ -913,7 +918,7 @@ mod tests {
             output: None,
         })]);
         let mut run = run();
-        run.current_step = "agent".to_string();
+        run.step.current = "agent".to_string();
 
         let status = execute_step(
             &store,
@@ -927,7 +932,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, RunStatus::Completed);
-        assert!(run.head.is_some());
+        assert!(run.step.head.is_some());
     }
 
     #[tokio::test]
@@ -969,7 +974,7 @@ mod tests {
             let provider = StaticProvider::new(vec![action]);
             let mut run = run();
             if expected == "agent" {
-                run.current_step = "agent".to_string();
+                run.step.current = "agent".to_string();
             }
 
             execute_step(
@@ -1023,15 +1028,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, RunStatus::Running);
-        assert_eq!(run.current_step, "next");
-        assert!(run.head.is_some());
+        assert_eq!(run.step.current, "next");
+        assert!(run.step.head.is_some());
         assert_eq!(
             store.load_run(&run.id).await.unwrap().status,
             RunStatus::Running
         );
         assert_eq!(
             store.load_run_head(&run.id).await.unwrap().head_step,
-            run.head
+            run.step.head
         );
     }
 
@@ -1045,8 +1050,8 @@ mod tests {
             body: String::new(),
         })]);
         let mut run = run();
-        run.steps_executed = 1;
-        run.step_visits.insert("start".to_string(), 1);
+        run.step.executed = 1;
+        run.step.visits.insert("start".to_string(), 1);
 
         let status = retry_current_step(
             &store,
@@ -1061,8 +1066,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, RunStatus::Completed);
-        assert_eq!(run.steps_executed, 1);
-        assert_eq!(run.step_visits["start"], 1);
+        assert_eq!(run.step.executed, 1);
+        assert_eq!(run.step.visits["start"], 1);
     }
 
     #[tokio::test]
@@ -1075,7 +1080,7 @@ mod tests {
             body: String::new(),
         })]);
         let mut run = run();
-        run.steps_executed = 1;
+        run.step.executed = 1;
 
         let err = execute_step(
             &store,

@@ -43,14 +43,8 @@ impl Default for ConfigSetRef {
 pub struct WorkflowRun {
     /// Stable run id.
     pub id: RunId,
-    /// Name/id of the workflow used for this run.
-    pub workflow_name: WorkflowId,
-    /// Host API version used to interpret the snapshotted Lua sources.
-    pub workflow_api_version: u32,
-    /// Hash of the source bundle used to compile the workflow.
-    pub workflow_hash: ObjectHash,
-    /// Workflow-local source files keyed by normalized path relative to workflow root.
-    pub workflow_sources: BTreeMap<String, String>,
+    /// Snapshotted workflow identity and sources used by this run.
+    pub workflow: WorkflowSnapshot,
     /// Original user request that started the run.
     pub original_request: String,
     /// Short generated topic shown in run listings when available.
@@ -65,25 +59,14 @@ pub struct WorkflowRun {
     pub parent: Option<WorkflowRunParent>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
-    /// Step id that should run next when the run resumes.
-    pub current_step: StepId,
-    /// Hash of the latest completed step record.
-    pub head: Option<ObjectHash>,
+    /// Current step cursor and cumulative step accounting.
+    pub step: StepState,
     /// Legacy resume data retained for old serialized runs; new ask-user answers flow through `ctx.prev`.
     #[serde(default)]
     pub resume: Value,
-    /// Total number of step actions completed or terminally handled.
-    #[serde(default)]
-    pub steps_executed: u32,
-    /// Number of times each step has been visited in this run.
-    #[serde(default)]
-    pub step_visits: BTreeMap<StepId, u32>,
     /// Recoverable retry dispatches reserved across the entire run.
     #[serde(default)]
     pub retries_used: u32,
-    /// Recoverable retry dispatches reserved for each step id across all visits.
-    #[serde(default)]
-    pub step_retries_used: BTreeMap<StepId, u32>,
     /// Persisted milliseconds spent actively executing Cowboy runtime work for this run.
     #[serde(default)]
     pub active_duration_ms: u64,
@@ -91,6 +74,37 @@ pub struct WorkflowRun {
     pub created_at: DateTime<Utc>,
     /// Last update timestamp.
     pub updated_at: DateTime<Utc>,
+}
+
+/// Snapshotted workflow identity and sources for one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    /// Name/id of the workflow used for this run.
+    pub name: WorkflowId,
+    /// Host API version used to interpret the snapshotted Lua sources.
+    pub api_version: u32,
+    /// Hash of the source bundle used to compile the workflow.
+    pub hash: ObjectHash,
+    /// Workflow-local source files keyed by normalized path relative to workflow root.
+    pub sources: BTreeMap<String, String>,
+}
+
+/// Current step cursor and cumulative step accounting for one run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepState {
+    /// Step id that should run next when the run resumes.
+    pub current: StepId,
+    /// Hash of the latest completed step record.
+    pub head: Option<ObjectHash>,
+    /// Total number of step actions completed or terminally handled.
+    #[serde(default)]
+    pub executed: u32,
+    /// Number of times each step has been visited in this run.
+    #[serde(default)]
+    pub visits: BTreeMap<StepId, u32>,
+    /// Recoverable retry dispatches reserved for each step id across all visits.
+    #[serde(default)]
+    pub retries_used: BTreeMap<StepId, u32>,
 }
 
 /// Durable identity linking a child run to one parent workflow-step invocation.
@@ -470,9 +484,9 @@ impl RunHeadSummary {
     pub fn from_run(run: &WorkflowRun) -> Self {
         Self {
             created_at: Some(run.created_at),
-            workflow_name: run.workflow_name.clone(),
+            workflow_name: run.workflow.name.clone(),
             request_topic: run.request_topic.clone(),
-            current_step: run.current_step.clone(),
+            current_step: run.step.current.clone(),
         }
     }
 }
@@ -500,8 +514,8 @@ impl RunHead {
     pub fn from_run(run: &WorkflowRun) -> Self {
         Self {
             run_id: run.id.clone(),
-            workflow_hash: run.workflow_hash.clone(),
-            head_step: run.head.clone(),
+            workflow_hash: run.workflow.hash.clone(),
+            head_step: run.step.head.clone(),
             status: run.status.clone(),
             updated_at: run.updated_at,
             summary: Some(RunHeadSummary::from_run(run)),
@@ -631,20 +645,24 @@ mod tests {
     }
 
     #[test]
-    fn legacy_run_defaults_resolved_config_and_retry_counters() {
+    fn run_defaults_resolved_config_and_retry_counters() {
         let run: WorkflowRun = serde_json::from_value(serde_json::json!({
-            "id": "legacy",
-            "workflow_name": "wf",
-            "workflow_api_version": 1,
-            "workflow_hash": "hash",
-            "workflow_sources": {},
+            "id": "run",
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
             "original_request": "do it",
             "status": { "status": "running" },
-            "current_step": "start",
-            "head": null,
+            "step": {
+                "current": "start",
+                "head": null,
+                "executed": 1,
+                "visits": { "start": 1 }
+            },
             "resume": null,
-            "steps_executed": 1,
-            "step_visits": { "start": 1 },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         }))
@@ -653,21 +671,22 @@ mod tests {
         assert_eq!(run.config_set, ConfigSetRef::default());
         assert_eq!(run.parent, None);
         assert_eq!(run.retries_used, 0);
-        assert!(run.step_retries_used.is_empty());
+        assert!(run.step.retries_used.is_empty());
     }
 
     #[test]
     fn workflow_run_parent_lineage_defaults_and_round_trips() {
         let old_json = serde_json::json!({
-            "id": "legacy",
-            "workflow_name": "wf",
-            "workflow_api_version": 1,
-            "workflow_hash": "hash",
-            "workflow_sources": {},
+            "id": "run",
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
             "original_request": "do it",
             "status": { "status": "running" },
-            "current_step": "start",
-            "head": null,
+            "step": { "current": "start", "head": null },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         });
@@ -718,15 +737,16 @@ mod tests {
 
         let run: WorkflowRun = serde_json::from_value(serde_json::json!({
             "id": "run",
-            "workflow_name": "wf",
-            "workflow_api_version": 1,
-            "workflow_hash": "hash",
-            "workflow_sources": {},
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
             "original_request": "do it",
             "request_topic": "topic",
             "status": { "status": "running" },
-            "current_step": "start",
-            "head": "record-hash",
+            "step": { "current": "start", "head": "record-hash" },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-02T00:00:00Z"
         }))
@@ -747,14 +767,15 @@ mod tests {
     fn retry_counters_and_resolved_config_round_trip() {
         let mut run: WorkflowRun = serde_json::from_value(serde_json::json!({
             "id": "run",
-            "workflow_name": "wf",
-            "workflow_api_version": 1,
-            "workflow_hash": "hash",
-            "workflow_sources": {},
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
             "original_request": "do it",
             "status": { "status": "running" },
-            "current_step": "start",
-            "head": null,
+            "step": { "current": "start", "head": null },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         }))
@@ -763,13 +784,18 @@ mod tests {
             name: "careful".to_string(),
         };
         run.retries_used = 3;
-        run.step_retries_used.insert("start".to_string(), 2);
+        run.step.retries_used.insert("start".to_string(), 2);
 
-        let round_trip: WorkflowRun =
-            serde_json::from_value(serde_json::to_value(run).unwrap()).unwrap();
+        let value = serde_json::to_value(run).unwrap();
+        assert!(value.get("workflow_name").is_none());
+        assert!(value.get("current_step").is_none());
+        assert_eq!(value["workflow"]["name"], "wf");
+        assert_eq!(value["step"]["retries_used"]["start"], 2);
+
+        let round_trip: WorkflowRun = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip.config_set.name, "careful");
         assert_eq!(round_trip.retries_used, 3);
-        assert_eq!(round_trip.step_retries_used["start"], 2);
+        assert_eq!(round_trip.step.retries_used["start"], 2);
     }
 
     #[test]
@@ -801,14 +827,15 @@ mod tests {
     fn ordered_user_inputs_synthesizes_initial_entry_and_follow_ups() {
         let run: WorkflowRun = serde_json::from_value(serde_json::json!({
             "id": "run",
-            "workflow_name": "wf",
-            "workflow_api_version": 1,
-            "workflow_hash": "hash",
-            "workflow_sources": {},
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
             "original_request": "original",
             "status": { "status": "running" },
-            "current_step": "start",
-            "head": null,
+            "step": { "current": "start", "head": null },
             "created_at": "2026-01-02T03:04:05Z",
             "updated_at": "2026-01-02T03:04:05Z"
         }))

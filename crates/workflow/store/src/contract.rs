@@ -3,7 +3,7 @@ pub(crate) mod tests {
     use chrono::Utc;
     use cowboy_workflow_core::{
         ConfigSetRef, RoleSession, RunStatus, StepDetail, StepInput, StepOutput, StepRecord,
-        TurnRecord, WorkflowRun, WorkflowSourceSnapshot,
+        StepState, TurnRecord, WorkflowRun, WorkflowSnapshot, WorkflowSourceSnapshot,
     };
     use serde_json::Value;
 
@@ -13,10 +13,12 @@ pub(crate) mod tests {
         let now = Utc::now();
         WorkflowRun {
             id: id.into(),
-            workflow_name: "wf".into(),
-            workflow_api_version: 1,
-            workflow_hash: "source-hash".into(),
-            workflow_sources: Default::default(),
+            workflow: WorkflowSnapshot {
+                name: "wf".into(),
+                api_version: 1,
+                hash: "source-hash".into(),
+                sources: Default::default(),
+            },
             original_request: "do it".into(),
             request_topic: Some("topic".into()),
             config_set: ConfigSetRef {
@@ -25,12 +27,14 @@ pub(crate) mod tests {
             parent: None,
             status: RunStatus::Running,
             retries_used: 2,
-            step_retries_used: [("start".into(), 1)].into_iter().collect(),
-            current_step: "start".into(),
-            head: None,
+            step: StepState {
+                current: "start".into(),
+                head: None,
+                executed: 1,
+                visits: [("start".into(), 1)].into_iter().collect(),
+                retries_used: [("start".into(), 1)].into_iter().collect(),
+            },
             resume: Value::Null,
-            steps_executed: 1,
-            step_visits: [("start".into(), 1)].into_iter().collect(),
             active_duration_ms: 42,
             created_at: now,
             updated_at: now,

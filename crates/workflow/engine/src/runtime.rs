@@ -22,10 +22,10 @@ use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, Choice, ConfigSetRef, DEFAULT_CONFIG_SET_NAME,
     ExecutionContext, Fields, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead,
     RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction, StepActionProvider,
-    StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction, WorkflowCatalog,
+    StepDetail, StepInput, StepOutput, StepRecord, StepState, WorkflowAction, WorkflowCatalog,
     WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowRunParent, WorkflowSelector,
-    WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status,
-    apply_step_record,
+    WorkflowSnapshot, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
+    apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -659,11 +659,11 @@ impl WorkflowRuntime {
                 runs.push(RunSummaryLine {
                     run_id: run.id,
                     started_at: Some(run.created_at),
-                    workflow_name: run.workflow_name,
+                    workflow_name: run.workflow.name,
                     topic,
                     status,
                     status_detail,
-                    current_step: run.current_step,
+                    current_step: run.step.current,
                     head_step,
                 });
             }
@@ -866,22 +866,26 @@ impl WorkflowRuntime {
                 let now = Utc::now();
                 let mut run = WorkflowRun {
                     id: spec.run_id,
-                    workflow_name: definition.name.clone(),
-                    workflow_api_version: 1,
-                    workflow_hash,
-                    workflow_sources: snapshot.files.clone(),
+                    workflow: WorkflowSnapshot {
+                        name: definition.name.clone(),
+                        api_version: 1,
+                        hash: workflow_hash,
+                        sources: snapshot.files.clone(),
+                    },
                     original_request: spec.request,
                     request_topic: None,
                     config_set,
                     parent: spec.parent,
                     status: RunStatus::Running,
-                    current_step: definition.head.clone(),
-                    head: None,
+                    step: StepState {
+                        current: definition.head.clone(),
+                        head: None,
+                        executed: 0,
+                        visits: BTreeMap::new(),
+                        retries_used: BTreeMap::new(),
+                    },
                     resume: Value::Null,
                     retries_used: 0,
-                    step_retries_used: BTreeMap::new(),
-                    steps_executed: 0,
-                    step_visits: BTreeMap::new(),
                     active_duration_ms: 0,
                     created_at: now,
                     updated_at: now,
@@ -889,7 +893,7 @@ impl WorkflowRuntime {
                 let store = self.store_for_run(&run.id)?;
                 store.save_run(&run).await?;
                 let active_clock = ActiveRunClock::open(&run);
-                tracing::info!(run_id = %run.id, workflow = %run.workflow_name, "created workflow run");
+                tracing::info!(run_id = %run.id, workflow = %run.workflow.name, "created workflow run");
                 let request_topic = self.generate_request_topic(&run.original_request).await;
                 if let Some(topic) = &request_topic {
                     run.request_topic = Some(topic.clone());
@@ -916,7 +920,7 @@ impl WorkflowRuntime {
     }
 
     fn validate_catalog_run_match(&self, run: &WorkflowRun, spec: &CatalogRunSpec) -> Result<()> {
-        if run.workflow_name != spec.workflow_id
+        if run.workflow.name != spec.workflow_id
             || run.original_request != spec.request
             || run.parent != spec.parent
         {
@@ -939,8 +943,8 @@ impl WorkflowRuntime {
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        definition.name = run.workflow_name.clone();
-        definition.source_hash = run.workflow_hash.clone();
+        definition.name = run.workflow.name.clone();
+        definition.source_hash = run.workflow.hash.clone();
         let request_topic = run.request_topic.clone();
         self.run_existing_with_events(
             run,
@@ -1104,7 +1108,7 @@ impl WorkflowRuntime {
                 }))
             }
             RunStatus::Completed => {
-                let head = child.head.as_ref().ok_or_else(|| {
+                let head = child.step.head.as_ref().ok_or_else(|| {
                     WorkflowError::InvalidAction(format!(
                         "completed child run {:?} has no terminal step record",
                         child.id
@@ -1225,7 +1229,7 @@ impl WorkflowRuntime {
                 )));
             }
             let run = store.load_run(&run_id).await?;
-            chain.push(run.workflow_name.clone());
+            chain.push(run.workflow.name.clone());
             cursor = run.parent.map(|parent| parent.run_id);
         }
         chain.reverse();
@@ -1373,8 +1377,8 @@ impl WorkflowRuntime {
         tracing::debug!(
             run_id = %run.id,
             status = ?run.status,
-            current_step = %run.current_step,
-            steps_executed = run.steps_executed,
+            current_step = %run.step.current,
+            steps_executed = run.step.executed,
             "loaded workflow run"
         );
         match run.status {
@@ -1394,7 +1398,7 @@ impl WorkflowRuntime {
                 tracing::debug!(
                     run_id = %run.id,
                     status = ?run.status,
-                    current_step = %run.current_step,
+                    current_step = %run.step.current,
                     "resuming non-terminal run; re-executing the retained current step"
                 );
                 apply_run_status(&store, &mut run, RunStatus::Running).await?;
@@ -1434,8 +1438,8 @@ impl WorkflowRuntime {
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        definition.name = run.workflow_name.clone();
-        definition.source_hash = run.workflow_hash.clone();
+        definition.name = run.workflow.name.clone();
+        definition.source_hash = run.workflow.hash.clone();
         let mut events = Vec::new();
         drain_available_workflow_events(&mut rx, &mut events, run_id);
         let status = match result {
@@ -1497,10 +1501,10 @@ impl WorkflowRuntime {
         let snapshot = snapshot_from_run(run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        definition.name = run.workflow_name.clone();
-        definition.source_hash = run.workflow_hash.clone();
+        definition.name = run.workflow.name.clone();
+        definition.source_hash = run.workflow.hash.clone();
 
-        let failed_step = run.current_step.clone();
+        let failed_step = run.step.current.clone();
         let step = definition
             .steps
             .get(&failed_step)
@@ -1511,7 +1515,7 @@ impl WorkflowRuntime {
 
         // Recompute the failed step's action to recover its output shape; a
         // failed step persists no StepRecord, so the schema must be re-evaluated.
-        let prev_record = match &run.head {
+        let prev_record = match &run.step.head {
             Some(head) => Some(store.load_step_record(head).await?),
             None => None,
         };
@@ -1575,7 +1579,7 @@ impl WorkflowRuntime {
         let Some(chosen) = options.statuses.iter().find(|s| s.status == status) else {
             return Err(WorkflowError::InvalidAction(format!(
                 "status {status:?} cannot resolve step {:?}. {}",
-                run.current_step,
+                run.step.current,
                 describe_resolution_options(&options)
             )));
         };
@@ -1606,15 +1610,15 @@ impl WorkflowRuntime {
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        definition.name = run.workflow_name.clone();
-        definition.source_hash = run.workflow_hash.clone();
+        definition.name = run.workflow.name.clone();
+        definition.source_hash = run.workflow.hash.clone();
 
-        let record_id = format!("{}-{}", run.id, run.steps_executed.max(1));
+        let record_id = format!("{}-{}", run.id, run.step.executed.max(1));
         let context = ExecutionContext {
             run_id: run.id.clone(),
-            step_id: run.current_step.clone(),
+            step_id: run.step.current.clone(),
             step_record_id: record_id,
-            prev: run.head.clone(),
+            prev: run.step.head.clone(),
             role: None,
             attempt: 1,
             retry_reason: None,
@@ -1779,8 +1783,8 @@ impl WorkflowRuntime {
             run_id = %run.id,
             workflow = %definition.name,
             mode = ?mode,
-            current_step = %run.current_step,
-            steps_executed = run.steps_executed,
+            current_step = %run.step.current,
+            steps_executed = run.step.executed,
             "running workflow"
         );
         let run_id = run.id.clone();
@@ -2144,11 +2148,12 @@ fn describe_resolution_options(options: &ResolutionOptions) -> String {
 }
 
 fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
-    let workflow_entry = format!("{}.lua", run.workflow_name);
-    let entry = if run.workflow_sources.contains_key(&workflow_entry) {
+    let workflow_entry = format!("{}.lua", run.workflow.name);
+    let entry = if run.workflow.sources.contains_key(&workflow_entry) {
         workflow_entry
     } else {
-        run.workflow_sources
+        run.workflow
+            .sources
             .keys()
             .next()
             .cloned()
@@ -2157,7 +2162,7 @@ fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
     WorkflowSourceSnapshot {
         root: None,
         entry,
-        files: run.workflow_sources.clone(),
+        files: run.workflow.sources.clone(),
     }
 }
 
@@ -3045,7 +3050,7 @@ implementation_evidence: []
         let implemented = runtime.step_run(&started.run.id).await.unwrap();
         let implement_record = command_output_record(&runtime, &implemented).await;
         let feedback = runtime.step_run(&started.run.id).await.unwrap();
-        assert_eq!(feedback.run.current_step, "revise");
+        assert_eq!(feedback.run.step.current, "revise");
         let revised = runtime.step_run(&started.run.id).await.unwrap();
         let revise_record = command_output_record(&runtime, &revised).await;
         let prompts = factory.prompts();
@@ -3404,7 +3409,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         let report = run_task.await.unwrap().unwrap();
         let store = runtime.store().unwrap();
         let record = store
-            .load_step_record(report.run.head.as_ref().unwrap())
+            .load_step_record(report.run.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(record.output.as_ref().unwrap().body, "corrected");
@@ -3595,7 +3600,7 @@ done
         assert_eq!(report.run.status, RunStatus::Completed);
         let store = runtime.store().unwrap();
         let final_record = store
-            .load_step_record(report.run.head.as_ref().unwrap())
+            .load_step_record(report.run.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(final_record.step, "verify");
@@ -3777,22 +3782,26 @@ done
         let now = Utc::now();
         WorkflowRun {
             id: run_id.to_string(),
-            workflow_name: "aaa".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "hash".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: WorkflowSnapshot {
+                name: "aaa".to_string(),
+                api_version: 1,
+                hash: "hash".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
             parent: None,
             status,
-            current_step: "start".to_string(),
-            head: None,
+            step: StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: BTreeMap::new(),
+            },
             resume: Value::Null,
             retries_used: 0,
-            step_retries_used: BTreeMap::new(),
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -3811,7 +3820,7 @@ done
                 window_id: "window-1".to_string(),
                 run_id: run.id.clone(),
                 step_record_id: "record-1".to_string(),
-                step_id: run.current_step.clone(),
+                step_id: run.step.current.clone(),
                 role_id: "developer".to_string(),
                 baseline_sequence: 0,
                 applied_sequence: 0,
@@ -3858,7 +3867,7 @@ done
                 window_id: "window-cancel".to_string(),
                 run_id: run.id.clone(),
                 step_record_id: "record-cancel".to_string(),
-                step_id: run.current_step.clone(),
+                step_id: run.step.current.clone(),
                 role_id: "developer".to_string(),
                 baseline_sequence: 0,
                 applied_sequence: 0,
@@ -3959,7 +3968,7 @@ exit 0
     }
 
     async fn command_output_record(runtime: &WorkflowRuntime, report: &RunReport) -> StepRecord {
-        let head = report.run.head.as_ref().expect("completed head");
+        let head = report.run.step.head.as_ref().expect("completed head");
         runtime
             .store()
             .unwrap()
@@ -4376,14 +4385,14 @@ exit 0
             .start_run_with_workflow_stepwise("multi", "do it")
             .await
             .unwrap();
-        assert_eq!(run_a.run.steps_executed, 1);
-        assert_eq!(run_a.run.current_step, "second");
+        assert_eq!(run_a.run.step.executed, 1);
+        assert_eq!(run_a.run.step.current, "second");
         let run_b = creator
             .start_run_with_workflow_stepwise("multi", "do it")
             .await
             .unwrap();
-        assert_eq!(run_b.run.steps_executed, 1);
-        assert_eq!(run_b.run.current_step, "second");
+        assert_eq!(run_b.run.step.executed, 1);
+        assert_eq!(run_b.run.step.current, "second");
 
         // A second runtime whose `careful` set lowers the step ceiling to 1.
         let changed = RunnerLimitsConfig {
@@ -4407,8 +4416,8 @@ exit 0
         );
         let loaded_a = resumed_runtime.load_run(&run_a.run.id).await.unwrap();
         assert!(matches!(loaded_a.status, RunStatus::Failed { .. }));
-        assert_eq!(loaded_a.current_step, "second");
-        assert_eq!(loaded_a.steps_executed, 1);
+        assert_eq!(loaded_a.step.current, "second");
+        assert_eq!(loaded_a.step.executed, 1);
 
         // Run B: `resume_run` applies the same lowered live limit and is blocked.
         let resumed_err = resumed_runtime.resume_run(&run_b.run.id).await.unwrap_err();
@@ -4420,8 +4429,8 @@ exit 0
         );
         let loaded_b = resumed_runtime.load_run(&run_b.run.id).await.unwrap();
         assert!(matches!(loaded_b.status, RunStatus::Failed { .. }));
-        assert_eq!(loaded_b.current_step, "second");
-        assert_eq!(loaded_b.steps_executed, 1);
+        assert_eq!(loaded_b.step.current, "second");
+        assert_eq!(loaded_b.step.executed, 1);
     }
 
     #[tokio::test]
@@ -4480,15 +4489,15 @@ exit 0
             waiting.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        assert_eq!(waiting.run.steps_executed, 1);
-        let waiting_head = waiting.run.head.clone();
+        assert_eq!(waiting.run.step.executed, 1);
+        let waiting_head = waiting.run.step.head.clone();
         let failed = creator
             .start_run_with_workflow("resolve", "do it")
             .await
             .unwrap();
         assert!(matches!(failed.run.status, RunStatus::Failed { .. }));
-        assert_eq!(failed.run.steps_executed, 1);
-        let failed_head = failed.run.head.clone();
+        assert_eq!(failed.run.step.executed, 1);
+        let failed_head = failed.run.step.head.clone();
 
         // A second runtime that DELETES `careful` and lowers `default` to a
         // one-step ceiling. Live resolution falls back to `default` limit 1,
@@ -4519,11 +4528,11 @@ exit 0
         let loaded_answer = without_careful.load_run(&waiting.run.id).await.unwrap();
         assert!(matches!(loaded_answer.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_answer.status, RunStatus::Completed);
-        assert_eq!(loaded_answer.current_step, "done");
-        assert_eq!(loaded_answer.steps_executed, 1);
-        assert_ne!(loaded_answer.head, waiting_head);
+        assert_eq!(loaded_answer.step.current, "done");
+        assert_eq!(loaded_answer.step.executed, 1);
+        assert_ne!(loaded_answer.step.head, waiting_head);
         let answer_record = store
-            .load_step_record(loaded_answer.head.as_ref().unwrap())
+            .load_step_record(loaded_answer.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(answer_record.step, "ask");
@@ -4552,11 +4561,11 @@ exit 0
         let loaded_resolve = without_careful.load_run(&failed.run.id).await.unwrap();
         assert!(matches!(loaded_resolve.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_resolve.status, RunStatus::Completed);
-        assert_eq!(loaded_resolve.current_step, "done");
-        assert_eq!(loaded_resolve.steps_executed, 1);
-        assert_ne!(loaded_resolve.head, failed_head);
+        assert_eq!(loaded_resolve.step.current, "done");
+        assert_eq!(loaded_resolve.step.executed, 1);
+        assert_ne!(loaded_resolve.step.head, failed_head);
         let resolve_record = store
-            .load_step_record(loaded_resolve.head.as_ref().unwrap())
+            .load_step_record(loaded_resolve.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(resolve_record.action, "manual_resolution");
@@ -5104,7 +5113,7 @@ exit 0
             .await
             .unwrap();
 
-        assert_eq!(report.run.workflow_name, "aaa");
+        assert_eq!(report.run.workflow.name, "aaa");
         assert_eq!(first_run_started_topic(&report), Some("Review branch"));
     }
 
@@ -5189,7 +5198,7 @@ exit 0
         ).await;
         let start = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(start.run.status, RunStatus::Running);
-        assert_eq!(start.run.current_step, "middle");
+        assert_eq!(start.run.step.current, "middle");
 
         let active_before_idle_ms = 2_000;
         persist_run_active_duration(
@@ -5203,7 +5212,7 @@ exit 0
         let report = runtime.step_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.current_step, "finish");
+        assert_eq!(report.run.step.current, "finish");
         let stored = runtime.load_run(&start.run.id).await.unwrap();
         assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
         assert!(
@@ -5449,7 +5458,7 @@ exit 0
             .unwrap();
         assert!(matches!(run.status, RunStatus::Failed { .. }));
         assert_eq!(run.retries_used, 2);
-        assert_eq!(run.step_retries_used.values().copied().sum::<u32>(), 2);
+        assert_eq!(run.step.retries_used.values().copied().sum::<u32>(), 2);
     }
 
     #[tokio::test]
@@ -5606,7 +5615,7 @@ exit 0
             .unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        let head = report.run.head.as_ref().expect("final head");
+        let head = report.run.step.head.as_ref().expect("final head");
         let store = runtime.store().unwrap();
         let record = store.load_step_record(head).await.unwrap();
         let output = record.output.expect("finish output");
@@ -5727,7 +5736,7 @@ exit 0
 
         let report = runtime.start_run("request").await.unwrap();
 
-        assert_eq!(report.run.workflow_name, "aaa");
+        assert_eq!(report.run.workflow.name, "aaa");
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
         assert!(!runtime.load_events(&report.run.id).unwrap().is_empty());
@@ -5767,10 +5776,10 @@ exit 0
             .await
             .unwrap();
 
-        assert_eq!(report.run.workflow_name, "review");
+        assert_eq!(report.run.workflow.name, "review");
         assert_eq!(report.run.original_request, "do work");
         assert_eq!(report.run.status, RunStatus::Completed);
-        let head = report.run.head.as_ref().expect("completed head");
+        let head = report.run.step.head.as_ref().expect("completed head");
         let record = runtime
             .store()
             .unwrap()
@@ -5823,10 +5832,10 @@ exit 0
             .await
             .unwrap();
 
-        assert_eq!(report.run.workflow_name, "review");
+        assert_eq!(report.run.workflow.name, "review");
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.current_step, "review-finish");
-        assert_eq!(report.run.steps_executed, 1);
+        assert_eq!(report.run.step.current, "review-finish");
+        assert_eq!(report.run.step.executed, 1);
         assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
     }
 
@@ -5906,14 +5915,14 @@ exit 0
 
         let start = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(start.run.status, RunStatus::Running);
-        assert_eq!(start.run.current_step, "finish");
-        assert_eq!(start.run.steps_executed, 1);
+        assert_eq!(start.run.step.current, "finish");
+        assert_eq!(start.run.step.executed, 1);
 
         let report = runtime.resume_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(report.run.current_step, "finish");
-        assert_eq!(report.run.steps_executed, 2);
+        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.executed, 2);
         assert!(report.events.iter().any(|event| matches!(
             &event.kind,
             WorkflowEventKind::StepStarted { step_id } if step_id == "finish"
@@ -5974,8 +5983,8 @@ exit 0
             .await
             .unwrap();
         assert_eq!(started.run.status, RunStatus::Running);
-        assert_eq!(started.run.current_step, "finish");
-        assert!(started.run.workflow_sources["aaa.lua"].contains("body = \"original\""));
+        assert_eq!(started.run.step.current, "finish");
+        assert!(started.run.workflow.sources["aaa.lua"].contains("body = \"original\""));
 
         fs::write(
             &workflow_path,
@@ -5999,7 +6008,7 @@ exit 0
         let resumed = runtime.resume_run(&started.run.id).await.unwrap();
 
         assert_eq!(resumed.run.status, RunStatus::Completed);
-        assert_eq!(resumed.run.current_step, "finish");
+        assert_eq!(resumed.run.step.current, "finish");
         assert!(resumed.events.iter().any(|event| matches!(
             &event.kind,
             WorkflowEventKind::StepCompleted { step_id, status, body, .. }
@@ -6091,7 +6100,7 @@ exit 0
             "expected Failed run, got {:?}",
             failed.status
         );
-        assert_eq!(failed.current_step, "start");
+        assert_eq!(failed.step.current, "start");
 
         // Resume must retry the current step and drive the run forward. Before
         // the fix, resume short-circuits on the Failed status and returns the
@@ -6189,9 +6198,9 @@ exit 0
             "expected Failed run, got {:?}",
             failed.status
         );
-        assert_eq!(failed.current_step, "start");
+        assert_eq!(failed.step.current, "start");
         assert_eq!(failed.retries_used, 2);
-        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(failed.step.retries_used.get("start").copied(), Some(2));
         run_id
     }
 
@@ -6294,7 +6303,7 @@ exit 0
             started.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        assert_eq!(started.run.current_step, "ask");
+        assert_eq!(started.run.step.current, "ask");
         let first_callback_record = waiting_callback_record_id(&started.run.status);
 
         // Resume must re-execute (re-prompt) the retained ask_user step rather
@@ -6357,7 +6366,7 @@ exit 0
         // The single fresh attempt succeeds and advances the run to `finish`,
         // leaving it Running (step mode executes exactly one step).
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.current_step, "finish");
+        assert_eq!(report.run.step.current, "finish");
         assert!(report.events.iter().any(|event| matches!(
             &event.kind,
             WorkflowEventKind::StepStarted { step_id } if step_id == "start"
@@ -6365,10 +6374,10 @@ exit 0
 
         let loaded = runtime.load_run(&run_id).await.unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
-        assert_eq!(loaded.current_step, "finish");
+        assert_eq!(loaded.step.current, "finish");
         // The fresh initial attempt does not consume retry budget.
         assert_eq!(loaded.retries_used, 2);
-        assert_eq!(loaded.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(loaded.step.retries_used.get("start").copied(), Some(2));
         factory.assert_exhausted();
     }
 
@@ -6401,10 +6410,10 @@ exit 0
             "expected Failed run, got {:?}",
             loaded.status
         );
-        assert_eq!(loaded.current_step, "start");
+        assert_eq!(loaded.step.current, "start");
         // No budget was available to consume, so counters are unchanged.
         assert_eq!(loaded.retries_used, 2);
-        assert_eq!(loaded.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(loaded.step.retries_used.get("start").copied(), Some(2));
         factory.assert_exhausted();
     }
 
@@ -6491,7 +6500,7 @@ exit 0
             "expected Failed run, got {:?}",
             failed.status
         );
-        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(failed.step.retries_used.get("start").copied(), Some(2));
 
         // The user raises `max_retries_per_step` to 20 and resumes the same run.
         // The fresh attempt fails once more, but with the raised budget a single
@@ -6610,7 +6619,7 @@ exit 0
         );
         let run_id = low.list_runs(None).await.unwrap()[0].run_id.clone();
         let failed = low.load_run(&run_id).await.unwrap();
-        assert_eq!(failed.step_retries_used.get("start").copied(), Some(2));
+        assert_eq!(failed.step.retries_used.get("start").copied(), Some(2));
         assert_eq!(failed.retries_used, 2);
 
         let high = WorkflowRuntime::with_dependencies(
@@ -6627,7 +6636,7 @@ exit 0
         let report = high.resume_run(&run_id).await.unwrap();
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(report.run.retries_used, 3);
-        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
+        assert_eq!(report.run.step.retries_used.get("start"), Some(&3));
     }
 
     #[tokio::test]
@@ -6658,7 +6667,8 @@ exit 0
             low.load_run(&run_id)
                 .await
                 .unwrap()
-                .step_retries_used
+                .step
+                .retries_used
                 .get("start")
                 .copied(),
             Some(2)
@@ -6677,8 +6687,8 @@ exit 0
 
         let report = high.step_run(&run_id).await.unwrap();
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.current_step, "finish");
-        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
+        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.retries_used.get("start"), Some(&3));
     }
 
     #[tokio::test]
@@ -6714,7 +6724,8 @@ exit 0
             high.load_run(&run_id)
                 .await
                 .unwrap()
-                .step_retries_used
+                .step
+                .retries_used
                 .get("start")
                 .copied(),
             Some(5)
@@ -6735,7 +6746,7 @@ exit 0
         assert!(err.to_string().contains("5/3 retries used"), "{err}");
         let reloaded = low.load_run(&run_id).await.unwrap();
         assert_eq!(reloaded.retries_used, 5);
-        assert_eq!(reloaded.step_retries_used.get("start").copied(), Some(5));
+        assert_eq!(reloaded.step.retries_used.get("start").copied(), Some(5));
     }
 
     #[tokio::test]
@@ -6786,7 +6797,8 @@ exit 0
             low.load_run(&run_id)
                 .await
                 .unwrap()
-                .step_retries_used
+                .step
+                .retries_used
                 .get("start")
                 .copied(),
             Some(2)
@@ -6809,7 +6821,7 @@ exit 0
         assert_eq!(report.run.status, RunStatus::Completed);
         // The durable pointer is unchanged even though `careful` no longer exists.
         assert_eq!(report.run.config_set.name, "careful");
-        assert_eq!(report.run.step_retries_used.get("start"), Some(&3));
+        assert_eq!(report.run.step.retries_used.get("start"), Some(&3));
     }
 
     #[tokio::test]
@@ -7039,7 +7051,7 @@ exit 0
             start.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        let steps_before_answer = start.run.steps_executed;
+        let steps_before_answer = start.run.step.executed;
         assert_eq!(
             first_run_started_topic(&start),
             Some("Initial prompt topic")
@@ -7050,7 +7062,7 @@ exit 0
             .unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(report.run.steps_executed, steps_before_answer + 2);
+        assert_eq!(report.run.step.executed, steps_before_answer + 2);
         assert!(matches!(
             &report.events[0].kind,
             WorkflowEventKind::StepCompleted { step_id, action, status, .. }
@@ -8379,37 +8391,41 @@ Recovery implementation review"#
         let now = Utc::now();
         let run = WorkflowRun {
             id: "run-1".to_string(),
-            workflow_name: "workflows/feature".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "hash".to_string(),
-            workflow_sources: BTreeMap::from([
-                (
-                    "roles/planner.lua".to_string(),
-                    r#"return role("planner", "Plan work")"#.to_string(),
-                ),
-                (
-                    "workflows/feature.lua".to_string(),
-                    r#"
-                local planner = require("roles/planner.lua")
-                local start = step("start", { role = planner })
-                start.run = function(ctx) return action.status { status = "success" } end
-                return workflow("feature", start)
-                "#
-                    .to_string(),
-                ),
-            ]),
+            workflow: WorkflowSnapshot {
+                name: "workflows/feature".to_string(),
+                api_version: 1,
+                hash: "hash".to_string(),
+                sources: BTreeMap::from([
+                    (
+                        "roles/planner.lua".to_string(),
+                        r#"return role("planner", "Plan work")"#.to_string(),
+                    ),
+                    (
+                        "workflows/feature.lua".to_string(),
+                        r#"
+                    local planner = require("roles/planner.lua")
+                    local start = step("start", { role = planner })
+                    start.run = function(ctx) return action.status { status = "success" } end
+                    return workflow("feature", start)
+                    "#
+                        .to_string(),
+                    ),
+                ]),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
             status: RunStatus::Running,
             retries_used: 0,
-            step_retries_used: Default::default(),
-            current_step: "start".to_string(),
-            head: None,
+            step: StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: Default::default(),
+            },
             resume: Value::Null,
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -8655,22 +8671,26 @@ Recovery implementation review"#
         let now = Utc::now();
         WorkflowRun {
             id: id.to_string(),
-            workflow_name: workflow_name.to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "hash".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: WorkflowSnapshot {
+                name: workflow_name.to_string(),
+                api_version: 1,
+                hash: "hash".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: request.to_string(),
             request_topic: None,
             config_set: Default::default(),
             parent,
             status: RunStatus::Running,
-            current_step: "start".to_string(),
-            head: None,
+            step: StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: BTreeMap::new(),
+            },
             resume: Value::Null,
             retries_used: 0,
-            step_retries_used: BTreeMap::new(),
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -8741,7 +8761,7 @@ Recovery implementation review"#
         let parent = runtime.load_run(&parent_id).await.unwrap();
         let child = runtime.load_run(&child_id).await.unwrap();
 
-        assert_eq!(child.workflow_name, "child");
+        assert_eq!(child.workflow.name, "child");
         assert_eq!(child.original_request, "exact child request");
         assert_eq!(child.config_set.name, "careful");
         assert_eq!(
@@ -8762,11 +8782,11 @@ Recovery implementation review"#
             workflow_invocation_id(&parent_id, "call_child", None).to_string()
         );
 
-        assert_ne!(child.workflow_hash, parent.workflow_hash);
+        assert_ne!(child.workflow.hash, parent.workflow.hash);
         let catalog = runtime.catalog().unwrap();
         let child_source = catalog.workflows.get("child").expect("child source ref");
         let (_, _, child_hash) = runtime.compile_source(child_source).await.unwrap();
-        assert_eq!(child.workflow_hash, child_hash);
+        assert_eq!(child.workflow.hash, child_hash);
 
         let parent_events = runtime.load_events(&parent_id).unwrap();
         assert!(
@@ -8953,7 +8973,7 @@ Recovery implementation review"#
 
         // Mutated workflow id.
         let mut mismatch = matching.clone();
-        mismatch.workflow_name = "other".to_string();
+        mismatch.workflow.name = "other".to_string();
         let err = runtime
             .validate_catalog_run_match(&mismatch, &spec)
             .unwrap_err();
@@ -9150,7 +9170,7 @@ Recovery implementation review"#
         let store = runtime.store().unwrap();
 
         let final_record = store
-            .load_step_record(parent.head.as_ref().unwrap())
+            .load_step_record(parent.step.head.as_ref().unwrap())
             .await
             .unwrap();
         let workflow_record = store
@@ -9158,7 +9178,7 @@ Recovery implementation review"#
             .await
             .unwrap();
         let child_record = store
-            .load_step_record(child.head.as_ref().unwrap())
+            .load_step_record(child.step.head.as_ref().unwrap())
             .await
             .unwrap();
 

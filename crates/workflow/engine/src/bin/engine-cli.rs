@@ -295,13 +295,13 @@ fn print_run_summary(run: &RunSummaryLine) {
 async fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
     let run = rt.load_run(run_id).await?;
     println!("id:             {}", run.id);
-    println!("workflow:       {}", run.workflow_name);
+    println!("workflow:       {}", run.workflow.name);
     println!("status:         {}", status_label(&run.status));
-    println!("current_step:   {}", run.current_step);
-    println!("steps_executed: {}", run.steps_executed);
+    println!("current_step:   {}", run.step.current);
+    println!("steps_executed: {}", run.step.executed);
     println!(
         "head:           {}",
-        run.head.as_deref().unwrap_or("<none>")
+        run.step.head.as_deref().unwrap_or("<none>")
     );
     println!("request:        {}", run.original_request);
     if !run.resume.is_null() {
@@ -498,10 +498,10 @@ fn print_report(report: &RunReport) {
     println!(
         "run={} workflow={} status={} step={} steps_executed={}",
         run.id,
-        run.workflow_name,
+        run.workflow.name,
         status_label(&run.status),
-        run.current_step,
-        run.steps_executed,
+        run.step.current,
+        run.step.executed,
     );
     if let RunStatus::WaitingForInput {
         prompt_id,

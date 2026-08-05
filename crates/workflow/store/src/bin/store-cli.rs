@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use cowboy_workflow_core::{
-    RunStatus, StepDetail, StepInput, StepOutput, StepRecord, TurnRecord, WorkflowRun,
-    WorkflowSourceSnapshot,
+    RunStatus, StepDetail, StepInput, StepOutput, StepRecord, StepState, TurnRecord, WorkflowRun,
+    WorkflowSnapshot, WorkflowSourceSnapshot,
 };
 use cowboy_workflow_store::SqliteWorkflowStore;
 use serde_json::Value;
@@ -109,22 +109,26 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
     let now = Utc::now();
     WorkflowRun {
         id: id.to_string(),
-        workflow_name: workflow.to_string(),
-        workflow_api_version: 1,
-        workflow_hash: workflow_hash.to_string(),
-        workflow_sources: Default::default(),
+        workflow: WorkflowSnapshot {
+            name: workflow.to_string(),
+            api_version: 1,
+            hash: workflow_hash.to_string(),
+            sources: Default::default(),
+        },
         original_request: "manual store-cli run".to_string(),
         request_topic: None,
         config_set: Default::default(),
         parent: None,
         status: RunStatus::Running,
         retries_used: 0,
-        step_retries_used: Default::default(),
-        current_step: current_step.to_string(),
-        head: None,
+        step: StepState {
+            current: current_step.to_string(),
+            head: None,
+            executed: 0,
+            visits: Default::default(),
+            retries_used: Default::default(),
+        },
         resume: Value::Null,
-        steps_executed: 0,
-        step_visits: Default::default(),
         active_duration_ms: 0,
         created_at: now,
         updated_at: now,

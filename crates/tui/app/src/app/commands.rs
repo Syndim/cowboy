@@ -530,7 +530,10 @@ mod tests {
     use super::*;
     use crate::config::{AgentConfig, AppConfig};
     use chrono::{DateTime, Utc};
-    use cowboy_workflow_core::{AgentPromptWindow, Choice, ResumeCallback, RunStatus, WorkflowRun};
+    use cowboy_workflow_core::{
+        AgentPromptWindow, Choice, ResumeCallback, RunStatus, StepState, WorkflowRun,
+        WorkflowSnapshot,
+    };
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::SqliteWorkflowStore;
     use serde_json::Value;
@@ -673,22 +676,26 @@ mod tests {
             .to_utc();
         WorkflowRun {
             id: id.to_string(),
-            workflow_name: "deploy".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: format!("hash-{id}"),
-            workflow_sources: Default::default(),
+            workflow: WorkflowSnapshot {
+                name: "deploy".to_string(),
+                api_version: 1,
+                hash: format!("hash-{id}"),
+                sources: Default::default(),
+            },
             original_request: format!("request for {id}"),
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
             parent: None,
             status,
-            current_step: current_step.to_string(),
-            head: head.map(ToString::to_string),
+            step: StepState {
+                current: current_step.to_string(),
+                head: head.map(ToString::to_string),
+                executed: 0,
+                visits: Default::default(),
+                retries_used: Default::default(),
+            },
             resume: Value::Null,
             retries_used: 0,
-            step_retries_used: Default::default(),
-            steps_executed: 0,
-            step_visits: Default::default(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -2142,7 +2149,7 @@ mod tests {
             .await
             .unwrap();
         let record = store
-            .load_step_record(run.head.as_ref().unwrap())
+            .load_step_record(run.step.head.as_ref().unwrap())
             .await
             .unwrap();
         let output = record.output.unwrap();
@@ -2708,7 +2715,7 @@ mod tests {
             .await
             .unwrap();
         let record = store
-            .load_step_record(answered.head.as_ref().unwrap())
+            .load_step_record(answered.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(record.output.unwrap().body, "yes");
@@ -2781,8 +2788,8 @@ mod tests {
         state.apply_workflow_event(WorkflowEvent::new(
             &run.id,
             WorkflowEventKind::RunStarted {
-                workflow_name: run.workflow_name.clone(),
-                current_step: run.current_step.clone(),
+                workflow_name: run.workflow.name.clone(),
+                current_step: run.step.current.clone(),
                 request_topic: None,
             },
         ));
@@ -2840,8 +2847,8 @@ mod tests {
         state.apply_workflow_event(WorkflowEvent::new(
             &run.id,
             WorkflowEventKind::RunStarted {
-                workflow_name: run.workflow_name.clone(),
-                current_step: run.current_step.clone(),
+                workflow_name: run.workflow.name.clone(),
+                current_step: run.step.current.clone(),
                 request_topic: None,
             },
         ));

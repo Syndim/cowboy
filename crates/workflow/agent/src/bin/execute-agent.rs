@@ -9,7 +9,8 @@ use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
 };
 use cowboy_workflow_core::{
-    AgentAction, RoleDefinition, RunId, RunStatus, RunUserPrompt, WorkflowRun,
+    AgentAction, RoleDefinition, RunId, RunStatus, RunUserPrompt, StepState, WorkflowRun,
+    WorkflowSnapshot,
 };
 use cowboy_workflow_store::{Error as StoreError, SqliteWorkflowStore};
 
@@ -72,7 +73,7 @@ fn execution_context(
         run_id: run.id.clone(),
         step_id: config.step_id.clone(),
         step_record_id: config.record_id.clone(),
-        prev: run.head.clone(),
+        prev: run.step.head.clone(),
         role: Some(RoleDefinition {
             id: config.role.clone(),
             instructions: String::new(),
@@ -97,22 +98,26 @@ async fn ensure_standalone_run(
             let now = Utc::now();
             let run = WorkflowRun {
                 id: config.run_id.clone(),
-                workflow_name: "execute-agent".to_string(),
-                workflow_api_version: 1,
-                workflow_hash: "execute-agent".to_string(),
-                workflow_sources: Default::default(),
+                workflow: WorkflowSnapshot {
+                    name: "execute-agent".to_string(),
+                    api_version: 1,
+                    hash: "execute-agent".to_string(),
+                    sources: Default::default(),
+                },
                 original_request: config.prompt.clone(),
                 request_topic: None,
                 config_set: Default::default(),
                 parent: None,
                 status: RunStatus::Running,
-                current_step: config.step_id.clone(),
-                head: None,
+                step: StepState {
+                    current: config.step_id.clone(),
+                    head: None,
+                    executed: 0,
+                    visits: Default::default(),
+                    retries_used: Default::default(),
+                },
                 resume: serde_json::Value::Null,
                 retries_used: 0,
-                step_retries_used: Default::default(),
-                steps_executed: 0,
-                step_visits: Default::default(),
                 active_duration_ms: 0,
                 created_at: now,
                 updated_at: now,

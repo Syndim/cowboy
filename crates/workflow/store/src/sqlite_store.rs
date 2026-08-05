@@ -184,7 +184,7 @@ impl SqliteWorkflowStore {
                 let mut tx = self.pool.begin().await?;
                 put_object_in_tx(&mut tx, ObjectKind::StepRecord, record).await?;
                 let mut stored_run = run.clone();
-                stored_run.head = Some(hash.clone());
+                stored_run.step.head = Some(hash.clone());
                 upsert_run_and_head(&mut tx, &stored_run).await?;
                 #[cfg(test)]
                 if self

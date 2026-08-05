@@ -444,10 +444,10 @@ where
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         let summary: WorkflowSummary = parse_json_response(&text, "summary")?;
-        if summary.selected_workflow_id != run.workflow_name {
+        if summary.selected_workflow_id != run.workflow.name {
             return Err(WorkflowError::InvalidAction(format!(
                 "summary selected workflow {:?} does not match run workflow {:?}",
-                summary.selected_workflow_id, run.workflow_name
+                summary.selected_workflow_id, run.workflow.name
             )));
         }
         Ok(summary)
@@ -506,8 +506,8 @@ mod tests {
     use chrono::Utc;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        RunStatus, WorkflowImprovement, WorkflowRun, WorkflowSelector, WorkflowSourceRef,
-        WorkflowSummarizer,
+        RunStatus, StepState, WorkflowImprovement, WorkflowRun, WorkflowSelector, WorkflowSnapshot,
+        WorkflowSourceRef, WorkflowSummarizer,
     };
     use serde_json::Value;
 
@@ -814,22 +814,26 @@ mod tests {
         let now = Utc::now();
         let run = WorkflowRun {
             id: "run-1".to_string(),
-            workflow_name: "default".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "hash".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: WorkflowSnapshot {
+                name: "default".to_string(),
+                api_version: 1,
+                hash: "hash".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
             status: RunStatus::Completed,
             retries_used: 0,
-            step_retries_used: Default::default(),
-            current_step: "finish".to_string(),
-            head: None,
+            step: StepState {
+                current: "finish".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: Default::default(),
+            },
             resume: serde_json::Value::Null,
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,

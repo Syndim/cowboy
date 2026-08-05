@@ -48,8 +48,8 @@ impl ActiveRunClock {
         self.event_for_run(
             run,
             WorkflowEventKind::RunStarted {
-                workflow_name: run.workflow_name.clone(),
-                current_step: run.current_step.clone(),
+                workflow_name: run.workflow.name.clone(),
+                current_step: run.step.current.clone(),
                 request_topic,
             },
         )
@@ -173,22 +173,26 @@ mod tests {
     fn run(created_at: DateTime<Utc>, active_duration_ms: u64) -> WorkflowRun {
         WorkflowRun {
             id: "run-1".to_string(),
-            workflow_name: "wf".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "source".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: cowboy_workflow_core::WorkflowSnapshot {
+                name: "wf".to_string(),
+                api_version: 1,
+                hash: "source".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
             status: RunStatus::Running,
             retries_used: 0,
-            step_retries_used: Default::default(),
-            current_step: "start".to_string(),
-            head: None,
+            step: cowboy_workflow_core::StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: Default::default(),
+            },
             resume: Value::Null,
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms,
             created_at,
             updated_at: created_at,

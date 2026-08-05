@@ -164,8 +164,8 @@ where
         definition: &WorkflowDefinition,
         run: &mut WorkflowRun,
     ) -> Result<RunStatus> {
-        let step_id = run.current_step.clone();
-        let previous_head = run.head.clone();
+        let step_id = run.step.current.clone();
+        let previous_head = run.step.head.clone();
         self.events.emit(self.workflow_event_for_run(
             run,
             WorkflowEventKind::StepStarted {
@@ -205,8 +205,8 @@ where
             },
         };
 
-        if run.head != previous_head
-            && let Some(head) = &run.head
+        if run.step.head != previous_head
+            && let Some(head) = &run.step.head
         {
             let record = self.store.load_step_record(head).await?;
             self.events.emit(self.step_completed_event(run, &record));
@@ -234,7 +234,7 @@ where
         let run_remaining = limits.max_retries_per_run.saturating_sub(run.retries_used);
         let step_remaining = limits
             .max_retries_per_step
-            .saturating_sub(run.step_retries_used.get(step_id).copied().unwrap_or(0));
+            .saturating_sub(run.step.retries_used.get(step_id).copied().unwrap_or(0));
         let (allowance, max_attempts) = retry_visit_bounds(run_remaining, step_remaining);
         let mut last_error = first_error;
 
@@ -244,7 +244,8 @@ where
             }
 
             run.retries_used += 1;
-            *run.step_retries_used
+            *run.step
+                .retries_used
                 .entry(step_id.to_string())
                 .or_default() += 1;
             run.updated_at = Utc::now();
@@ -296,7 +297,7 @@ where
             )));
         }
 
-        let step_retries_used = run.step_retries_used.get(step_id).copied().unwrap_or(0);
+        let step_retries_used = run.step.retries_used.get(step_id).copied().unwrap_or(0);
         if step_retries_used >= limits.max_retries_per_step {
             return Some(WorkflowError::InvalidAction(format!(
                 "config set {:?} exhausted retry budget for step {step_id:?}: {step_retries_used}/{} retries used; last recoverable error: {last_error}",
@@ -380,7 +381,7 @@ impl StepActionProvider for LuaStepActionProvider {
             },
             "resume": Value::Null,
             "prev": previous_step_context(prev),
-            "steps_executed": run.steps_executed,
+            "steps_executed": run.step.executed,
             "system": crate::system::system_context(),
         });
         cowboy_workflow_lua::run_step(&self.source_bundle, &step.id, ctx)
@@ -450,7 +451,7 @@ mod tests {
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
             self.objects.lock().insert(hash.clone(), bytes);
             let mut stored_run = run.clone();
-            stored_run.head = Some(hash.clone());
+            stored_run.step.head = Some(hash.clone());
             self.save_run(&stored_run).await?;
             Ok(hash)
         }
@@ -656,7 +657,7 @@ mod tests {
             if context.attempt > 1 {
                 let persisted = self.store.load_run(&context.run_id).await?;
                 assert_eq!(persisted.retries_used, 1);
-                assert_eq!(persisted.step_retries_used[&context.step_id], 1);
+                assert_eq!(persisted.step.retries_used[&context.step_id], 1);
             }
 
             Err(WorkflowError::RecoverableAction(
@@ -676,7 +677,7 @@ mod tests {
             _prev: Option<&StepRecord>,
             _user_prompts: &[cowboy_workflow_core::RunUserPrompt],
         ) -> Result<StepAction> {
-            let index = run.steps_executed.saturating_sub(1) as usize;
+            let index = run.step.executed.saturating_sub(1) as usize;
             self.0
                 .get(index)
                 .cloned()
@@ -728,22 +729,26 @@ mod tests {
         let now = Utc::now();
         WorkflowRun {
             id: "run-1".to_string(),
-            workflow_name: "wf".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "source".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: cowboy_workflow_core::WorkflowSnapshot {
+                name: "wf".to_string(),
+                api_version: 1,
+                hash: "source".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
             status: RunStatus::Running,
             retries_used: 0,
-            step_retries_used: Default::default(),
-            current_step: "start".to_string(),
-            head: None,
+            step: cowboy_workflow_core::StepState {
+                current: "start".to_string(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: Default::default(),
+            },
             resume: Value::Null,
-            steps_executed: 0,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -782,7 +787,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(run.status, RunStatus::Completed);
-        assert_eq!(run.steps_executed, 2);
+        assert_eq!(run.step.executed, 2);
 
         let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
@@ -855,8 +860,8 @@ mod tests {
 
         // First step runs `start`, routes to `agent`, run stays Running.
         let run = runner.step_once(&definition, run()).await.unwrap();
-        assert_eq!(run.steps_executed, 1);
-        assert_eq!(run.current_step, "agent");
+        assert_eq!(run.step.executed, 1);
+        assert_eq!(run.step.current, "agent");
         assert_eq!(run.status, RunStatus::Running);
         let first_event = events.try_recv().unwrap();
         assert_eq!(
@@ -870,12 +875,12 @@ mod tests {
 
         // Second step runs `agent`, which has no transition -> Completed.
         let run = runner.step_once(&definition, run).await.unwrap();
-        assert_eq!(run.steps_executed, 2);
+        assert_eq!(run.step.executed, 2);
         assert_eq!(run.status, RunStatus::Completed);
 
         // Stepping a non-running run is a no-op.
         let run = runner.step_once(&definition, run).await.unwrap();
-        assert_eq!(run.steps_executed, 2);
+        assert_eq!(run.step.executed, 2);
         assert_eq!(run.status, RunStatus::Completed);
     }
 
@@ -936,7 +941,11 @@ mod tests {
         let run = runner.run_until_blocked(&definition, run()).await.unwrap();
 
         assert_eq!(run.status, RunStatus::Completed);
-        let head = run.head.as_ref().expect("final step should be persisted");
+        let head = run
+            .step
+            .head
+            .as_ref()
+            .expect("final step should be persisted");
         let record = runner.store().load_step_record(head).await.unwrap();
         let output = record.output.expect("final step should have output");
         assert_eq!(output.status, "success");
@@ -970,7 +979,7 @@ mod tests {
             )]),
         });
         let mut run = run();
-        run.current_step = "implement".to_string();
+        run.step.current = "implement".to_string();
         let definition = cowboy_workflow_lua::compile_snapshot(provider.source_bundle()).unwrap();
         let action = provider
             .step_action(
@@ -1020,7 +1029,7 @@ mod tests {
             )]),
         });
         let mut run = run();
-        run.current_step = "implement".to_string();
+        run.step.current = "implement".to_string();
         run.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -1090,7 +1099,11 @@ mod tests {
         let run = runner.run_until_blocked(&definition, run()).await.unwrap();
 
         assert_eq!(run.status, RunStatus::Completed);
-        let head = run.head.as_ref().expect("final step should be persisted");
+        let head = run
+            .step
+            .head
+            .as_ref()
+            .expect("final step should be persisted");
         let record = runner.store().load_step_record(head).await.unwrap();
         let output = record.output.expect("final step should have output");
         assert_eq!(output.body, std::env::consts::OS);
@@ -1098,7 +1111,7 @@ mod tests {
 
     fn agent_run() -> WorkflowRun {
         let mut run = run();
-        run.current_step = "agent".to_string();
+        run.step.current = "agent".to_string();
         run
     }
 
@@ -1162,9 +1175,9 @@ mod tests {
         // Attempts are numbered 1, 2, 3 across the retries.
         assert_eq!(*seen_attempts.lock(), vec![1, 2, 3]);
         // Retries reuse the same step budget: the step is only visited once.
-        assert_eq!(run.step_visits.get("agent").copied().unwrap_or(0), 1);
+        assert_eq!(run.step.visits.get("agent").copied().unwrap_or(0), 1);
         assert_eq!(run.retries_used, 2);
-        assert_eq!(run.step_retries_used["agent"], 2);
+        assert_eq!(run.step.retries_used["agent"], 2);
 
         let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
@@ -1235,9 +1248,9 @@ mod tests {
         let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert!(matches!(stored.status, RunStatus::Failed { .. }));
         // The failed step stays current so it can be resolved manually.
-        assert_eq!(stored.current_step, "agent");
+        assert_eq!(stored.step.current, "agent");
         assert_eq!(stored.retries_used, 2);
-        assert_eq!(stored.step_retries_used["agent"], 2);
+        assert_eq!(stored.step.retries_used["agent"], 2);
 
         let mut collected_events = Vec::new();
         while let Ok(event) = events.try_recv() {
@@ -1293,7 +1306,7 @@ mod tests {
         let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert!(matches!(stored.status, RunStatus::Failed { .. }));
         assert_eq!(stored.retries_used, 0);
-        assert!(stored.step_retries_used.is_empty());
+        assert!(stored.step.retries_used.is_empty());
 
         let mut kinds = Vec::new();
         while let Ok(event) = events.try_recv() {
@@ -1333,7 +1346,7 @@ mod tests {
         assert_eq!(*dispatches.lock(), 1);
         let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert_eq!(stored.retries_used, 0);
-        assert!(stored.step_retries_used.is_empty());
+        assert!(stored.step.retries_used.is_empty());
     }
 
     #[tokio::test]
@@ -1392,10 +1405,10 @@ mod tests {
             .step_once(&definition(), first_visit)
             .await
             .unwrap();
-        assert_eq!(second_visit.step_retries_used["agent"], 1);
+        assert_eq!(second_visit.step.retries_used["agent"], 1);
         second_visit.status = RunStatus::Running;
-        second_visit.current_step = "agent".to_string();
-        second_visit.head = None;
+        second_visit.step.current = "agent".to_string();
+        second_visit.step.head = None;
 
         let dispatches = Arc::new(Mutex::new(0));
         let attempts = Arc::new(Mutex::new(Vec::new()));
@@ -1424,7 +1437,7 @@ mod tests {
             .load_run(&"run-1".to_string())
             .await
             .unwrap();
-        assert_eq!(stored.step_retries_used["agent"], 2);
+        assert_eq!(stored.step.retries_used["agent"], 2);
     }
 
     #[tokio::test]
@@ -1451,7 +1464,7 @@ mod tests {
         assert_eq!(*first_dispatches.lock(), 2);
         let persisted = store.load_run(&"run-1".to_string()).await.unwrap();
         assert_eq!(persisted.retries_used, 1);
-        assert_eq!(persisted.step_retries_used["agent"], 1);
+        assert_eq!(persisted.step.retries_used["agent"], 1);
         println!("EVIDENCE runner-retry reserved_before_dispatch=true");
     }
 
@@ -1468,7 +1481,8 @@ mod tests {
         };
         persisted.retries_used = retries_used;
         persisted
-            .step_retries_used
+            .step
+            .retries_used
             .insert("agent".to_string(), step_retries_used);
         store.save_run(&persisted).await.unwrap();
         let reloaded = store.load_run(&persisted.id).await.unwrap();

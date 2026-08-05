@@ -74,8 +74,8 @@ impl WorkflowEvent {
         Self::for_run(
             run,
             WorkflowEventKind::RunStarted {
-                workflow_name: run.workflow_name.clone(),
-                current_step: run.current_step.clone(),
+                workflow_name: run.workflow.name.clone(),
+                current_step: run.step.current.clone(),
                 request_topic,
             },
         )

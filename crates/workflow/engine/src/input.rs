@@ -131,10 +131,12 @@ mod tests {
         let now = Utc::now();
         WorkflowRun {
             id: "run-1".to_string(),
-            workflow_name: "wf".to_string(),
-            workflow_api_version: 1,
-            workflow_hash: "hash".to_string(),
-            workflow_sources: BTreeMap::new(),
+            workflow: cowboy_workflow_core::WorkflowSnapshot {
+                name: "wf".to_string(),
+                api_version: 1,
+                hash: "hash".to_string(),
+                sources: BTreeMap::new(),
+            },
             original_request: "do it".to_string(),
             request_topic: None,
             config_set: Default::default(),
@@ -166,12 +168,14 @@ mod tests {
                 .unwrap(),
             },
             retries_used: 0,
-            step_retries_used: Default::default(),
-            current_step: "approve".to_string(),
-            head: None,
+            step: cowboy_workflow_core::StepState {
+                current: "approve".to_string(),
+                head: None,
+                executed: 1,
+                visits: BTreeMap::new(),
+                retries_used: Default::default(),
+            },
             resume: Value::Null,
-            steps_executed: 1,
-            step_visits: BTreeMap::new(),
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -196,8 +200,8 @@ mod tests {
     async fn answer_dispatches_callback_without_mutating_resume_or_counters() {
         let run = waiting_run();
         let before_resume = run.resume.clone();
-        let before_steps = run.steps_executed;
-        let before_visits = run.step_visits.clone();
+        let before_steps = run.step.executed;
+        let before_visits = run.step.visits.clone();
         let ActionResult::Completed(record) = ResumeRouter::default()
             .answer(&run, "approval", "yes")
             .await
@@ -207,8 +211,8 @@ mod tests {
         };
 
         assert_eq!(run.resume, before_resume);
-        assert_eq!(run.steps_executed, before_steps);
-        assert_eq!(run.step_visits, before_visits);
+        assert_eq!(run.step.executed, before_steps);
+        assert_eq!(run.step.visits, before_visits);
         assert_eq!(record.id, "run-1-ask");
         assert_eq!(record.prev, Some("previous-hash".to_string()));
         assert_eq!(record.step, "approve");
