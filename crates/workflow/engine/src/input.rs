@@ -8,8 +8,7 @@ use crate::ResumeCallbackRegistry;
 /// Applies user answers to a workflow run waiting on a registered resume callback.
 ///
 /// The router owns prompt validation. It then dispatches the persisted callback
-/// descriptor by kind without mutating `run.resume`, step counters, or visit
-/// counters.
+/// descriptor by kind without mutating step counters or visit counters.
 #[derive(Debug, Clone)]
 pub struct ResumeRouter {
     registry: ResumeCallbackRegistry,
@@ -175,7 +174,6 @@ mod tests {
                 visits: BTreeMap::new(),
                 retries_used: Default::default(),
             },
-            resume: Value::Null,
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,
@@ -197,9 +195,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answer_dispatches_callback_without_mutating_resume_or_counters() {
+    async fn answer_dispatches_callback_without_mutating_counters() {
         let run = waiting_run();
-        let before_resume = run.resume.clone();
         let before_steps = run.step.executed;
         let before_visits = run.step.visits.clone();
         let ActionResult::Completed(record) = ResumeRouter::default()
@@ -210,7 +207,6 @@ mod tests {
             panic!("expected completed ask-user result")
         };
 
-        assert_eq!(run.resume, before_resume);
         assert_eq!(run.step.executed, before_steps);
         assert_eq!(run.step.visits, before_visits);
         assert_eq!(record.id, "run-1-ask");

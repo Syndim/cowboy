@@ -61,9 +61,6 @@ pub struct WorkflowRun {
     pub status: RunStatus,
     /// Current step cursor and cumulative step accounting.
     pub step: StepState,
-    /// Legacy resume data retained for old serialized runs; new ask-user answers flow through `ctx.prev`.
-    #[serde(default)]
-    pub resume: Value,
     /// Recoverable retry dispatches reserved across the entire run.
     #[serde(default)]
     pub retries_used: u32,
@@ -662,7 +659,6 @@ mod tests {
                 "executed": 1,
                 "visits": { "start": 1 }
             },
-            "resume": null,
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         }))
@@ -789,6 +785,7 @@ mod tests {
         let value = serde_json::to_value(run).unwrap();
         assert!(value.get("workflow_name").is_none());
         assert!(value.get("current_step").is_none());
+        assert!(value.get("resume").is_none());
         assert_eq!(value["workflow"]["name"], "wf");
         assert_eq!(value["step"]["retries_used"]["start"], 2);
 

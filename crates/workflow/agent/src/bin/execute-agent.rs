@@ -116,7 +116,6 @@ async fn ensure_standalone_run(
                     visits: Default::default(),
                     retries_used: Default::default(),
                 },
-                resume: serde_json::Value::Null,
                 retries_used: 0,
                 active_duration_ms: 0,
                 created_at: now,

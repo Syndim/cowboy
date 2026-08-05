@@ -682,7 +682,6 @@ mod tests {
                 visits: BTreeMap::new(),
                 retries_used: BTreeMap::new(),
             },
-            resume: Value::Null,
             config_set: crate::ConfigSetRef::default(),
             parent: None,
             retries_used: 0,

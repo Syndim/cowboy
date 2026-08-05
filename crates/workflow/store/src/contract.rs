@@ -34,7 +34,6 @@ pub(crate) mod tests {
                 visits: [("start".into(), 1)].into_iter().collect(),
                 retries_used: [("start".into(), 1)].into_iter().collect(),
             },
-            resume: Value::Null,
             active_duration_ms: 42,
             created_at: now,
             updated_at: now,

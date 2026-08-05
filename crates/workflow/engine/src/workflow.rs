@@ -833,7 +833,6 @@ mod tests {
                 visits: BTreeMap::new(),
                 retries_used: Default::default(),
             },
-            resume: serde_json::Value::Null,
             active_duration_ms: 0,
             created_at: now,
             updated_at: now,

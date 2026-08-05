@@ -536,7 +536,6 @@ mod tests {
     };
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::SqliteWorkflowStore;
-    use serde_json::Value;
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();
@@ -694,7 +693,6 @@ mod tests {
                 visits: Default::default(),
                 retries_used: Default::default(),
             },
-            resume: Value::Null,
             retries_used: 0,
             active_duration_ms: 0,
             created_at: now,

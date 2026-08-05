@@ -10,7 +10,7 @@ Cowboy workflows are Lua files that compile into a durable workflow graph. A run
   -> status transitions: step:on(status, next_step)
 ```
 
-The Lua VM is sandboxed and recreated for each compile or step execution. Persist run state through action outputs and `ctx.prev`; do not depend on mutable Lua globals surviving between steps. `ctx.resume` is inactive legacy state and is not the ask-user answer path.
+The Lua VM is sandboxed and recreated for each compile or step execution. Persist run state through action outputs and `ctx.prev`; do not depend on mutable Lua globals surviving between steps.
 
 ## File placement
 
@@ -110,7 +110,6 @@ Runtime context passed to `run(ctx)`:
 | `ctx.step.id` | Current step id. |
 | `ctx.step.role` | Current step's configured role id, or `nil`. |
 | `ctx.step.properties` | Non-reserved fields from the step config. |
-| `ctx.resume` | Inactive legacy state retained for old serialized runs; do not use for new workflows. |
 | `ctx.prev` | Latest completed step output, including completed ask-user answers, or `nil` on the first step. |
 | `ctx.steps_executed` | Number of already-executed steps in the run. |
 | `ctx.system.os` | Host operating system (`std::env::consts::OS`), e.g. `linux`. |

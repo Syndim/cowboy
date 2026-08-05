@@ -128,7 +128,6 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
             visits: Default::default(),
             retries_used: Default::default(),
         },
-        resume: Value::Null,
         active_duration_ms: 0,
         created_at: now,
         updated_at: now,

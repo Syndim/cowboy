@@ -304,9 +304,6 @@ async fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
         run.step.head.as_deref().unwrap_or("<none>")
     );
     println!("request:        {}", run.original_request);
-    if !run.resume.is_null() {
-        println!("resume:         {}", run.resume);
-    }
     if let RunStatus::WaitingForInput {
         prompt_id,
         message,

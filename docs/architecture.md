@@ -254,7 +254,7 @@ for snapshotted-workflow compatibility.
 4. applies the callback-produced `ActionResult` through the same `apply_step_record` / `apply_run_status` paths as other actions
 5. emits and persists the ask-user `StepCompleted` event before resumed-step events
 
-Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`; `ctx.resume` is inactive legacy state.
+Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`.
 
 No Lua coroutine or host-call replay cache is persisted.
 

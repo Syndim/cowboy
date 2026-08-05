@@ -127,7 +127,6 @@ mod tests {
 
     use chrono::{Duration, TimeZone};
     use cowboy_workflow_core::RunStatus;
-    use serde_json::Value;
 
     #[test]
     fn event_at_uses_supplied_timestamp_for_event_and_active_elapsed() {
@@ -192,7 +191,6 @@ mod tests {
                 visits: BTreeMap::new(),
                 retries_used: Default::default(),
             },
-            resume: Value::Null,
             active_duration_ms,
             created_at,
             updated_at: created_at,

@@ -103,7 +103,7 @@ Important seams:
 - `WorkflowRuntime` is the high-level application interface.
 - `WorkflowRunner<S, D, P>` depends on the async typed store capabilities it uses, plus `ActionDispatcher` and `StepActionProvider`.
 - `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
-- `ResumeRouter` does not mutate `WorkflowRun.resume`; it validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path.
+- `ResumeRouter` validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path without mutating step counters.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
 
 Runner-policy contract: TOML uses `[config_sets.<name>]` with
