@@ -177,15 +177,24 @@ pub fn ordered_user_inputs_from_parts(
 /// Durable lifecycle record for the agent prompt window of a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentPromptWindow {
+    /// Unique token for this exact window, used to reject stale prompt submissions.
     pub window_id: String,
+    /// Workflow run that owns the window.
     pub run_id: RunId,
+    /// Step record being produced while the window is active.
     pub step_record_id: RecordId,
+    /// Workflow step whose agent action opened the window.
     pub step_id: StepId,
+    /// Role whose backend session receives prompts accepted through the window.
     pub role_id: RoleId,
+    /// Highest user-prompt sequence that existed when the window opened.
     pub baseline_sequence: u64,
+    /// Highest user-prompt sequence already incorporated into an agent turn.
     pub applied_sequence: u64,
+    /// Timestamp when the window opened.
     #[serde(with = "rfc3339_millis")]
     pub opened_at: DateTime<Utc>,
+    /// Timestamp when the window stopped accepting prompts; `None` while open.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
