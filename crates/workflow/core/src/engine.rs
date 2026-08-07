@@ -945,6 +945,7 @@ mod tests {
             StepAction::Command(CommandAction {
                 program: "echo".to_string(),
                 args: vec!["ok".to_string()],
+                fields: Fields::new(),
                 status_map: default_command_status_map(),
                 timeout_ms: None,
             }),

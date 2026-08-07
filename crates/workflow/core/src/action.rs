@@ -124,6 +124,10 @@ pub struct CommandAction {
     /// Exact argument vector passed to the program.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Workflow fields carried through the command result alongside command
+    /// execution metadata.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: Fields,
     /// Maps an exit code (stringified, e.g. `"0"`) to the resulting output
     /// status. The catch-all `"_"` key handles any exit code without an
     /// exact match, plus spawn errors and timeouts, which have no exit code.
@@ -247,6 +251,10 @@ mod tests {
         let action = StepAction::Command(CommandAction {
             program: "printf".to_string(),
             args: vec!["hello".to_string()],
+            fields: Fields::from([(
+                "plan_doc".to_string(),
+                serde_json::json!("docs/plans/test.md"),
+            )]),
             status_map: BTreeMap::from([
                 ("0".to_string(), "ok".to_string()),
                 ("_".to_string(), "nope".to_string()),
@@ -258,6 +266,7 @@ mod tests {
         assert_eq!(json["action"], "command");
         assert_eq!(json["program"], "printf");
         assert_eq!(json["args"], serde_json::json!(["hello"]));
+        assert_eq!(json["fields"]["plan_doc"], "docs/plans/test.md");
         assert_eq!(
             json["status_map"],
             serde_json::json!({"0": "ok", "_": "nope"})
@@ -275,6 +284,7 @@ mod tests {
         };
         assert_eq!(defaulted.program, "true");
         assert!(defaulted.args.is_empty());
+        assert!(defaulted.fields.is_empty());
         assert_eq!(defaulted.status_map, default_command_status_map());
         assert_eq!(defaulted.timeout_ms, None);
     }
@@ -284,6 +294,7 @@ mod tests {
         let action = CommandAction {
             program: "echo".to_string(),
             args: Vec::new(),
+            fields: Fields::new(),
             status_map: BTreeMap::from([
                 ("0".to_string(), "clean".to_string()),
                 ("1".to_string(), "dirty".to_string()),
@@ -301,6 +312,7 @@ mod tests {
         let no_catch_all = CommandAction {
             program: "echo".to_string(),
             args: Vec::new(),
+            fields: Fields::new(),
             status_map: BTreeMap::from([("0".to_string(), "clean".to_string())]),
             timeout_ms: None,
         };
@@ -353,6 +365,7 @@ mod tests {
             StepAction::Command(CommandAction {
                 program: "echo".to_string(),
                 args: Vec::new(),
+                fields: Fields::new(),
                 status_map: default_command_status_map(),
                 timeout_ms: None,
             })

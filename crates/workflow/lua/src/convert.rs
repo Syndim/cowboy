@@ -137,6 +137,7 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
         "command" => Ok(StepAction::Command(CommandAction {
             program: non_empty_required_string(&table, &action, "program")?,
             args: string_array_field(&table, &action, "args")?,
+            fields: action_fields(table.get::<Value>("fields")?, &action)?,
             status_map: status_map_field(&table, &action)?,
             timeout_ms: optional_positive_timeout_ms(&table, &action)?,
         })),

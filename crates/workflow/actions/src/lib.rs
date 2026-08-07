@@ -527,6 +527,7 @@ mod tests {
                 StepAction::Command(CommandAction {
                     program: missing_command.to_string_lossy().to_string(),
                     args: Vec::new(),
+                    fields: Default::default(),
                     status_map: BTreeMap::from([
                         ("0".to_string(), "ok".to_string()),
                         ("_".to_string(), "bad".to_string()),

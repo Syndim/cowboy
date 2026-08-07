@@ -146,7 +146,7 @@ const NO_RESULT_REASON_MARKER: &str = "did not contain a workflow result";
 
 /// Whether the retry `reason` indicates the previous reply carried no parseable
 /// workflow result (as opposed to a malformed frontmatter block).
-fn is_no_result_reason(reason: Option<&str>) -> bool {
+pub(crate) fn is_no_result_reason(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| reason.contains(NO_RESULT_REASON_MARKER))
 }
 

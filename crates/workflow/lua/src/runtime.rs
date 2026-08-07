@@ -272,6 +272,7 @@ mod tests {
               return action.command {
                 program = "printf",
                 args = { "hello", ctx.request },
+                fields = { plan_doc = "docs/plans/test.md" },
                 status_map = { ["0"] = "ok", ["_"] = "bad" },
                 timeout_ms = 1000,
               }
@@ -290,6 +291,10 @@ mod tests {
         };
         assert_eq!(action.program, "printf");
         assert_eq!(action.args, vec!["hello", "world"]);
+        assert_eq!(
+            action.fields.get("plan_doc"),
+            Some(&serde_json::json!("docs/plans/test.md"))
+        );
         assert_eq!(
             action.status_map,
             BTreeMap::from([
@@ -317,6 +322,7 @@ mod tests {
         };
         assert_eq!(action.program, "true");
         assert!(action.args.is_empty());
+        assert!(action.fields.is_empty());
         assert_eq!(action.status_map, default_command_status_map());
         assert_eq!(action.timeout_ms, None);
     }

@@ -309,7 +309,12 @@ async fn join_capture(task: JoinHandle<Result<CapturedStream>>) -> Result<Captur
 }
 
 fn command_fields(action: &CommandAction, outcome: &CommandOutcome, success: bool) -> Value {
-    let mut fields = json!({
+    let mut fields = action
+        .fields
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<String, Value>>();
+    let metadata = json!({
         "program": &action.program,
         "args": &action.args,
         "success": success,
@@ -320,12 +325,19 @@ fn command_fields(action: &CommandAction, outcome: &CommandOutcome, success: boo
         "stdout_truncated": outcome.stdout.truncated,
         "stderr_truncated": outcome.stderr.truncated,
     });
+    let Value::Object(metadata) = metadata else {
+        unreachable!("command metadata is always an object")
+    };
+    fields.extend(metadata);
 
     if let Some(spawn_error) = &outcome.spawn_error {
-        fields["spawn_error"] = Value::String(spawn_error.clone());
+        fields.insert(
+            "spawn_error".to_string(),
+            Value::String(spawn_error.clone()),
+        );
     }
 
-    fields
+    Value::Object(fields)
 }
 
 fn command_body(success: bool, outcome: &CommandOutcome) -> String {
@@ -410,6 +422,7 @@ mod tests {
         CommandAction {
             program: program.to_string_lossy().to_string(),
             args,
+            fields: Default::default(),
             status_map: BTreeMap::from([
                 ("0".to_string(), "ok".to_string()),
                 ("_".to_string(), "bad".to_string()),
@@ -482,16 +495,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "success");
         let runner = CommandActionRunner::new(dir.path(), Vec::new());
-
-        let output = command_output(
-            runner
-                .run(action(program, helper_args()), context())
-                .await
-                .unwrap(),
+        let mut command = action(program, helper_args());
+        command.fields.insert(
+            "plan_doc".to_string(),
+            Value::String("docs/plans/test.md".to_string()),
         );
+
+        let output = command_output(runner.run(command, context()).await.unwrap());
 
         assert_eq!(output.fields["exit_code"], 0);
         assert_eq!(output.status, "ok");
+        assert_eq!(output.fields["plan_doc"], "docs/plans/test.md");
         assert_eq!(output.fields["success"], true);
         assert!(
             output.fields["stdout"]

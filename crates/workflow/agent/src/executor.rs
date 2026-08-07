@@ -463,7 +463,11 @@ where
         let active = clients
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
-        let acquired = self.ensure_session(active, &key).await?;
+        let force_fresh_session = context.attempt > 1
+            && crate::prompt::is_no_result_reason(context.retry_reason.as_deref());
+        let acquired = self
+            .ensure_session(active, &key, force_fresh_session)
+            .await?;
         let session_id = acquired.session_id;
         // Resolve the per-session prompt-delivery watermark. A brand-new backend
         // session ignores any stale stored row and resends everything; a reused
@@ -839,63 +843,73 @@ where
         &self,
         active: &mut ActiveClient,
         key: &RoleSessionKey,
+        force_fresh: bool,
     ) -> Result<AcquiredSession> {
         let client = active.client.as_mut();
-        if let Some(session_id) = client.session_id() {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
-            return Ok(AcquiredSession {
-                session_id: session_id.to_string(),
-                fresh: false,
-            });
-        }
-
-        if let Some(saved) = self
-            .store
-            .load_role_session(&key.run_id, &key.role_id)
-            .await
-            .map_err(Error::from)?
-        {
-            if client.supports_load_session() {
-                tracing::debug!(
-                    run_id = %key.run_id,
-                    role = %key.role_id,
-                    session_id = %saved.session_id,
-                    "agent session: loading saved backend session"
-                );
-                match client
-                    .load_session(
-                        &saved.session_id,
-                        &self.config.cwd,
-                        &self.config.mcp_servers,
-                    )
-                    .await
-                {
-                    Ok(history) => {
-                        tracing::info!(
-                            run_id = %key.run_id,
-                            role = %key.role_id,
-                            session_id = %saved.session_id,
-                            history_events = history.len(),
-                            "agent session loaded"
-                        );
-                        return Ok(AcquiredSession {
-                            session_id: saved.session_id,
-                            fresh: false,
-                        });
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            run_id = %key.run_id,
-                            role = %key.role_id,
-                            session_id = %saved.session_id,
-                            error = %err,
-                            "agent session load failed; creating a new session"
-                        );
-                    }
-                }
-            } else {
-                tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent backend cannot load saved sessions");
+        if !force_fresh {
+            if let Some(session_id) = client.session_id() {
+                tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
+                return Ok(AcquiredSession {
+                    session_id: session_id.to_string(),
+                    fresh: false,
+                });
             }
+
+            if let Some(saved) = self
+                .store
+                .load_role_session(&key.run_id, &key.role_id)
+                .await
+                .map_err(Error::from)?
+            {
+                if client.supports_load_session() {
+                    tracing::debug!(
+                        run_id = %key.run_id,
+                        role = %key.role_id,
+                        session_id = %saved.session_id,
+                        "agent session: loading saved backend session"
+                    );
+                    match client
+                        .load_session(
+                            &saved.session_id,
+                            &self.config.cwd,
+                            &self.config.mcp_servers,
+                        )
+                        .await
+                    {
+                        Ok(history) => {
+                            tracing::info!(
+                                run_id = %key.run_id,
+                                role = %key.role_id,
+                                session_id = %saved.session_id,
+                                history_events = history.len(),
+                                "agent session loaded"
+                            );
+                            return Ok(AcquiredSession {
+                                session_id: saved.session_id,
+                                fresh: false,
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                run_id = %key.run_id,
+                                role = %key.role_id,
+                                session_id = %saved.session_id,
+                                error = %err,
+                                "agent session load failed; creating a new session"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent backend cannot load saved sessions");
+                }
+            }
+        } else {
+            tracing::warn!(
+                run_id = %key.run_id,
+                role = %key.role_id,
+                previous_session = ?client.session_id(),
+                "agent no-result retry: creating a fresh backend session"
+            );
         }
 
         tracing::debug!(
@@ -3648,7 +3662,10 @@ still applies, got non-recoverable: {error:?}"
             backend: "fake-agent".to_string(),
         };
 
-        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
+        let acquired = executor
+            .ensure_session(&mut active, &key, false)
+            .await
+            .unwrap();
         assert!(acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
@@ -3672,7 +3689,10 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap();
 
-        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
+        let acquired = executor
+            .ensure_session(&mut active, &key, false)
+            .await
+            .unwrap();
         assert!(!acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
@@ -3972,5 +3992,60 @@ still applies, got non-recoverable: {error:?}"
         assert!(retry_prompt.contains("Do work"));
         assert!(retry_prompt.contains("valid YAML frontmatter"));
         assert!(retry_prompt.contains("Retry"));
+    }
+
+    #[tokio::test]
+    async fn no_result_retry_creates_fresh_session() {
+        let client = FakeClient::new(vec![
+            Event::MessageChunk {
+                content: serde_json::json!({"text": "no workflow result"}),
+            },
+            event(),
+        ]);
+        let prompt_calls = client.prompt_calls.clone();
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NoWorkflowResult));
+
+        let first = store_handle
+            .load_role_session("run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.session_id, "session-1");
+
+        let mut retry = context("run", "record-1");
+        retry.attempt = 2;
+        retry.retry_reason = Some(
+            "recoverable action failure: agent reply did not contain a workflow result".into(),
+        );
+        executor
+            .execute_agent(output_action("developer"), retry)
+            .await
+            .unwrap();
+
+        let second = store_handle
+            .load_role_session("run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.session_id, "session-2");
+
+        let calls = prompt_calls.lock();
+        assert_eq!(calls.len(), 2);
+        let retry_prompt = &calls[1][0].text;
+        assert!(retry_prompt.contains("Instructions for developer"));
+        assert!(retry_prompt.contains("\"sequence\": 0"));
+        assert!(retry_prompt.contains("## Retry"));
     }
 }
