@@ -33,7 +33,9 @@ const SHUTDOWN_TIMEOUT: Duration = DEFAULT_SHUTDOWN_TIMEOUT;
 /// Start the new workflow-first terminal shell.
 pub async fn run_tui(config: AppConfig) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let runtime = WorkflowRuntime::new(config.runtime_config(cwd)).await?;
+    let runtime = WorkflowRuntime::new(config.runtime_config(cwd))
+        .await?
+        .with_request_topic_generation();
     let events = runtime.events();
     let mut workflow_events = events.subscribe();
     let state = AppState::new(config);

@@ -377,6 +377,7 @@ pub struct WorkflowRuntime {
     dependencies: Arc<dyn RuntimeDependencies>,
     acp_connector: Arc<dyn AcpConnector>,
     prompt_turn_controls: PromptTurnControlRegistry,
+    request_topic_generation_enabled: bool,
     #[cfg(feature = "test-support")]
     handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
@@ -535,6 +536,7 @@ impl WorkflowRuntime {
             dependencies,
             acp_connector,
             prompt_turn_controls: PromptTurnControlRegistry::default(),
+            request_topic_generation_enabled: false,
             #[cfg(feature = "test-support")]
             handoff_observer: None,
         })
@@ -544,6 +546,15 @@ impl WorkflowRuntime {
     /// one. Intended for tests that have no live agent backend.
     pub fn with_deterministic_selector(mut self) -> Self {
         self.selector = SelectorMode::Deterministic;
+        self
+    }
+
+    /// Enable LLM-generated request topics for an interactive title bar.
+    ///
+    /// Disabled by default so non-interactive callers never spend a separate
+    /// agent turn on presentation-only metadata.
+    pub fn with_request_topic_generation(mut self) -> Self {
+        self.request_topic_generation_enabled = true;
         self
     }
 
@@ -1353,6 +1364,10 @@ impl WorkflowRuntime {
     }
 
     async fn generate_request_topic(&self, request: &str) -> Option<String> {
+        if !self.request_topic_generation_enabled {
+            return None;
+        }
+
         self.dependencies
             .generate_request_topic(&self.config, self.selector, request)
             .await
@@ -2530,7 +2545,7 @@ mod tests {
         let topic = topic.map(str::to_string);
         dependencies
             .expect_generate_request_topic()
-            .times(1)
+            .times(0..=1)
             .withf(|_, selector, request| {
                 *selector == SelectorMode::Deterministic && !request.is_empty()
             })
@@ -2588,6 +2603,30 @@ mod tests {
             .await;
 
         assert_eq!(topic, None);
+    }
+
+    #[tokio::test]
+    async fn request_topic_generation_is_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = RuntimeConfig {
+            cwd: dir.path().to_path_buf(),
+            state_dir: dir.path().join("state"),
+            workflow_store: dir.path().join("state/data.db"),
+            workflow_dirs: Vec::new(),
+            allowed_env: Vec::new(),
+            agents: Vec::new(),
+            config_sets: BTreeMap::new(),
+        };
+        let mut dependencies = MockRuntimeDependencies::new();
+        dependencies.expect_generate_request_topic().times(0);
+        let runtime = WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime.generate_request_topic("add a health route").await,
+            None
+        );
     }
 
     fn production_connector_test_config(dir: &tempfile::TempDir) -> RuntimeConfig {
@@ -2807,10 +2846,7 @@ mod tests {
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
         let mut dependencies = MockRuntimeDependencies::new();
-        dependencies
-            .expect_generate_request_topic()
-            .times(1)
-            .return_const(None);
+        dependencies.expect_generate_request_topic().times(0);
         dependencies.expect_agent_factory().times(1).returning(|_| {
             Err(WorkflowError::InvalidAction(
                 "injected factory failure".to_string(),
@@ -3943,6 +3979,7 @@ done
             .await
             .unwrap()
             .with_deterministic_selector()
+            .with_request_topic_generation()
     }
 
     fn command_script(dir: &tempfile::TempDir) -> PathBuf {
