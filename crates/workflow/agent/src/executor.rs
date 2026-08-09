@@ -13,8 +13,9 @@ use cowboy_agent_client::{
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow, AgentSessionStore,
     CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
-    PromptWindowStore, RoleDefinition, RoleId, RoleSession, RunId, RunUserInput, StepDetail,
-    StepInput, StepRecord, TurnRecord, TurnStore, WorkflowError, ordered_user_inputs_from_parts,
+    PROVIDED_SESSION_BACKEND, PromptWindowStore, RoleDefinition, RoleId, RoleSession, RunId,
+    RunUserInput, StepDetail, StepInput, StepRecord, TurnRecord, TurnStore, WorkflowError,
+    ordered_user_inputs_from_parts,
 };
 use tokio::sync::{Mutex, watch};
 
@@ -890,6 +891,14 @@ where
                             });
                         }
                         Err(err) => {
+                            if saved.backend == PROVIDED_SESSION_BACKEND {
+                                return Err(WorkflowError::InvalidAction(format!(
+                                    "failed to load supplied session {:?} for role {:?}: {err}",
+                                    saved.session_id, key.role_id
+                                ))
+                                .into());
+                            }
+
                             tracing::warn!(
                                 run_id = %key.run_id,
                                 role = %key.role_id,
@@ -899,6 +908,12 @@ where
                             );
                         }
                     }
+                } else if saved.backend == PROVIDED_SESSION_BACKEND {
+                    return Err(WorkflowError::InvalidAction(format!(
+                        "agent backend cannot load supplied session {:?} for role {:?}",
+                        saved.session_id, key.role_id
+                    ))
+                    .into());
                 } else {
                     tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent backend cannot load saved sessions");
                 }

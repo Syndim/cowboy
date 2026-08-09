@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,12 +20,12 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, Choice, ConfigSetRef, DEFAULT_CONFIG_SET_NAME,
-    ExecutionContext, Fields, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunHead,
-    RunStatus, RunUserPrompt, RunnerLimits, StatusAction, StepAction, StepActionProvider,
-    StepDetail, StepInput, StepOutput, StepRecord, StepState, WorkflowAction, WorkflowCatalog,
-    WorkflowDefinition, WorkflowError, WorkflowRun, WorkflowRunParent, WorkflowSelector,
-    WorkflowSnapshot, WorkflowSourceRef, WorkflowSourceSnapshot, WorkflowSummarizer,
-    apply_run_status, apply_step_record,
+    ExecutionContext, Fields, PROVIDED_SESSION_BACKEND, Result, ResumeCallback,
+    ResumeCallbackHandler, ResumeInput, RoleSession, RunHead, RunStatus, RunUserPrompt,
+    RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail, StepInput, StepOutput,
+    StepRecord, StepState, WorkflowAction, WorkflowCatalog, WorkflowDefinition, WorkflowError,
+    WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSnapshot, WorkflowSourceRef,
+    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -198,6 +198,22 @@ impl From<RunnerLimitsConfig> for RunnerLimits {
             max_visits_per_step: value.max_visits_per_step,
             max_retries_per_run: value.max_retries_per_run,
             max_retries_per_step: value.max_retries_per_step,
+        }
+    }
+}
+
+/// Externally supplied backend sessions that a new run should load by role.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunStartOptions {
+    role_session_ids: Vec<(String, String)>,
+}
+
+impl RunStartOptions {
+    pub fn with_role_session_ids(
+        role_session_ids: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        Self {
+            role_session_ids: role_session_ids.into_iter().collect(),
         }
     }
 }
@@ -403,6 +419,7 @@ struct CatalogRunSpec {
     workflow_id: String,
     request: String,
     parent: Option<WorkflowRunParent>,
+    start_options: RunStartOptions,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -739,7 +756,18 @@ impl WorkflowRuntime {
     }
 
     pub async fn start_run(&self, request: impl Into<String>) -> Result<RunReport> {
-        self.start_with(request, RunMode::UntilBlocked).await
+        self.start_run_with_options(request, RunStartOptions::default())
+            .await
+    }
+
+    /// Start a new run with externally supplied sessions for workflow roles.
+    pub async fn start_run_with_options(
+        &self,
+        request: impl Into<String>,
+        options: RunStartOptions,
+    ) -> Result<RunReport> {
+        self.start_with(request, RunMode::UntilBlocked, options)
+            .await
     }
 
     /// Start a new run for the requested catalog workflow id and execute until
@@ -749,14 +777,35 @@ impl WorkflowRuntime {
         workflow_id: impl Into<String>,
         request: impl Into<String>,
     ) -> Result<RunReport> {
-        self.start_with_workflow(workflow_id.into(), request, RunMode::UntilBlocked)
+        self.start_run_with_workflow_and_options(workflow_id, request, RunStartOptions::default())
+            .await
+    }
+
+    /// Start a requested workflow with externally supplied sessions for roles.
+    pub async fn start_run_with_workflow_and_options(
+        &self,
+        workflow_id: impl Into<String>,
+        request: impl Into<String>,
+        options: RunStartOptions,
+    ) -> Result<RunReport> {
+        self.start_with_workflow(workflow_id.into(), request, RunMode::UntilBlocked, options)
             .await
     }
 
     /// Start a new run and execute exactly one workflow step, leaving the run
     /// ready to be advanced with [`step_run`].
     pub async fn start_run_stepwise(&self, request: impl Into<String>) -> Result<RunReport> {
-        self.start_with(request, RunMode::SingleStep).await
+        self.start_run_stepwise_with_options(request, RunStartOptions::default())
+            .await
+    }
+
+    /// Start one workflow step with externally supplied sessions for roles.
+    pub async fn start_run_stepwise_with_options(
+        &self,
+        request: impl Into<String>,
+        options: RunStartOptions,
+    ) -> Result<RunReport> {
+        self.start_with(request, RunMode::SingleStep, options).await
     }
 
     /// Start a new run for the requested catalog workflow id and execute exactly
@@ -766,11 +815,31 @@ impl WorkflowRuntime {
         workflow_id: impl Into<String>,
         request: impl Into<String>,
     ) -> Result<RunReport> {
-        self.start_with_workflow(workflow_id.into(), request, RunMode::SingleStep)
+        self.start_run_with_workflow_stepwise_and_options(
+            workflow_id,
+            request,
+            RunStartOptions::default(),
+        )
+        .await
+    }
+
+    /// Start one requested workflow step with externally supplied role sessions.
+    pub async fn start_run_with_workflow_stepwise_and_options(
+        &self,
+        workflow_id: impl Into<String>,
+        request: impl Into<String>,
+        options: RunStartOptions,
+    ) -> Result<RunReport> {
+        self.start_with_workflow(workflow_id.into(), request, RunMode::SingleStep, options)
             .await
     }
 
-    async fn start_with(&self, request: impl Into<String>, mode: RunMode) -> Result<RunReport> {
+    async fn start_with(
+        &self,
+        request: impl Into<String>,
+        mode: RunMode,
+        options: RunStartOptions,
+    ) -> Result<RunReport> {
         let request = request.into();
         tracing::info!(request = %request, mode = ?mode, "starting workflow run");
         let catalog = self.catalog()?;
@@ -779,7 +848,7 @@ impl WorkflowRuntime {
             "workflow catalog loaded"
         );
         let selection = self.select_workflow(&request, &catalog).await?;
-        self.start_catalog_workflow(request, mode, &catalog, &selection.workflow_id)
+        self.start_catalog_workflow(request, mode, &catalog, &selection.workflow_id, options)
             .await
     }
 
@@ -788,6 +857,7 @@ impl WorkflowRuntime {
         workflow_id: String,
         request: impl Into<String>,
         mode: RunMode,
+        options: RunStartOptions,
     ) -> Result<RunReport> {
         let request = request.into();
         tracing::info!(request = %request, workflow_id = %workflow_id, mode = ?mode, "starting requested workflow run");
@@ -797,7 +867,7 @@ impl WorkflowRuntime {
             "workflow catalog loaded"
         );
         self.ensure_workflow_exists(&catalog, &workflow_id)?;
-        self.start_catalog_workflow(request, mode, &catalog, &workflow_id)
+        self.start_catalog_workflow(request, mode, &catalog, &workflow_id, options)
             .await
     }
 
@@ -823,6 +893,7 @@ impl WorkflowRuntime {
         mode: RunMode,
         catalog: &WorkflowCatalog,
         workflow_id: &str,
+        start_options: RunStartOptions,
     ) -> Result<RunReport> {
         self.execute_catalog_run(
             CatalogRunSpec {
@@ -830,11 +901,64 @@ impl WorkflowRuntime {
                 workflow_id: workflow_id.to_string(),
                 request,
                 parent: None,
+                start_options,
             },
             mode,
             catalog,
         )
         .await
+    }
+
+    fn role_sessions_for_start(
+        &self,
+        run_id: &str,
+        definition: &WorkflowDefinition,
+        options: &RunStartOptions,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Vec<RoleSession>> {
+        let mut roles = BTreeSet::new();
+        let available_roles = definition
+            .roles
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut sessions = Vec::with_capacity(options.role_session_ids.len());
+        for (role_id, session_id) in &options.role_session_ids {
+            if role_id.trim().is_empty() || session_id.trim().is_empty() {
+                return Err(WorkflowError::InvalidAction(
+                    "provided role session ids must have non-empty roles and session ids"
+                        .to_string(),
+                ));
+            }
+
+            if !roles.insert(role_id) {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "session id was provided more than once for role {role_id:?}"
+                )));
+            }
+
+            if !definition.roles.contains_key(role_id) {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "session id was provided for unknown role {role_id:?}; available roles: {available_roles}"
+                )));
+            }
+
+            sessions.push(RoleSession {
+                run_id: run_id.to_string(),
+                role_id: role_id.clone(),
+                // The executor treats this as a required external load and never
+                // falls back to creating a replacement session.
+                backend: PROVIDED_SESSION_BACKEND.to_string(),
+                session_id: session_id.clone(),
+                updated_at,
+                role_instructions_sent: true,
+                last_sent_input_sequence: None,
+                delivered_task_contracts: BTreeMap::new(),
+            });
+        }
+
+        Ok(sessions)
     }
 
     async fn execute_catalog_run(
@@ -875,6 +999,12 @@ impl WorkflowRuntime {
                     "workflow source compiled"
                 );
                 let now = Utc::now();
+                let provided_sessions = self.role_sessions_for_start(
+                    &spec.run_id,
+                    &definition,
+                    &spec.start_options,
+                    now,
+                )?;
                 let mut run = WorkflowRun {
                     id: spec.run_id,
                     workflow: WorkflowSnapshot {
@@ -902,6 +1032,9 @@ impl WorkflowRuntime {
                 };
                 let store = self.store_for_run(&run.id)?;
                 store.save_run(&run).await?;
+                for session in provided_sessions {
+                    store.save_role_session(session).await?;
+                }
                 let active_clock = ActiveRunClock::open(&run);
                 tracing::info!(run_id = %run.id, workflow = %run.workflow.name, "created workflow run");
                 let request_topic = self.generate_request_topic(&run.original_request).await;
@@ -1012,6 +1145,7 @@ impl WorkflowRuntime {
                         previous_head: context.prev,
                         invocation_id: invocation_id.to_string(),
                     }),
+                    start_options: RunStartOptions::default(),
                 },
                 RunMode::UntilBlocked,
                 &catalog,
@@ -3115,6 +3249,90 @@ implementation_evidence: []
             }),
         );
         factory.assert_exhausted();
+    }
+    #[tokio::test]
+    async fn supplied_role_session_loads_without_resending_role_instructions() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(vec![successful_implementation_response(
+            "loaded supplied implementation",
+        )]);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let options = RunStartOptions::with_role_session_ids([(
+            "implementer".to_string(),
+            "supplied-session".to_string(),
+        )]);
+
+        let started = runtime
+            .start_run_with_workflow_stepwise_and_options(
+                "runtime-contract",
+                "continue an existing implementation",
+                options,
+            )
+            .await
+            .unwrap();
+        let implemented = runtime.step_run(&started.run.id).await.unwrap();
+        let record = command_output_record(&runtime, &implemented).await;
+
+        assert_eq!(factory.load_attempts(), vec!["supplied-session"]);
+        assert!(factory.created_sessions().is_empty());
+        assert_eq!(
+            record.detail.session_id.as_deref(),
+            Some("supplied-session")
+        );
+        assert!(
+            !record.input.context["prompt_blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|block| block == "role")
+        );
+        assert!(factory.prompts()[0].contains("continue an existing implementation"));
+        factory.assert_exhausted();
+    }
+
+    #[tokio::test]
+    async fn supplied_role_session_load_failure_does_not_create_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(Vec::new());
+        factory.set_load_session_succeeds(false);
+        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+        let options = RunStartOptions::with_role_session_ids([(
+            "implementer".to_string(),
+            "supplied-session".to_string(),
+        )]);
+
+        let started = runtime
+            .start_run_with_workflow_stepwise_and_options("runtime-contract", "request", options)
+            .await
+            .unwrap();
+        let error = runtime.step_run(&started.run.id).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load supplied session")
+        );
+        assert_eq!(factory.load_attempts(), vec!["supplied-session"]);
+        assert!(factory.created_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn supplied_role_session_rejects_duplicate_roles_before_persisting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = ScriptedAgentFactory::new(Vec::new());
+        let runtime = runtime_for_prompt_contract(&dir, factory).await;
+        let options = RunStartOptions::with_role_session_ids([
+            ("implementer".to_string(), "session-1".to_string()),
+            ("implementer".to_string(), "session-2".to_string()),
+        ]);
+
+        let error = runtime
+            .start_run_with_workflow_and_options("runtime-contract", "request", options)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("more than once"));
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -8998,6 +9216,7 @@ Recovery implementation review"#
             workflow_id: "child".to_string(),
             request: "child req".to_string(),
             parent: Some(parent.clone()),
+            start_options: RunStartOptions::default(),
         };
         let matching = lineage_run("run-child", "child", "child req", Some(parent.clone()));
         runtime

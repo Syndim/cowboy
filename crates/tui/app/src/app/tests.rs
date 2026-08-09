@@ -1315,7 +1315,7 @@ impl io::Write for RecordingWriter {
 }
 
 #[test]
-fn finish_tui_restores_before_writing_hint() {
+fn finish_tui_restores_before_writing_exit_details() {
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let mut guard = RecordingRestore {
         log: log.clone(),
@@ -1327,17 +1327,31 @@ fn finish_tui_restores_before_writing_hint() {
     };
 
     let line = "Run r1 is not complete. Resume with: cowboy resume r1";
-    finish_tui(Ok(Some(line.to_string())), &mut guard, &mut writer).unwrap();
+    finish_tui(
+        Ok(TuiExit {
+            resume_hint: Some(line.to_string()),
+            agent_session_lines: vec![
+                "developer: session-1".to_string(),
+                "reviewer: session-2".to_string(),
+            ],
+        }),
+        &mut guard,
+        &mut writer,
+    )
+    .unwrap();
 
     assert_eq!(
         *log.borrow(),
         vec!["restore".to_string(), "write".to_string()]
     );
-    assert_eq!(writer.bytes, format!("{line}\n").into_bytes());
+    assert_eq!(
+        writer.bytes,
+        format!("{line}\ndeveloper: session-1\nreviewer: session-2\n").into_bytes()
+    );
 }
 
 #[test]
-fn finish_tui_suppresses_hint_on_none() {
+fn finish_tui_suppresses_exit_details_when_empty() {
     let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let mut guard = RecordingRestore {
         log: log.clone(),
@@ -1348,7 +1362,15 @@ fn finish_tui_suppresses_hint_on_none() {
         bytes: Vec::new(),
     };
 
-    finish_tui(Ok(None), &mut guard, &mut writer).unwrap();
+    finish_tui(
+        Ok(TuiExit {
+            resume_hint: None,
+            agent_session_lines: Vec::new(),
+        }),
+        &mut guard,
+        &mut writer,
+    )
+    .unwrap();
 
     assert_eq!(*log.borrow(), vec!["restore".to_string()]);
     assert!(writer.bytes.is_empty());

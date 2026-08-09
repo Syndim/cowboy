@@ -115,6 +115,34 @@ pub enum SharedCommand {
     Resolve(ResolveArgs),
 }
 
+/// One externally supplied backend session for a workflow role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleSessionId {
+    pub role: String,
+    pub session_id: String,
+}
+
+impl std::str::FromStr for RoleSessionId {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((role, session_id)) = value.split_once('=') else {
+            return Err("expected role=session-id".to_string());
+        };
+
+        let role = role.trim();
+        let session_id = session_id.trim();
+        if role.is_empty() || session_id.is_empty() {
+            return Err("expected non-empty role and session id".to_string());
+        }
+
+        Ok(Self {
+            role: role.to_string(),
+            session_id: session_id.to_string(),
+        })
+    }
+}
+
 /// Arguments for starting a workflow run.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct RunArgs {
@@ -125,6 +153,14 @@ pub struct RunArgs {
     /// Catalog workflow id to run, bypassing workflow selection.
     #[arg(long, value_name = "workflow-id")]
     pub workflow: Option<String>,
+
+    /// Existing backend sessions to load by role instead of creating fresh sessions.
+    #[arg(
+        long = "session-id",
+        value_name = "role=session-id",
+        value_delimiter = ','
+    )]
+    pub session_ids: Vec<RoleSessionId>,
 
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "request")]
     pub request: Vec<String>,
@@ -575,6 +611,49 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_role_session_ids_on_cli_and_slash_surfaces() {
+        for command in [
+            shared_cli_command([
+                "cowboy",
+                "run",
+                "--session-id",
+                "developer=session-1,reviewer=session-2",
+                "do",
+                "work",
+            ]),
+            shared_slash_command(
+                "/run --session-id developer=session-1 --session-id reviewer=session-2 do work",
+            ),
+        ] {
+            let SharedCommand::Run(args) = command else {
+                panic!("expected run command");
+            };
+
+            assert_eq!(
+                args.session_ids,
+                vec![
+                    RoleSessionId {
+                        role: "developer".to_string(),
+                        session_id: "session-1".to_string(),
+                    },
+                    RoleSessionId {
+                        role: "reviewer".to_string(),
+                        session_id: "session-2".to_string(),
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn run_rejects_malformed_role_session_id() {
+        let error =
+            Cli::try_parse_from(["cowboy", "run", "--session-id", "developer", "do"]).unwrap_err();
+
+        assert!(error.to_string().contains("expected role=session-id"));
+    }
+
+    #[test]
     fn slash_run_parses_through_shared_command() {
         match shared_slash_command("/run do work") {
             SharedCommand::Run(args) => {
@@ -675,6 +754,7 @@ mod tests {
         let expected = SharedCommand::Run(RunArgs {
             step: false,
             workflow: None,
+            session_ids: Vec::new(),
             request: vec!["do work".to_string()],
         });
 
@@ -1057,9 +1137,10 @@ mod tests {
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(
-            suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
-        );
+        assert!(suggestions.contains(
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+                .to_string()
+        ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
         assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
         assert!(
@@ -1088,7 +1169,8 @@ mod tests {
         let rows = slash_help_rows();
         assert!(rows.iter().any(|row| {
             row.name == "/run"
-                && row.usage == "/run [--step] [--workflow <workflow-id>] <request>"
+                && row.usage
+                    == "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
                 && row.description == "start a workflow run"
                 && row.takes_arguments
         }));

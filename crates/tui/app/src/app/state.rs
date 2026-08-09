@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use cowboy_tui_animation::FrameCycle;
@@ -553,6 +553,7 @@ pub(super) struct AppState {
     history_store: InputHistory,
     background: Vec<BackgroundTask>,
     exit_requested: bool,
+    agent_sessions: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl AppState {
@@ -587,6 +588,7 @@ impl AppState {
             history_store,
             background: Vec::new(),
             exit_requested: false,
+            agent_sessions: BTreeMap::new(),
         }
     }
 
@@ -614,6 +616,18 @@ impl AppState {
         Some(format!(
             "Run {run_id} is not complete. Resume with: {command}"
         ))
+    }
+
+    pub(in crate::app) fn agent_session_id_lines(&self) -> Vec<String> {
+        self.agent_sessions
+            .iter()
+            .map(|(role, session_ids)| {
+                format!(
+                    "{role}: {}",
+                    session_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect()
     }
 
     pub(in crate::app) fn current_step(&self) -> Option<&str> {
@@ -1327,6 +1341,15 @@ impl AppState {
 
     fn apply_workflow_event_metadata(&mut self, event: &WorkflowEvent) {
         self.active_run_id = Some(event.run_id.clone());
+        if let WorkflowEventKind::AgentSessionReady {
+            role, session_id, ..
+        } = &event.kind
+        {
+            self.agent_sessions
+                .entry(role.clone())
+                .or_default()
+                .insert(session_id.clone());
+        }
         match &event.kind {
             WorkflowEventKind::RunStarted {
                 workflow_name,
@@ -2768,6 +2791,34 @@ mod tests {
         FileExt::lock_exclusive(&lock_file).unwrap();
         fs::write(ready_path, "ready").unwrap();
         thread::sleep(Duration::from_secs(10));
+    }
+    #[test]
+    fn agent_session_id_lines_are_sorted_and_deduplicated() {
+        let mut state = test_state();
+        for (role, session_id) in [
+            ("reviewer", "session-2"),
+            ("developer", "session-3"),
+            ("developer", "session-1"),
+            ("developer", "session-1"),
+        ] {
+            state.apply_workflow_event(WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentSessionReady {
+                    step_id: "work".to_string(),
+                    role: role.to_string(),
+                    session_id: session_id.to_string(),
+                    descriptor: None,
+                },
+            ));
+        }
+
+        assert_eq!(
+            state.agent_session_id_lines(),
+            vec![
+                "developer: session-1, session-3".to_string(),
+                "reviewer: session-2".to_string(),
+            ]
+        );
     }
 
     fn entry_title(entry: &TranscriptEntry) -> String {

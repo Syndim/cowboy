@@ -62,6 +62,20 @@ cowboy run add a /healthz route
 cowboy run --workflow <workflow-id> add a /healthz route
 ```
 
+Continue existing agent conversations by supplying one or more role-to-session
+pairs. Separate pairs with commas or repeat `--session-id`. Cowboy loads each
+supplied backend session, omits that role's static prompt, and sends the new
+run request; a supplied session that cannot load fails instead of being
+replaced.
+
+```bash
+cowboy run --session-id developer=<session-id> add a /healthz route
+cowboy run --session-id developer=<session-id>,reviewer=<session-id> review the change
+```
+
+After an agent-backed CLI run or when the TUI exits, Cowboy prints observed
+role sessions as `developer: <session-id>`.
+
 List existing runs, optionally filtering by a literal partial run id:
 
 ```bash
@@ -135,7 +149,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 ### TUI commands
 
 ```text
-/run [--step] [--workflow <workflow-id>] <request>  start a workflow run
+/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>  start a workflow run
 /step <run-id>                                    execute exactly one more step
 /resume <run-id>                                  continue a run until blocked
 /answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly
@@ -153,6 +167,10 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 `step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes. Both also re-execute the retained current step of any non-terminal run — `Running`, `Failed` (for example one that gave up after exhausting its recoverable-retry budget), and `WaitingForInput`: `step` takes one fresh attempt and `resume` continues until the run blocks, fails, or completes. Re-executing a `WaitingForInput` run re-prompts its retained `ask_user` step and safely replaces the durable pending callback. Only `Completed` and `Cancelled` runs are non-resumable no-ops and left unchanged; `answer` remains the way to supply a prompt answer.
 
 `/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
+
+`/run --session-id <role=session-id> <request>` accepts the same repeatable or
+comma-separated role session pairs as the CLI and resumes those role sessions
+without resending their static role prompts.
 
 ### TUI keys
 

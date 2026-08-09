@@ -58,24 +58,35 @@ async fn run_shared_command(
             let cowboy_command_parser::RunArgs {
                 step,
                 workflow,
+                session_ids,
                 request,
             } = args;
+            let options = cowboy_workflow_engine::RunStartOptions::with_role_session_ids(
+                session_ids
+                    .into_iter()
+                    .map(|session| (session.role, session.session_id)),
+            );
             let request = request.join(" ");
             let report = match (step, workflow) {
                 (true, Some(workflow_id)) => {
                     runtime
-                        .start_run_with_workflow_stepwise(workflow_id, request)
+                        .start_run_with_workflow_stepwise_and_options(workflow_id, request, options)
                         .await?
                 }
                 (false, Some(workflow_id)) => {
                     runtime
-                        .start_run_with_workflow(workflow_id, request)
+                        .start_run_with_workflow_and_options(workflow_id, request, options)
                         .await?
                 }
-                (true, None) => runtime.start_run_stepwise(request).await?,
-                (false, None) => runtime.start_run(request).await?,
+                (true, None) => {
+                    runtime
+                        .start_run_stepwise_with_options(request, options)
+                        .await?
+                }
+                (false, None) => runtime.start_run_with_options(request, options).await?,
             };
             print_report(&report);
+            print_agent_session_ids(&report.events);
             Ok(())
         }
         SharedCommand::Step(args) => {
@@ -178,5 +189,87 @@ fn print_report(report: &cowboy_workflow_engine::RunReport) {
     );
     for event in &report.events {
         println!("event={:?}", event.kind);
+    }
+}
+
+fn agent_session_id_lines(events: &[cowboy_workflow_engine::WorkflowEvent]) -> Vec<String> {
+    let mut sessions =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+    for event in events {
+        let cowboy_workflow_engine::WorkflowEventKind::AgentSessionReady {
+            role, session_id, ..
+        } = &event.kind
+        else {
+            continue;
+        };
+
+        sessions
+            .entry(role.clone())
+            .or_default()
+            .insert(session_id.clone());
+    }
+
+    sessions
+        .into_iter()
+        .map(|(role, session_ids)| {
+            format!(
+                "{role}: {}",
+                session_ids.into_iter().collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect()
+}
+
+fn print_agent_session_ids(events: &[cowboy_workflow_engine::WorkflowEvent]) {
+    for line in agent_session_id_lines(events) {
+        println!("{line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cowboy_workflow_engine::{WorkflowEvent, WorkflowEventKind};
+
+    use super::agent_session_id_lines;
+
+    #[test]
+    fn agent_session_id_lines_are_sorted_and_deduplicated() {
+        let events = vec![
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentSessionReady {
+                    step_id: "review".to_string(),
+                    role: "reviewer".to_string(),
+                    session_id: "session-2".to_string(),
+                    descriptor: None,
+                },
+            ),
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentSessionReady {
+                    step_id: "implement".to_string(),
+                    role: "developer".to_string(),
+                    session_id: "session-3".to_string(),
+                    descriptor: None,
+                },
+            ),
+            WorkflowEvent::new(
+                "run-1",
+                WorkflowEventKind::AgentSessionReady {
+                    step_id: "implement".to_string(),
+                    role: "developer".to_string(),
+                    session_id: "session-1".to_string(),
+                    descriptor: None,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            agent_session_id_lines(&events),
+            vec![
+                "developer: session-1, session-3".to_string(),
+                "reviewer: session-2".to_string(),
+            ]
+        );
     }
 }

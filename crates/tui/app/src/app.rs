@@ -30,6 +30,12 @@ use state::AppState;
 /// never keeps the process alive.
 const SHUTDOWN_TIMEOUT: Duration = DEFAULT_SHUTDOWN_TIMEOUT;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TuiExit {
+    resume_hint: Option<String>,
+    agent_session_lines: Vec<String>,
+}
+
 /// Start the new workflow-first terminal shell.
 pub async fn run_tui(config: AppConfig) -> Result<()> {
     let cwd = std::env::current_dir()?;
@@ -78,20 +84,28 @@ fn print_resume_hint(out: &mut impl io::Write, hint: Option<&str>) -> io::Result
     Ok(())
 }
 
-/// Restore the terminal, then print the resume hint after restoration so it
-/// lands on the normal screen. A restore error propagates before any output;
-/// the hint prints only on `Ok(Some)`; the original loop error is returned
-/// unchanged when the loop failed.
+fn print_agent_session_ids(out: &mut impl io::Write, session_lines: &[String]) -> io::Result<()> {
+    for line in session_lines {
+        writeln!(out, "{line}")?;
+    }
+
+    Ok(())
+}
+
+/// Restore the terminal, then print exit details after restoration so they land
+/// on the normal screen. A restore error propagates before any output; details
+/// print only after a clean loop exit; the original loop error is unchanged.
 fn finish_tui(
-    loop_result: Result<Option<String>>,
+    loop_result: Result<TuiExit>,
     guard: &mut impl TerminalRestore,
     out: &mut impl io::Write,
 ) -> Result<()> {
     guard.restore()?;
-    print_resume_hint(
-        out,
-        loop_result.as_ref().ok().and_then(|hint| hint.as_deref()),
-    )?;
+    if let Ok(exit) = &loop_result {
+        print_resume_hint(out, exit.resume_hint.as_deref())?;
+        print_agent_session_ids(out, &exit.agent_session_lines)?;
+    }
+
     loop_result.map(|_| ())
 }
 
@@ -181,10 +195,10 @@ async fn run_loop<B>(
     mut state: AppState,
     runtime: &WorkflowRuntime,
     workflow_events: &mut tokio::sync::broadcast::Receiver<WorkflowEvent>,
-) -> Result<Option<String>>
+) -> Result<TuiExit>
 where
-    B: ratatui::backend::Backend,
-    B::Error: Send + Sync + 'static,
+    B: ratatui::backend::Backend + std::io::Write,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     let mut draw_scheduler = DrawScheduler::new();
     let mut current_layout = AppLayout::new(Rect::default(), &state);
@@ -192,7 +206,10 @@ where
         draw_scheduler.mark_dirty_if(state.drain_workflow_events(workflow_events));
         draw_scheduler.mark_dirty_if(state.drain_background_tasks().await);
         if state.exit_requested() {
-            return Ok(state.resume_hint());
+            return Ok(TuiExit {
+                resume_hint: state.resume_hint(),
+                agent_session_lines: state.agent_session_id_lines(),
+            });
         }
         if draw_scheduler.should_draw() {
             match draw_cursor_safe_production_frame(terminal, &mut state, current_layout) {
@@ -248,7 +265,12 @@ where
                         commands::submit_input(&mut state, runtime).await;
                         draw_scheduler.mark_dirty();
                     }
-                    KeyHandling::Exit => return Ok(state.resume_hint()),
+                    KeyHandling::Exit => {
+                        return Ok(TuiExit {
+                            resume_hint: state.resume_hint(),
+                            agent_session_lines: state.agent_session_id_lines(),
+                        });
+                    }
                 }
             }
             Event::Mouse(mouse) => {

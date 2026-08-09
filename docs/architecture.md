@@ -335,6 +335,7 @@ cowboy                                  # launch TUI
 cowboy tui                              # launch TUI explicitly
 cowboy run <request...>                 # start a run; --step runs only the first step
 cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
+cowboy run --session-id <role=session-id> <request...>  # load an existing role session
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
 cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
@@ -352,6 +353,12 @@ descriptor snapshots used by the live TUI, then writes
 standalone document has collapsed `<details>` cards, complete untruncated
 headers and bodies, inline expand/collapse controls, and case-insensitive text
 search with no external resources.
+
+`--session-id` accepts repeatable or comma-separated `role=session-id` pairs.
+The runtime loads each supplied session, marks its role prompt as already
+delivered, and fails if the session cannot load rather than creating a new one.
+When an agent-backed CLI run finishes or the TUI exits, Cowboy prints each
+observed role session as `role: session-id`.
 
 Each `--field` accepts an exact field name followed by its value. Names may
 include spaces, `=`, or a leading `-`; quote them when needed. Plain values
@@ -409,7 +416,7 @@ Current vertical layout:
 Slash commands:
 
 ```text
-/run [--step] [--workflow <workflow-id>] <request>
+/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>
 /step <run-id>
 /resume <run-id>
 /answer <run-id> <prompt-id> <answer>

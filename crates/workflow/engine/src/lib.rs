@@ -27,7 +27,7 @@ pub use input::ResumeRouter;
 pub use runner::{LuaStepActionProvider, ResolvedRuntimePolicy, WorkflowRunner};
 pub use runtime::{
     AgentRuntimeConfig, AgentWatchdogRuntimeConfig, DEFAULT_SHUTDOWN_TIMEOUT, ResolutionOptions,
-    ResolutionStatus, RunReport, RunStatusDetail, RunStatusState, RunSummaryLine,
+    ResolutionStatus, RunReport, RunStartOptions, RunStatusDetail, RunStatusState, RunSummaryLine,
     RunnerLimitsConfig, RuntimeConfig, UserPromptRejection, UserPromptSubmission, WorkflowRuntime,
 };
 pub use workflow::{

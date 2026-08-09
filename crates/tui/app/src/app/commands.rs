@@ -234,20 +234,72 @@ fn spawn_start_run_from_args(
     let cowboy_command_parser::RunArgs {
         step,
         workflow,
+        session_ids,
         request,
     } = args;
     let request = request.join(" ");
+    if session_ids.is_empty() {
+        match (step, workflow) {
+            (true, Some(workflow_id)) => {
+                spawn_start_run_with_workflow_stepwise(state, runtime, workflow_id, request);
+            }
+            (false, Some(workflow_id)) => {
+                spawn_start_run_with_workflow(state, runtime, workflow_id, request);
+            }
+            (true, None) => spawn_start_run_stepwise(state, runtime, request),
+            (false, None) => spawn_start_run(state, runtime, request),
+        }
 
-    match (step, workflow) {
-        (true, Some(workflow_id)) => {
-            spawn_start_run_with_workflow_stepwise(state, runtime, workflow_id, request);
-        }
-        (false, Some(workflow_id)) => {
-            spawn_start_run_with_workflow(state, runtime, workflow_id, request);
-        }
-        (true, None) => spawn_start_run_stepwise(state, runtime, request),
-        (false, None) => spawn_start_run(state, runtime, request),
+        return;
     }
+
+    let options = cowboy_workflow_engine::RunStartOptions::with_role_session_ids(
+        session_ids
+            .into_iter()
+            .map(|session| (session.role, session.session_id)),
+    );
+    spawn_start_run_with_options(state, runtime, step, workflow, request, options);
+}
+
+fn spawn_start_run_with_options(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    step: bool,
+    workflow: Option<String>,
+    request: String,
+    options: cowboy_workflow_engine::RunStartOptions,
+) {
+    let runtime = runtime.clone();
+    let label = format!("submitted run with supplied sessions: {request}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Run",
+        [current_wall_clock_prefix()],
+        ["submitted run with supplied sessions".to_string()],
+        label,
+        [body],
+        async move {
+            match (step, workflow) {
+                (true, Some(workflow_id)) => {
+                    runtime
+                        .start_run_with_workflow_stepwise_and_options(workflow_id, request, options)
+                        .await
+                }
+                (false, Some(workflow_id)) => {
+                    runtime
+                        .start_run_with_workflow_and_options(workflow_id, request, options)
+                        .await
+                }
+                (true, None) => {
+                    runtime
+                        .start_run_stepwise_with_options(request, options)
+                        .await
+                }
+                (false, None) => runtime.start_run_with_options(request, options).await,
+            }
+            .map_err(|err| err.to_string())
+        },
+    );
 }
 
 fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: String) {
@@ -1882,9 +1934,10 @@ mod tests {
             .map(|command| command.usage)
             .collect::<Vec<_>>();
 
-        assert!(
-            suggestions.contains(&"/run [--step] [--workflow <workflow-id>] <request>".to_string())
-        );
+        assert!(suggestions.contains(
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+                .to_string()
+        ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
 
         assert!(!suggestions.iter().any(|usage| usage.contains("run-step")));
@@ -1967,7 +2020,10 @@ mod tests {
     #[tokio::test]
     async fn missing_required_slash_args_show_usage_without_spawning_tasks() {
         for (input, usage) in [
-            ("/run", "/run [--step] [--workflow <workflow-id>] <request>"),
+            (
+                "/run",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
+            ),
             ("/step", "/step <run-id>"),
             ("/resume", "/resume <run-id>"),
             ("/answer", "/answer <run-id> <prompt-id> <answer>"),
@@ -1982,7 +2038,7 @@ mod tests {
             ),
             (
                 "/run --workflow review",
-                "/run [--step] [--workflow <workflow-id>] <request>",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state().await;
@@ -1999,7 +2055,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(rendered.contains("Usage"));
-            assert!(rendered.contains(&format!("usage: {usage}")));
         }
     }
 

@@ -529,6 +529,9 @@ impl RunHead {
     }
 }
 
+/// Backend marker for an externally supplied session that must load exactly.
+pub const PROVIDED_SESSION_BACKEND: &str = "provided";
+
 /// Persisted backend session for one role within one workflow run.
 ///
 /// Also carries a per-session prompt-delivery watermark used to avoid resending
@@ -542,7 +545,7 @@ pub struct RoleSession {
     pub run_id: RunId,
     /// Role id whose agent calls reuse this session.
     pub role_id: RoleId,
-    /// Backend identifier, such as `acp`.
+    /// Backend identifier, or [`PROVIDED_SESSION_BACKEND`] for an imported session.
     pub backend: String,
     /// Backend-specific session id.
     pub session_id: String,
