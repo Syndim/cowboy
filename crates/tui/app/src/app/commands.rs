@@ -587,8 +587,7 @@ mod tests {
     use crate::config::{AgentConfig, AppConfig};
     use chrono::{DateTime, Utc};
     use cowboy_workflow_core::{
-        AgentPromptWindow, Choice, ResumeCallback, RunStatus, StepState, WorkflowRun,
-        WorkflowSnapshot,
+        AgentPromptWindow, Choice, ResumeCallback, Run, RunStatus, StepState, WorkflowSnapshot,
     };
     use cowboy_workflow_engine::{RunReport, WorkflowEvent, WorkflowEventKind};
     use cowboy_workflow_store::SqliteWorkflowStore;
@@ -725,11 +724,11 @@ mod tests {
         status: RunStatus,
         current_step: &str,
         head: Option<&str>,
-    ) -> WorkflowRun {
+    ) -> Run {
         let now = DateTime::parse_from_rfc3339("2026-07-28T05:40:44Z")
             .unwrap()
             .to_utc();
-        WorkflowRun {
+        Run {
             id: id.to_string(),
             workflow: WorkflowSnapshot {
                 name: "deploy".to_string(),
@@ -743,7 +742,7 @@ mod tests {
             parent: None,
             status,
             step: StepState {
-                current: current_step.to_string(),
+                next: current_step.to_string(),
                 head: head.map(ToString::to_string),
                 executed: 0,
                 visits: Default::default(),
@@ -756,7 +755,7 @@ mod tests {
         }
     }
 
-    async fn seed_run(store: &SqliteWorkflowStore, run: WorkflowRun) {
+    async fn seed_run(store: &SqliteWorkflowStore, run: Run) {
         store.save_run(&run).await.unwrap();
     }
 
@@ -2846,7 +2845,7 @@ mod tests {
             &run.id,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow.name.clone(),
-                current_step: run.step.current.clone(),
+                current_step: run.step.next.clone(),
                 request_topic: None,
             },
         ));
@@ -2905,7 +2904,7 @@ mod tests {
             &run.id,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow.name.clone(),
-                current_step: run.step.current.clone(),
+                current_step: run.step.next.clone(),
                 request_topic: None,
             },
         ));

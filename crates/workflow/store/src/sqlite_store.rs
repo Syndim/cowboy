@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentPromptWindow, AgentSessionStore, AppendUserPromptOutcome,
-    CompareAndSealPromptWindowOutcome, ObjectHash, ObjectKind, OpenAgentPromptWindowOutcome,
-    PromptWindowStore, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt, StepRecord,
-    TurnRecord, TurnStore, UserPromptStore, WorkflowObjectStore, WorkflowRun,
+    CompareAndSealPromptWindowOutcome, FollowUpPrompt, ObjectHash, ObjectKind,
+    OpenAgentPromptWindowOutcome, PromptWindowStore, RoleSession, Run, RunHead, RunId, RunStatus,
+    StepRecord, TurnRecord, TurnStore, UserPromptStore, WorkflowObjectStore,
     WorkflowSourceSnapshot, WorkflowStateStore,
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -135,7 +135,7 @@ impl SqliteWorkflowStore {
         }
     }
 
-    pub async fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+    pub async fn save_run(&self, run: &Run) -> Result<()> {
         self.retry_write(|| async {
             let mut tx = self.pool.begin().await?;
             upsert_run_and_head(&mut tx, run).await?;
@@ -145,7 +145,7 @@ impl SqliteWorkflowStore {
         .await
     }
 
-    pub async fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
+    pub async fn load_run(&self, run_id: &str) -> Result<Run> {
         let data = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM runs WHERE run_id = ?")
             .bind(run_id)
             .fetch_optional(&self.pool)
@@ -174,7 +174,7 @@ impl SqliteWorkflowStore {
 
     pub async fn commit_completed_step(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         record: &StepRecord,
     ) -> Result<ObjectHash> {
         let hash = object_hash(ObjectKind::StepRecord, record)?;
@@ -333,7 +333,7 @@ impl SqliteWorkflowStore {
             .collect()
     }
 
-    pub async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>> {
+    pub async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<FollowUpPrompt>> {
         let rows =
             sqlx::query("SELECT data FROM run_user_prompts WHERE run_id = ? ORDER BY sequence")
                 .bind(run_id)
@@ -415,7 +415,7 @@ impl SqliteWorkflowStore {
                 .fetch_one(&mut *tx)
                 .await?;
                 let now = Utc::now();
-                let prompt = RunUserPrompt {
+                let prompt = FollowUpPrompt {
                     sequence: sequence as u64,
                     content,
                     submitted_at: DateTime::from_timestamp_millis(now.timestamp_millis())
@@ -569,7 +569,7 @@ impl SqliteWorkflowStore {
     }
 }
 
-async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &WorkflowRun) -> Result<()> {
+async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
     sqlx::query(
         "INSERT INTO runs(run_id, data) VALUES(?, ?) \
          ON CONFLICT(run_id) DO UPDATE SET data=excluded.data",
@@ -617,10 +617,7 @@ async fn put_object_in_tx<T: Serialize>(
     Ok(hash)
 }
 
-async fn load_run_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    run_id: &str,
-) -> Result<Option<WorkflowRun>> {
+async fn load_run_in_tx(tx: &mut Transaction<'_, Sqlite>, run_id: &str) -> Result<Option<Run>> {
     sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM runs WHERE run_id = ?")
         .bind(run_id)
         .fetch_optional(&mut **tx)
@@ -660,7 +657,7 @@ async fn save_window_in_tx(
 async fn load_prompts_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run_id: &str,
-) -> Result<Vec<RunUserPrompt>> {
+) -> Result<Vec<FollowUpPrompt>> {
     let rows = sqlx::query("SELECT data FROM run_user_prompts WHERE run_id = ? ORDER BY sequence")
         .bind(run_id)
         .fetch_all(&mut **tx)
@@ -697,12 +694,12 @@ pub fn is_retryable_sqlite_code(code: Option<&str>) -> bool {
 
 #[async_trait]
 impl WorkflowStateStore for SqliteWorkflowStore {
-    async fn save_run(&self, run: &WorkflowRun) -> cowboy_workflow_core::Result<()> {
+    async fn save_run(&self, run: &Run) -> cowboy_workflow_core::Result<()> {
         SqliteWorkflowStore::save_run(self, run)
             .await
             .map_err(Into::into)
     }
-    async fn load_run(&self, run_id: &RunId) -> cowboy_workflow_core::Result<WorkflowRun> {
+    async fn load_run(&self, run_id: &RunId) -> cowboy_workflow_core::Result<Run> {
         SqliteWorkflowStore::load_run(self, run_id)
             .await
             .map_err(Into::into)
@@ -719,7 +716,7 @@ impl WorkflowStateStore for SqliteWorkflowStore {
     }
     async fn commit_completed_step(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         record: &StepRecord,
     ) -> cowboy_workflow_core::Result<ObjectHash> {
         SqliteWorkflowStore::commit_completed_step(self, run, record)
@@ -829,7 +826,7 @@ impl UserPromptStore for SqliteWorkflowStore {
     async fn load_user_prompts(
         &self,
         run_id: &str,
-    ) -> cowboy_workflow_core::Result<Vec<RunUserPrompt>> {
+    ) -> cowboy_workflow_core::Result<Vec<FollowUpPrompt>> {
         SqliteWorkflowStore::load_user_prompts(self, run_id)
             .await
             .map_err(Into::into)

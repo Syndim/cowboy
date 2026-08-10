@@ -13,7 +13,7 @@ process argv / slash composer input
   -> cowboy CLI/TUI app
        -> cowboy-workflow-engine
             -> catalog loading / workflow selection / summarization
-            -> WorkflowRun state orchestration
+            -> Run state orchestration
             -> Lua step action provider
             -> ACP-backed agent action executor / input router
             -> StepRecord + RunHead persistence
@@ -71,7 +71,7 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 
 ### Workflow run
 
-`WorkflowRun` is the mutable run snapshot:
+`Run` is the mutable run snapshot:
 
 - run id
 - workflow id/hash/source snapshot
@@ -105,7 +105,7 @@ Internally it uses `WorkflowRunner`, which delegates step semantics to `cowboy-w
 One loop iteration:
 
 ```text
-current WorkflowRun
+current `Run`
   -> StepActionProvider evaluates current step
   -> ActionDispatcher runs the StepAction
       agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
@@ -128,7 +128,7 @@ set is always present. Retry limits may be zero, while step and visit limits
 must be nonzero. The old top-level runner-limit keys are rejected.
 
 After Lua compilation, `WorkflowRuntime` resolves the workflow's optional
-`config_set` name (or `default`) before persisting a new `WorkflowRun`. Unknown
+`config_set` name (or `default`) before persisting a new `Run`. Unknown
 sets fail before run persistence. Only the name is durable run state; effective
 `RunnerLimits` are resolved live from current config on every resume, step,
 answer, resolve, and resolution-options path. A config edit (for example a
@@ -265,7 +265,7 @@ No Lua coroutine or host-call replay cache is persisted.
 ### Nested workflow calls
 
 `StepAction::Workflow` lets a step invoke another catalog workflow (by the id
-shown by `/workflows`) as a durable child `WorkflowRun`. The engine reuses one
+shown by `/workflows`) as a durable child `Run`. The engine reuses one
 internal execution helper for both top-level starts and children, so a child
 independently compiles/snapshots its source, resolves its own config set,
 acquires its own run lock, and runs through the same `WorkflowRunner` and event

@@ -40,7 +40,7 @@ impl Default for ConfigSetRef {
 
 /// Durable state of a workflow run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WorkflowRun {
+pub struct Run {
     /// Stable run id.
     pub id: RunId,
     /// Snapshotted workflow identity and sources used by this run.
@@ -56,10 +56,10 @@ pub struct WorkflowRun {
     pub config_set: ConfigSetRef,
     /// Durable lineage when this run was invoked by a parent workflow action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<WorkflowRunParent>,
+    pub parent: Option<ParentRun>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
-    /// Current step cursor and cumulative step accounting.
+    /// Next-step cursor and cumulative step accounting.
     pub step: StepState,
     /// Recoverable retry dispatches reserved across the entire run.
     #[serde(default)]
@@ -86,11 +86,11 @@ pub struct WorkflowSnapshot {
     pub sources: BTreeMap<String, String>,
 }
 
-/// Current step cursor and cumulative step accounting for one run.
+/// Next step cursor and cumulative step accounting for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepState {
     /// Step id that should run next when the run resumes.
-    pub current: StepId,
+    pub next: StepId,
     /// Hash of the latest completed step record.
     pub head: Option<ObjectHash>,
     /// Total number of step actions completed or terminally handled.
@@ -106,7 +106,7 @@ pub struct StepState {
 
 /// Durable identity linking a child run to one parent workflow-step invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkflowRunParent {
+pub struct ParentRun {
     /// Parent workflow run id.
     pub run_id: RunId,
     /// Parent step that invoked the child.
@@ -117,9 +117,9 @@ pub struct WorkflowRunParent {
     pub invocation_id: String,
 }
 
-/// Durable on-the-fly prompt accepted for a workflow run.
+/// Durable follow-up prompt accepted for a workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunUserPrompt {
+pub struct FollowUpPrompt {
     /// Monotonic sequence within the run. Follow-up prompts start at `1`.
     pub sequence: u64,
     /// Exact user-provided text, preserved byte-for-byte.
@@ -131,9 +131,9 @@ pub struct RunUserPrompt {
 
 /// User input exposed to Lua and included in every agent prompt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunUserInput {
+pub struct UserInput {
     pub sequence: u64,
-    pub kind: RunUserInputKind,
+    pub kind: UserInputKind,
     pub content: String,
     #[serde(with = "rfc3339_millis")]
     pub submitted_at: DateTime<Utc>,
@@ -142,13 +142,13 @@ pub struct RunUserInput {
 /// Origin of an entry in the ordered run input history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunUserInputKind {
+pub enum UserInputKind {
     Initial,
     FollowUp,
 }
 
 /// Build the complete ordered user-input history for one prompt snapshot.
-pub fn ordered_user_inputs(run: &WorkflowRun, prompts: &[RunUserPrompt]) -> Vec<RunUserInput> {
+pub fn ordered_user_inputs(run: &Run, prompts: &[FollowUpPrompt]) -> Vec<UserInput> {
     ordered_user_inputs_from_parts(&run.original_request, run.created_at, prompts)
 }
 
@@ -156,18 +156,18 @@ pub fn ordered_user_inputs(run: &WorkflowRun, prompts: &[RunUserPrompt]) -> Vec<
 pub fn ordered_user_inputs_from_parts(
     original_request: &str,
     created_at: DateTime<Utc>,
-    prompts: &[RunUserPrompt],
-) -> Vec<RunUserInput> {
+    prompts: &[FollowUpPrompt],
+) -> Vec<UserInput> {
     let mut inputs = Vec::with_capacity(prompts.len() + 1);
-    inputs.push(RunUserInput {
+    inputs.push(UserInput {
         sequence: 0,
-        kind: RunUserInputKind::Initial,
+        kind: UserInputKind::Initial,
         content: original_request.to_string(),
         submitted_at: created_at,
     });
-    inputs.extend(prompts.iter().map(|prompt| RunUserInput {
+    inputs.extend(prompts.iter().map(|prompt| UserInput {
         sequence: prompt.sequence,
-        kind: RunUserInputKind::FollowUp,
+        kind: UserInputKind::FollowUp,
         content: prompt.content.clone(),
         submitted_at: prompt.submitted_at,
     }));
@@ -220,7 +220,7 @@ pub enum OpenAgentPromptWindowOutcome {
 /// Outcome of transactionally appending an on-the-fly prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppendUserPromptOutcome {
-    Accepted(RunUserPrompt),
+    Accepted(FollowUpPrompt),
     MissingRun,
     TerminalRun,
     NoWindow,
@@ -233,7 +233,7 @@ pub enum AppendUserPromptOutcome {
 pub enum CompareAndSealPromptWindowOutcome {
     Pending {
         window: AgentPromptWindow,
-        prompts: Vec<RunUserPrompt>,
+        prompts: Vec<FollowUpPrompt>,
     },
     Sealed(AgentPromptWindow),
     MissingRun,
@@ -487,12 +487,12 @@ pub struct RunHeadSummary {
 
 impl RunHeadSummary {
     /// Build summary data from the mutable workflow run state.
-    pub fn from_run(run: &WorkflowRun) -> Self {
+    pub fn from_run(run: &Run) -> Self {
         Self {
             created_at: Some(run.created_at),
             workflow_name: run.workflow.name.clone(),
             request_topic: run.request_topic.clone(),
-            current_step: run.step.current.clone(),
+            current_step: run.step.next.clone(),
         }
     }
 }
@@ -517,7 +517,7 @@ pub struct RunHead {
 
 impl RunHead {
     /// Build a run head from the mutable workflow run state.
-    pub fn from_run(run: &WorkflowRun) -> Self {
+    pub fn from_run(run: &Run) -> Self {
         Self {
             run_id: run.id.clone(),
             workflow_hash: run.workflow.hash.clone(),
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn run_defaults_resolved_config_and_retry_counters() {
-        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+        let run: Run = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow": {
                 "name": "wf",
@@ -666,7 +666,7 @@ mod tests {
             "original_request": "do it",
             "status": { "status": "running" },
             "step": {
-                "current": "start",
+                "next": "start",
                 "head": null,
                 "executed": 1,
                 "visits": { "start": 1 }
@@ -683,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn workflow_run_parent_lineage_defaults_and_round_trips() {
+    fn parent_workflow_run_lineage_defaults_and_round_trips() {
         let old_json = serde_json::json!({
             "id": "run",
             "workflow": {
@@ -694,21 +694,21 @@ mod tests {
             },
             "original_request": "do it",
             "status": { "status": "running" },
-            "step": { "current": "start", "head": null },
+            "step": { "next": "start", "head": null },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         });
-        let legacy: WorkflowRun = serde_json::from_value(old_json).unwrap();
+        let legacy: Run = serde_json::from_value(old_json).unwrap();
         assert_eq!(legacy.parent, None);
 
         let mut linked = legacy;
-        linked.parent = Some(WorkflowRunParent {
+        linked.parent = Some(ParentRun {
             run_id: "parent-run".to_string(),
             step_id: "call_child".to_string(),
             previous_head: Some("previous-head".to_string()),
             invocation_id: "9a39cab2-8417-5ca4-b545-6f0a30bb913f".to_string(),
         });
-        let round_trip: WorkflowRun =
+        let round_trip: Run =
             serde_json::from_value(serde_json::to_value(&linked).unwrap()).unwrap();
         assert_eq!(round_trip.parent, linked.parent);
     }
@@ -743,7 +743,7 @@ mod tests {
             None
         );
 
-        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+        let run: Run = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow": {
                 "name": "wf",
@@ -754,7 +754,7 @@ mod tests {
             "original_request": "do it",
             "request_topic": "topic",
             "status": { "status": "running" },
-            "step": { "current": "start", "head": "record-hash" },
+            "step": { "next": "start", "head": "record-hash" },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-02T00:00:00Z"
         }))
@@ -773,7 +773,7 @@ mod tests {
 
     #[test]
     fn retry_counters_and_resolved_config_round_trip() {
-        let mut run: WorkflowRun = serde_json::from_value(serde_json::json!({
+        let mut run: Run = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow": {
                 "name": "wf",
@@ -783,7 +783,7 @@ mod tests {
             },
             "original_request": "do it",
             "status": { "status": "running" },
-            "step": { "current": "start", "head": null },
+            "step": { "next": "start", "head": null },
             "created_at": "2026-01-01T00:00:00Z",
             "updated_at": "2026-01-01T00:00:00Z"
         }))
@@ -798,18 +798,18 @@ mod tests {
         assert!(value.get("workflow_name").is_none());
         assert!(value.get("current_step").is_none());
         assert!(value.get("resume").is_none());
-        assert_eq!(value["workflow"]["name"], "wf");
+        assert!(value["step"].get("current").is_none());
+        assert_eq!(value["step"]["next"], "start");
         assert_eq!(value["step"]["retries_used"]["start"], 2);
-
-        let round_trip: WorkflowRun = serde_json::from_value(value).unwrap();
+        let round_trip: Run = serde_json::from_value(value).unwrap();
         assert_eq!(round_trip.config_set.name, "careful");
         assert_eq!(round_trip.retries_used, 3);
         assert_eq!(round_trip.step.retries_used["start"], 2);
     }
 
     #[test]
-    fn run_user_prompt_serializes_exact_content_and_millisecond_timestamp() {
-        let prompt = RunUserPrompt {
+    fn run_follow_up_prompt_serializes_exact_content_and_millisecond_timestamp() {
+        let prompt = FollowUpPrompt {
             sequence: 1,
             content: "  keep\nspacing  ".to_string(),
             submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
@@ -826,7 +826,7 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::from_value::<RunUserPrompt>(serde_json::to_value(&prompt).unwrap())
+            serde_json::from_value::<FollowUpPrompt>(serde_json::to_value(&prompt).unwrap())
                 .unwrap(),
             prompt
         );
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn ordered_user_inputs_synthesizes_initial_entry_and_follow_ups() {
-        let run: WorkflowRun = serde_json::from_value(serde_json::json!({
+        let run: Run = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow": {
                 "name": "wf",
@@ -844,12 +844,12 @@ mod tests {
             },
             "original_request": "original",
             "status": { "status": "running" },
-            "step": { "current": "start", "head": null },
+            "step": { "next": "start", "head": null },
             "created_at": "2026-01-02T03:04:05Z",
             "updated_at": "2026-01-02T03:04:05Z"
         }))
         .unwrap();
-        let prompts = vec![RunUserPrompt {
+        let prompts = vec![FollowUpPrompt {
             sequence: 1,
             content: "follow up".to_string(),
             submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")

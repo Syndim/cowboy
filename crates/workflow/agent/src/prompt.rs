@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use cowboy_agent_client::PromptContent;
 use cowboy_workflow_core::{
-    AgentAction, AgentTaskContract, Field, OutputSpec, RoleDefinition, RunUserInput, RunUserPrompt,
+    AgentAction, AgentTaskContract, Field, FollowUpPrompt, OutputSpec, RoleDefinition, UserInput,
 };
 
 const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
@@ -12,7 +12,7 @@ Choose `blocked` only when a precise prerequisite cannot be obtained or resolved
 pub fn build_agent_prompt(
     role: &RoleDefinition,
     action: &AgentAction,
-    user_inputs: &[RunUserInput],
+    user_inputs: &[UserInput],
     include_role: bool,
 ) -> String {
     build_prompt_blocks(
@@ -60,7 +60,7 @@ pub(crate) fn task_contract_fingerprint(
 pub fn build_prompt_blocks(
     role: &RoleDefinition,
     action: &AgentAction,
-    user_inputs: &[RunUserInput],
+    user_inputs: &[UserInput],
     selection: PromptBlockSelection,
 ) -> PromptAssembly {
     let mut parts = Vec::new();
@@ -115,7 +115,7 @@ pub fn build_prompt_blocks(
 
 pub(crate) fn build_correction_prompt(
     action: &AgentAction,
-    prompts: &[RunUserPrompt],
+    prompts: &[FollowUpPrompt],
 ) -> Vec<PromptContent> {
     let mut blocks = Vec::with_capacity(prompts.len() * 2 + 2);
     blocks.push(PromptContent::text(
@@ -261,7 +261,7 @@ fn describe_fields(fields: &BTreeMap<String, Field>) -> String {
 mod tests {
     use super::*;
     use chrono::DateTime;
-    use cowboy_workflow_core::{FieldType, RunUserInputKind};
+    use cowboy_workflow_core::{FieldType, UserInputKind};
     use serde_json::Value;
 
     fn summary_field(required: bool) -> BTreeMap<String, Field> {
@@ -367,15 +367,15 @@ mod tests {
             .unwrap()
             .with_timezone(&chrono::Utc);
         let user_inputs = vec![
-            RunUserInput {
+            UserInput {
                 sequence: 0,
-                kind: cowboy_workflow_core::RunUserInputKind::Initial,
+                kind: cowboy_workflow_core::UserInputKind::Initial,
                 content: "INITIAL_INPUT_SENTINEL".into(),
                 submitted_at: timestamp,
             },
-            RunUserInput {
+            UserInput {
                 sequence: 1,
-                kind: cowboy_workflow_core::RunUserInputKind::FollowUp,
+                kind: cowboy_workflow_core::UserInputKind::FollowUp,
                 content: "FOLLOW_UP_INPUT_SENTINEL".into(),
                 submitted_at: timestamp,
             },
@@ -517,8 +517,8 @@ mod tests {
         assert!(!nudge.contains("did not produce a parseable workflow result"));
     }
 
-    fn user_input(sequence: u64, kind: RunUserInputKind, content: &str) -> RunUserInput {
-        RunUserInput {
+    fn user_input(sequence: u64, kind: UserInputKind, content: &str) -> UserInput {
+        UserInput {
             sequence,
             kind,
             content: content.into(),
@@ -570,7 +570,7 @@ mod tests {
         let empty = build_agent_prompt(&role, &action, &[], false);
         assert!(!empty.contains("## User Inputs"));
 
-        let delta = vec![user_input(2, RunUserInputKind::FollowUp, "new direction")];
+        let delta = vec![user_input(2, UserInputKind::FollowUp, "new direction")];
         let prompt = build_agent_prompt(&role, &action, &delta, false);
         assert!(prompt.contains("## User Inputs"));
         assert!(prompt.contains("New user direction not yet sent in this session"));
@@ -593,7 +593,7 @@ mod tests {
             task: None,
             output: None,
         };
-        let inputs = vec![user_input(0, RunUserInputKind::Initial, "initial request")];
+        let inputs = vec![user_input(0, UserInputKind::Initial, "initial request")];
         let prompt = build_agent_prompt(&role, &action, &inputs, true);
         assert!(prompt.contains("cumulative user direction"));
         assert!(!prompt.contains("New user direction not yet sent"));

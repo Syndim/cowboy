@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use cowboy_workflow_core::{Result, StepRecord, WorkflowRun, WorkflowStateStore};
+use cowboy_workflow_core::{Result, Run, StepRecord, WorkflowStateStore};
 
 use crate::events::{WorkflowEvent, WorkflowEventKind};
 
@@ -12,11 +12,11 @@ pub(crate) struct ActiveRunClock {
 }
 
 impl ActiveRunClock {
-    pub(crate) fn open(run: &WorkflowRun) -> Self {
+    pub(crate) fn open(run: &Run) -> Self {
         Self::open_at(run, Utc::now())
     }
 
-    pub(crate) fn open_at(run: &WorkflowRun, active_window_started_at: DateTime<Utc>) -> Self {
+    pub(crate) fn open_at(run: &Run, active_window_started_at: DateTime<Utc>) -> Self {
         Self {
             run_started_at: run.created_at,
             base_active_duration_ms: run.active_duration_ms,
@@ -32,24 +32,20 @@ impl ActiveRunClock {
         self.event_at(run_id, Utc::now(), kind)
     }
 
-    pub(crate) fn event_for_run(
-        &self,
-        run: &WorkflowRun,
-        kind: WorkflowEventKind,
-    ) -> WorkflowEvent {
+    pub(crate) fn event_for_run(&self, run: &Run, kind: WorkflowEventKind) -> WorkflowEvent {
         self.event(run.id.clone(), kind)
     }
 
     pub(crate) fn run_started_with_topic(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         request_topic: Option<String>,
     ) -> WorkflowEvent {
         self.event_for_run(
             run,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow.name.clone(),
-                current_step: run.step.current.clone(),
+                current_step: run.step.next.clone(),
                 request_topic,
             },
         )
@@ -57,17 +53,13 @@ impl ActiveRunClock {
 
     pub(crate) fn run_status_for_run(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         status: &cowboy_workflow_core::RunStatus,
     ) -> WorkflowEvent {
         self.event_for_run(run, WorkflowEventKind::from(status))
     }
 
-    pub(crate) fn step_completed_for_run(
-        &self,
-        run: &WorkflowRun,
-        record: &StepRecord,
-    ) -> WorkflowEvent {
+    pub(crate) fn step_completed_for_run(&self, run: &Run, record: &StepRecord) -> WorkflowEvent {
         self.event_for_run(run, WorkflowEvent::step_completed_kind(record))
     }
 
@@ -97,7 +89,7 @@ impl ActiveRunClock {
     pub(crate) async fn close<S: WorkflowStateStore + ?Sized>(
         &self,
         store: &S,
-        run: &mut WorkflowRun,
+        run: &mut Run,
     ) -> Result<()> {
         self.close_at(store, run, Utc::now()).await
     }
@@ -105,7 +97,7 @@ impl ActiveRunClock {
     pub(crate) async fn close_at<S: WorkflowStateStore + ?Sized>(
         &self,
         store: &S,
-        run: &mut WorkflowRun,
+        run: &mut Run,
         timestamp: DateTime<Utc>,
     ) -> Result<()> {
         run.active_duration_ms = self.active_duration_at(timestamp);
@@ -169,8 +161,8 @@ mod tests {
         assert_eq!(event.run_active_duration_ms, Some(u64::MAX));
     }
 
-    fn run(created_at: DateTime<Utc>, active_duration_ms: u64) -> WorkflowRun {
-        WorkflowRun {
+    fn run(created_at: DateTime<Utc>, active_duration_ms: u64) -> Run {
+        Run {
             id: "run-1".to_string(),
             workflow: cowboy_workflow_core::WorkflowSnapshot {
                 name: "wf".to_string(),
@@ -185,7 +177,7 @@ mod tests {
             status: RunStatus::Running,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),

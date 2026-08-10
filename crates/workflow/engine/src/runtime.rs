@@ -20,12 +20,12 @@ use cowboy_workflow_catalog::{
 };
 use cowboy_workflow_core::{
     ActionResult, AppendUserPromptOutcome, Choice, ConfigSetRef, DEFAULT_CONFIG_SET_NAME,
-    ExecutionContext, Fields, PROVIDED_SESSION_BACKEND, Result, ResumeCallback,
-    ResumeCallbackHandler, ResumeInput, RoleSession, RunHead, RunStatus, RunUserPrompt,
+    ExecutionContext, Fields, FollowUpPrompt, PROVIDED_SESSION_BACKEND, ParentRun, Result,
+    ResumeCallback, ResumeCallbackHandler, ResumeInput, RoleSession, Run, RunHead, RunStatus,
     RunnerLimits, StatusAction, StepAction, StepActionProvider, StepDetail, StepInput, StepOutput,
     StepRecord, StepState, WorkflowAction, WorkflowCatalog, WorkflowDefinition, WorkflowError,
-    WorkflowRun, WorkflowRunParent, WorkflowSelector, WorkflowSnapshot, WorkflowSource,
-    WorkflowSourceSnapshot, WorkflowSummarizer, apply_run_status, apply_step_record,
+    WorkflowSelector, WorkflowSnapshot, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummarizer,
+    apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
 use serde::{Deserialize, Serialize};
@@ -220,7 +220,7 @@ impl RunStartOptions {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunReport {
-    pub run: WorkflowRun,
+    pub run: Run,
     pub events: Vec<WorkflowEvent>,
 }
 
@@ -324,7 +324,7 @@ impl RunStatusDetail {
 /// Durable result of attempting to send an on-the-fly prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserPromptSubmission {
-    Accepted(RunUserPrompt),
+    Accepted(FollowUpPrompt),
     Rejected(UserPromptRejection),
 }
 
@@ -418,7 +418,7 @@ struct CatalogRunSpec {
     run_id: String,
     workflow_id: String,
     request: String,
-    parent: Option<WorkflowRunParent>,
+    parent: Option<ParentRun>,
     start_options: RunStartOptions,
 }
 
@@ -691,7 +691,7 @@ impl WorkflowRuntime {
                     topic,
                     status,
                     status_detail,
-                    current_step: run.step.current,
+                    current_step: run.step.next,
                     head_step,
                 });
             }
@@ -699,7 +699,7 @@ impl WorkflowRuntime {
         Ok(runs)
     }
 
-    fn summary_topic(&self, run: &WorkflowRun) -> Option<String> {
+    fn summary_topic(&self, run: &Run) -> Option<String> {
         run.request_topic.clone().or_else(|| {
             self.load_events(&run.id).ok().and_then(|events| {
                 events.into_iter().find_map(|event| match event.kind {
@@ -710,7 +710,7 @@ impl WorkflowRuntime {
         })
     }
 
-    pub async fn load_run(&self, run_id: &str) -> Result<WorkflowRun> {
+    pub async fn load_run(&self, run_id: &str) -> Result<Run> {
         Ok(self.store()?.load_run(run_id).await?)
     }
 
@@ -1005,7 +1005,7 @@ impl WorkflowRuntime {
                     &spec.start_options,
                     now,
                 )?;
-                let mut run = WorkflowRun {
+                let mut run = Run {
                     id: spec.run_id,
                     workflow: WorkflowSnapshot {
                         name: definition.name.clone(),
@@ -1019,7 +1019,7 @@ impl WorkflowRuntime {
                     parent: spec.parent,
                     status: RunStatus::Running,
                     step: StepState {
-                        current: definition.head.clone(),
+                        next: definition.head.clone(),
                         head: None,
                         executed: 0,
                         visits: BTreeMap::new(),
@@ -1062,7 +1062,7 @@ impl WorkflowRuntime {
         }
     }
 
-    fn validate_catalog_run_match(&self, run: &WorkflowRun, spec: &CatalogRunSpec) -> Result<()> {
+    fn validate_catalog_run_match(&self, run: &Run, spec: &CatalogRunSpec) -> Result<()> {
         if run.workflow.name != spec.workflow_id
             || run.original_request != spec.request
             || run.parent != spec.parent
@@ -1077,7 +1077,7 @@ impl WorkflowRuntime {
 
     async fn execute_loaded_run(
         &self,
-        run: WorkflowRun,
+        run: Run,
         mode: RunMode,
         run_guard: RunExecutionGuard,
         events: Vec<WorkflowEvent>,
@@ -1139,7 +1139,7 @@ impl WorkflowRuntime {
                     run_id: child_run_id,
                     workflow_id: action.workflow,
                     request: action.request,
-                    parent: Some(WorkflowRunParent {
+                    parent: Some(ParentRun {
                         run_id: context.run_id,
                         step_id: context.step_id,
                         previous_head: context.prev,
@@ -1200,7 +1200,7 @@ impl WorkflowRuntime {
         &self,
         child_run_id: &str,
         result: Result<RunReport>,
-    ) -> Result<WorkflowRun> {
+    ) -> Result<Run> {
         match result {
             Ok(report) => Ok(report.run),
             Err(err) => {
@@ -1219,7 +1219,7 @@ impl WorkflowRuntime {
     async fn workflow_action_result(
         &self,
         pending: &PendingWorkflowChild,
-        child: &WorkflowRun,
+        child: &Run,
     ) -> Result<ActionResult> {
         match &child.status {
             RunStatus::WaitingForInput {
@@ -1525,7 +1525,7 @@ impl WorkflowRuntime {
         tracing::debug!(
             run_id = %run.id,
             status = ?run.status,
-            current_step = %run.step.current,
+            current_step = %run.step.next,
             steps_executed = run.step.executed,
             "loaded workflow run"
         );
@@ -1546,7 +1546,7 @@ impl WorkflowRuntime {
                 tracing::debug!(
                     run_id = %run.id,
                     status = ?run.status,
-                    current_step = %run.step.current,
+                    current_step = %run.step.next,
                     "resuming non-terminal run; re-executing the retained current step"
                 );
                 apply_run_status(&store, &mut run, RunStatus::Running).await?;
@@ -1642,7 +1642,7 @@ impl WorkflowRuntime {
 
     async fn build_resolution_options(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         store: &SqliteWorkflowStore,
     ) -> Result<ResolutionOptions> {
         ensure_resolvable(run)?;
@@ -1652,7 +1652,7 @@ impl WorkflowRuntime {
         definition.name = run.workflow.name.clone();
         definition.source_hash = run.workflow.hash.clone();
 
-        let failed_step = run.step.current.clone();
+        let failed_step = run.step.next.clone();
         let step = definition
             .steps
             .get(&failed_step)
@@ -1727,7 +1727,7 @@ impl WorkflowRuntime {
         let Some(chosen) = options.statuses.iter().find(|s| s.status == status) else {
             return Err(WorkflowError::InvalidAction(format!(
                 "status {status:?} cannot resolve step {:?}. {}",
-                run.step.current,
+                run.step.next,
                 describe_resolution_options(&options)
             )));
         };
@@ -1764,7 +1764,7 @@ impl WorkflowRuntime {
         let record_id = format!("{}-{}", run.id, run.step.executed.max(1));
         let context = ExecutionContext {
             run_id: run.id.clone(),
-            step_id: run.step.current.clone(),
+            step_id: run.step.next.clone(),
             step_record_id: record_id,
             prev: run.step.head.clone(),
             role: None,
@@ -1926,7 +1926,7 @@ impl WorkflowRuntime {
     }
     async fn run_existing_with_events(
         &self,
-        run: WorkflowRun,
+        run: Run,
         definition: cowboy_workflow_core::WorkflowDefinition,
         snapshot: WorkflowSourceSnapshot,
         mode: RunMode,
@@ -1942,7 +1942,7 @@ impl WorkflowRuntime {
             run_id = %run.id,
             workflow = %definition.name,
             mode = ?mode,
-            current_step = %run.step.current,
+            current_step = %run.step.next,
             steps_executed = run.step.executed,
             "running workflow"
         );
@@ -2229,7 +2229,7 @@ fn drain_available_workflow_events(
 
 /// A run can be manually resolved only when it is stopped on a step, i.e. it is
 /// `Failed` (after giving up) or still `Running` on the failed step.
-fn ensure_resolvable(run: &WorkflowRun) -> Result<()> {
+fn ensure_resolvable(run: &Run) -> Result<()> {
     if matches!(run.status, RunStatus::Failed { .. } | RunStatus::Running) {
         Ok(())
     } else {
@@ -2306,7 +2306,7 @@ fn describe_resolution_options(options: &ResolutionOptions) -> String {
     format!("Valid statuses: {}", parts.join("; "))
 }
 
-fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
+fn snapshot_from_run(run: &Run) -> WorkflowSourceSnapshot {
     let workflow_entry = format!("{}.lua", run.workflow.name);
     let entry = if run.workflow.sources.contains_key(&workflow_entry) {
         workflow_entry
@@ -2326,7 +2326,7 @@ fn snapshot_from_run(run: &WorkflowRun) -> WorkflowSourceSnapshot {
 }
 
 #[cfg(test)]
-fn run_head(run: &WorkflowRun) -> RunHead {
+fn run_head(run: &Run) -> RunHead {
     RunHead::from_run(run)
 }
 
@@ -3230,7 +3230,7 @@ implementation_evidence: []
         let implemented = runtime.step_run(&started.run.id).await.unwrap();
         let implement_record = command_output_record(&runtime, &implemented).await;
         let feedback = runtime.step_run(&started.run.id).await.unwrap();
-        assert_eq!(feedback.run.step.current, "revise");
+        assert_eq!(feedback.run.step.next, "revise");
         let revised = runtime.step_run(&started.run.id).await.unwrap();
         let revise_record = command_output_record(&runtime, &revised).await;
         let prompts = factory.prompts();
@@ -4038,13 +4038,9 @@ done
         .unwrap()
     }
 
-    fn summary_test_run(
-        run_id: &str,
-        status: RunStatus,
-        request_topic: Option<&str>,
-    ) -> WorkflowRun {
+    fn summary_test_run(run_id: &str, status: RunStatus, request_topic: Option<&str>) -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: run_id.to_string(),
             workflow: WorkflowSnapshot {
                 name: "aaa".to_string(),
@@ -4058,7 +4054,7 @@ done
             parent: None,
             status,
             step: StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),
@@ -4083,7 +4079,7 @@ done
                 window_id: "window-1".to_string(),
                 run_id: run.id.clone(),
                 step_record_id: "record-1".to_string(),
-                step_id: run.step.current.clone(),
+                step_id: run.step.next.clone(),
                 role_id: "developer".to_string(),
                 baseline_sequence: 0,
                 applied_sequence: 0,
@@ -4130,7 +4126,7 @@ done
                 window_id: "window-cancel".to_string(),
                 run_id: run.id.clone(),
                 step_record_id: "record-cancel".to_string(),
-                step_id: run.step.current.clone(),
+                step_id: run.step.next.clone(),
                 role_id: "developer".to_string(),
                 baseline_sequence: 0,
                 applied_sequence: 0,
@@ -4650,13 +4646,13 @@ exit 0
             .await
             .unwrap();
         assert_eq!(run_a.run.step.executed, 1);
-        assert_eq!(run_a.run.step.current, "second");
+        assert_eq!(run_a.run.step.next, "second");
         let run_b = creator
             .start_run_with_workflow_stepwise("multi", "do it")
             .await
             .unwrap();
         assert_eq!(run_b.run.step.executed, 1);
-        assert_eq!(run_b.run.step.current, "second");
+        assert_eq!(run_b.run.step.next, "second");
 
         // A second runtime whose `careful` set lowers the step ceiling to 1.
         let changed = RunnerLimitsConfig {
@@ -4680,7 +4676,7 @@ exit 0
         );
         let loaded_a = resumed_runtime.load_run(&run_a.run.id).await.unwrap();
         assert!(matches!(loaded_a.status, RunStatus::Failed { .. }));
-        assert_eq!(loaded_a.step.current, "second");
+        assert_eq!(loaded_a.step.next, "second");
         assert_eq!(loaded_a.step.executed, 1);
 
         // Run B: `resume_run` applies the same lowered live limit and is blocked.
@@ -4693,7 +4689,7 @@ exit 0
         );
         let loaded_b = resumed_runtime.load_run(&run_b.run.id).await.unwrap();
         assert!(matches!(loaded_b.status, RunStatus::Failed { .. }));
-        assert_eq!(loaded_b.step.current, "second");
+        assert_eq!(loaded_b.step.next, "second");
         assert_eq!(loaded_b.step.executed, 1);
     }
 
@@ -4792,7 +4788,7 @@ exit 0
         let loaded_answer = without_careful.load_run(&waiting.run.id).await.unwrap();
         assert!(matches!(loaded_answer.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_answer.status, RunStatus::Completed);
-        assert_eq!(loaded_answer.step.current, "done");
+        assert_eq!(loaded_answer.step.next, "done");
         assert_eq!(loaded_answer.step.executed, 1);
         assert_ne!(loaded_answer.step.head, waiting_head);
         let answer_record = store
@@ -4825,7 +4821,7 @@ exit 0
         let loaded_resolve = without_careful.load_run(&failed.run.id).await.unwrap();
         assert!(matches!(loaded_resolve.status, RunStatus::Failed { .. }));
         assert_ne!(loaded_resolve.status, RunStatus::Completed);
-        assert_eq!(loaded_resolve.step.current, "done");
+        assert_eq!(loaded_resolve.step.next, "done");
         assert_eq!(loaded_resolve.step.executed, 1);
         assert_ne!(loaded_resolve.step.head, failed_head);
         let resolve_record = store
@@ -4947,7 +4943,7 @@ exit 0
         run_id: &str,
         active_duration_ms: u64,
         created_at: chrono::DateTime<Utc>,
-    ) -> WorkflowRun {
+    ) -> Run {
         let store = runtime.store().unwrap();
         let mut run = store.load_run(run_id).await.unwrap();
         run.created_at = created_at;
@@ -4974,7 +4970,7 @@ exit 0
         let object = raw.as_object_mut().unwrap();
         assert!(object.remove("request_topic").is_some());
 
-        let run: WorkflowRun = serde_json::from_value(raw).unwrap();
+        let run: Run = serde_json::from_value(raw).unwrap();
 
         assert_eq!(run.id, "legacy-run");
         assert_eq!(run.request_topic, None);
@@ -5462,7 +5458,7 @@ exit 0
         ).await;
         let start = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(start.run.status, RunStatus::Running);
-        assert_eq!(start.run.step.current, "middle");
+        assert_eq!(start.run.step.next, "middle");
 
         let active_before_idle_ms = 2_000;
         persist_run_active_duration(
@@ -5476,7 +5472,7 @@ exit 0
         let report = runtime.step_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.next, "finish");
         let stored = runtime.load_run(&start.run.id).await.unwrap();
         assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
         assert!(
@@ -6099,7 +6095,7 @@ exit 0
 
         assert_eq!(report.run.workflow.name, "review");
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.step.current, "review-finish");
+        assert_eq!(report.run.step.next, "review-finish");
         assert_eq!(report.run.step.executed, 1);
         assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
     }
@@ -6180,13 +6176,13 @@ exit 0
 
         let start = runtime.start_run_stepwise("request").await.unwrap();
         assert_eq!(start.run.status, RunStatus::Running);
-        assert_eq!(start.run.step.current, "finish");
+        assert_eq!(start.run.step.next, "finish");
         assert_eq!(start.run.step.executed, 1);
 
         let report = runtime.resume_run(&start.run.id).await.unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.next, "finish");
         assert_eq!(report.run.step.executed, 2);
         assert!(report.events.iter().any(|event| matches!(
             &event.kind,
@@ -6248,7 +6244,7 @@ exit 0
             .await
             .unwrap();
         assert_eq!(started.run.status, RunStatus::Running);
-        assert_eq!(started.run.step.current, "finish");
+        assert_eq!(started.run.step.next, "finish");
         assert!(started.run.workflow.sources["aaa.lua"].contains("body = \"original\""));
 
         fs::write(
@@ -6273,7 +6269,7 @@ exit 0
         let resumed = runtime.resume_run(&started.run.id).await.unwrap();
 
         assert_eq!(resumed.run.status, RunStatus::Completed);
-        assert_eq!(resumed.run.step.current, "finish");
+        assert_eq!(resumed.run.step.next, "finish");
         assert!(resumed.events.iter().any(|event| matches!(
             &event.kind,
             WorkflowEventKind::StepCompleted { step_id, status, body, .. }
@@ -6365,7 +6361,7 @@ exit 0
             "expected Failed run, got {:?}",
             failed.status
         );
-        assert_eq!(failed.step.current, "start");
+        assert_eq!(failed.step.next, "start");
 
         // Resume must retry the current step and drive the run forward. Before
         // the fix, resume short-circuits on the Failed status and returns the
@@ -6463,7 +6459,7 @@ exit 0
             "expected Failed run, got {:?}",
             failed.status
         );
-        assert_eq!(failed.step.current, "start");
+        assert_eq!(failed.step.next, "start");
         assert_eq!(failed.retries_used, 2);
         assert_eq!(failed.step.retries_used.get("start").copied(), Some(2));
         run_id
@@ -6568,7 +6564,7 @@ exit 0
             started.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        assert_eq!(started.run.step.current, "ask");
+        assert_eq!(started.run.step.next, "ask");
         let first_callback_record = waiting_callback_record_id(&started.run.status);
 
         // Resume must re-execute (re-prompt) the retained ask_user step rather
@@ -6631,7 +6627,7 @@ exit 0
         // The single fresh attempt succeeds and advances the run to `finish`,
         // leaving it Running (step mode executes exactly one step).
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.next, "finish");
         assert!(report.events.iter().any(|event| matches!(
             &event.kind,
             WorkflowEventKind::StepStarted { step_id } if step_id == "start"
@@ -6639,7 +6635,7 @@ exit 0
 
         let loaded = runtime.load_run(&run_id).await.unwrap();
         assert_eq!(loaded.status, RunStatus::Running);
-        assert_eq!(loaded.step.current, "finish");
+        assert_eq!(loaded.step.next, "finish");
         // The fresh initial attempt does not consume retry budget.
         assert_eq!(loaded.retries_used, 2);
         assert_eq!(loaded.step.retries_used.get("start").copied(), Some(2));
@@ -6675,7 +6671,7 @@ exit 0
             "expected Failed run, got {:?}",
             loaded.status
         );
-        assert_eq!(loaded.step.current, "start");
+        assert_eq!(loaded.step.next, "start");
         // No budget was available to consume, so counters are unchanged.
         assert_eq!(loaded.retries_used, 2);
         assert_eq!(loaded.step.retries_used.get("start").copied(), Some(2));
@@ -6952,7 +6948,7 @@ exit 0
 
         let report = high.step_run(&run_id).await.unwrap();
         assert_eq!(report.run.status, RunStatus::Running);
-        assert_eq!(report.run.step.current, "finish");
+        assert_eq!(report.run.step.next, "finish");
         assert_eq!(report.run.step.retries_used.get("start"), Some(&3));
     }
 
@@ -8655,7 +8651,7 @@ Recovery implementation review"#
     #[tokio::test]
     async fn snapshot_from_run_uses_workflow_entry_not_first_import() {
         let now = Utc::now();
-        let run = WorkflowRun {
+        let run = Run {
             id: "run-1".to_string(),
             workflow: WorkflowSnapshot {
                 name: "workflows/feature".to_string(),
@@ -8685,7 +8681,7 @@ Recovery implementation review"#
             status: RunStatus::Running,
             retries_used: 0,
             step: StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),
@@ -8927,14 +8923,9 @@ Recovery implementation review"#
         }
     }
 
-    fn lineage_run(
-        id: &str,
-        workflow_name: &str,
-        request: &str,
-        parent: Option<WorkflowRunParent>,
-    ) -> WorkflowRun {
+    fn lineage_run(id: &str, workflow_name: &str, request: &str, parent: Option<ParentRun>) -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: id.to_string(),
             workflow: WorkflowSnapshot {
                 name: workflow_name.to_string(),
@@ -8948,7 +8939,7 @@ Recovery implementation review"#
             parent,
             status: RunStatus::Running,
             step: StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),
@@ -9218,7 +9209,7 @@ Recovery implementation review"#
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_empty_state(&dir).await;
 
-        let parent = WorkflowRunParent {
+        let parent = ParentRun {
             run_id: "run-parent".to_string(),
             step_id: "call".to_string(),
             previous_head: None,
@@ -9262,7 +9253,7 @@ Recovery implementation review"#
 
         // Mutated lineage (invocation id component).
         let mut mismatch = matching.clone();
-        mismatch.parent = Some(WorkflowRunParent {
+        mismatch.parent = Some(ParentRun {
             invocation_id: "changed".to_string(),
             ..parent.clone()
         });
@@ -9277,7 +9268,7 @@ Recovery implementation review"#
 
         // Mutated lineage (parent run id component).
         let mut mismatch = matching;
-        mismatch.parent = Some(WorkflowRunParent {
+        mismatch.parent = Some(ParentRun {
             run_id: "run-other-parent".to_string(),
             ..parent
         });

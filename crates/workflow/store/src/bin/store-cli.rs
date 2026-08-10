@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use cowboy_workflow_core::{
-    RunStatus, StepDetail, StepInput, StepOutput, StepRecord, StepState, TurnRecord, WorkflowRun,
+    Run, RunStatus, StepDetail, StepInput, StepOutput, StepRecord, StepState, TurnRecord,
     WorkflowSnapshot, WorkflowSourceSnapshot,
 };
 use cowboy_workflow_store::SqliteWorkflowStore;
@@ -105,9 +105,9 @@ async fn open_store(path: String) -> Result<SqliteWorkflowStore, Box<dyn std::er
     Ok(SqliteWorkflowStore::connect(path).await?)
 }
 
-fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str) -> WorkflowRun {
+fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str) -> Run {
     let now = Utc::now();
-    WorkflowRun {
+    Run {
         id: id.to_string(),
         workflow: WorkflowSnapshot {
             name: workflow.to_string(),
@@ -122,7 +122,7 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
         status: RunStatus::Running,
         retries_used: 0,
         step: StepState {
-            current: current_step.to_string(),
+            next: current_step.to_string(),
             head: None,
             executed: 0,
             visits: Default::default(),

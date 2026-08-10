@@ -85,7 +85,7 @@ impl cowboy_workflow_core::DefinitionLoader for Loader {
 ///
 /// We intentionally recreate the VM instead of preserving Lua state as durable
 /// workflow state. A run is recovered from the source snapshot plus persisted
-/// `WorkflowRun` data, not from a serialized Lua coroutine/global environment.
+/// `Run` data, not from a serialized Lua coroutine/global environment.
 /// Fresh setup also prevents step code from accidentally depending on mutable
 /// globals left behind by earlier steps in the same process. If performance
 /// becomes a problem, the runner can cache a compiled VM for the lifetime of a

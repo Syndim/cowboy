@@ -14,7 +14,7 @@ use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow, AgentSessionStore,
     CompareAndSealPromptWindowOutcome, ExecutionContext, OpenAgentPromptWindowOutcome,
     PROVIDED_SESSION_BACKEND, PromptWindowStore, RoleDefinition, RoleId, RoleSession, RunId,
-    RunUserInput, StepDetail, StepInput, StepRecord, TurnRecord, TurnStore, WorkflowError,
+    StepDetail, StepInput, StepRecord, TurnRecord, TurnStore, UserInput, WorkflowError,
     ordered_user_inputs_from_parts,
 };
 use tokio::sync::{Mutex, watch};
@@ -499,7 +499,7 @@ where
             .map(|session| session.backend.clone())
             .unwrap_or_else(|| active.backend.clone());
         let include_role = !role_instructions_sent;
-        let delta_inputs: Vec<RunUserInput> = user_inputs
+        let delta_inputs: Vec<UserInput> = user_inputs
             .iter()
             .filter(|input| match last_sent_input_sequence {
                 Some(sent) => input.sequence > sent,
@@ -1338,7 +1338,7 @@ mod tests {
     use anyhow::anyhow;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        AppendUserPromptOutcome, ObjectHash, Result as CoreResult, RunUserPrompt,
+        AppendUserPromptOutcome, FollowUpPrompt, ObjectHash, Result as CoreResult,
     };
     use parking_lot::Mutex as SyncMutex;
     use tokio::sync::mpsc;
@@ -1696,9 +1696,9 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         sessions: SyncMutex<HashMap<(String, String), RoleSession>>,
-        accepted_prompts: SyncMutex<Vec<RunUserPrompt>>,
+        accepted_prompts: SyncMutex<Vec<FollowUpPrompt>>,
         window: SyncMutex<Option<AgentPromptWindow>>,
-        pending_prompt_batches: SyncMutex<VecDeque<Vec<RunUserPrompt>>>,
+        pending_prompt_batches: SyncMutex<VecDeque<Vec<FollowUpPrompt>>>,
         /// Ordered record of every `save_role_session` call for assertions.
         save_history: SyncMutex<Vec<RoleSession>>,
     }
@@ -1880,7 +1880,7 @@ mod tests {
                 return Ok(AppendUserPromptOutcome::SealedWindow);
             }
             let mut prompts = self.accepted_prompts.lock();
-            let prompt = RunUserPrompt {
+            let prompt = FollowUpPrompt {
                 sequence: prompts.last().map_or(1, |prompt| prompt.sequence + 1),
                 content,
                 submitted_at: Utc::now(),
@@ -2796,7 +2796,7 @@ resending the same instruction as attempt two"
         store
             .pending_prompt_batches
             .lock()
-            .push_back(vec![RunUserPrompt {
+            .push_back(vec![FollowUpPrompt {
                 sequence: 2,
                 content: "  preserve\nthis correction  ".to_string(),
                 submitted_at: Utc::now(),
@@ -2804,14 +2804,14 @@ resending the same instruction as attempt two"
         store
             .pending_prompt_batches
             .lock()
-            .push_back(vec![RunUserPrompt {
+            .push_back(vec![FollowUpPrompt {
                 sequence: 3,
                 content: "second correction".to_string(),
                 submitted_at: Utc::now(),
             }]);
         let executor = AgentExecutor::new(factory, store, AgentExecutionConfig::default());
         let mut context = context("run", "record");
-        context.user_prompts.push(RunUserPrompt {
+        context.user_prompts.push(FollowUpPrompt {
             sequence: 1,
             content: "prior direction".to_string(),
             submitted_at: Utc::now(),
@@ -3773,7 +3773,7 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap();
         let mut second = context("run", "record-2");
-        second.user_prompts.push(RunUserPrompt {
+        second.user_prompts.push(FollowUpPrompt {
             sequence: 1,
             content: "new follow-up direction".to_string(),
             submitted_at: Utc::now(),
@@ -3882,7 +3882,7 @@ still applies, got non-recoverable: {error:?}"
             AgentExecutionConfig::default(),
         );
         let mut second_context = context("run", "record-2");
-        second_context.user_prompts.push(RunUserPrompt {
+        second_context.user_prompts.push(FollowUpPrompt {
             sequence: 1,
             content: "reload follow-up".to_string(),
             submitted_at: Utc::now(),
@@ -3927,7 +3927,7 @@ still applies, got non-recoverable: {error:?}"
             AgentExecutionConfig::default(),
         );
         let mut ctx = context("run", "record");
-        ctx.user_prompts.push(RunUserPrompt {
+        ctx.user_prompts.push(FollowUpPrompt {
             sequence: 1,
             content: "seeded follow-up".to_string(),
             submitted_at: Utc::now(),

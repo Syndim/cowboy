@@ -430,7 +430,7 @@ impl<C> WorkflowSummarizer for AgentWorkflowSummarizer<C>
 where
     C: Client + 'static,
 {
-    async fn summarize(&self, run: &cowboy_workflow_core::WorkflowRun) -> Result<WorkflowSummary> {
+    async fn summarize(&self, run: &cowboy_workflow_core::Run) -> Result<WorkflowSummary> {
         let mut client = self.client.lock().await;
         let session_id = self.ensure_session(client.as_mut_client()).await?;
         let mut text = String::new();
@@ -476,7 +476,7 @@ where
     }
 }
 
-fn summary_prompt(run: &cowboy_workflow_core::WorkflowRun) -> Result<String> {
+fn summary_prompt(run: &cowboy_workflow_core::Run) -> Result<String> {
     let run = serde_json::to_string_pretty(run)
         .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
     Ok(format!(
@@ -506,7 +506,7 @@ mod tests {
     use chrono::Utc;
     use cowboy_agent_client::{AgentInfo, StopReason};
     use cowboy_workflow_core::{
-        RunStatus, StepState, WorkflowImprovement, WorkflowLocation, WorkflowRun, WorkflowSelector,
+        Run, RunStatus, StepState, WorkflowImprovement, WorkflowLocation, WorkflowSelector,
         WorkflowSnapshot, WorkflowSource, WorkflowSummarizer,
     };
     use serde_json::Value;
@@ -818,7 +818,7 @@ mod tests {
     #[tokio::test]
     async fn agent_summarizer_parses_workflow_summary() {
         let now = Utc::now();
-        let run = WorkflowRun {
+        let run = Run {
             id: "run-1".to_string(),
             workflow: WorkflowSnapshot {
                 name: "default".to_string(),
@@ -833,7 +833,7 @@ mod tests {
             status: RunStatus::Completed,
             retries_used: 0,
             step: StepState {
-                current: "finish".to_string(),
+                next: "finish".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),

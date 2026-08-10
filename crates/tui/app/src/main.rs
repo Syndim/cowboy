@@ -185,7 +185,7 @@ fn print_resolution_options(options: &cowboy_workflow_engine::ResolutionOptions)
 fn print_report(report: &cowboy_workflow_engine::RunReport) {
     println!(
         "run={} workflow={} status={:?} step={}",
-        report.run.id, report.run.workflow.name, report.run.status, report.run.step.current
+        report.run.id, report.run.workflow.name, report.run.status, report.run.step.next
     );
     for event in &report.events {
         println!("event={:?}", event.kind);

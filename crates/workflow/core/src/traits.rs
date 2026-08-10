@@ -1,9 +1,9 @@
 use crate::{
     AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome, Choice,
-    CompareAndSealPromptWindowOutcome, ObjectHash, OpenAgentPromptWindowOutcome, Result,
-    ResumeCallback, RoleDefinition, RoleSession, RunHead, RunId, RunStatus, RunUserPrompt,
+    CompareAndSealPromptWindowOutcome, FollowUpPrompt, ObjectHash, OpenAgentPromptWindowOutcome,
+    Result, ResumeCallback, RoleDefinition, RoleSession, Run, RunHead, RunId, RunStatus,
     StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
-    WorkflowDefinition, WorkflowRun, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummary,
+    WorkflowDefinition, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummary,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -50,7 +50,7 @@ pub struct ExecutionContext {
     /// Timestamp of the initial request.
     pub run_created_at: DateTime<Utc>,
     /// Ordered durable follow-up prompt snapshot used for this dispatch.
-    pub user_prompts: Vec<RunUserPrompt>,
+    pub user_prompts: Vec<FollowUpPrompt>,
 }
 
 /// User answer and prompt metadata supplied to a registered resume callback.
@@ -99,10 +99,10 @@ pub trait StepActionProvider: Send + Sync {
     fn step_action(
         &self,
         definition: &WorkflowDefinition,
-        run: &WorkflowRun,
+        run: &Run,
         step: &StepDefinition,
         prev: Option<&StepRecord>,
-        user_prompts: &[RunUserPrompt],
+        user_prompts: &[FollowUpPrompt],
     ) -> Result<StepAction>;
 }
 
@@ -128,20 +128,16 @@ pub trait ResumeCallbackHandler: Send + Sync {
 }
 #[async_trait]
 pub trait WorkflowSummarizer: Send + Sync {
-    async fn summarize(&self, run: &WorkflowRun) -> Result<WorkflowSummary>;
+    async fn summarize(&self, run: &Run) -> Result<WorkflowSummary>;
 }
 
 #[async_trait]
 pub trait WorkflowStateStore: Send + Sync {
-    async fn save_run(&self, run: &WorkflowRun) -> Result<()>;
-    async fn load_run(&self, run_id: &RunId) -> Result<WorkflowRun>;
+    async fn save_run(&self, run: &Run) -> Result<()>;
+    async fn load_run(&self, run_id: &RunId) -> Result<Run>;
     async fn list_runs(&self) -> Result<Vec<RunHead>>;
     async fn load_run_head(&self, run_id: &str) -> Result<RunHead>;
-    async fn commit_completed_step(
-        &self,
-        run: &WorkflowRun,
-        record: &StepRecord,
-    ) -> Result<ObjectHash>;
+    async fn commit_completed_step(&self, run: &Run, record: &StepRecord) -> Result<ObjectHash>;
     async fn delete_run(&self, run_id: &str) -> Result<()>;
 }
 
@@ -176,7 +172,7 @@ pub trait TurnStore: Send + Sync {
 
 #[async_trait]
 pub trait UserPromptStore: Send + Sync {
-    async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<RunUserPrompt>>;
+    async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<FollowUpPrompt>>;
 }
 
 #[async_trait]

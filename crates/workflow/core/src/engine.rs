@@ -2,9 +2,9 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionDispatcher, ActionResult, Result, RunStatus, StepAction, StepActionProvider, StepId,
+    ActionDispatcher, ActionResult, Result, Run, RunStatus, StepAction, StepActionProvider, StepId,
     StepRecord, UserPromptStore, WorkflowDefinition, WorkflowError, WorkflowObjectStore,
-    WorkflowRun, WorkflowStateStore,
+    WorkflowStateStore,
 };
 
 /// Safety budgets enforced by the workflow runner.
@@ -42,7 +42,7 @@ pub async fn execute_step<S, D, P>(
     dispatcher: &D,
     provider: &P,
     definition: &WorkflowDefinition,
-    run: &mut WorkflowRun,
+    run: &mut Run,
     limits: &RunnerLimits,
 ) -> Result<RunStatus>
 where
@@ -65,7 +65,7 @@ pub async fn retry_current_step<S, D, P>(
     dispatcher: &D,
     provider: &P,
     definition: &WorkflowDefinition,
-    run: &mut WorkflowRun,
+    run: &mut Run,
     attempt: u64,
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
@@ -91,7 +91,7 @@ async fn dispatch_current_step<S, D, P>(
     dispatcher: &D,
     provider: &P,
     definition: &WorkflowDefinition,
-    run: &mut WorkflowRun,
+    run: &mut Run,
     attempt: u64,
     retry_reason: Option<String>,
 ) -> Result<RunStatus>
@@ -100,13 +100,12 @@ where
     D: ActionDispatcher,
     P: StepActionProvider,
 {
-    let step =
-        definition
-            .steps
-            .get(&run.step.current)
-            .ok_or_else(|| WorkflowError::UnknownStep {
-                step: run.step.current.clone(),
-            })?;
+    let step = definition
+        .steps
+        .get(&run.step.next)
+        .ok_or_else(|| WorkflowError::UnknownStep {
+            step: run.step.next.clone(),
+        })?;
 
     let previous_head = run.step.head.clone();
     let prev_record = match previous_head {
@@ -148,33 +147,33 @@ where
     }
 }
 
-fn enforce_budget(run: &WorkflowRun, limits: &RunnerLimits) -> Result<()> {
+fn enforce_budget(run: &Run, limits: &RunnerLimits) -> Result<()> {
     if run.step.executed >= limits.max_steps_per_run {
         return Err(WorkflowError::InvalidAction(format!(
             "run exceeded max step count ({})",
             limits.max_steps_per_run
         )));
     }
-    let visits = run.step.visits.get(&run.step.current).copied().unwrap_or(0);
+    let visits = run.step.visits.get(&run.step.next).copied().unwrap_or(0);
     if visits >= limits.max_visits_per_step {
         return Err(WorkflowError::InvalidAction(format!(
             "step {:?} exceeded max visits ({})",
-            run.step.current, limits.max_visits_per_step
+            run.step.next, limits.max_visits_per_step
         )));
     }
     Ok(())
 }
 
-fn increment_budget(run: &mut WorkflowRun) {
+fn increment_budget(run: &mut Run) {
     run.step.executed += 1;
-    *run.step.visits.entry(run.step.current.clone()).or_default() += 1;
+    *run.step.visits.entry(run.step.next.clone()).or_default() += 1;
 }
 
 /// Persist a completed step record, advance the run head, and route by output status.
 pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
     store: &S,
     definition: &WorkflowDefinition,
-    run: &mut WorkflowRun,
+    run: &mut Run,
     record: StepRecord,
 ) -> Result<RunStatus> {
     let output = record
@@ -185,7 +184,7 @@ pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
     run.updated_at = Utc::now();
 
     let status = if let Some(next) = next {
-        run.step.current = next;
+        run.step.next = next;
         RunStatus::Running
     } else {
         RunStatus::Completed
@@ -199,7 +198,7 @@ pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
 /// Persist a run status produced by a blocked or terminal action.
 pub async fn apply_run_status<S: WorkflowStateStore + ?Sized>(
     store: &S,
-    run: &mut WorkflowRun,
+    run: &mut Run,
     status: RunStatus,
 ) -> Result<RunStatus> {
     run.status = status.clone();
@@ -208,7 +207,7 @@ pub async fn apply_run_status<S: WorkflowStateStore + ?Sized>(
     Ok(status)
 }
 
-fn next_record_id(run: &WorkflowRun) -> String {
+fn next_record_id(run: &Run) -> String {
     format!("{}-{}", run.id, run.step.executed + 1)
 }
 
@@ -262,7 +261,7 @@ mod tests {
 
     struct StaticProvider {
         actions: Mutex<Vec<StepAction>>,
-        seen_prompts: Mutex<Vec<Vec<crate::RunUserPrompt>>>,
+        seen_prompts: Mutex<Vec<Vec<crate::FollowUpPrompt>>>,
     }
 
     impl StaticProvider {
@@ -278,10 +277,10 @@ mod tests {
         fn step_action(
             &self,
             _definition: &WorkflowDefinition,
-            _run: &WorkflowRun,
+            _run: &Run,
             _step: &StepDefinition,
             _prev: Option<&StepRecord>,
-            user_prompts: &[crate::RunUserPrompt],
+            user_prompts: &[crate::FollowUpPrompt],
         ) -> Result<StepAction> {
             self.seen_prompts.lock().push(user_prompts.to_vec());
             Ok(self.actions.lock().remove(0))
@@ -438,16 +437,16 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryStore {
-        runs: Mutex<HashMap<String, WorkflowRun>>,
+        runs: Mutex<HashMap<String, Run>>,
         heads: Mutex<HashMap<String, crate::RunHead>>,
         sessions: Mutex<HashMap<(String, String), crate::RoleSession>>,
         objects: Mutex<HashMap<String, Vec<u8>>>,
-        prompts: Mutex<HashMap<String, Vec<crate::RunUserPrompt>>>,
+        prompts: Mutex<HashMap<String, Vec<crate::FollowUpPrompt>>>,
     }
 
     #[async_trait]
     impl WorkflowStateStore for MemoryStore {
-        async fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+        async fn save_run(&self, run: &Run) -> Result<()> {
             self.runs.lock().insert(run.id.clone(), run.clone());
             self.heads
                 .lock()
@@ -455,7 +454,7 @@ mod tests {
             Ok(())
         }
 
-        async fn load_run(&self, run_id: &crate::RunId) -> Result<WorkflowRun> {
+        async fn load_run(&self, run_id: &crate::RunId) -> Result<Run> {
             self.runs
                 .lock()
                 .get(run_id)
@@ -477,7 +476,7 @@ mod tests {
 
         async fn commit_completed_step(
             &self,
-            run: &WorkflowRun,
+            run: &Run,
             record: &StepRecord,
         ) -> Result<crate::ObjectHash> {
             let bytes = serde_json::to_vec(record).unwrap();
@@ -598,7 +597,7 @@ mod tests {
 
     #[async_trait]
     impl UserPromptStore for MemoryStore {
-        async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<crate::RunUserPrompt>> {
+        async fn load_user_prompts(&self, run_id: &str) -> Result<Vec<crate::FollowUpPrompt>> {
             Ok(self.prompts.lock().get(run_id).cloned().unwrap_or_default())
         }
     }
@@ -693,9 +692,9 @@ mod tests {
         }
     }
 
-    fn run() -> WorkflowRun {
+    fn run() -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: "run".to_string(),
             workflow: WorkflowSnapshot {
                 name: "wf".to_string(),
@@ -707,7 +706,7 @@ mod tests {
             request_topic: None,
             status: RunStatus::Running,
             step: StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),
@@ -725,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn initial_and_retry_dispatch_share_the_loaded_prompt_baseline() {
         let store = MemoryStore::default();
-        let prompt = crate::RunUserPrompt {
+        let prompt = crate::FollowUpPrompt {
             sequence: 1,
             content: "correction".to_string(),
             submitted_at: Utc::now(),
@@ -809,7 +808,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(status, RunStatus::Running);
-        assert_eq!(run.step.current, "next");
+        assert_eq!(run.step.next, "next");
         assert_eq!(run.step.executed, 1);
         assert!(run.step.head.is_some());
     }
@@ -824,7 +823,7 @@ mod tests {
             body: String::new(),
         })]);
         let mut run = run();
-        run.step.current = "next".to_string();
+        run.step.next = "next".to_string();
 
         let status = execute_step(
             &store,
@@ -948,7 +947,7 @@ mod tests {
             output: None,
         })]);
         let mut run = run();
-        run.step.current = "agent".to_string();
+        run.step.next = "agent".to_string();
 
         let status = execute_step(
             &store,
@@ -1005,7 +1004,7 @@ mod tests {
             let provider = StaticProvider::new(vec![action]);
             let mut run = run();
             if expected == "agent" {
-                run.step.current = "agent".to_string();
+                run.step.next = "agent".to_string();
             }
 
             execute_step(
@@ -1059,7 +1058,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(status, RunStatus::Running);
-        assert_eq!(run.step.current, "next");
+        assert_eq!(run.step.next, "next");
         assert!(run.step.head.is_some());
         assert_eq!(
             store.load_run(&run.id).await.unwrap().status,

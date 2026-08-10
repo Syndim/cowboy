@@ -136,7 +136,7 @@ Owns workflow domain data and pure execution rules.
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
 | `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
-| `state.rs` | Durable `WorkflowRun`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
+| `state.rs` | Durable `Run`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
 | `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, `next_step` routing, and step/visit budget enforcement. |
@@ -240,7 +240,7 @@ CLI/TUI command
   -> catalog chooses/loads workflow source
   -> workflow-lua compiles/snapshots workflow source
   -> engine resolves workflow config_set name (or default); limits resolved live per operation
-  -> WorkflowRun persisted through async WorkflowStore capabilities
+  -> Run persisted through async WorkflowStore capabilities
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction
   -> ActionDispatcher/action runners handle initial StepAction values

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use cowboy_workflow_core::{Choice, RunStatus, StepRecord, WorkflowRun};
+use cowboy_workflow_core::{Choice, Run, RunStatus, StepRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -23,7 +23,7 @@ impl WorkflowEvent {
         Self::with_timing(run_id, Utc::now(), None, None, kind)
     }
 
-    pub fn for_run(run: &WorkflowRun, kind: WorkflowEventKind) -> Self {
+    pub fn for_run(run: &Run, kind: WorkflowEventKind) -> Self {
         Self::with_run_started_at(run.id.clone(), run.created_at, kind)
     }
 
@@ -66,16 +66,16 @@ impl WorkflowEvent {
         }
     }
 
-    pub fn run_started(run: &WorkflowRun) -> Self {
+    pub fn run_started(run: &Run) -> Self {
         Self::run_started_with_topic(run, None)
     }
 
-    pub fn run_started_with_topic(run: &WorkflowRun, request_topic: Option<String>) -> Self {
+    pub fn run_started_with_topic(run: &Run, request_topic: Option<String>) -> Self {
         Self::for_run(
             run,
             WorkflowEventKind::RunStarted {
                 workflow_name: run.workflow.name.clone(),
-                current_step: run.step.current.clone(),
+                current_step: run.step.next.clone(),
                 request_topic,
             },
         )
@@ -85,7 +85,7 @@ impl WorkflowEvent {
         Self::new(run_id, WorkflowEventKind::from(status))
     }
 
-    pub fn run_status_for_run(run: &WorkflowRun, status: &RunStatus) -> Self {
+    pub fn run_status_for_run(run: &Run, status: &RunStatus) -> Self {
         Self::for_run(run, WorkflowEventKind::from(status))
     }
 
@@ -93,7 +93,7 @@ impl WorkflowEvent {
         Self::new(run_id, Self::step_completed_kind(record))
     }
 
-    pub fn step_completed_for_run(run: &WorkflowRun, record: &StepRecord) -> Self {
+    pub fn step_completed_for_run(run: &Run, record: &StepRecord) -> Self {
         Self::for_run(run, Self::step_completed_kind(record))
     }
 

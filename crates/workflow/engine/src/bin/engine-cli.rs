@@ -297,7 +297,7 @@ async fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
     println!("id:             {}", run.id);
     println!("workflow:       {}", run.workflow.name);
     println!("status:         {}", status_label(&run.status));
-    println!("current_step:   {}", run.step.current);
+    println!("current_step:   {}", run.step.next);
     println!("steps_executed: {}", run.step.executed);
     println!(
         "head:           {}",
@@ -497,7 +497,7 @@ fn print_report(report: &RunReport) {
         run.id,
         run.workflow.name,
         status_label(&run.status),
-        run.step.current,
+        run.step.next,
         run.step.executed,
     );
     if let RunStatus::WaitingForInput {

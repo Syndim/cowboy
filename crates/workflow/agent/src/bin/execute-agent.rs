@@ -9,8 +9,7 @@ use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
 };
 use cowboy_workflow_core::{
-    AgentAction, RoleDefinition, RunId, RunStatus, RunUserPrompt, StepState, WorkflowRun,
-    WorkflowSnapshot,
+    AgentAction, FollowUpPrompt, RoleDefinition, Run, RunId, RunStatus, StepState, WorkflowSnapshot,
 };
 use cowboy_workflow_store::{Error as StoreError, SqliteWorkflowStore};
 
@@ -66,8 +65,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 fn execution_context(
     config: &Args,
-    run: &WorkflowRun,
-    user_prompts: Vec<RunUserPrompt>,
+    run: &Run,
+    user_prompts: Vec<FollowUpPrompt>,
 ) -> cowboy_workflow_core::ExecutionContext {
     cowboy_workflow_core::ExecutionContext {
         run_id: run.id.clone(),
@@ -91,12 +90,12 @@ fn execution_context(
 async fn ensure_standalone_run(
     store: &SqliteWorkflowStore,
     config: &Args,
-) -> Result<WorkflowRun, StoreError> {
+) -> Result<Run, StoreError> {
     match store.load_run(&config.run_id).await {
         Ok(run) => Ok(run),
         Err(StoreError::RunNotFound(_)) => {
             let now = Utc::now();
-            let run = WorkflowRun {
+            let run = Run {
                 id: config.run_id.clone(),
                 workflow: WorkflowSnapshot {
                     name: "execute-agent".to_string(),
@@ -110,7 +109,7 @@ async fn ensure_standalone_run(
                 parent: None,
                 status: RunStatus::Running,
                 step: StepState {
-                    current: config.step_id.clone(),
+                    next: config.step_id.clone(),
                     head: None,
                     executed: 0,
                     visits: Default::default(),

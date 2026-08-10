@@ -1626,13 +1626,13 @@ impl AppState {
         self.clear_stale_topic_for_report(&report);
         self.active_run_id = Some(report.run.id.clone());
         self.workflow_name = Some(report.run.workflow.name.clone());
-        self.current_step = Some(report.run.step.current.clone());
+        self.current_step = Some(report.run.step.next.clone());
         self.run_state = format!("{:?}", report.run.status).to_ascii_lowercase();
         self.durable_run_status = Some(RunStatusDetail::from_status(&report.run.status).state);
         self.agent_prompt_window = None;
         self.status = format!(
             "run={} status={:?} step={}",
-            report.run.id, report.run.status, report.run.step.current
+            report.run.id, report.run.status, report.run.step.next
         );
         for event in report.events {
             self.apply_workflow_event(event);

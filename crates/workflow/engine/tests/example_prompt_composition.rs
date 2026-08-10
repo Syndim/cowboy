@@ -1,6 +1,6 @@
 use cowboy_workflow_agent::build_agent_prompt;
 use cowboy_workflow_core::{
-    RunUserInput, RunUserInputKind, StepAction, WorkflowLocation, WorkflowSource,
+    StepAction, UserInput, UserInputKind, WorkflowLocation, WorkflowSource,
 };
 use cowboy_workflow_lua::{load, run_step};
 
@@ -23,15 +23,15 @@ fn actual_example_lua_prompt_includes_each_user_input_once() {
         .unwrap()
         .with_timezone(&chrono::Utc);
     let user_inputs = vec![
-        RunUserInput {
+        UserInput {
             sequence: 0,
-            kind: RunUserInputKind::Initial,
+            kind: UserInputKind::Initial,
             content: "ACTUAL_INITIAL_REQUEST_SENTINEL".into(),
             submitted_at: timestamp,
         },
-        RunUserInput {
+        UserInput {
             sequence: 1,
-            kind: RunUserInputKind::FollowUp,
+            kind: UserInputKind::FollowUp,
             content: "ACTUAL_FOLLOW_UP_SENTINEL".into(),
             submitted_at: timestamp,
         },

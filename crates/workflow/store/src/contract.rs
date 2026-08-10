@@ -2,16 +2,16 @@
 pub(crate) mod tests {
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ConfigSetRef, RoleSession, RunStatus, StepDetail, StepInput, StepOutput, StepRecord,
-        StepState, TurnRecord, WorkflowRun, WorkflowSnapshot, WorkflowSourceSnapshot,
+        ConfigSetRef, RoleSession, Run, RunStatus, StepDetail, StepInput, StepOutput, StepRecord,
+        StepState, TurnRecord, WorkflowSnapshot, WorkflowSourceSnapshot,
     };
     use serde_json::Value;
 
     use crate::{Error, SqliteWorkflowStore};
 
-    pub(crate) fn run(id: &str) -> WorkflowRun {
+    pub(crate) fn run(id: &str) -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: id.into(),
             workflow: WorkflowSnapshot {
                 name: "wf".into(),
@@ -28,7 +28,7 @@ pub(crate) mod tests {
             status: RunStatus::Running,
             retries_used: 2,
             step: StepState {
-                current: "start".into(),
+                next: "start".into(),
                 head: None,
                 executed: 1,
                 visits: [("start".into(), 1)].into_iter().collect(),

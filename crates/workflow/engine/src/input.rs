@@ -1,6 +1,6 @@
 use chrono::Utc;
 use cowboy_workflow_core::{
-    ActionResult, Choice, ResumeCallback, ResumeInput, RunStatus, WorkflowError, WorkflowRun,
+    ActionResult, Choice, ResumeCallback, ResumeInput, Run, RunStatus, WorkflowError,
 };
 
 use crate::ResumeCallbackRegistry;
@@ -35,7 +35,7 @@ impl ResumeRouter {
 
     pub fn validate_answer(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         prompt_id: &str,
         answer: impl Into<String>,
     ) -> cowboy_workflow_core::Result<ValidatedAnswer> {
@@ -97,7 +97,7 @@ impl ResumeRouter {
 
     pub async fn answer(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         prompt_id: &str,
         answer: impl Into<String>,
     ) -> cowboy_workflow_core::Result<ActionResult> {
@@ -126,9 +126,9 @@ mod tests {
 
     use super::*;
 
-    fn waiting_run() -> WorkflowRun {
+    fn waiting_run() -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: "run-1".to_string(),
             workflow: cowboy_workflow_core::WorkflowSnapshot {
                 name: "wf".to_string(),
@@ -168,7 +168,7 @@ mod tests {
             },
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
-                current: "approve".to_string(),
+                next: "approve".to_string(),
                 head: None,
                 executed: 1,
                 visits: BTreeMap::new(),

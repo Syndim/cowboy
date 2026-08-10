@@ -2,9 +2,9 @@ use chrono::Utc;
 use std::sync::Arc;
 
 use cowboy_workflow_core::{
-    ActionDispatcher, Result, RunStatus, RunUserPrompt, RunnerLimits, StepAction,
+    ActionDispatcher, FollowUpPrompt, Result, Run, RunStatus, RunnerLimits, StepAction,
     StepActionProvider, StepDefinition, StepRecord, UserPromptStore, WorkflowDefinition,
-    WorkflowError, WorkflowObjectStore, WorkflowRun, WorkflowSourceSnapshot, WorkflowStateStore,
+    WorkflowError, WorkflowObjectStore, WorkflowSourceSnapshot, WorkflowStateStore,
     apply_run_status, execute_step, ordered_user_inputs, retry_current_step,
 };
 use serde_json::{Value, json};
@@ -77,21 +77,21 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
         &self.events
     }
 
-    fn run_started_event(&self, run: &WorkflowRun) -> WorkflowEvent {
+    fn run_started_event(&self, run: &Run) -> WorkflowEvent {
         match &self.active_clock {
             Some(clock) => clock.run_started_with_topic(run, self.request_topic.clone()),
             None => WorkflowEvent::run_started_with_topic(run, self.request_topic.clone()),
         }
     }
 
-    fn workflow_event_for_run(&self, run: &WorkflowRun, kind: WorkflowEventKind) -> WorkflowEvent {
+    fn workflow_event_for_run(&self, run: &Run, kind: WorkflowEventKind) -> WorkflowEvent {
         match &self.active_clock {
             Some(clock) => clock.event_for_run(run, kind),
             None => WorkflowEvent::for_run(run, kind),
         }
     }
 
-    fn step_completed_event(&self, run: &WorkflowRun, record: &StepRecord) -> WorkflowEvent {
+    fn step_completed_event(&self, run: &Run, record: &StepRecord) -> WorkflowEvent {
         match &self.active_clock {
             Some(clock) => clock.step_completed_for_run(run, record),
             None => WorkflowEvent::step_completed_for_run(run, record),
@@ -110,8 +110,8 @@ where
     pub async fn run_until_blocked(
         &self,
         definition: &WorkflowDefinition,
-        mut run: WorkflowRun,
-    ) -> Result<WorkflowRun> {
+        mut run: Run,
+    ) -> Result<Run> {
         self.events.emit(self.run_started_event(&run));
 
         let mut execution = Ok(());
@@ -130,11 +130,7 @@ where
     /// Execute exactly one workflow step when the run is still running, then
     /// return without looping. The run may remain `Running`, advanced to its
     /// next step, so callers can drive a workflow one step at a time.
-    pub async fn step_once(
-        &self,
-        definition: &WorkflowDefinition,
-        mut run: WorkflowRun,
-    ) -> Result<WorkflowRun> {
+    pub async fn step_once(&self, definition: &WorkflowDefinition, mut run: Run) -> Result<Run> {
         self.events.emit(self.run_started_event(&run));
 
         let mut execution = Ok(());
@@ -149,7 +145,7 @@ where
         Ok(run)
     }
 
-    async fn close_active_window(&self, run: &mut WorkflowRun) -> Result<()> {
+    async fn close_active_window(&self, run: &mut Run) -> Result<()> {
         if let Some(clock) = &self.active_clock {
             clock.close(&self.store, run).await?;
         }
@@ -162,9 +158,9 @@ where
     async fn execute_one(
         &self,
         definition: &WorkflowDefinition,
-        run: &mut WorkflowRun,
+        run: &mut Run,
     ) -> Result<RunStatus> {
-        let step_id = run.step.current.clone();
+        let step_id = run.step.next.clone();
         let previous_head = run.step.head.clone();
         self.events.emit(self.workflow_event_for_run(
             run,
@@ -222,7 +218,7 @@ where
     async fn retry_step(
         &self,
         definition: &WorkflowDefinition,
-        run: &mut WorkflowRun,
+        run: &mut Run,
         step_id: &str,
         first_error: WorkflowError,
     ) -> Result<RunStatus> {
@@ -285,7 +281,7 @@ where
 
     fn retry_exhaustion_error(
         &self,
-        run: &WorkflowRun,
+        run: &Run,
         step_id: &str,
         last_error: &WorkflowError,
     ) -> Option<WorkflowError> {
@@ -359,10 +355,10 @@ impl StepActionProvider for LuaStepActionProvider {
     fn step_action(
         &self,
         definition: &WorkflowDefinition,
-        run: &WorkflowRun,
+        run: &Run,
         step: &StepDefinition,
         prev: Option<&StepRecord>,
-        user_prompts: &[RunUserPrompt],
+        user_prompts: &[FollowUpPrompt],
     ) -> Result<StepAction> {
         let user_inputs = ordered_user_inputs(run, user_prompts);
         let ctx = json!({
@@ -407,14 +403,14 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MemoryStore {
-        runs: Arc<Mutex<HashMap<String, WorkflowRun>>>,
+        runs: Arc<Mutex<HashMap<String, Run>>>,
         heads: Arc<Mutex<HashMap<String, RunHead>>>,
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     }
 
     #[async_trait]
     impl WorkflowStateStore for MemoryStore {
-        async fn save_run(&self, run: &WorkflowRun) -> Result<()> {
+        async fn save_run(&self, run: &Run) -> Result<()> {
             self.runs.lock().insert(run.id.clone(), run.clone());
             self.heads
                 .lock()
@@ -422,7 +418,7 @@ mod tests {
             Ok(())
         }
 
-        async fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> Result<WorkflowRun> {
+        async fn load_run(&self, run_id: &cowboy_workflow_core::RunId) -> Result<Run> {
             self.runs
                 .lock()
                 .get(run_id)
@@ -444,7 +440,7 @@ mod tests {
 
         async fn commit_completed_step(
             &self,
-            run: &WorkflowRun,
+            run: &Run,
             record: &StepRecord,
         ) -> Result<ObjectHash> {
             let bytes = serde_json::to_vec(record).unwrap();
@@ -516,7 +512,7 @@ mod tests {
         async fn load_user_prompts(
             &self,
             _run_id: &str,
-        ) -> Result<Vec<cowboy_workflow_core::RunUserPrompt>> {
+        ) -> Result<Vec<cowboy_workflow_core::FollowUpPrompt>> {
             Ok(Vec::new())
         }
     }
@@ -672,10 +668,10 @@ mod tests {
         fn step_action(
             &self,
             _definition: &WorkflowDefinition,
-            run: &WorkflowRun,
+            run: &Run,
             _step: &StepDefinition,
             _prev: Option<&StepRecord>,
-            _user_prompts: &[cowboy_workflow_core::RunUserPrompt],
+            _user_prompts: &[cowboy_workflow_core::FollowUpPrompt],
         ) -> Result<StepAction> {
             let index = run.step.executed.saturating_sub(1) as usize;
             self.0
@@ -725,9 +721,9 @@ mod tests {
         }
     }
 
-    fn run() -> WorkflowRun {
+    fn run() -> Run {
         let now = Utc::now();
-        WorkflowRun {
+        Run {
             id: "run-1".to_string(),
             workflow: cowboy_workflow_core::WorkflowSnapshot {
                 name: "wf".to_string(),
@@ -742,7 +738,7 @@ mod tests {
             status: RunStatus::Running,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
-                current: "start".to_string(),
+                next: "start".to_string(),
                 head: None,
                 executed: 0,
                 visits: BTreeMap::new(),
@@ -860,7 +856,7 @@ mod tests {
         // First step runs `start`, routes to `agent`, run stays Running.
         let run = runner.step_once(&definition, run()).await.unwrap();
         assert_eq!(run.step.executed, 1);
-        assert_eq!(run.step.current, "agent");
+        assert_eq!(run.step.next, "agent");
         assert_eq!(run.status, RunStatus::Running);
         let first_event = events.try_recv().unwrap();
         assert_eq!(
@@ -978,7 +974,7 @@ mod tests {
             )]),
         });
         let mut run = run();
-        run.step.current = "implement".to_string();
+        run.step.next = "implement".to_string();
         let definition = cowboy_workflow_lua::compile_snapshot(provider.source_bundle()).unwrap();
         let action = provider
             .step_action(
@@ -1028,11 +1024,11 @@ mod tests {
             )]),
         });
         let mut run = run();
-        run.step.current = "implement".to_string();
+        run.step.next = "implement".to_string();
         run.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
             .unwrap()
             .with_timezone(&Utc);
-        let prompt = cowboy_workflow_core::RunUserPrompt {
+        let prompt = cowboy_workflow_core::FollowUpPrompt {
             sequence: 1,
             content: "  follow\nup  ".to_string(),
             submitted_at: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
@@ -1108,9 +1104,9 @@ mod tests {
         assert_eq!(output.body, std::env::consts::OS);
     }
 
-    fn agent_run() -> WorkflowRun {
+    fn agent_run() -> Run {
         let mut run = run();
-        run.step.current = "agent".to_string();
+        run.step.next = "agent".to_string();
         run
     }
 
@@ -1247,7 +1243,7 @@ mod tests {
         let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
         assert!(matches!(stored.status, RunStatus::Failed { .. }));
         // The failed step stays current so it can be resolved manually.
-        assert_eq!(stored.step.current, "agent");
+        assert_eq!(stored.step.next, "agent");
         assert_eq!(stored.retries_used, 2);
         assert_eq!(stored.step.retries_used["agent"], 2);
 
@@ -1406,7 +1402,7 @@ mod tests {
             .unwrap();
         assert_eq!(second_visit.step.retries_used["agent"], 1);
         second_visit.status = RunStatus::Running;
-        second_visit.step.current = "agent".to_string();
+        second_visit.step.next = "agent".to_string();
         second_visit.step.head = None;
 
         let dispatches = Arc::new(Mutex::new(0));
