@@ -93,6 +93,12 @@ The file is written to the current working directory as
 expanded individually or globally. The embedded case-insensitive search finds
 text in complete card headers and bodies without network access.
 
+When a run reaches `Completed`, `Failed`, or `Cancelled`, Cowboy also writes its persisted
+semantic workflow/event transcript automatically to `<state_dir>/exports/` and reports that
+local path at completion. These owner-only files replace the same run's export on repeat;
+waiting runs are not exported. The manual `cowboy export` command keeps its current-directory
+behavior above.
+
 Execute one additional step for a run, or continue it until it blocks, fails, or completes:
 
 ```bash

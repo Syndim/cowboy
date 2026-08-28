@@ -85,18 +85,18 @@ async fn run_shared_command(
                 }
                 (false, None) => runtime.start_run_with_options(request, options).await?,
             };
-            print_report(&report);
+            print_report_with_terminal_export(&runtime, &report).await;
             print_agent_session_ids(&report.events);
             Ok(())
         }
         SharedCommand::Step(args) => {
             let report = runtime.step_run(&args.run_id).await?;
-            print_report(&report);
+            print_report_with_terminal_export(&runtime, &report).await;
             Ok(())
         }
         SharedCommand::Resume(args) => {
             let report = runtime.resume_run(&args.run_id).await?;
-            print_report(&report);
+            print_report_with_terminal_export(&runtime, &report).await;
             Ok(())
         }
         SharedCommand::Answer(args) => {
@@ -107,7 +107,7 @@ async fn run_shared_command(
             } = args;
             let answer = answer.join(" ");
             let report = runtime.answer_run(&run_id, &prompt_id, &answer).await?;
-            print_report(&report);
+            print_report_with_terminal_export(&runtime, &report).await;
             Ok(())
         }
         SharedCommand::Improve(args) => {
@@ -149,7 +149,7 @@ async fn run_shared_command(
                 }
                 Some(status) => {
                     let report = runtime.resolve_run(&run_id, &status, fields, body).await?;
-                    print_report(&report);
+                    print_report_with_terminal_export(&runtime, &report).await;
                     Ok(())
                 }
             }
@@ -189,6 +189,18 @@ fn print_report(report: &cowboy_workflow_engine::RunReport) {
     );
     for event in &report.events {
         println!("event={:?}", event.kind);
+    }
+}
+
+async fn print_report_with_terminal_export(
+    runtime: &cowboy_workflow_engine::WorkflowRuntime,
+    report: &cowboy_workflow_engine::RunReport,
+) {
+    print_report(report);
+    match cowboy::export_terminal_report(runtime, report).await {
+        Ok(Some(exported)) => println!("terminal_transcript={}", exported.path.display()),
+        Ok(None) => {}
+        Err(_) => eprintln!("warning: terminal transcript export failed"),
     }
 }
 

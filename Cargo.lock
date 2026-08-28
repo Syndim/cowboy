@@ -408,6 +408,7 @@ dependencies = [
  "tui-input",
  "unicode-segmentation",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

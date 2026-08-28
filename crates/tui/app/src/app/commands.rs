@@ -7,7 +7,21 @@ use cowboy_command_parser::{
 use cowboy_workflow_engine::{UserPromptSubmission, WorkflowRuntime};
 
 use super::events::current_wall_clock_prefix;
-use super::state::{AppState, ComposerSubmissionMode};
+use super::state::{AppState, ComposerSubmissionMode, TranscriptEntry};
+
+fn action_submission_entry(
+    title: impl Into<String>,
+    title_prefix: impl IntoIterator<Item = String>,
+    title_suffix: impl IntoIterator<Item = String>,
+    details: impl IntoIterator<Item = String>,
+) -> TranscriptEntry {
+    TranscriptEntry::Card {
+        title: title.into(),
+        title_prefix: title_prefix.into_iter().collect(),
+        title_suffix: title_suffix.into_iter().collect(),
+        details: details.into_iter().collect(),
+    }
+}
 
 pub(in crate::app) fn complete_slash_suggestion(state: &mut AppState) {
     let Some(command) = slash_suggestions(state.input()).into_iter().next() else {
@@ -272,12 +286,15 @@ fn spawn_start_run_with_options(
     let runtime = runtime.clone();
     let label = format!("submitted run with supplied sessions: {request}");
     let body = request.clone();
-    state.spawn_card_report_task(
-        "Run",
-        [current_wall_clock_prefix()],
-        ["submitted run with supplied sessions".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry(
+            "Run",
+            [current_wall_clock_prefix()],
+            ["submitted run with supplied sessions".to_string()],
+            [body],
+        ),
         async move {
             match (step, workflow) {
                 (true, Some(workflow_id)) => {
@@ -306,12 +323,15 @@ fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: Str
     let runtime = runtime.clone();
     let label = format!("submitted run: {request}");
     let body = request.clone();
-    state.spawn_card_report_task(
-        "Run",
-        [current_wall_clock_prefix()],
-        ["submitted run".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry(
+            "Run",
+            [current_wall_clock_prefix()],
+            ["submitted run".to_string()],
+            [body],
+        ),
         async move {
             runtime
                 .start_run(request)
@@ -325,12 +345,15 @@ fn spawn_start_run_stepwise(state: &mut AppState, runtime: &WorkflowRuntime, req
     let runtime = runtime.clone();
     let label = format!("submitted run --step: {request}");
     let body = request.clone();
-    state.spawn_card_report_task(
-        "Run",
-        [current_wall_clock_prefix()],
-        ["submitted run --step".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry(
+            "Run",
+            [current_wall_clock_prefix()],
+            ["submitted run --step".to_string()],
+            [body],
+        ),
         async move {
             runtime
                 .start_run_stepwise(request)
@@ -350,12 +373,10 @@ fn spawn_start_run_with_workflow(
     let label = format!("submitted run --workflow {workflow_id}: {request}");
     let title_suffix = format!("submitted run --workflow {workflow_id}");
     let body = request.clone();
-    state.spawn_card_report_task(
-        "Run",
-        [current_wall_clock_prefix()],
-        [title_suffix],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry("Run", [current_wall_clock_prefix()], [title_suffix], [body]),
         async move {
             runtime
                 .start_run_with_workflow(workflow_id, request)
@@ -375,12 +396,10 @@ fn spawn_start_run_with_workflow_stepwise(
     let label = format!("submitted run --step --workflow {workflow_id}: {request}");
     let title_suffix = format!("submitted run --step --workflow {workflow_id}");
     let body = request.clone();
-    state.spawn_card_report_task(
-        "Run",
-        [current_wall_clock_prefix()],
-        [title_suffix],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry("Run", [current_wall_clock_prefix()], [title_suffix], [body]),
         async move {
             runtime
                 .start_run_with_workflow_stepwise(workflow_id, request)
@@ -394,12 +413,15 @@ fn spawn_step_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Strin
     let runtime = runtime.clone();
     let label = format!("submitted step: {run_id}");
     let body = run_id.clone();
-    state.spawn_card_report_task(
-        "Step",
-        [current_wall_clock_prefix()],
-        ["submitted step".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry(
+            "Step",
+            [current_wall_clock_prefix()],
+            ["submitted step".to_string()],
+            [body],
+        ),
         async move {
             runtime
                 .step_run(&run_id)
@@ -413,12 +435,15 @@ fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Str
     let runtime = runtime.clone();
     let label = format!("submitted resume: {run_id}");
     let body = run_id.clone();
-    state.spawn_card_report_task(
-        "Resume",
-        [current_wall_clock_prefix()],
-        ["submitted resume".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        [body],
+        action_submission_entry(
+            "Resume",
+            [current_wall_clock_prefix()],
+            ["submitted resume".to_string()],
+            [body],
+        ),
         async move {
             runtime
                 .resume_run(&run_id)
@@ -439,12 +464,15 @@ fn spawn_answer_task(
     let label = format!("submitted answer: {run_id} {prompt_id}");
     let details = [run_id.clone(), prompt_id.clone()];
     state.clear_pending_prompt();
-    state.spawn_card_report_task(
-        "Answer",
-        [current_wall_clock_prefix()],
-        ["submitted answer".to_string()],
+    state.spawn_terminal_export_report_task(
+        runtime.clone(),
         label,
-        details,
+        action_submission_entry(
+            "Answer",
+            [current_wall_clock_prefix()],
+            ["submitted answer".to_string()],
+            details,
+        ),
         async move {
             runtime
                 .answer_run(&run_id, &prompt_id, &answer)
@@ -527,12 +555,15 @@ async fn resolve_run(
             let runtime = runtime.clone();
             let label = format!("submitted resolve: {run_id} {status}");
             let details = [run_id.clone(), status.clone()];
-            state.spawn_card_report_task(
-                "Resolve",
-                [current_wall_clock_prefix()],
-                ["submitted resolve".to_string()],
+            state.spawn_terminal_export_report_task(
+                runtime.clone(),
                 label,
-                details,
+                action_submission_entry(
+                    "Resolve",
+                    [current_wall_clock_prefix()],
+                    ["submitted resolve".to_string()],
+                    details,
+                ),
                 async move {
                     runtime
                         .resolve_run(&run_id, &status, fields, body)
@@ -2537,6 +2568,17 @@ mod tests {
             assert!(!state.workflow_execution_running());
         }
 
+        fn assert_terminal_export(state: &AppState, config: &AppConfig, run_id: &str) {
+            let path = config
+                .state_dir
+                .join("exports")
+                .join(format!("cowboy-export-{run_id}.html"));
+            assert!(path.exists());
+            let rendered = rendered_entries(state);
+            assert!(rendered.contains("Transcript export"), "{rendered}");
+            assert!(rendered.contains("path: "), "{rendered}");
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         std::fs::create_dir(&workflow_dir).unwrap();
@@ -2608,6 +2650,7 @@ mod tests {
             runtime.load_run(&step_run_id).await.unwrap().status,
             RunStatus::Completed
         );
+        assert_terminal_export(&step_state, &config, &step_run_id);
 
         step_state.push_input("new request after completion");
         submit_input(&mut step_state, &runtime).await;
@@ -2630,6 +2673,7 @@ mod tests {
             runtime.load_run(&resume_run_id).await.unwrap().status,
             RunStatus::Completed
         );
+        assert_terminal_export(&resume_state, &config, &resume_run_id);
 
         let waiting = runtime
             .start_run_with_workflow("ask", "plain answer request")
@@ -2647,6 +2691,7 @@ mod tests {
             runtime.load_run(&plain_answer_run).await.unwrap().status,
             RunStatus::Completed
         );
+        assert_terminal_export(&answer_state, &config, &plain_answer_run);
 
         let waiting = runtime
             .start_run_with_workflow("ask", "explicit answer request")
@@ -2670,6 +2715,7 @@ mod tests {
             runtime.load_run(&explicit_answer_run).await.unwrap().status,
             RunStatus::Completed
         );
+        assert_terminal_export(&explicit_state, &config, &explicit_answer_run);
 
         let mut cancelled_state = AppState::new(config);
         cancelled_state.apply_workflow_event(WorkflowEvent::new(

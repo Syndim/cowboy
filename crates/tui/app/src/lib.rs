@@ -14,5 +14,5 @@ pub mod run_summary;
 
 pub use app::run_tui;
 pub use config::{AppConfig, default_config_path, load_config};
-pub use export::{ExportResult, export_run};
+pub use export::{ExportResult, export_run, export_terminal_report};
 pub use process_exit::{DEFAULT_PROCESS_SHUTDOWN_TIMEOUT, run_with_bounded_shutdown};

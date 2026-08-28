@@ -718,6 +718,10 @@ impl WorkflowRuntime {
         &self.config.cwd
     }
 
+    pub fn state_dir(&self) -> &Path {
+        &self.config.state_dir
+    }
+
     pub async fn submit_user_prompt(
         &self,
         run_id: &str,

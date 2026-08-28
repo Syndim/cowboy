@@ -5,7 +5,7 @@ use anyhow::Result;
 use cowboy_tui_animation::FrameCycle;
 use cowboy_workflow_engine::{
     Choice, RunReport, RunStatusDetail, RunStatusState, RunSummaryLine, WorkflowEvent,
-    WorkflowEventKind,
+    WorkflowEventKind, WorkflowRuntime,
 };
 use tui_input::{Input, InputRequest};
 
@@ -483,8 +483,18 @@ enum BackgroundTaskKind {
 }
 
 #[derive(Debug)]
+enum TerminalExport {
+    NotNeeded,
+    Exported(crate::ExportResult),
+    Failed,
+}
+
+#[derive(Debug)]
 enum BackgroundTaskResult {
-    WorkflowReport(Box<RunReport>),
+    WorkflowReport {
+        report: Box<RunReport>,
+        terminal_export: TerminalExport,
+    },
     RunsList {
         runs: Vec<RunSummaryLine>,
         partial_run_id: Option<String>,
@@ -1197,6 +1207,7 @@ impl AppState {
         view.preferred_column = None;
         self.composer_view.set(view);
     }
+    #[cfg(test)]
     pub(in crate::app) fn spawn_card_report_task<F>(
         &mut self,
         title: &str,
@@ -1217,6 +1228,37 @@ impl AppState {
                 details: details.into_iter().collect(),
             },
             future,
+        );
+    }
+
+    pub(in crate::app) fn spawn_terminal_export_report_task<F>(
+        &mut self,
+        runtime: WorkflowRuntime,
+        status: String,
+        entry: TranscriptEntry,
+        future: F,
+    ) where
+        F: Future<Output = Result<RunReport, String>> + Send + 'static,
+    {
+        self.spawn_background_task(
+            BackgroundTaskKind::WorkflowExecution,
+            status,
+            entry,
+            async move {
+                let report = future.await?;
+                let terminal_export = match crate::export_terminal_report(&runtime, &report).await {
+                    Ok(Some(exported)) => TerminalExport::Exported(exported),
+                    Ok(None) => TerminalExport::NotNeeded,
+                    Err(_) => {
+                        tracing::warn!(run_id = %report.run.id, "automatic terminal transcript export failed");
+                        TerminalExport::Failed
+                    }
+                };
+                Ok(BackgroundTaskResult::WorkflowReport {
+                    report: Box::new(report),
+                    terminal_export,
+                })
+            },
         );
     }
 
@@ -1271,6 +1313,7 @@ impl AppState {
         self.spawn_card_report_task("Task", [], [], status.clone(), [status], future);
     }
 
+    #[cfg(test)]
     fn spawn_report_task_with_entry<F>(&mut self, status: String, entry: TranscriptEntry, future: F)
     where
         F: Future<Output = Result<RunReport, String>> + Send + 'static,
@@ -1282,7 +1325,10 @@ impl AppState {
             async move {
                 future
                     .await
-                    .map(|report| BackgroundTaskResult::WorkflowReport(Box::new(report)))
+                    .map(|report| BackgroundTaskResult::WorkflowReport {
+                        report: Box::new(report),
+                        terminal_export: TerminalExport::NotNeeded,
+                    })
             },
         );
     }
@@ -1512,8 +1558,11 @@ impl AppState {
                 changed = true;
                 let kind = task.kind;
                 match task.handle.await {
-                    Ok(Ok(BackgroundTaskResult::WorkflowReport(report))) => {
-                        self.apply_report(*report);
+                    Ok(Ok(BackgroundTaskResult::WorkflowReport {
+                        report,
+                        terminal_export,
+                    })) => {
+                        self.apply_report_with_terminal_export(*report, terminal_export);
                     }
                     Ok(Ok(BackgroundTaskResult::RunsList {
                         runs,
@@ -1622,7 +1671,11 @@ impl AppState {
         }
     }
 
-    fn apply_report(&mut self, report: RunReport) {
+    fn apply_report_with_terminal_export(
+        &mut self,
+        report: RunReport,
+        terminal_export: TerminalExport,
+    ) {
         self.clear_stale_topic_for_report(&report);
         self.active_run_id = Some(report.run.id.clone());
         self.workflow_name = Some(report.run.workflow.name.clone());
@@ -1637,6 +1690,28 @@ impl AppState {
         for event in report.events {
             self.apply_workflow_event(event);
         }
+        match terminal_export {
+            TerminalExport::NotNeeded => {}
+            TerminalExport::Exported(exported) => {
+                self.status = format!("terminal transcript exported: {}", exported.path.display());
+                self.push_card(
+                    "Transcript export",
+                    [format!("path: {}", exported.path.display())],
+                );
+            }
+            TerminalExport::Failed => {
+                self.status = "warning: terminal transcript export failed".to_string();
+                self.push_card(
+                    "Warning",
+                    ["terminal transcript was not exported".to_string()],
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn apply_report(&mut self, report: RunReport) {
+        self.apply_report_with_terminal_export(report, TerminalExport::NotNeeded);
     }
 }
 
