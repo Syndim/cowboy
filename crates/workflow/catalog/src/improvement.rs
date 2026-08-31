@@ -174,6 +174,7 @@ mod tests {
             id: "custom".to_string(),
             location: WorkflowLocation {
                 root: Some(draft_root.path().to_path_buf()),
+                import_roots: Vec::new(),
                 entry: "custom.lua".into(),
             },
             description: Some("custom workflow".to_string()),
@@ -203,6 +204,7 @@ mod tests {
             id: "custom".to_string(),
             location: WorkflowLocation {
                 root: None,
+                import_roots: Vec::new(),
                 entry: "nested/custom.lua".into(),
             },
             description: Some("custom workflow".to_string()),

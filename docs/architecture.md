@@ -47,7 +47,11 @@ process argv / slash composer input
 - safe relative `.lua` path validation
 - `WorkflowImprovement` application for updating/creating workflow files
 
-The built-in workflow is always available. Project/user workflow directories extend or override selection by adding normal Lua workflow files.
+The built-in workflow is always available. Configured filesystem roots form a
+low-to-high precedence overlay stack: a later root replaces an earlier workflow
+with the same relative Lua path, and its imports resolve from the selected root
+down through lower-precedence roots. The compiled snapshot records every
+resolved entry and import, preserving resume determinism after disk changes.
 
 ### Workflow definition
 

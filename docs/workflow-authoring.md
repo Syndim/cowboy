@@ -22,6 +22,16 @@ workflow_dirs = [".cowboy/workflows", "~/.config/cowboy/workflows"]
 
 Cowboy scans configured workflow directories recursively and uses each relative `.lua` path as the workflow id without the `.lua` suffix; for example, `.cowboy/workflows/review/security.lua` is cataloged as `review/security`. The built-in default workflow is always available, so custom workflows only need to be added when the default developer flow is not enough.
 
+`workflow_dirs` is a low-to-high precedence overlay stack. When multiple roots
+contain the same relative Lua path, the later root provides that workflow entry.
+Its `require` calls search the selected root first, then each lower-precedence
+root. This permits a project overlay such as `github/assignment.lua` to reuse
+`github/common.lua` from a base directory while still overriding that helper
+locally. Imports must remain relative paths inside one of those roots; absolute
+paths, `..` traversal, and escaping symlinks are rejected rather than falling
+back. Cowboy snapshots the resolved entry and every imported file, so resumed
+runs are unaffected by later source changes.
+
 A workflow file must return one `workflow(...)` table:
 
 ```lua

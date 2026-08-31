@@ -36,6 +36,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         id: entry.trim_end_matches(".lua").to_string(),
         location: WorkflowLocation {
             root: Some(root),
+            import_roots: Vec::new(),
             entry: entry.into(),
         },
         description: None,

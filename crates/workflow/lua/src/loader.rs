@@ -18,13 +18,22 @@ use crate::{Error, Result};
 pub fn load(source: &WorkflowSource) -> Result<CompiledWorkflow> {
     let root = source.location.root.as_ref().ok_or(Error::MissingRoot)?;
     let root = root.canonicalize()?;
+    let fallback_roots = source
+        .location
+        .import_roots
+        .iter()
+        .map(|root| root.canonicalize())
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut import_roots = Vec::with_capacity(fallback_roots.len() + 1);
+    import_roots.push(root.clone());
+    import_roots.extend(fallback_roots);
     let entry = normalize_relative_path(&source.location.entry.to_string_lossy())?;
     let sources: SharedSources = Arc::new(Mutex::new(BTreeMap::new()));
-    let entry_content = std::fs::read_to_string(root.join(&entry))?;
+    let entry_content = crate::api::read_workflow_file(std::slice::from_ref(&root), &entry)?;
     sources.lock().insert(entry.clone(), entry_content.clone());
 
     let lua = setup_lua(ImportMode::Filesystem {
-        root: root.clone(),
+        roots: import_roots,
         sources: sources.clone(),
     })?;
     let workflow = lua.load(&entry_content).set_name(&entry).eval::<Value>()?;
@@ -111,6 +120,7 @@ mod tests {
             id: name.into(),
             location: WorkflowLocation {
                 root: Some(root),
+                import_roots: Vec::new(),
                 entry: format!("workflows/{name}.lua").into(),
             },
             description: None,
@@ -4774,12 +4784,14 @@ mod tests {
             id: "wf".into(),
             location: WorkflowLocation {
                 root: Some(dir.path().to_path_buf()),
+                import_roots: Vec::new(),
                 entry: "main.lua".into(),
             },
             description: None,
         };
         let compiled = load(&source).unwrap();
         assert!(compiled.source_bundle.files.contains_key("main.lua"));
+
         assert!(compiled.source_bundle.files.contains_key("roles/dev.lua"));
         assert_eq!(
             compiled.definition.roles["developer"].instructions,
@@ -4787,6 +4799,49 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unsafe_overlay_import_without_falling_back() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::create_dir_all(base.path().join("roles")).unwrap();
+        std::fs::create_dir_all(overlay.path().join("roles")).unwrap();
+        std::fs::write(
+            base.path().join("roles/developer.lua"),
+            r#"return role("developer", "base role")"#,
+        )
+        .unwrap();
+        std::fs::write(
+            outside.path(),
+            r#"return role("developer", "outside role")"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), overlay.path().join("roles/developer.lua"))
+            .unwrap();
+        std::fs::write(
+            overlay.path().join("main.lua"),
+            r#"
+            local developer = require("roles/developer.lua")
+            local start = step("start", { role = developer })
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("wf", start)
+            "#,
+        )
+        .unwrap();
+        let source = WorkflowSource {
+            id: "wf".into(),
+            location: WorkflowLocation {
+                root: Some(overlay.path().to_path_buf()),
+                import_roots: vec![base.path().to_path_buf()],
+                entry: "main.lua".into(),
+            },
+            description: None,
+        };
+
+        let err = load(&source).unwrap_err();
+        assert!(err.to_string().contains("outside the workflow root"));
+    }
     #[test]
     fn captures_workflow_config_set_with_description() {
         let source = snapshot(
