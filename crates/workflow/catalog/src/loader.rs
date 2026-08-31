@@ -98,8 +98,50 @@ impl WorkflowCatalogLoader {
         if self.include_builtin {
             sources.push(builtin_default_workflow_source());
         }
+
+        let mut roots = Vec::new();
+        let mut candidates = BTreeMap::new();
         for root in &self.roots {
-            sources.extend(load_directory(root)?);
+            let root_path = Path::new(&root.path);
+            if !root_path.exists() {
+                continue;
+            }
+            let root_path = canonical_dir(root_path)?;
+            let root_index = roots.len();
+            let mut files = Vec::new();
+            collect_lua_files(&root_path, &root_path, &mut files)?;
+            files.sort();
+            roots.push(root_path.clone());
+
+            for entry in files {
+                candidates.insert(
+                    workflow_id_from_entry(&entry),
+                    (root_index, root_path.clone(), entry),
+                );
+            }
+        }
+
+        for (workflow_id, (root_index, root, entry)) in candidates {
+            let source_ref = WorkflowSource {
+                id: workflow_id.clone(),
+                location: WorkflowLocation {
+                    root: Some(root),
+                    import_roots: roots[..root_index].iter().rev().cloned().collect(),
+                    entry: entry.into(),
+                },
+                description: None,
+            };
+            let loaded = load_source_ref(&source_ref)?;
+            match cowboy_workflow_lua::load(&loaded.source_ref) {
+                Ok(_) => sources.push(loaded),
+                Err(err) if is_non_workflow_source(&err) => {}
+                Err(err) => {
+                    return Err(crate::Error::InvalidWorkflowSource {
+                        workflow_id,
+                        message: err.to_string(),
+                    });
+                }
+            }
         }
         Ok(sources)
     }
@@ -111,40 +153,6 @@ impl Default for WorkflowCatalogLoader {
     }
 }
 
-fn load_directory(root: &CatalogRoot) -> Result<Vec<LoadedWorkflowSource>> {
-    let root_path = Path::new(&root.path);
-    if !root_path.exists() {
-        return Ok(Vec::new());
-    }
-    let root_path = canonical_dir(root_path)?;
-    let mut files = Vec::new();
-    collect_lua_files(&root_path, &root_path, &mut files)?;
-    files.sort();
-
-    let mut sources = Vec::new();
-    for entry in files {
-        let source_ref = WorkflowSource {
-            id: workflow_id_from_entry(&entry),
-            location: WorkflowLocation {
-                root: Some(root_path.clone()),
-                entry: entry.into(),
-            },
-            description: None,
-        };
-        let loaded = load_source_ref(&source_ref)?;
-        match cowboy_workflow_lua::load(&loaded.source_ref) {
-            Ok(_) => sources.push(loaded),
-            Err(err) if is_non_workflow_source(&err) => {}
-            Err(err) => {
-                return Err(crate::Error::InvalidWorkflowSource {
-                    workflow_id: source_ref.id,
-                    message: err.to_string(),
-                });
-            }
-        }
-    }
-    Ok(sources)
-}
 fn is_non_workflow_source(err: &cowboy_workflow_lua::Error) -> bool {
     match err {
         cowboy_workflow_lua::Error::MissingWorkflow => true,
@@ -165,20 +173,20 @@ fn collect_lua_files(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result
         let file_type = entry.file_type().map_err(|err| io_error(&path, err))?;
         if file_type.is_dir() {
             collect_lua_files(root, &path, files)?;
-        } else if file_type.is_file() {
+        } else if (file_type.is_file() || file_type.is_symlink())
+            && path.extension().is_some_and(|extension| extension == "lua")
+        {
             let relative = path
                 .strip_prefix(root)
                 .map_err(|_| crate::Error::InvalidRelativePath(path.display().to_string()))?;
             let relative = relative
                 .to_str()
                 .ok_or_else(|| crate::Error::NonUtf8Path(path.display().to_string()))?;
-            if relative.ends_with(".lua") {
-                files.push(
-                    normalize_workflow_entry(relative)?
-                        .to_string_lossy()
-                        .to_string(),
-                );
-            }
+            files.push(
+                normalize_workflow_entry(relative)?
+                    .to_string_lossy()
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -254,5 +262,220 @@ mod tests {
 
         assert!(catalog.workflows.contains_key("workflows/feature"));
         assert!(!catalog.workflows.contains_key("roles/planner"));
+    }
+    fn write_lua(root: &Path, entry: &str, source: &str) {
+        let path = root.join(entry);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, source).unwrap();
+    }
+
+    fn workflow_requiring_common() -> &'static str {
+        r#"
+        local developer = require("github/common.lua")
+        local start = step("start", { role = developer })
+        start.run = function(ctx) return action.status { status = "success" } end
+        return workflow("assignment", start)
+        "#
+    }
+
+    #[test]
+    fn preserves_base_only_workflow_sources() {
+        let base = tempfile::tempdir().unwrap();
+        write_lua(
+            base.path(),
+            "github/common.lua",
+            r#"return role("developer", "base common")"#,
+        );
+        write_lua(
+            base.path(),
+            "github/assignment.lua",
+            workflow_requiring_common(),
+        );
+
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(base.path())
+            .load_catalog()
+            .unwrap();
+        let source = &catalog.workflows["github/assignment"];
+        let compiled = cowboy_workflow_lua::load(source).unwrap();
+
+        assert!(source.location.import_roots.is_empty());
+        assert_eq!(
+            compiled.definition.roles["developer"].instructions,
+            "base common"
+        );
+    }
+
+    #[test]
+    fn selects_overlay_entry_before_compiling_and_falls_back_to_base_imports() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        write_lua(
+            base.path(),
+            "github/common.lua",
+            r#"return role("developer", "base common")"#,
+        );
+        write_lua(
+            base.path(),
+            "github/assignment.lua",
+            "return this is invalid",
+        );
+        write_lua(
+            overlay.path(),
+            "github/assignment.lua",
+            workflow_requiring_common(),
+        );
+        write_lua(
+            overlay.path(),
+            "github/verification.lua",
+            r#"
+            local start = step("start")
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("verification", start)
+            "#,
+        );
+        write_lua(
+            overlay.path(),
+            "github/helper.lua",
+            r#"return role("helper", "not a workflow")"#,
+        );
+
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(base.path())
+            .with_project_dir(overlay.path())
+            .load_catalog()
+            .unwrap();
+        let source = &catalog.workflows["github/assignment"];
+        let compiled = cowboy_workflow_lua::load(source).unwrap();
+
+        assert_eq!(source.id, "github/assignment");
+        assert_eq!(
+            source.location.root.as_deref(),
+            Some(overlay.path().canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            source.location.import_roots,
+            vec![base.path().canonicalize().unwrap()]
+        );
+        assert!(catalog.workflows.contains_key("github/verification"));
+        assert!(!catalog.workflows.contains_key("github/helper"));
+        assert_eq!(
+            compiled.definition.roles["developer"].instructions,
+            "base common"
+        );
+        assert_eq!(compiled.source_bundle.files.len(), 2);
+        assert!(
+            compiled
+                .source_bundle
+                .files
+                .contains_key("github/common.lua")
+        );
+    }
+
+    #[test]
+    fn uses_overlay_dependency_and_keeps_snapshot_after_disk_changes() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        write_lua(
+            base.path(),
+            "github/common.lua",
+            r#"return role("developer", "base common")"#,
+        );
+        write_lua(
+            overlay.path(),
+            "github/common.lua",
+            r#"return role("developer", "overlay common")"#,
+        );
+        write_lua(
+            overlay.path(),
+            "github/assignment.lua",
+            workflow_requiring_common(),
+        );
+
+        let catalog = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(base.path())
+            .with_project_dir(overlay.path())
+            .load_catalog()
+            .unwrap();
+        let compiled = cowboy_workflow_lua::load(&catalog.workflows["github/assignment"]).unwrap();
+
+        assert_eq!(
+            compiled.definition.roles["developer"].instructions,
+            "overlay common"
+        );
+        let snapshot = compiled.source_bundle;
+        assert!(snapshot.files["github/common.lua"].contains("overlay common"));
+        write_lua(
+            overlay.path(),
+            "github/assignment.lua",
+            r#"return role("developer", "changed entry")"#,
+        );
+        fs::remove_file(overlay.path().join("github/common.lua")).unwrap();
+
+        let restored = cowboy_workflow_lua::compile_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.roles["developer"].instructions, "overlay common");
+    }
+
+    #[test]
+    fn rejects_invalid_overlay_entry_without_running_base() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        write_lua(
+            base.path(),
+            "github/assignment.lua",
+            r#"
+            local start = step("start")
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("assignment", start)
+            "#,
+        );
+        write_lua(
+            overlay.path(),
+            "github/assignment.lua",
+            "return this is invalid",
+        );
+
+        let err = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(base.path())
+            .with_project_dir(overlay.path())
+            .load_catalog()
+            .unwrap_err();
+
+        assert!(
+            matches!(err, crate::Error::InvalidWorkflowSource { workflow_id, .. } if workflow_id == "github/assignment")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_overlay_entry_without_falling_back() {
+        let base = tempfile::tempdir().unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        write_lua(
+            base.path(),
+            "github/assignment.lua",
+            r#"
+            local start = step("start")
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("assignment", start)
+            "#,
+        );
+        fs::create_dir_all(overlay.path().join("github")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), overlay.path().join("github/assignment.lua"))
+            .unwrap();
+
+        let err = WorkflowCatalogLoader::new()
+            .without_builtin()
+            .with_project_dir(base.path())
+            .with_project_dir(overlay.path())
+            .load_catalog()
+            .unwrap_err();
+
+        assert!(matches!(err, crate::Error::InvalidRelativePath(_)));
     }
 }

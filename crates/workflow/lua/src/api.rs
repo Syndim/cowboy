@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mlua::{Lua, Value};
@@ -12,7 +12,7 @@ pub type SharedSources = Arc<Mutex<BTreeMap<String, String>>>;
 
 pub enum ImportMode {
     Filesystem {
-        root: PathBuf,
+        roots: Vec<PathBuf>,
         sources: SharedSources,
     },
     Snapshot {
@@ -190,11 +190,11 @@ fn copy_config_fields(
 pub fn install_import(lua: &Lua, mode: ImportMode) -> Result<()> {
     let import =
         lua.create_function(move |lua, path: String| match &mode {
-            ImportMode::Filesystem { root, sources } => {
+            ImportMode::Filesystem { roots, sources } => {
                 let normalized = normalize_relative_path(&path).map_err(mlua::Error::external)?;
                 if !sources.lock().contains_key(&normalized) {
                     let content =
-                        read_workflow_file(root, &normalized).map_err(mlua::Error::external)?;
+                        read_workflow_file(roots, &normalized).map_err(mlua::Error::external)?;
                     sources.lock().insert(normalized.clone(), content);
                 }
                 let content = sources.lock().get(&normalized).cloned().ok_or_else(|| {
@@ -214,12 +214,22 @@ pub fn install_import(lua: &Lua, mode: ImportMode) -> Result<()> {
     Ok(())
 }
 
-fn read_workflow_file(root: &Path, normalized: &str) -> Result<String> {
-    let canonical_root = root.canonicalize()?;
-    let path = canonical_root.join(normalized);
-    let canonical = path.canonicalize()?;
-    if !canonical.starts_with(&canonical_root) {
-        return Err(Error::ImportOutsideRoot(normalized.to_string()));
+pub(crate) fn read_workflow_file(roots: &[PathBuf], normalized: &str) -> Result<String> {
+    for root in roots {
+        let canonical_root = root.canonicalize()?;
+        let path = canonical_root.join(normalized);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let canonical = path.canonicalize()?;
+                if !canonical.starts_with(&canonical_root) {
+                    return Err(Error::ImportOutsideRoot(normalized.to_string()));
+                }
+                return Ok(std::fs::read_to_string(canonical)?);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
     }
-    Ok(std::fs::read_to_string(canonical)?)
+
+    Err(Error::MissingEntry(normalized.to_string()))
 }

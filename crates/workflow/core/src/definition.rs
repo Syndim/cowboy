@@ -42,8 +42,13 @@ impl Default for WorkflowCatalog {
 /// workflows have no real root on disk and carry only a virtual `entry` name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowLocation {
-    /// Workflow root directory. `None` for built-in workflows.
+    /// Selected workflow root containing the entry file. `None` for built-ins.
     pub root: Option<PathBuf>,
+    /// Additional, lower-precedence roots searched for Lua imports after `root`.
+    ///
+    /// The empty default preserves persisted single-root source references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub import_roots: Vec<PathBuf>,
     /// Entry Lua file path relative to `root` (or a virtual name when `root` is `None`).
     pub entry: PathBuf,
 }
@@ -238,6 +243,26 @@ fn unreachable_steps(definition: &WorkflowDefinition) -> Vec<StepId> {
         .filter(|step| !seen.contains(*step))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::WorkflowLocation;
+
+    #[test]
+    fn location_without_import_roots_deserializes_as_single_root() {
+        let location: WorkflowLocation = serde_json::from_value(serde_json::json!({
+            "root": "/workflows",
+            "entry": "github/assignment.lua"
+        }))
+        .unwrap();
+
+        assert_eq!(
+            location.root.unwrap(),
+            std::path::PathBuf::from("/workflows")
+        );
+        assert!(location.import_roots.is_empty());
+    }
 }
 
 #[cfg(test)]

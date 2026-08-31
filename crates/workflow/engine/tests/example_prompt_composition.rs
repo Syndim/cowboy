@@ -13,6 +13,7 @@ fn actual_example_lua_prompt_includes_each_user_input_once() {
         id: "feature".into(),
         location: WorkflowLocation {
             root: Some(root),
+            import_roots: Vec::new(),
             entry: "workflows/feature.lua".into(),
         },
         description: None,

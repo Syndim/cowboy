@@ -21,6 +21,12 @@ pub fn load_source_ref(source_ref: &WorkflowSource) -> Result<LoadedWorkflowSour
 
     let entry = normalize_workflow_entry(&source_ref.location.entry)?;
     let root_path = canonical_dir(root)?;
+    let import_roots = source_ref
+        .location
+        .import_roots
+        .iter()
+        .map(|root| canonical_dir(root))
+        .collect::<Result<Vec<_>>>()?;
     let path = root_path.join(&entry);
     let canonical = canonical_file(&path)?;
     if !canonical.starts_with(&root_path) {
@@ -34,6 +40,7 @@ pub fn load_source_ref(source_ref: &WorkflowSource) -> Result<LoadedWorkflowSour
             id: source_ref.id.clone(),
             location: WorkflowLocation {
                 root: Some(root_path),
+                import_roots,
                 entry,
             },
             description: source_ref.description.clone(),
@@ -79,6 +86,7 @@ pub(crate) fn write_source_ref(
             id: source_ref.id.clone(),
             location: WorkflowLocation {
                 root: Some(root),
+                import_roots: Vec::new(),
                 entry,
             },
             description: source_ref.description.clone(),

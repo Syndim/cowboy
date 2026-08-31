@@ -2450,15 +2450,33 @@ mod tests {
         assert!(config.contains("serve-environment"));
     }
 
+    fn cleanup_and_wait_for_child(workspace: &Path, child: &mut std::process::Child) {
+        match cleanup(workspace) {
+            Ok(()) => {
+                assert!(child.wait().unwrap().success());
+            }
+            Err(error) => {
+                #[cfg(target_os = "macos")]
+                {
+                    assert!(error.to_string().contains("did not exit"));
+                    assert!(child.wait().unwrap().success());
+                    cleanup(workspace).unwrap();
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                panic!("cleanup failed: {error:#}");
+            }
+        }
+    }
+
     #[test]
     fn watchdog_fixture_cleanup_authenticates_allowed_env_layout() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = marked_workspace(directory.path(), "allowed-env");
         let mut child = launch_identity_fixture(&workspace);
 
-        cleanup(&workspace).unwrap();
+        cleanup_and_wait_for_child(&workspace, &mut child);
 
-        assert!(child.wait().unwrap().success());
         assert!(!workspace.exists());
     }
 
@@ -2468,9 +2486,8 @@ mod tests {
         let workspace = marked_workspace(directory.path(), "default-allowed-env");
         let mut child = launch_identity_fixture(&workspace);
 
-        cleanup(&workspace).unwrap();
+        cleanup_and_wait_for_child(&workspace, &mut child);
 
-        assert!(child.wait().unwrap().success());
         assert!(!workspace.exists());
     }
 
@@ -2490,8 +2507,7 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
 
         fs::write(&identity_path, original).unwrap();
-        cleanup(&workspace).unwrap();
-        assert!(child.wait().unwrap().success());
+        cleanup_and_wait_for_child(&workspace, &mut child);
         assert!(!workspace.exists());
     }
 

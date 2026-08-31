@@ -1,4 +1,3 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 
 use cowboy_workflow_core::{WorkflowSource, WorkflowSourceSnapshot};
@@ -9,40 +8,9 @@ use crate::{Error, Result};
 pub struct SourceResolver;
 
 impl SourceResolver {
+    /// Load the entry and every dependency resolved while compiling it.
     pub fn load(&self, source: &WorkflowSource) -> Result<WorkflowSourceSnapshot> {
-        let root = source.location.root.as_ref().ok_or(Error::MissingRoot)?;
-        let canonical_root = root.canonicalize()?;
-        let mut files = BTreeMap::new();
-        let mut loading = BTreeSet::new();
-        let entry = source.location.entry.to_string_lossy();
-        self.load_one(&canonical_root, &entry, &mut files, &mut loading)?;
-        Ok(WorkflowSourceSnapshot {
-            root: Some(canonical_root.to_string_lossy().to_string()),
-            entry: normalize_relative_path(&entry)?,
-            files,
-        })
-    }
-
-    fn load_one(
-        &self,
-        root: &Path,
-        relative: &str,
-        files: &mut BTreeMap<String, String>,
-        loading: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        let normalized = normalize_relative_path(relative)?;
-        if files.contains_key(&normalized) || !loading.insert(normalized.clone()) {
-            return Ok(());
-        }
-        let path = root.join(&normalized);
-        let canonical = path.canonicalize()?;
-        if !canonical.starts_with(root) {
-            return Err(Error::ImportOutsideRoot(relative.to_string()));
-        }
-        let source = std::fs::read_to_string(&canonical)?;
-        files.insert(normalized.clone(), source);
-        loading.remove(&normalized);
-        Ok(())
+        crate::load(source).map(|compiled| compiled.source_bundle)
     }
 }
 
@@ -95,11 +63,20 @@ mod tests {
     fn loads_entry_file() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("main.lua");
-        std::fs::write(&file, "return workflow('x', step('s'))").unwrap();
+        std::fs::write(
+            &file,
+            r#"
+            local start = step("s")
+            start.run = function(ctx) return action.status { status = "success" } end
+            return workflow("x", start)
+            "#,
+        )
+        .unwrap();
         let source = WorkflowSource {
             id: "x".into(),
             location: WorkflowLocation {
                 root: Some(dir.path().to_path_buf()),
+                import_roots: Vec::new(),
                 entry: "main.lua".into(),
             },
             description: None,

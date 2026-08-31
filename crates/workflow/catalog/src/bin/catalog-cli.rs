@@ -97,6 +97,7 @@ fn show(args: &[String]) -> CliResult {
         id: workflow_id_from_entry(entry),
         location: WorkflowLocation {
             root: Some(root.into()),
+            import_roots: Vec::new(),
             entry: entry.into(),
         },
         description: None,
@@ -158,6 +159,7 @@ fn create(args: &[String]) -> CliResult {
         id: workflow_id_from_entry(entry),
         location: WorkflowLocation {
             root: None,
+            import_roots: Vec::new(),
             entry: entry.into(),
         },
         description: None,

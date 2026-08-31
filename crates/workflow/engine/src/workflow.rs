@@ -522,6 +522,7 @@ mod tests {
                         id: "default".to_string(),
                         location: WorkflowLocation {
                             root: None,
+                            import_roots: Vec::new(),
                             entry: "main.lua".into(),
                         },
                         description: Some("built-in default workflow".to_string()),
@@ -533,6 +534,7 @@ mod tests {
                         id: "special".to_string(),
                         location: WorkflowLocation {
                             root: None,
+                            import_roots: Vec::new(),
                             entry: "special.lua".into(),
                         },
                         description: None,

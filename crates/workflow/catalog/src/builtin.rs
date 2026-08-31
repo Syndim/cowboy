@@ -25,6 +25,7 @@ pub fn builtin_default_source_ref() -> WorkflowSource {
         id: DEFAULT_WORKFLOW_ID.to_string(),
         location: WorkflowLocation {
             root: None,
+            import_roots: Vec::new(),
             entry: DEFAULT_WORKFLOW_ENTRY.into(),
         },
         description: Some(DEFAULT_WORKFLOW_DESCRIPTION.to_string()),
