@@ -143,11 +143,22 @@ pub(crate) fn build_correction_prompt(
 /// wrapped runner form `recoverable action failure: agent reply did not contain
 /// a workflow result`.
 const NO_RESULT_REASON_MARKER: &str = "did not contain a workflow result";
+const REPEATED_EMPTY_END_TURN_REASON_MARKER: &str =
+    "ACP prompt received repeated empty end_turn responses";
 
 /// Whether the retry `reason` indicates the previous reply carried no parseable
 /// workflow result (as opposed to a malformed frontmatter block).
 pub(crate) fn is_no_result_reason(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| reason.contains(NO_RESULT_REASON_MARKER))
+}
+
+/// Whether the retry `reason` indicates the current backend session reached a
+/// terminal no-output state and should not be reused.
+pub(crate) fn requires_fresh_session(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| {
+        reason.contains(NO_RESULT_REASON_MARKER)
+            || reason.contains(REPEATED_EMPTY_END_TURN_REASON_MARKER)
+    })
 }
 
 /// Build a corrective instruction appended to a retry prompt after a parse or
@@ -455,6 +466,21 @@ mod tests {
         assert!(nudge.contains("closing `---`"));
         // (e) must NOT reuse the malformed-frontmatter wording.
         assert!(!nudge.contains("Do not redo the work"));
+    }
+
+    #[test]
+    fn fresh_session_reason_matches_only_terminal_no_output_conditions() {
+        assert!(requires_fresh_session(Some(
+            "recoverable action failure: agent reply did not contain a workflow result"
+        )));
+        assert!(requires_fresh_session(Some(
+            "recoverable action failure: agent client error: ACP prompt received repeated empty end_turn responses after 5 continuation prompts for session s1"
+        )));
+        assert!(!requires_fresh_session(Some(
+            "recoverable action failure: agent client error: temporary transport disconnect"
+        )));
+        assert!(!requires_fresh_session(Some("missing YAML frontmatter")));
+        assert!(!requires_fresh_session(None));
     }
 
     #[test]

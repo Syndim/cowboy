@@ -465,7 +465,7 @@ where
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
         let force_fresh_session = context.attempt > 1
-            && crate::prompt::is_no_result_reason(context.retry_reason.as_deref());
+            && crate::prompt::requires_fresh_session(context.retry_reason.as_deref());
         let acquired = self
             .ensure_session(active, &key, force_fresh_session)
             .await?;
@@ -1367,6 +1367,7 @@ mod tests {
     enum FakePromptBehavior {
         Reply,
         Error(String),
+        ErrorOnce(Option<String>),
         Pending,
     }
 
@@ -1411,6 +1412,13 @@ mod tests {
             Self {
                 prompt_behavior: FakePromptBehavior::Error(message.into()),
                 ..Self::new(Vec::new())
+            }
+        }
+
+        fn with_prompt_error_once(events: Vec<Event>, message: impl Into<String>) -> Self {
+            Self {
+                prompt_behavior: FakePromptBehavior::ErrorOnce(Some(message.into())),
+                ..Self::new(events)
             }
         }
 
@@ -1500,9 +1508,14 @@ mod tests {
             event_handler: &mut (dyn FnMut(Event) + Send),
         ) -> anyhow::Result<StopReason> {
             self.prompt_calls.lock().push(prompt_content);
-            match &self.prompt_behavior {
+            match &mut self.prompt_behavior {
                 FakePromptBehavior::Reply => {}
                 FakePromptBehavior::Error(message) => return Err(anyhow!(message.clone())),
+                FakePromptBehavior::ErrorOnce(message) => {
+                    if let Some(message) = message.take() {
+                        return Err(anyhow!(message));
+                    }
+                }
                 FakePromptBehavior::Pending => pending::<()>().await,
             }
             while let Some(event) = self.events.lock().pop_front() {
@@ -4062,5 +4075,45 @@ still applies, got non-recoverable: {error:?}"
         assert!(retry_prompt.contains("Instructions for developer"));
         assert!(retry_prompt.contains("\"sequence\": 0"));
         assert!(retry_prompt.contains("## Retry"));
+    }
+
+    #[tokio::test]
+    async fn repeated_empty_end_turn_retry_creates_fresh_session() {
+        let client = FakeClient::with_prompt_error_once(
+            vec![event()],
+            "ACP prompt received repeated empty end_turn responses after 5 continuation prompts \
+             for session session-1",
+        );
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Client(_)));
+
+        let mut retry = context("run", "record-1");
+        retry.attempt = 2;
+        retry.retry_reason = Some(format!("recoverable action failure: {error}"));
+        executor
+            .execute_agent(output_action("developer"), retry)
+            .await
+            .unwrap();
+
+        let recovered = store_handle
+            .load_role_session("run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.session_id, "session-2",
+            "a session that repeatedly returned empty end_turn responses must not be reused"
+        );
     }
 }
