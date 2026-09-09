@@ -50,6 +50,10 @@ pub struct Client {
     pub agent_info: Option<AgentInfo>,
     /// Current ACP session ID (set by new_session / load_session)
     session_id: Option<String>,
+    /// Parameters needed to re-register the current session after a watchdog
+    /// replaces the ACP server process.
+    #[serde(skip)]
+    session_load_context: Option<SessionLoadContext>,
     /// Push-back buffer for messages consumed during trailing event drain
     #[serde(skip)]
     pushback: Vec<String>,
@@ -110,6 +114,7 @@ impl Clone for Client {
             agent_capabilities: self.agent_capabilities.clone(),
             agent_info: self.agent_info.clone(),
             session_id: self.session_id.clone(),
+            session_load_context: self.session_load_context.clone(),
             pushback: Vec::new(),
             session_descriptor: self.session_descriptor.clone(),
             watchdog: self.watchdog,
@@ -133,6 +138,12 @@ impl std::fmt::Debug for Client {
             .field("watchdog", &self.watchdog)
             .finish()
     }
+}
+
+#[derive(Clone, Debug)]
+struct SessionLoadContext {
+    cwd: String,
+    mcp_servers: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -641,6 +652,7 @@ impl Client {
             agent_capabilities: None,
             agent_info: None,
             session_id: None,
+            session_load_context: None,
             pushback: Vec::new(),
             session_descriptor: None,
             watchdog,
@@ -733,6 +745,10 @@ impl Client {
         }
         self.session_descriptor = Self::descriptor_from_config_options(&descriptor_options);
         self.session_id = Some(session.session_id.clone());
+        self.session_load_context = Some(SessionLoadContext {
+            cwd: cwd.to_string(),
+            mcp_servers: mcp_servers.to_vec(),
+        });
         tracing::info!(
             session_id = %session.session_id,
             model_id = ?model.map(|model| model.id.as_str()),
@@ -993,6 +1009,28 @@ impl Client {
             .map_err(|err| anyhow::anyhow!("agent watchdog continuation dispatch failed: {err}"))
     }
 
+    async fn reload_watchdog_replacement_session(
+        &mut self,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        let Some(context) = self.session_load_context.clone() else {
+            tracing::warn!(
+                session_id,
+                "Agent watchdog has no session/load context; continuing legacy recovery"
+            );
+            return Ok(());
+        };
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        tokio::time::timeout(
+            timeout,
+            self.load_session(session_id, &context.cwd, &context.mcp_servers),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("agent watchdog replacement session/load timed out"))?
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("agent watchdog replacement session/load failed: {err}"))
+    }
+
     async fn cleanup_replacement(&mut self) {
         let Some(mut transport) = self.transport.take() else {
             return;
@@ -1091,6 +1129,12 @@ impl Client {
             return Err(anyhow::anyhow!(reason));
         }
 
+        if let Err(err) = self.reload_watchdog_replacement_session(session_id).await {
+            let reason = err.to_string();
+            self.invalidate_session_after_failed_recovery(session_id, &reason)
+                .await;
+            return Err(anyhow::anyhow!(reason));
+        }
         tracing::warn!(
             event = "agent_watchdog_transport_resumed",
             session_id,
@@ -1608,6 +1652,10 @@ impl Client {
                     self.session_descriptor =
                         Self::descriptor_from_config_options(&result.config_options);
                     self.session_id = Some(session_id.to_string());
+                    self.session_load_context = Some(SessionLoadContext {
+                        cwd: cwd.to_string(),
+                        mcp_servers: mcp_servers.to_vec(),
+                    });
                     tracing::info!(
                         session_id,
                         history_events = history.len(),
@@ -3871,6 +3919,10 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         .await
         .unwrap();
         client.session_id = Some("sess_1".to_string());
+        client.session_load_context = Some(SessionLoadContext {
+            cwd: "/project".to_string(),
+            mcp_servers: Vec::new(),
+        });
         let _initialize = next_outgoing(&mut initial_out_rx).await;
 
         let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
@@ -3906,15 +3958,27 @@ sent no continuation after cancelling and returned {result:?} with the truncated
 
         let replacement_initialize = next_outgoing(&mut replacement_out_rx).await;
         assert_eq!(replacement_initialize["method"], "initialize");
+        let load = next_outgoing(&mut replacement_out_rx).await;
+        assert_eq!(load["method"], "session/load");
+        assert_eq!(load["params"]["sessionId"], "sess_1");
+        assert_eq!(load["params"]["cwd"], "/project");
+        replacement_in_tx
+            .send(rpc_response(
+                load["id"].as_u64().unwrap(),
+                serde_json::json!({}),
+            ))
+            .unwrap();
         let continuation = next_outgoing(&mut replacement_out_rx).await;
-        assert_eq!(continuation["id"], 3);
         assert_eq!(continuation["params"]["sessionId"], "sess_1");
         assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
         replacement_in_tx
             .send(text_chunk_update("sess_1", "recovered"))
             .unwrap();
         replacement_in_tx
-            .send(prompt_response(3, "end_turn"))
+            .send(prompt_response(
+                continuation["id"].as_u64().unwrap(),
+                "end_turn",
+            ))
             .unwrap();
 
         let (client, result) = prompt.await.unwrap();
@@ -3925,7 +3989,7 @@ sent no continuation after cancelling and returned {result:?} with the truncated
     }
 
     #[tokio::test(start_paused = true)]
-    async fn watchdog_hard_replacement_missing_session_invalidates_client_session() {
+    async fn watchdog_hard_replacement_load_missing_session_invalidates_client_session() {
         let replacement_counters = Arc::new(ControlledTransportCounters::default());
         let (initial_in_tx, initial_in_rx) = mpsc::unbounded_channel();
         let (initial_out_tx, mut initial_out_rx) = mpsc::unbounded_channel();
@@ -3947,6 +4011,10 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         .await
         .unwrap();
         client.session_id = Some("sess_1".to_string());
+        client.session_load_context = Some(SessionLoadContext {
+            cwd: "/project".to_string(),
+            mcp_servers: Vec::new(),
+        });
         let _initialize = next_outgoing(&mut initial_out_rx).await;
         let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
         let (replacement_out_tx, mut replacement_out_rx) = mpsc::unbounded_channel();
@@ -3973,10 +4041,11 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         let _cancel = next_outgoing(&mut initial_out_rx).await;
         tokio::time::advance(Duration::from_secs(2)).await;
         let _replacement_initialize = next_outgoing(&mut replacement_out_rx).await;
-        let continuation = next_outgoing(&mut replacement_out_rx).await;
+        let load = next_outgoing(&mut replacement_out_rx).await;
+        assert_eq!(load["method"], "session/load");
         replacement_in_tx
             .send(rpc_error(
-                continuation["id"].as_u64().unwrap(),
+                load["id"].as_u64().unwrap(),
                 -32602,
                 "Session sess_1 not found",
             ))
@@ -3987,7 +4056,7 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         assert!(
             error
                 .to_string()
-                .contains("replacement continuation RPC error")
+                .contains("replacement session/load failed")
         );
         assert_eq!(
             replacement_counters.force_terminated.load(Ordering::SeqCst),
