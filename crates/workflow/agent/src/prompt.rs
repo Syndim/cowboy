@@ -9,6 +9,8 @@ const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
 `blocked` is a last resort. Before choosing it, exhaust reasonable, safe, in-scope actions available through the repository, supplied context, and tools: inspect relevant context, diagnose failures, try reasonable safe fixes, and try viable in-scope alternatives. A crash, failing command or test, unfamiliar code, or an unsuccessful first approach does not by itself justify `blocked`.\n\n\
 Choose `blocked` only when a precise prerequisite cannot be obtained or resolved with the available tools and context and requires a human action, decision, credential, permission, or external resource. A blocked response MUST document what was tried, the evidence that rules out self-service recovery, and the exact human help needed to continue.";
 
+const CONCISE_OUTPUT_POLICY: &str = "Return only the workflow result required by this contract. In frontmatter, include `status` plus required fields and any optional fields that contain information needed by the next step; omit undeclared, redundant, empty, and null fields. Keep field values short while preserving exact paths, commands, evidence, errors, and other details required for correctness. Leave the Markdown body empty unless essential information cannot be represented in the declared fields. Do not repeat the task, reasoning, frontmatter, logs, command output, or file contents in the body.";
+
 pub fn build_agent_prompt(
     role: &RoleDefinition,
     action: &AgentAction,
@@ -133,7 +135,9 @@ pub(crate) fn build_correction_prompt(
     }
     blocks.push(PromptContent::text(match &action.output {
         Some(output) => build_output_instruction(output),
-        None => "Return a complete replacement response beginning with YAML frontmatter containing a `status` field.".to_string(),
+        None => format!(
+            "Return a complete replacement response beginning with YAML frontmatter containing a `status` field.\n\n{CONCISE_OUTPUT_POLICY}"
+        ),
     }));
     blocks
 }
@@ -218,11 +222,12 @@ on its own before the Markdown body.",
         );
         nudge
     };
-    if action.task.is_none()
-        && let Some(output) = &action.output
-    {
+    if action.task.is_none() {
         nudge.push_str("\n\n");
-        nudge.push_str(&build_output_instruction(output));
+        match &action.output {
+            Some(output) => nudge.push_str(&build_output_instruction(output)),
+            None => nudge.push_str(CONCISE_OUTPUT_POLICY),
+        }
     }
     nudge
 }
@@ -236,10 +241,11 @@ fn build_output_instruction(output: &OutputSpec) -> String {
     let fields = describe_fields(&output.fields);
     let mut instruction = format!(
         "## Deliverable Format\n\n\
-Your response MUST begin with valid YAML frontmatter followed by Markdown body. Quote frontmatter strings and list items that contain `: `, backticks, brackets, braces, or other YAML punctuation.\n\n\
+Your response MUST begin with valid YAML frontmatter. A Markdown body may follow the closing delimiter, but should normally be empty. Quote frontmatter strings and list items that contain `: `, backticks, brackets, braces, or other YAML punctuation.\n\n\
 Allowed status values: {statuses}\n\n\
 Frontmatter fields:\n{fields}\n\n\
-Example:\n\n---\nstatus: success\nsummary: short summary\n---\n\nMarkdown details here."
+{CONCISE_OUTPUT_POLICY}\n\n\
+Example:\n\n---\nstatus: success\nsummary: short summary\n---"
     );
 
     if output.statuses.iter().any(|status| status == "blocked") {
@@ -329,7 +335,47 @@ mod tests {
         assert!(prompt.contains("valid YAML frontmatter"));
         assert!(prompt.contains("success, failed, needs_fix, unblocked"));
         assert!(prompt.contains("summary"));
+        assert!(prompt.contains("Leave the Markdown body empty"));
+        assert!(prompt.contains("details required for correctness"));
         assert!(!prompt.contains("Blocked Status Policy"));
+    }
+
+    #[test]
+    fn deliverable_requests_only_required_downstream_information() {
+        let output = OutputSpec {
+            statuses: vec!["success".into()],
+            fields: BTreeMap::from([
+                (
+                    "summary".to_string(),
+                    Field {
+                        field_type: FieldType::String,
+                        required: true,
+                        description: String::new(),
+                    },
+                ),
+                (
+                    "notes".to_string(),
+                    Field {
+                        field_type: FieldType::Array,
+                        required: false,
+                        description: String::new(),
+                    },
+                ),
+            ]),
+        };
+
+        let instruction = build_output_instruction(&output);
+
+        assert!(instruction.contains("include `status` plus required fields"));
+        assert!(
+            instruction
+                .contains("optional fields that contain information needed by the next step")
+        );
+        assert!(instruction.contains("omit undeclared, redundant, empty, and null fields"));
+        assert!(instruction.contains("Keep field values short"));
+        assert!(instruction.contains("preserving exact paths, commands, evidence, errors"));
+        assert!(instruction.contains("Leave the Markdown body empty"));
+        assert!(instruction.contains("Do not repeat the task, reasoning"));
     }
 
     #[test]

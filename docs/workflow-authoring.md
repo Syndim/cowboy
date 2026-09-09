@@ -655,7 +655,8 @@ Rules:
 
 ## Agent frontmatter output expectations
 
-Agent responses must begin with YAML frontmatter followed by a Markdown body.
+Agent responses must begin with YAML frontmatter. A Markdown body may follow the
+closing delimiter, but should normally be empty.
 
 ```markdown
 ---
@@ -664,8 +665,6 @@ summary: Implemented workflow docs
 files:
   - docs/workflow-authoring.md
 ---
-
-Detailed Markdown body visible to later steps as `ctx.prev.body`.
 ```
 
 Parsing rules:
@@ -682,7 +681,8 @@ When you specify `action.agent.output`, Cowboy appends delivery instructions lik
 ```markdown
 ## Deliverable Format
 
-Your response MUST begin with YAML frontmatter followed by Markdown body.
+Your response MUST begin with valid YAML frontmatter. A Markdown body may follow
+the closing delimiter, but should normally be empty.
 
 Allowed status values: success, failed, needs_fix
 
@@ -690,9 +690,18 @@ Frontmatter fields:
 - status: routing status string
 - summary: string
 - files: array
+
+Return only the workflow result required by this contract. Include `status`,
+required fields, and optional fields needed by the next step. Omit undeclared,
+redundant, empty, and null fields. Keep values short without dropping exact
+paths, commands, evidence, errors, or other correctness-critical details. Use a
+body only when essential information cannot fit the declared fields, and do not
+repeat the task, reasoning, logs, command output, or file contents there.
 ```
 
-Design statuses as workflow-routing values, not prose. Put human-readable detail in other fields and the Markdown body.
+Design statuses as workflow-routing values, not prose. Put necessary
+human-readable detail in declared fields. The trimmed body remains available as
+`ctx.prev.body` when a body is genuinely needed.
 
 ## Complete examples
 
