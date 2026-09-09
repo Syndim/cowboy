@@ -145,6 +145,8 @@ pub(crate) fn build_correction_prompt(
 const NO_RESULT_REASON_MARKER: &str = "did not contain a workflow result";
 const REPEATED_EMPTY_END_TURN_REASON_MARKER: &str =
     "ACP prompt received repeated empty end_turn responses";
+const SESSION_NOT_FOUND_REASON_MARKER: &str = "session";
+const SESSION_NOT_FOUND_ERROR_MARKER: &str = "not found";
 
 /// Whether the retry `reason` indicates the previous reply carried no parseable
 /// workflow result (as opposed to a malformed frontmatter block).
@@ -158,6 +160,11 @@ pub(crate) fn requires_fresh_session(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| {
         reason.contains(NO_RESULT_REASON_MARKER)
             || reason.contains(REPEATED_EMPTY_END_TURN_REASON_MARKER)
+            || {
+                let normalized = reason.to_ascii_lowercase();
+                normalized.contains(SESSION_NOT_FOUND_REASON_MARKER)
+                    && normalized.contains(SESSION_NOT_FOUND_ERROR_MARKER)
+            }
     })
 }
 
@@ -475,6 +482,9 @@ mod tests {
         )));
         assert!(requires_fresh_session(Some(
             "recoverable action failure: agent client error: ACP prompt received repeated empty end_turn responses after 5 continuation prompts for session s1"
+        )));
+        assert!(requires_fresh_session(Some(
+            "recoverable action failure: agent client error: Agent error: {\"code\":-32602,\"message\":\"Session s1 not found\"}"
         )));
         assert!(!requires_fresh_session(Some(
             "recoverable action failure: agent client error: temporary transport disconnect"

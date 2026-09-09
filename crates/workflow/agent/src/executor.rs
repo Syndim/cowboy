@@ -4116,4 +4116,43 @@ still applies, got non-recoverable: {error:?}"
             "a session that repeatedly returned empty end_turn responses must not be reused"
         );
     }
+
+    #[tokio::test]
+    async fn missing_session_retry_creates_fresh_session() {
+        let client = FakeClient::with_prompt_error_once(
+            vec![event()],
+            r#"Agent error: {"code":-32602,"message":"Session session-1 not found"}"#,
+        );
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+
+        let error = executor
+            .execute_agent(output_action("developer"), context("run", "record-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Client(_)));
+
+        let mut retry = context("run", "record-1");
+        retry.attempt = 2;
+        retry.retry_reason = Some(format!("recoverable action failure: {error}"));
+        executor
+            .execute_agent(output_action("developer"), retry)
+            .await
+            .unwrap();
+
+        let recovered = store_handle
+            .load_role_session("run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.session_id, "session-2",
+            "a missing backend session must be replaced before retrying"
+        );
+    }
 }
