@@ -246,6 +246,11 @@ request. Fresh sessions receive the full ordered history; reused sessions
 receive only sequences above their durable delivery watermark. Explicit
 `ask_user` answers are excluded and remain in `ctx.prev.fields.answer`.
 
+For a restarted run, sequence `0` has `kind = "restart"` instead of
+`kind = "initial"` while preserving the submitted request and timestamp exactly.
+The agent prompt introduces that unseen entry with “The user restarted the
+workflow with the following prompt” immediately before the raw request.
+
 The canonical previous-step view is `ctx.prev.output = { status, fields, body,
 raw }`. Flattened `ctx.prev.status`, `fields`, `body`, and `raw` aliases remain
 for snapshotted-workflow compatibility.
@@ -285,6 +290,16 @@ through its own `WaitingForInput` with a durable workflow-child resume callback;
 answering the parent answers and continues the child through the shared executor.
 Parent and child keep isolated per-run event logs, and the active parent emits
 `child workflow <id> started/waiting for input/resumed/finished` progress.
+
+Terminal restart is a new-run operation, not resume. `WorkflowRuntime::restart_run`
+locks and revalidates a `Completed` or `Failed` source, compiles its stored
+snapshot object, and atomically inserts the target run, run head, and inherited
+role sessions before emitting events. The target starts at the snapshot head
+with clean step, visit, and retry counters and stores its source run id as
+restart lineage. Workflow-action descendants are matched by the parent step's
+stable visit ordinal and are independently restarted from their own snapshots
+and sessions. Missing or inconsistent matched lineage fails explicitly; only a
+genuinely new branch uses the current catalog.
 
 ### Event logs
 
@@ -384,6 +399,12 @@ forces a manual status on a failed run.
 
 The TUI accepts plain requests and slash commands in its composer. Slash command parsing and completion metadata come from `cowboy-command-parser`; the app crate owns dispatch, pending-prompt fallback, and rendering. Runtime behavior is delegated to `cowboy-workflow-engine`, and the TUI renders the workflow event stream from the runtime event bus.
 
+Idle plain text after a durable `Completed` or `Failed` active run calls
+`WorkflowRuntime::restart_run` and follows the returned new run id. Dispatch
+precedence is slash command, pending answer, active-agent prompt, terminal
+restart, then normal new-run selection. `Cancelled`, missing, and unknown
+durable states keep normal new-run behavior.
+
 Agent cards show the agent-reported model descriptor (model/context/reasoning) captured when a session is created or loaded, built only from agent-returned ACP config option values and never from the configured `ModelInfo`.
 
 Composer behavior derives from three independent facts: whether a typed
@@ -396,8 +417,9 @@ open agent prompt window, and the latest durable run status.
 | running | absent/closed | any | Block Enter and retain the exact draft because no agent can accept it. |
 | idle | absent | `Running` | Normal idle behavior; `/step` and `/resume` remain available. |
 | idle | absent | `WaitingForInput` | Route plain text through the pending-answer fallback; explicit `/answer` remains available, and `/step`/`/resume` re-prompt the retained `ask_user` step. |
-| idle | absent | `Failed` | Normal idle behavior; `/step` and `/resume` retry the retained failed step, and read-only and mutating `/resolve` remain available. |
-| idle | absent | `Completed`/`Cancelled` | Normal new-request and command behavior. |
+| idle | absent | `Failed` | Plain text restarts the visible workflow as a new run; `/step` and `/resume` retry the retained failed step, and read-only and mutating `/resolve` remain available. |
+| idle | absent | `Completed` | Plain text restarts the visible workflow as a new run. |
+| idle | absent | `Cancelled` or unknown | Normal new-request and command behavior. |
 
 While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/export`,
 `/workflows`, and read-only `/resolve <run-id>` remain available. `/run`, `/step`, `/resume`,

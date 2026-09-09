@@ -156,6 +156,11 @@ creation timestamp. Durable follow-ups start at `1`. Timestamps are UTC RFC
 every accepted string byte-for-byte, including leading/trailing whitespace and newlines.
 `ctx.request` remains the unchanged original request.
 
+Ordinary runs use `"kind": "initial"` for sequence `0`. A terminal TUI restart
+creates a new run whose sequence `0` uses `"kind": "restart"` and whose
+`content` is the exact restart submission, including leading/trailing whitespace
+and newlines. Restart does not expose inputs from the source run.
+
 Every fresh agent session receives the complete `ctx.user_inputs` history.
 Reused sessions receive only entries whose sequence has not already been
 delivered, regardless of the workflow-authored `prompt`.
@@ -173,6 +178,15 @@ sent once per `(run, role, task.key, contract fingerprint)`; recovery context is
 sent with that contract and after fresh-session fallback; the current turn and
 new user-input sequences are sent per dispatch. A same-session retry sends only
 the retry correction and new user inputs.
+
+Restarted runs reuse the source run's exact workflow snapshot and config-set
+name. Persisted role sessions are copied per role with the same backend session
+id and static-delivery fingerprints, but their per-run input watermark resets so
+the restart sequence `0` is delivered once. Copied sessions use exact supplied
+session semantics: if the backend cannot load the recorded session, execution
+fails and Cowboy does not create a replacement or replay role/task contracts.
+Nested `action.workflow` runs apply the same rule recursively to their own
+snapshots and role sessions.
 
 Reuse requires both an equal `task.key` and an equal fingerprint of
 `task.instructions` plus the `output` specification. Steps such as

@@ -144,6 +144,16 @@ retries do not consume step or visit budgets.
 
 ![Cowboy TUI snapshot](docs/assets/tui-snapshot.svg)
 
+When the visible run is durably `Completed` or `Failed` and no workflow task is
+active, submitting non-slash text restarts that workflow. Cowboy creates a new
+run id from the terminal run's exact stored workflow snapshot and durable
+config-set name; it never mutates the source run or reselects from the current
+catalog. Root and nested workflow-action runs inherit their corresponding
+backend role sessions. Already delivered role/task contracts are not replayed,
+and a copied session must load exactly or the restarted run fails without
+creating a replacement session. Slash commands, pending `ask_user` answers, and
+active-agent prompts retain priority over terminal restart.
+
 Plain text submitted in the composer starts a workflow run. When a workflow is waiting for input, typing the answer directly submits it to the pending prompt; `/answer` remains available for explicit answers.
 
 ### TUI commands

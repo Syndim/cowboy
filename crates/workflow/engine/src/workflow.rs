@@ -830,6 +830,7 @@ mod tests {
             request_topic: None,
             config_set: Default::default(),
             parent: None,
+            restart_source_run_id: None,
             status: RunStatus::Completed,
             retries_used: 0,
             step: StepState {

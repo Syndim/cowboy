@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use cowboy_agent_client::PromptContent;
 use cowboy_workflow_core::{
     AgentAction, AgentTaskContract, Field, FollowUpPrompt, OutputSpec, RoleDefinition, UserInput,
+    UserInputKind,
 };
 
 const BLOCKED_STATUS_POLICY: &str = "## Blocked Status Policy\n\n\
@@ -97,10 +98,32 @@ pub fn build_prompt_blocks(
         } else {
             "New user direction not yet sent in this session. Apply in sequence."
         };
-        parts.push(format!(
-            "## User Inputs\n\n{header}\n\n```json\n{}\n```",
-            serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
-        ));
+        let restart = user_inputs
+            .first()
+            .filter(|input| input.sequence == 0 && input.kind == UserInputKind::Restart);
+        let body = match restart {
+            Some(restart) => {
+                let remaining = &user_inputs[1..];
+                let mut body = format!(
+                    "{header}\n\nThe user restarted the workflow with the following prompt:\n\n{}",
+                    restart.content
+                );
+                if !remaining.is_empty() {
+                    body.push_str("\n\n```json\n");
+                    body.push_str(
+                        &serde_json::to_string_pretty(remaining)
+                            .expect("follow-up user inputs serialize"),
+                    );
+                    body.push_str("\n```");
+                }
+                body
+            }
+            None => format!(
+                "{header}\n\n```json\n{}\n```",
+                serde_json::to_string_pretty(user_inputs).expect("run user inputs serialize")
+            ),
+        };
+        parts.push(format!("## User Inputs\n\n{body}"));
         included_blocks.push("user_inputs");
     }
     if (action.task.is_none() || selection.include_task)
@@ -598,6 +621,49 @@ mod tests {
                 .unwrap()
                 .with_timezone(&chrono::Utc),
         }
+    }
+
+    #[test]
+    fn restart_input_prepends_instruction_without_static_replay() {
+        let role = RoleDefinition {
+            id: "dev".into(),
+            instructions: "ROLE_INSTRUCTION_SENTINEL".into(),
+            agent: None,
+            properties: Value::Null,
+        };
+        let action = AgentAction {
+            role: "dev".into(),
+            prompt: String::new(),
+            task: Some(AgentTaskContract {
+                key: "implement".into(),
+                instructions: "TASK_CONTRACT_SENTINEL".into(),
+                recovery_context: "RECOVERY_SENTINEL".into(),
+                turn: "current turn".into(),
+            }),
+            output: None,
+        };
+        let raw = "  restart\nrequest with trailing space  ";
+        let assembly = build_prompt_blocks(
+            &role,
+            &action,
+            &[user_input(0, UserInputKind::Restart, raw)],
+            PromptBlockSelection {
+                include_role: false,
+                include_task: false,
+                include_recovery: false,
+                include_turn: true,
+            },
+        );
+
+        let instruction = "The user restarted the workflow with the following prompt:";
+        let instruction_index = assembly.prompt.find(instruction).unwrap();
+        let request_index = assembly.prompt.find(raw).unwrap();
+        assert!(instruction_index < request_index);
+        assert_eq!(assembly.prompt.matches(raw).count(), 1);
+        assert!(!assembly.prompt.contains(role.instructions.trim()));
+        assert!(!assembly.prompt.contains("TASK_CONTRACT_SENTINEL"));
+        assert_eq!(assembly.included_blocks, ["turn", "user_inputs"]);
+        println!("EVIDENCE restart-prompt instruction=true request=exact static_blocks=absent");
     }
 
     #[test]

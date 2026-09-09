@@ -458,6 +458,7 @@ where
         let user_inputs = ordered_user_inputs_from_parts(
             &context.original_request,
             context.run_created_at,
+            context.initial_input_kind,
             &context.user_prompts,
         );
         let mut clients = self.clients.lock().await;
@@ -818,6 +819,7 @@ where
                 prompt: Some(prompt),
                 context: serde_json::json!({
                     "role": action.role,
+                    "initial_input_kind": context.initial_input_kind,
                     "user_inputs": user_inputs,
                     "prompt_blocks": included_blocks,
                     "task_key": action.task.as_ref().map(|task| task.key.as_str()),
@@ -2002,6 +2004,8 @@ mod tests {
             role: Some(role("developer")),
             attempt: 1,
             retry_reason: None,
+            initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
+            step_visit: 1,
             original_request: "Original request".to_string(),
             run_created_at: Utc::now(),
             user_prompts: Vec::new(),
@@ -2017,6 +2021,8 @@ mod tests {
             role: Some(role(role_id)),
             attempt: 1,
             retry_reason: None,
+            initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
+            step_visit: 1,
             original_request: "Original request".to_string(),
             run_created_at: Utc::now(),
             user_prompts: Vec::new(),
@@ -3472,6 +3478,61 @@ still applies, got non-recoverable: {error:?}"
             turn: turn.into(),
         });
         action
+    }
+
+    #[tokio::test]
+    async fn inherited_restart_session_receives_only_restart_input() {
+        let action = structured_action("developer", "STATIC_TASK_SENTINEL", "restart current turn");
+        let fingerprint =
+            task_contract_fingerprint(action.task.as_ref().unwrap(), action.output.as_ref());
+        let client = FakeClient::with_load(vec![event()]);
+        let prompt_calls = client.prompt_calls.clone();
+        let store = SharedFakeStore::default();
+        let store_handle = store.clone();
+        store_handle
+            .save_role_session(RoleSession {
+                run_id: "restart-run".into(),
+                role_id: "developer".into(),
+                backend: PROVIDED_SESSION_BACKEND.into(),
+                session_id: "source-session".into(),
+                updated_at: Utc::now(),
+                role_instructions_sent: true,
+                last_sent_input_sequence: None,
+                delivered_task_contracts: [("implementation".to_string(), fingerprint)]
+                    .into_iter()
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store,
+            AgentExecutionConfig::default(),
+        );
+        let raw = "  restart\nrequest  ";
+        let mut context = context("restart-run", "record");
+        context.original_request = raw.to_string();
+        context.initial_input_kind = cowboy_workflow_core::UserInputKind::Restart;
+
+        let execution = executor.execute_agent(action, context).await.unwrap();
+        let prompt = prompt_calls.lock()[0][0].text.clone();
+        assert!(prompt.contains("The user restarted the workflow with the following prompt:"));
+        assert_eq!(prompt.matches(raw).count(), 1);
+        assert!(!prompt.contains("Instructions for developer"));
+        assert!(!prompt.contains("STATIC_TASK_SENTINEL"));
+        assert!(!prompt.contains("RECOVERY_CONTEXT_SENTINEL"));
+        assert_eq!(
+            execution.record.input.context["prompt_blocks"],
+            serde_json::json!(["turn", "user_inputs"])
+        );
+        let stored = store_handle
+            .load_role_session("restart-run", "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_id, "source-session");
+        assert_eq!(stored.last_sent_input_sequence, Some(0));
+        println!("EVIDENCE restart-session loaded=true input_once=true role_replayed=false");
     }
 
     #[tokio::test]

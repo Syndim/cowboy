@@ -27,7 +27,10 @@ use cowboy_workflow_core::{
     WorkflowSelector, WorkflowSnapshot, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummarizer,
     apply_run_status, apply_step_record,
 };
-use cowboy_workflow_store::{SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver};
+use cowboy_workflow_store::{
+    RestartCreationOutcome, RestartSeed, SqliteWorkflowStore, StoreWaitCancellation,
+    StoreWaitObserver,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -422,6 +425,14 @@ struct CatalogRunSpec {
     start_options: RunStartOptions,
 }
 
+#[derive(Debug, Clone)]
+struct RestartRunSpec {
+    source_run_id: String,
+    target_run_id: String,
+    request: String,
+    parent: Option<ParentRun>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingWorkflowChild {
     parent_run_id: String,
@@ -714,6 +725,25 @@ impl WorkflowRuntime {
         Ok(self.store()?.load_run(run_id).await?)
     }
 
+    /// Restart a completed or failed run from its exact durable workflow snapshot.
+    pub async fn restart_run(
+        &self,
+        source_run_id: &str,
+        request: impl Into<String>,
+    ) -> Result<RunReport> {
+        let target_run_id = format!("run-{}", Uuid::new_v4());
+        self.execute_restart_run(
+            RestartRunSpec {
+                source_run_id: source_run_id.to_string(),
+                target_run_id,
+                request: request.into(),
+                parent: None,
+            },
+            RunMode::UntilBlocked,
+        )
+        .await
+    }
+
     pub fn cwd(&self) -> &Path {
         &self.config.cwd
     }
@@ -961,6 +991,126 @@ impl WorkflowRuntime {
         Ok(sessions)
     }
 
+    async fn execute_restart_run(&self, spec: RestartRunSpec, mode: RunMode) -> Result<RunReport> {
+        let source_guard = self.run_locks.acquire_wait(&spec.source_run_id).await?;
+        let store = self.store()?;
+        let source = store.load_run(&spec.source_run_id).await?;
+        ensure_restartable(&source)?;
+
+        let snapshot = store
+            .load_workflow_source_snapshot(&source.workflow.hash)
+            .await?;
+        if snapshot.files != source.workflow.sources {
+            return Err(WorkflowError::InvalidAction(format!(
+                "run {:?} workflow snapshot does not match stored hash {:?}",
+                source.id, source.workflow.hash
+            )));
+        }
+        let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+            .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        definition.name = source.workflow.name.clone();
+        definition.source_hash = source.workflow.hash.clone();
+
+        let now = Utc::now();
+        let inherited_sessions = self
+            .inherited_role_sessions(&store, &source, &definition, &spec.target_run_id, now)
+            .await?;
+        let target = Run {
+            id: spec.target_run_id.clone(),
+            workflow: source.workflow.clone(),
+            original_request: spec.request,
+            request_topic: None,
+            config_set: source.config_set.clone(),
+            parent: spec.parent,
+            restart_source_run_id: Some(source.id.clone()),
+            status: RunStatus::Running,
+            step: StepState {
+                next: definition.head.clone(),
+                head: None,
+                executed: 0,
+                visits: BTreeMap::new(),
+                retries_used: BTreeMap::new(),
+            },
+            retries_used: 0,
+            active_duration_ms: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let outcome = store
+            .create_restart(&RestartSeed {
+                source_run_id: source.id.clone(),
+                expected_source_workflow_hash: source.workflow.hash.clone(),
+                target_run: target.clone(),
+                inherited_sessions,
+            })
+            .await?;
+        match outcome {
+            RestartCreationOutcome::Created => {}
+            RestartCreationOutcome::SourceNotTerminal(status) => {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "run {:?} is {status:?}; only completed or failed runs can be restarted",
+                    source.id
+                )));
+            }
+            RestartCreationOutcome::SourceWorkflowHashChanged { actual } => {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "run {:?} workflow hash changed while restart was being created (expected {:?}, found {:?})",
+                    source.id, source.workflow.hash, actual
+                )));
+            }
+            RestartCreationOutcome::TargetAlreadyExists => {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "restart target run {:?} already exists",
+                    target.id
+                )));
+            }
+        }
+        drop(source_guard);
+
+        let target_guard = self.run_locks.acquire(&target.id)?;
+        let active_clock = ActiveRunClock::open(&target);
+        self.run_existing_with_events(
+            target,
+            definition,
+            snapshot,
+            mode,
+            ActiveRunExecution {
+                request_topic: None,
+                events: Vec::new(),
+                active_clock,
+                run_guard: target_guard,
+            },
+        )
+        .await
+    }
+
+    async fn inherited_role_sessions(
+        &self,
+        store: &SqliteWorkflowStore,
+        source: &Run,
+        definition: &WorkflowDefinition,
+        target_run_id: &str,
+        updated_at: DateTime<Utc>,
+    ) -> Result<Vec<RoleSession>> {
+        let mut sessions = Vec::new();
+        for role_id in definition.roles.keys() {
+            let Some(session) = store.load_role_session(&source.id, role_id).await? else {
+                continue;
+            };
+            sessions.push(RoleSession {
+                run_id: target_run_id.to_string(),
+                role_id: role_id.clone(),
+                backend: PROVIDED_SESSION_BACKEND.to_string(),
+                session_id: session.session_id,
+                updated_at,
+                role_instructions_sent: session.role_instructions_sent,
+                last_sent_input_sequence: None,
+                delivered_task_contracts: session.delivered_task_contracts,
+            });
+        }
+        Ok(sessions)
+    }
+
     async fn execute_catalog_run(
         &self,
         spec: CatalogRunSpec,
@@ -1017,6 +1167,7 @@ impl WorkflowRuntime {
                     request_topic: None,
                     config_set,
                     parent: spec.parent,
+                    restart_source_run_id: None,
                     status: RunStatus::Running,
                     step: StepState {
                         next: definition.head.clone(),
@@ -1117,7 +1268,7 @@ impl WorkflowRuntime {
         let pending = PendingWorkflowChild {
             parent_run_id: context.run_id.clone(),
             parent_step_id: context.step_id.clone(),
-            parent_record_id: context.step_record_id,
+            parent_record_id: context.step_record_id.clone(),
             parent_previous_head: context.prev.clone(),
             workflow: action.workflow.clone(),
             request: action.request.clone(),
@@ -1125,36 +1276,156 @@ impl WorkflowRuntime {
             invocation_id: invocation_id.to_string(),
             started_at: Utc::now(),
         };
-        self.emit_child_progress(
-            &pending,
-            format!(
-                "child workflow {} started ({})",
-                pending.workflow, pending.child_run_id
-            ),
-        );
-        let catalog = self.catalog()?;
-        let result = self
-            .execute_catalog_run(
+        let parent = ParentRun {
+            run_id: context.run_id.clone(),
+            step_id: context.step_id.clone(),
+            previous_head: context.prev.clone(),
+            invocation_id: invocation_id.to_string(),
+        };
+        let source_child = self
+            .matching_restart_source_child(&context, &action)
+            .await?;
+        let result = if let Some(source_child) = source_child {
+            self.execute_restart_run(
+                RestartRunSpec {
+                    source_run_id: source_child.id,
+                    target_run_id: child_run_id,
+                    request: action.request,
+                    parent: Some(parent),
+                },
+                RunMode::UntilBlocked,
+            )
+            .await
+        } else {
+            self.emit_child_progress(
+                &pending,
+                format!(
+                    "child workflow {} started ({})",
+                    pending.workflow, pending.child_run_id
+                ),
+            );
+            let catalog = self.catalog()?;
+            self.execute_catalog_run(
                 CatalogRunSpec {
                     run_id: child_run_id,
                     workflow_id: action.workflow,
                     request: action.request,
-                    parent: Some(ParentRun {
-                        run_id: context.run_id,
-                        step_id: context.step_id,
-                        previous_head: context.prev,
-                        invocation_id: invocation_id.to_string(),
-                    }),
+                    parent: Some(parent),
                     start_options: RunStartOptions::default(),
                 },
                 RunMode::UntilBlocked,
                 &catalog,
             )
-            .await;
+            .await
+        };
         let child = self
             .child_report_or_failed_run(&pending.child_run_id, result)
             .await?;
         self.workflow_action_result(&pending, &child).await
+    }
+
+    async fn matching_restart_source_child(
+        &self,
+        context: &ExecutionContext,
+        action: &WorkflowAction,
+    ) -> Result<Option<Run>> {
+        let store = self.store()?;
+        let parent = store.load_run(&context.run_id).await?;
+        let Some(source_parent_id) = parent.restart_source_run_id.as_deref() else {
+            return Ok(None);
+        };
+        let source_parent = store.load_run(source_parent_id).await?;
+        let records = self
+            .chronological_step_records(&store, &source_parent)
+            .await?;
+        let occurrence = records
+            .iter()
+            .filter(|record| record.step == context.step_id)
+            .nth(context.step_visit.saturating_sub(1) as usize);
+        let Some(record) = occurrence else {
+            return Ok(None);
+        };
+        if record.action != "workflow" {
+            return Ok(None);
+        }
+        let recorded_workflow = record.input.context["workflow"].as_str().ok_or_else(|| {
+            WorkflowError::InvalidAction(format!(
+                "source workflow record {:?} is missing workflow identity",
+                record.id
+            ))
+        })?;
+        if recorded_workflow != action.workflow {
+            return Ok(None);
+        }
+        let child_run_id = record.input.context["child_run_id"]
+            .as_str()
+            .ok_or_else(|| {
+                WorkflowError::InvalidAction(format!(
+                    "source workflow record {:?} is missing child_run_id",
+                    record.id
+                ))
+            })?;
+        let recorded_invocation =
+            record.input.context["invocation_id"]
+                .as_str()
+                .ok_or_else(|| {
+                    WorkflowError::InvalidAction(format!(
+                        "source workflow record {:?} is missing invocation_id",
+                        record.id
+                    ))
+                })?;
+        let expected_invocation =
+            workflow_invocation_id(&source_parent.id, &record.step, record.prev.as_deref())
+                .to_string();
+        if recorded_invocation != expected_invocation {
+            return Err(WorkflowError::InvalidAction(format!(
+                "source workflow record {:?} has inconsistent invocation lineage",
+                record.id
+            )));
+        }
+
+        let child = store.load_run(child_run_id).await?;
+        ensure_restartable(&child)?;
+        let lineage = child.parent.as_ref().ok_or_else(|| {
+            WorkflowError::InvalidAction(format!(
+                "source child run {:?} has no parent lineage",
+                child.id
+            ))
+        })?;
+        if lineage.run_id != source_parent.id
+            || lineage.step_id != record.step
+            || lineage.previous_head != record.prev
+            || lineage.invocation_id != expected_invocation
+        {
+            return Err(WorkflowError::InvalidAction(format!(
+                "source child run {:?} has inconsistent parent lineage",
+                child.id
+            )));
+        }
+        Ok(Some(child))
+    }
+
+    async fn chronological_step_records(
+        &self,
+        store: &SqliteWorkflowStore,
+        run: &Run,
+    ) -> Result<Vec<StepRecord>> {
+        let mut records = Vec::new();
+        let mut cursor = run.step.head.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(hash) = cursor {
+            if !seen.insert(hash.clone()) {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "run {:?} step-record history contains a cycle",
+                    run.id
+                )));
+            }
+            let record = store.load_step_record(&hash).await?;
+            cursor = record.prev.clone();
+            records.push(record);
+        }
+        records.reverse();
+        Ok(records)
     }
 
     async fn resume_workflow_child(
@@ -1519,7 +1790,10 @@ impl WorkflowRuntime {
 
     async fn resume_with(&self, run_id: &str, mode: RunMode) -> Result<RunReport> {
         tracing::debug!(run_id, mode = ?mode, "resuming workflow run");
-        let run_guard = self.run_locks.acquire(run_id)?;
+        let run_guard = match mode {
+            RunMode::UntilBlocked => self.run_locks.acquire_wait(run_id).await?,
+            RunMode::SingleStep => self.run_locks.acquire(run_id)?,
+        };
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
         tracing::debug!(
@@ -1718,7 +1992,7 @@ impl WorkflowRuntime {
         body: Option<String>,
     ) -> Result<RunReport> {
         tracing::info!(run_id, status, "resolving failed workflow run");
-        let run_guard = self.run_locks.acquire(run_id)?;
+        let run_guard = self.run_locks.acquire_wait(run_id).await?;
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
         ensure_resolvable(&run)?;
@@ -1770,6 +2044,8 @@ impl WorkflowRuntime {
             role: None,
             attempt: 1,
             retry_reason: None,
+            initial_input_kind: run.initial_input_kind(),
+            step_visit: run.step.visits.get(&run.step.next).copied().unwrap_or(0),
             original_request: run.original_request.clone(),
             run_created_at: run.created_at,
             user_prompts: store.load_user_prompts(&run.id).await?,
@@ -2235,6 +2511,17 @@ fn ensure_resolvable(run: &Run) -> Result<()> {
     } else {
         Err(WorkflowError::InvalidAction(format!(
             "run {} is {:?}; only failed runs can be resolved",
+            run.id, run.status
+        )))
+    }
+}
+
+fn ensure_restartable(run: &Run) -> Result<()> {
+    if matches!(run.status, RunStatus::Completed | RunStatus::Failed { .. }) {
+        Ok(())
+    } else {
+        Err(WorkflowError::InvalidAction(format!(
+            "run {} is {:?}; only completed or failed runs can be restarted",
             run.id, run.status
         )))
     }
@@ -4052,6 +4339,7 @@ done
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
             parent: None,
+            restart_source_run_id: None,
             status,
             step: StepState {
                 next: "start".to_string(),
@@ -8678,6 +8966,7 @@ Recovery implementation review"#
             request_topic: None,
             config_set: Default::default(),
             parent: None,
+            restart_source_run_id: None,
             status: RunStatus::Running,
             retries_used: 0,
             step: StepState {
@@ -8695,6 +8984,841 @@ Recovery implementation review"#
         let snapshot = snapshot_from_run(&run);
         assert_eq!(snapshot.entry, "workflows/feature.lua");
         cowboy_workflow_lua::compile_snapshot(&snapshot).unwrap();
+    }
+
+    async fn scripted_restart_runtime(
+        dir: &tempfile::TempDir,
+        workflow_dir: PathBuf,
+        factory: ScriptedAgentFactory,
+    ) -> WorkflowRuntime {
+        WorkflowRuntime::with_dependencies(
+            RuntimeConfig {
+                cwd: dir.path().to_path_buf(),
+                state_dir: dir.path().join("state"),
+                workflow_store: dir.path().join("state/data.db"),
+                workflow_dirs: vec![workflow_dir],
+                allowed_env: Vec::new(),
+                agents: Vec::new(),
+                config_sets: BTreeMap::from([(
+                    "default".to_string(),
+                    RunnerLimitsConfig::default(),
+                )]),
+            },
+            mock_runtime_dependencies(None, Some(factory)),
+        )
+        .await
+        .unwrap()
+        .with_deterministic_selector()
+    }
+
+    #[tokio::test]
+    async fn restart_run_reuses_terminal_snapshot_and_resets_failed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("restartable.lua"),
+            r#"
+local start = step("start")
+start.run = function(ctx)
+  if ctx.request == "fail" then
+    return action.fail { reason = "requested failure" }
+  end
+  return action.status { status = "success", body = "snapshot-v1" }
+end
+return workflow("restartable", start)
+"#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir.clone(),
+            BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        )
+        .await;
+
+        let completed = runtime
+            .start_run_with_workflow("restartable", "complete")
+            .await
+            .unwrap();
+        let failed = runtime
+            .start_run_with_workflow("restartable", "fail")
+            .await
+            .unwrap();
+        let completed_before = runtime.load_run(&completed.run.id).await.unwrap();
+        let failed_before = runtime.load_run(&failed.run.id).await.unwrap();
+        assert!(matches!(
+            failed.run.status,
+            RunStatus::Failed { ref reason } if reason == "requested failure"
+        ));
+
+        fs::write(
+            workflow_dir.join("restartable.lua"),
+            r#"
+local start = step("changed")
+start.run = function(ctx) return action.status { status = "success", body = "snapshot-v2" } end
+return workflow("restartable", start)
+"#,
+        )
+        .unwrap();
+        let completed_restart = runtime
+            .restart_run(&completed_before.id, "completed restart")
+            .await
+            .unwrap();
+        let failed_restart = runtime
+            .restart_run(&failed_before.id, "complete after failure")
+            .await
+            .unwrap();
+
+        for (source, restarted) in [
+            (&completed_before, &completed_restart.run),
+            (&failed_before, &failed_restart.run),
+        ] {
+            assert_ne!(source.id, restarted.id);
+            assert_eq!(source.workflow, restarted.workflow);
+            assert_eq!(source.config_set, restarted.config_set);
+            assert_eq!(
+                restarted.restart_source_run_id.as_deref(),
+                Some(source.id.as_str())
+            );
+            assert_eq!(restarted.status, RunStatus::Completed);
+            assert_eq!(restarted.step.next, "start");
+            assert_eq!(restarted.step.executed, 1);
+            assert_eq!(restarted.retries_used, 0);
+        }
+        assert_eq!(
+            runtime.load_run(&completed_before.id).await.unwrap(),
+            completed_before
+        );
+        assert_eq!(
+            runtime.load_run(&failed_before.id).await.unwrap(),
+            failed_before
+        );
+
+        for status in [
+            RunStatus::Running,
+            RunStatus::WaitingForInput {
+                step: "start".to_string(),
+                prompt_id: "prompt".to_string(),
+                message: "wait".to_string(),
+                choices: Vec::new(),
+                resume_callback: ResumeCallback::new("test", serde_json::json!({})).unwrap(),
+            },
+            RunStatus::Cancelled,
+        ] {
+            let mut invalid = completed_before.clone();
+            invalid.id = format!("run-{}", Uuid::new_v4());
+            invalid.status = status;
+            runtime.store().unwrap().save_run(&invalid).await.unwrap();
+            let before_count = runtime.list_runs(None).await.unwrap().len();
+            assert!(runtime.restart_run(&invalid.id, "no").await.is_err());
+            assert_eq!(runtime.list_runs(None).await.unwrap().len(), before_count);
+        }
+    }
+
+    #[tokio::test]
+    async fn inherited_restart_session_loads_exact_identity_without_static_role_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("agent.lua"),
+            r#"
+local developer = role("developer", { instructions = "ROLE_RESTART_SENTINEL" })
+local start = step("start", { role = developer })
+start.run = function(ctx)
+  return action.agent {
+    role = developer,
+    prompt = "Do current work",
+    output = { status = { "success" }, fields = { summary = "string" } }
+  }
+end
+return workflow("agent", start)
+"#,
+        )
+        .unwrap();
+        let response = "---\nstatus: success\nsummary: done\n---\ndone".to_string();
+        let factory = ScriptedAgentFactory::new(vec![response.clone(), response]);
+        let runtime = scripted_restart_runtime(&dir, workflow_dir.clone(), factory.clone()).await;
+        let source = runtime
+            .start_run_with_workflow("agent", "source request")
+            .await
+            .unwrap();
+        let source_session = runtime
+            .store()
+            .unwrap()
+            .load_role_session(&source.run.id, "developer")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let restarted = runtime
+            .restart_run(&source.run.id, "  restart\nrequest  ")
+            .await
+            .unwrap();
+        let inherited = runtime
+            .store()
+            .unwrap()
+            .load_role_session(&restarted.run.id, "developer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(inherited.session_id, source_session.session_id);
+        assert_eq!(
+            inherited.role_instructions_sent,
+            source_session.role_instructions_sent
+        );
+        assert_eq!(
+            inherited.delivered_task_contracts,
+            source_session.delivered_task_contracts
+        );
+        assert_eq!(
+            factory.load_attempts(),
+            std::slice::from_ref(&source_session.session_id)
+        );
+        assert_eq!(factory.created_sessions().len(), 1);
+        let prompts = factory.prompts();
+        let prompt = prompts.last().unwrap();
+        assert!(prompt.contains("The user restarted the workflow with the following prompt:"));
+        assert!(prompt.contains("  restart\nrequest  "));
+        assert!(!prompt.contains("ROLE_RESTART_SENTINEL"));
+
+        let failure_dir = tempfile::tempdir().unwrap();
+        let failure_workflows = failure_dir.path().join("workflows");
+        fs::create_dir(&failure_workflows).unwrap();
+        fs::copy(
+            workflow_dir.join("agent.lua"),
+            failure_workflows.join("agent.lua"),
+        )
+        .unwrap();
+        let failure_factory = ScriptedAgentFactory::new(vec![
+            "---\nstatus: success\nsummary: source\n---\nsource".to_string(),
+        ]);
+        let failure_runtime =
+            scripted_restart_runtime(&failure_dir, failure_workflows, failure_factory.clone())
+                .await;
+        let failure_source = failure_runtime
+            .start_run_with_workflow("agent", "source")
+            .await
+            .unwrap();
+        failure_factory.set_load_session_succeeds(false);
+        let before_created = failure_factory.created_sessions();
+        let error = failure_runtime
+            .restart_run(&failure_source.run.id, "restart")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to load supplied session")
+        );
+        assert_eq!(failure_factory.created_sessions(), before_created);
+    }
+
+    #[tokio::test]
+    async fn restart_run_atomic_seed_failure_leaves_no_target_or_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("agent.lua"),
+            r#"
+local developer = role("developer", { instructions = "role" })
+local start = step("start", { role = developer })
+start.run = function(ctx)
+  return action.agent {
+    role = developer,
+    prompt = "work",
+    output = { status = { "success" }, fields = { summary = "string" } }
+  }
+end
+return workflow("agent", start)
+"#,
+        )
+        .unwrap();
+        let factory = ScriptedAgentFactory::new(vec![
+            "---\nstatus: success\nsummary: source\n---\nsource".to_string(),
+        ]);
+        let runtime = scripted_restart_runtime(&dir, workflow_dir, factory).await;
+        let source = runtime
+            .start_run_with_workflow("agent", "source")
+            .await
+            .unwrap();
+        let store = runtime.store().unwrap();
+        let before_runs = store.list_runs().await.unwrap();
+        sqlx::query(&format!(
+            "CREATE TRIGGER fail_restart_session BEFORE INSERT ON role_sessions \
+             WHEN NEW.run_id <> '{}' BEGIN SELECT RAISE(FAIL, 'injected restart failure'); END",
+            source.run.id
+        ))
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let mut events = runtime.events().subscribe();
+
+        let error = runtime
+            .restart_run(&source.run.id, "restart")
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected restart failure"));
+        assert_eq!(store.list_runs().await.unwrap(), before_runs);
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let event_files = fs::read_dir(dir.path().join("state/events"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(event_files, [format!("{}.json", source.run.id)]);
+    }
+
+    #[tokio::test]
+    async fn nested_restart_recursively_reuses_child_and_grandchild_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("grandchild.lua"),
+            r#"
+local finish = step("finish")
+finish.run = function(ctx) return action.status { status = "success", body = "grandchild-v1" } end
+return workflow("grandchild", finish)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("child.lua"),
+            r#"
+local call = step("call")
+call.run = function(ctx) return action.workflow { workflow = "grandchild", request = ctx.request } end
+local done = step("done")
+done.run = function(ctx) return action.status { status = "success", body = "child-v1" } end
+call:on("success", done)
+return workflow("child", call)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("parent.lua"),
+            r#"
+local call = step("call")
+call.run = function(ctx) return action.workflow { workflow = "child", request = ctx.request } end
+local done = step("done")
+done.run = function(ctx) return action.status { status = "success", body = "parent-v1" } end
+call:on("success", done)
+return workflow("parent", call)
+"#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir_with_config_sets(
+            &dir,
+            workflow_dir.clone(),
+            BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
+        )
+        .await;
+        let source = runtime
+            .start_run_with_workflow("parent", "source tree")
+            .await
+            .unwrap();
+        let store = runtime.store().unwrap();
+        let source_root_records = runtime
+            .chronological_step_records(&store, &source.run)
+            .await
+            .unwrap();
+        let source_child_id = source_root_records[0].input.context["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_child = runtime.load_run(&source_child_id).await.unwrap();
+        let source_child_records = runtime
+            .chronological_step_records(&store, &source_child)
+            .await
+            .unwrap();
+        let source_grandchild_id = source_child_records[0].input.context["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_grandchild = runtime.load_run(&source_grandchild_id).await.unwrap();
+        fs::remove_file(workflow_dir.join("child.lua")).unwrap();
+        fs::remove_file(workflow_dir.join("grandchild.lua")).unwrap();
+
+        let restarted = runtime
+            .restart_run(&source.run.id, "restarted tree")
+            .await
+            .unwrap();
+        let restarted_root_records = runtime
+            .chronological_step_records(&store, &restarted.run)
+            .await
+            .unwrap();
+        let restarted_child_id = restarted_root_records[0].input.context["child_run_id"]
+            .as_str()
+            .unwrap();
+        let restarted_child = runtime.load_run(restarted_child_id).await.unwrap();
+        let restarted_child_records = runtime
+            .chronological_step_records(&store, &restarted_child)
+            .await
+            .unwrap();
+        let restarted_grandchild_id = restarted_child_records[0].input.context["child_run_id"]
+            .as_str()
+            .unwrap();
+        let restarted_grandchild = runtime.load_run(restarted_grandchild_id).await.unwrap();
+
+        assert_eq!(
+            restarted_child.restart_source_run_id.as_deref(),
+            Some(source_child.id.as_str())
+        );
+        assert_eq!(
+            restarted_grandchild.restart_source_run_id.as_deref(),
+            Some(source_grandchild.id.as_str())
+        );
+        assert_eq!(restarted_child.workflow, source_child.workflow);
+        assert_eq!(restarted_grandchild.workflow, source_grandchild.workflow);
+        assert_ne!(restarted_child.id, source_child.id);
+        assert_ne!(restarted_grandchild.id, source_grandchild.id);
+    }
+
+    fn fixture_workflow_source(label: &str, child: Option<&str>, fail_on_request: bool) -> String {
+        let call = child.map_or_else(String::new, |child| {
+            format!(
+                r#"
+local call = step("call")
+call.run = function(ctx)
+  return action.workflow {{
+    workflow = "{child}",
+    request = string.gsub(ctx.request, "mode=fail", "mode=complete")
+  }}
+end
+implement:on("success", call)
+call:on("success", finish)
+"#
+            )
+        });
+        let direct = if child.is_none() {
+            "implement:on(\"success\", finish)"
+        } else {
+            ""
+        };
+        let finish_action = if fail_on_request {
+            r#"
+  if string.find(ctx.request, "mode=fail", 1, true) then
+    return action.fail { reason = "fixture requested failure" }
+  end
+  return action.status { status = "success", body = "fixture completed" }
+"#
+        } else {
+            r#"  return action.status { status = "success", body = "fixture completed" }
+"#
+        };
+        format!(
+            r#"
+local planner = role("planner", {{ instructions = "ROLE_{label}_planner_SENTINEL" }})
+local implementer = role("implementer", {{ instructions = "ROLE_{label}_implementer_SENTINEL" }})
+
+local plan = step("plan", {{ role = planner }})
+plan.run = function(ctx)
+  return action.agent {{
+    role = planner,
+    prompt = "planner current turn",
+    task = {{
+      key = "planner-contract",
+      instructions = "TASK_{label}_planner_SENTINEL",
+      recovery_context = "planner recovery",
+      turn = "planner current turn",
+    }},
+    output = {{ status = {{ "success" }}, fields = {{ summary = "string" }} }}
+  }}
+end
+
+local implement = step("implement", {{ role = implementer }})
+implement.run = function(ctx)
+  return action.agent {{
+    role = implementer,
+    prompt = "implementer current turn",
+    task = {{
+      key = "implementer-contract",
+      instructions = "TASK_{label}_implementer_SENTINEL",
+      recovery_context = "implementer recovery",
+      turn = "implementer current turn",
+    }},
+    output = {{ status = {{ "success" }}, fields = {{ summary = "string" }} }}
+  }}
+end
+
+local finish = step("finish")
+finish.run = function(ctx)
+{finish_action}end
+
+plan:on("success", implement)
+{direct}
+{call}
+return workflow("{label}", plan)
+"#
+        )
+    }
+
+    async fn fixture_run_tree(runtime: &WorkflowRuntime, root: Run) -> Vec<(String, Run)> {
+        let store = runtime.store().unwrap();
+        let root_records = runtime
+            .chronological_step_records(&store, &root)
+            .await
+            .unwrap();
+        let child_id = root_records
+            .iter()
+            .find(|record| record.action == "workflow")
+            .unwrap()
+            .input
+            .context["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let child = runtime.load_run(&child_id).await.unwrap();
+        let child_records = runtime
+            .chronological_step_records(&store, &child)
+            .await
+            .unwrap();
+        let grandchild_id = child_records
+            .iter()
+            .find(|record| record.action == "workflow")
+            .unwrap()
+            .input
+            .context["child_run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let grandchild = runtime.load_run(&grandchild_id).await.unwrap();
+        vec![
+            ("root".to_string(), root),
+            ("child".to_string(), child),
+            ("grandchild".to_string(), grandchild),
+        ]
+    }
+
+    fn fixture_state(run: &Run, seed: bool) -> Value {
+        if seed {
+            return serde_json::json!({
+                "next": "plan",
+                "head": null,
+                "executed": 0,
+                "visits": {},
+                "retries_used": 0,
+                "step_retries_used": {},
+            });
+        }
+        serde_json::json!({
+            "next": run.step.next,
+            "head": run.step.head,
+            "executed": run.step.executed,
+            "visits": run.step.visits,
+            "retries_used": run.retries_used,
+            "step_retries_used": run.step.retries_used,
+        })
+    }
+
+    fn fixture_status(run: &Run) -> Value {
+        match &run.status {
+            RunStatus::Completed => serde_json::json!({"state": "completed", "reason": null}),
+            RunStatus::Failed { reason } => {
+                serde_json::json!({"state": "failed", "reason": reason})
+            }
+            other => panic!("fixture run was not terminal: {other:?}"),
+        }
+    }
+
+    fn fixture_tree_value(tree: &[(String, Run)]) -> Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "root_run_id": tree[0].1.id,
+            "runs": tree.iter().map(|(label, run)| serde_json::json!({
+                "label": label,
+                "run_id": run.id,
+                "restart_source_id": run.restart_source_run_id,
+                "parent": run.parent,
+                "status": fixture_status(run),
+                "workflow": {
+                    "name": run.workflow.name,
+                    "hash": run.workflow.hash,
+                    "sources": run.workflow.sources,
+                },
+                "config_set": run.config_set.name,
+                "seed": fixture_state(run, true),
+                "final": fixture_state(run, false),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn fixture_session_value(session: &RoleSession) -> Value {
+        serde_json::json!({
+            "run_id": session.run_id,
+            "backend": session.backend,
+            "session_id": session.session_id,
+            "role_instructions_sent": session.role_instructions_sent,
+            "last_sent_input_sequence": session.last_sent_input_sequence,
+            "delivered_task_contracts": session.delivered_task_contracts,
+        })
+    }
+
+    async fn fixture_agent_records(
+        runtime: &WorkflowRuntime,
+        run: &Run,
+    ) -> BTreeMap<String, StepRecord> {
+        runtime
+            .chronological_step_records(&runtime.store().unwrap(), run)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|record| record.action == "agent")
+            .map(|record| {
+                (
+                    record.input.context["role"].as_str().unwrap().to_string(),
+                    record,
+                )
+            })
+            .collect()
+    }
+
+    fn write_fixture_json(directory: &Path, name: &str, value: &Value) {
+        fs::write(
+            directory.join(name),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_two_role_fixture_emits_source_labeled_evidence() {
+        let temp_evidence;
+        let evidence_dir = match std::env::var("COWBOY_RESTART_EVIDENCE_DIR") {
+            Ok(path) => {
+                let path = PathBuf::from(path);
+                if path.is_absolute() {
+                    path
+                } else {
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../..")
+                        .join(path)
+                }
+            }
+            Err(_) => {
+                temp_evidence = tempfile::tempdir().unwrap();
+                temp_evidence.path().to_path_buf()
+            }
+        };
+        fs::create_dir_all(&evidence_dir).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("parent.lua"),
+            fixture_workflow_source("parent", Some("child"), true),
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("child.lua"),
+            fixture_workflow_source("child", Some("grandchild"), false),
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("grandchild.lua"),
+            fixture_workflow_source("grandchild", None, false),
+        )
+        .unwrap();
+        let response = "---\nstatus: success\nsummary: fixture\n---\nfixture".to_string();
+        let factory = ScriptedAgentFactory::new(vec![response; 24]);
+        let limits = RunnerLimitsConfig {
+            max_steps_per_run: 16,
+            max_visits_per_step: 4,
+            max_retries_per_run: 0,
+            max_retries_per_step: 0,
+        };
+        let runtime = WorkflowRuntime::with_dependencies(
+            RuntimeConfig {
+                cwd: dir.path().to_path_buf(),
+                state_dir: dir.path().join("state"),
+                workflow_store: dir.path().join("state/data.db"),
+                workflow_dirs: vec![workflow_dir],
+                allowed_env: Vec::new(),
+                agents: Vec::new(),
+                config_sets: BTreeMap::from([("default".to_string(), limits)]),
+            },
+            mock_runtime_dependencies(None, Some(factory.clone())),
+        )
+        .await
+        .unwrap()
+        .with_deterministic_selector();
+
+        let completed_source_request = "mode=complete; change=alpha";
+        let failed_source_request = "mode=fail; change=beta";
+        let completed_restart_request = "mode=complete; change=alpha-restarted";
+        let failed_restart_request = "mode=complete; change=beta-restarted";
+        let completed_source = runtime
+            .start_run_with_workflow("parent", completed_source_request)
+            .await
+            .unwrap();
+        let failed_source = runtime
+            .start_run_with_workflow("parent", failed_source_request)
+            .await
+            .unwrap();
+        assert!(matches!(completed_source.run.status, RunStatus::Completed));
+        assert!(matches!(
+            failed_source.run.status,
+            RunStatus::Failed { ref reason } if reason == "fixture requested failure"
+        ));
+        let completed_source_tree = fixture_run_tree(&runtime, completed_source.run.clone()).await;
+        let failed_source_tree = fixture_run_tree(&runtime, failed_source.run.clone()).await;
+        let completed_before = fixture_tree_value(&completed_source_tree);
+        let failed_before = fixture_tree_value(&failed_source_tree);
+
+        let completed_restart = runtime
+            .restart_run(&completed_source.run.id, completed_restart_request)
+            .await
+            .unwrap();
+        let failed_restart = runtime
+            .restart_run(&failed_source.run.id, failed_restart_request)
+            .await
+            .unwrap();
+        let completed_restart_tree =
+            fixture_run_tree(&runtime, completed_restart.run.clone()).await;
+        let failed_restart_tree = fixture_run_tree(&runtime, failed_restart.run.clone()).await;
+        let completed_after = fixture_tree_value(
+            &fixture_run_tree(
+                &runtime,
+                runtime.load_run(&completed_source.run.id).await.unwrap(),
+            )
+            .await,
+        );
+        let failed_after = fixture_tree_value(
+            &fixture_run_tree(
+                &runtime,
+                runtime.load_run(&failed_source.run.id).await.unwrap(),
+            )
+            .await,
+        );
+        assert_eq!(completed_before, completed_after);
+        assert_eq!(failed_before, failed_after);
+
+        let prompt_sessions = factory.prompt_sessions();
+        let prompts = factory.prompts();
+        let mut session_records = Vec::new();
+        let mut prompt_records = Vec::new();
+        for (tree_name, source_tree, restart_tree, restart_request) in [
+            (
+                "completed",
+                &completed_source_tree,
+                &completed_restart_tree,
+                completed_restart_request,
+            ),
+            (
+                "failed",
+                &failed_source_tree,
+                &failed_restart_tree,
+                failed_restart_request,
+            ),
+        ] {
+            for ((label, source_run), (_, restart_run)) in
+                source_tree.iter().zip(restart_tree.iter())
+            {
+                let agent_records = fixture_agent_records(&runtime, restart_run).await;
+                for role in ["planner", "implementer"] {
+                    let source_session = runtime
+                        .store()
+                        .unwrap()
+                        .load_role_session(&source_run.id, role)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let final_target = runtime
+                        .store()
+                        .unwrap()
+                        .load_role_session(&restart_run.id, role)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let mut seeded_target = source_session.clone();
+                    seeded_target.run_id = restart_run.id.clone();
+                    seeded_target.backend = PROVIDED_SESSION_BACKEND.to_string();
+                    seeded_target.last_sent_input_sequence = None;
+                    seeded_target.updated_at = restart_run.created_at;
+                    session_records.push(serde_json::json!({
+                        "tree": tree_name,
+                        "run_label": label,
+                        "role": role,
+                        "source": fixture_session_value(&source_session),
+                        "seeded_target": fixture_session_value(&seeded_target),
+                        "final_target": fixture_session_value(&final_target),
+                    }));
+
+                    let prompt_indexes = prompt_sessions
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, session)| {
+                            (session == &final_target.session_id).then_some(index)
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(prompt_indexes.len(), 2);
+                    let record = &agent_records[role];
+                    prompt_records.push(serde_json::json!({
+                        "tree": tree_name,
+                        "run_label": label,
+                        "role": role,
+                        "session_id": final_target.session_id,
+                        "restart_request": restart_request,
+                        "prompt": prompts[prompt_indexes[1]],
+                        "included_blocks": record.input.context["prompt_blocks"],
+                        "role_sentinel": format!("ROLE_{}_{}_SENTINEL", source_run.workflow.name, role),
+                        "task_sentinel": format!("TASK_{}_{}_SENTINEL", source_run.workflow.name, role),
+                    }));
+                }
+            }
+        }
+        factory.assert_exhausted();
+
+        write_fixture_json(
+            &evidence_dir,
+            "fixture-config.json",
+            &serde_json::json!({
+                "schema_version": 1,
+                "limits": {
+                    "max_steps_per_run": 16,
+                    "max_visits_per_step": 4,
+                    "max_retries_per_run": 0,
+                    "max_retries_per_step": 0,
+                },
+                "requests": {
+                    "completed_source": completed_source_request,
+                    "failed_source": failed_source_request,
+                    "completed_restart": completed_restart_request,
+                    "failed_restart": failed_restart_request,
+                },
+            }),
+        );
+        for (name, value) in [
+            ("completed-source-before.json", completed_before),
+            ("completed-source-after.json", completed_after),
+            (
+                "completed-restart-tree.json",
+                fixture_tree_value(&completed_restart_tree),
+            ),
+            ("failed-source-before.json", failed_before),
+            ("failed-source-after.json", failed_after),
+            (
+                "failed-restart-tree.json",
+                fixture_tree_value(&failed_restart_tree),
+            ),
+            (
+                "session-inheritance.json",
+                serde_json::json!({"schema_version": 1, "records": session_records}),
+            ),
+            (
+                "agent-prompts.json",
+                serde_json::json!({"schema_version": 1, "records": prompt_records}),
+            ),
+        ] {
+            write_fixture_json(&evidence_dir, name, &value);
+        }
+        println!("EVIDENCE restart-fixture artifacts_written=true");
     }
 
     #[tokio::test]
@@ -8890,7 +10014,9 @@ Recovery implementation review"#
         fn decode_hex(value: &str) -> Vec<u8> {
             value
                 .as_bytes()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| {
                     let pair = std::str::from_utf8(pair).unwrap();
                     u8::from_str_radix(pair, 16).unwrap()
@@ -8937,6 +10063,7 @@ Recovery implementation review"#
             request_topic: None,
             config_set: Default::default(),
             parent,
+            restart_source_run_id: None,
             status: RunStatus::Running,
             step: StepState {
                 next: "start".to_string(),
@@ -9144,6 +10271,8 @@ Recovery implementation review"#
             role: None,
             attempt: 2,
             retry_reason: Some("transient".to_string()),
+            initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
+            step_visit: 1,
             original_request: started.run.original_request.clone(),
             run_created_at: started.run.created_at,
             user_prompts: Vec::new(),

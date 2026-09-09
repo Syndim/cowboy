@@ -30,6 +30,8 @@ pub enum Error {
     HashCollision(ObjectHash),
     #[error("invalid prompt-window state: {0}")]
     InvalidPromptState(String),
+    #[error("invalid restart seed: {0}")]
+    InvalidRestartSeed(String),
     #[cfg(test)]
     #[error("injected transaction failure")]
     InjectedFailure,

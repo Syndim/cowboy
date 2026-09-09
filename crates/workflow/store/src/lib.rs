@@ -10,6 +10,9 @@ mod contract;
 
 pub use error::{Error, Result};
 pub use hash::{canonical_object_bytes, object_hash};
+#[cfg(test)]
+pub use sqlite_store::RestartFailurePoint;
 pub use sqlite_store::{
-    SqliteWorkflowStore, StoreWaitCancellation, StoreWaitObserver, is_retryable_sqlite_code,
+    RestartCreationOutcome, RestartSeed, SqliteWorkflowStore, StoreWaitCancellation,
+    StoreWaitObserver, is_retryable_sqlite_code,
 };

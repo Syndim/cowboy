@@ -255,8 +255,8 @@ pub fn resolve_fields_object(
     }
 
     let mut fields = serde_json::Map::new();
-    let mut pairs = field_values.chunks_exact(2);
-    for pair in &mut pairs {
+    let (pairs, remainder) = field_values.as_chunks::<2>();
+    for pair in pairs {
         let name = &pair[0];
         if fields.contains_key(name) {
             return Err(ResolveFieldError::new(format!(
@@ -267,7 +267,7 @@ pub fn resolve_fields_object(
         fields.insert(name.clone(), parse_field_value(name, &pair[1])?);
     }
 
-    debug_assert!(pairs.remainder().is_empty());
+    debug_assert!(remainder.is_empty());
     Ok(Some(serde_json::Value::Object(fields)))
 }
 

@@ -225,6 +225,7 @@ fn app_card_status_and_tone(title: &str, title_suffix: &[String]) -> (&'static s
 fn is_submitted_background_task_card(title: &str, title_suffix: &[String]) -> bool {
     title_suffix.iter().any(|suffix| match title {
         "Run" => suffix == "submitted run" || suffix.starts_with("submitted run "),
+        "Restart" => suffix == "submitted restart",
         "Step" => suffix == "submitted step",
         "Resume" => suffix == "submitted resume",
         "Answer" => suffix == "submitted answer",
@@ -1052,6 +1053,18 @@ impl AppState {
         self.pending_prompt
             .as_ref()
             .map(|prompt| (prompt.run_id.clone(), prompt.prompt_id.clone()))
+    }
+
+    pub(in crate::app) fn terminal_restart_target(&self) -> Option<String> {
+        if self.workflow_execution_running()
+            || !matches!(
+                self.durable_run_status,
+                Some(RunStatusState::Completed | RunStatusState::Failed)
+            )
+        {
+            return None;
+        }
+        self.active_run_id.clone()
     }
 
     pub(in crate::app) fn push_card(

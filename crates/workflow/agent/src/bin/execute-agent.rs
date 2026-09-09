@@ -81,6 +81,8 @@ fn execution_context(
         }),
         attempt: 1,
         retry_reason: None,
+        initial_input_kind: run.initial_input_kind(),
+        step_visit: run.step.visits.get(&config.step_id).copied().unwrap_or(1),
         original_request: run.original_request.clone(),
         run_created_at: run.created_at,
         user_prompts,
@@ -107,6 +109,7 @@ async fn ensure_standalone_run(
                 request_topic: None,
                 config_set: Default::default(),
                 parent: None,
+                restart_source_run_id: None,
                 status: RunStatus::Running,
                 step: StepState {
                     next: config.step_id.clone(),

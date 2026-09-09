@@ -134,6 +134,8 @@ async fn dispatch_submitted_input(
         dispatch_slash_command(state, runtime, command).await?;
     } else if let Some((run_id, prompt_id)) = state.pending_prompt_answer_target() {
         spawn_answer_task(state, runtime, run_id, prompt_id, input.to_string());
+    } else if let Some(run_id) = state.terminal_restart_target() {
+        spawn_restart_run(state, runtime, run_id, input.to_string());
     } else {
         spawn_start_run(state, runtime, input.to_string());
     }
@@ -315,6 +317,30 @@ fn spawn_start_run(state: &mut AppState, runtime: &WorkflowRuntime, request: Str
         async move {
             runtime
                 .start_run(request)
+                .await
+                .map_err(|err| err.to_string())
+        },
+    );
+}
+
+fn spawn_restart_run(
+    state: &mut AppState,
+    runtime: &WorkflowRuntime,
+    source_run_id: String,
+    request: String,
+) {
+    let runtime = runtime.clone();
+    let label = format!("submitted restart: {request}");
+    let body = request.clone();
+    state.spawn_card_report_task(
+        "Restart",
+        [current_wall_clock_prefix()],
+        ["submitted restart".to_string()],
+        label,
+        [body],
+        async move {
+            runtime
+                .restart_run(&source_run_id, request)
                 .await
                 .map_err(|err| err.to_string())
         },
@@ -740,6 +766,7 @@ mod tests {
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
             parent: None,
+            restart_source_run_id: None,
             status,
             step: StepState {
                 next: current_step.to_string(),
@@ -775,6 +802,209 @@ mod tests {
         }
 
         panic!("background task did not finish");
+    }
+
+    fn terminal_event(run_id: &str, failed: bool) -> WorkflowEvent {
+        WorkflowEvent::new(
+            run_id,
+            if failed {
+                WorkflowEventKind::RunFailed {
+                    reason: "failed".to_string(),
+                }
+            } else {
+                WorkflowEventKind::RunCompleted
+            },
+        )
+    }
+
+    fn test_run_id(value: u128) -> String {
+        format!(
+            "run-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            (value >> 96) as u32,
+            (value >> 80) as u16,
+            (value >> 64) as u16,
+            (value >> 48) as u16,
+            value & 0xffffffffffff
+        )
+    }
+
+    #[tokio::test]
+    async fn terminal_plain_input_restarts_current_workflow() {
+        for failed in [false, true] {
+            let (_dir, runtime, mut state) = test_runtime_state().await;
+            let run_id = test_run_id(if failed { 2 } else { 1 });
+            state.apply_workflow_event(terminal_event(&run_id, failed));
+            state.push_input(if failed {
+                "retry failed workflow"
+            } else {
+                "extend completed workflow"
+            });
+
+            submit_input(&mut state, &runtime).await;
+
+            let rendered = state.event_entries().last().unwrap().plain_text();
+            assert!(
+                rendered.contains("Restart · submitted restart"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("Run · submitted run"), "{rendered}");
+            assert_eq!(state.background_task_count(), 1);
+            state.cancel_background_tasks();
+        }
+        println!("EVIDENCE tui-restart completed=true failed=true selector_bypassed=true");
+    }
+
+    #[tokio::test]
+    async fn terminal_restart_preserves_submission_priority() {
+        let (_dir, runtime, mut slash_state) = test_runtime_state().await;
+        slash_state.apply_workflow_event(terminal_event(&test_run_id(3), false));
+        slash_state.push_input("/help");
+        submit_input(&mut slash_state, &runtime).await;
+        assert!(slash_state.event_entries().last().unwrap().contains("Help"));
+        assert_eq!(slash_state.background_task_count(), 0);
+
+        let (_dir, runtime, mut answer_state) = test_runtime_state().await;
+        let answer_run = test_run_id(4);
+        answer_state.apply_workflow_event(WorkflowEvent::new(
+            &answer_run,
+            WorkflowEventKind::WaitingForInput {
+                step: "approve".to_string(),
+                prompt_id: "prompt".to_string(),
+                message: "Approve?".to_string(),
+                choices: Vec::new(),
+            },
+        ));
+        answer_state.push_input("yes");
+        submit_input(&mut answer_state, &runtime).await;
+        assert!(
+            answer_state
+                .event_entries()
+                .last()
+                .unwrap()
+                .contains("submitted answer")
+        );
+        answer_state.cancel_background_tasks();
+
+        let (_dir, runtime, mut agent_state) = test_runtime_state().await;
+        let agent_run = test_run_id(5);
+        agent_state.spawn_test_card_report_task(
+            "active".to_string(),
+            std::future::pending::<Result<RunReport, String>>(),
+        );
+        agent_state.apply_workflow_event(WorkflowEvent::new(
+            &agent_run,
+            WorkflowEventKind::RunStatusChanged {
+                status: "running".to_string(),
+            },
+        ));
+        agent_state.apply_workflow_event(WorkflowEvent::new(
+            &agent_run,
+            WorkflowEventKind::AgentPromptWindowOpened {
+                step_id: "implement".to_string(),
+                role: "developer".to_string(),
+                window_id: "window".to_string(),
+            },
+        ));
+        agent_state.push_input("agent direction");
+        submit_input(&mut agent_state, &runtime).await;
+        assert!(
+            !agent_state
+                .event_entries()
+                .last()
+                .unwrap()
+                .contains("submitted restart")
+        );
+        agent_state.cancel_background_tasks();
+
+        for status in [
+            WorkflowEventKind::RunCancelled,
+            WorkflowEventKind::RunStatusChanged {
+                status: "unknown".to_string(),
+            },
+        ] {
+            let (_dir, runtime, mut state) = test_runtime_state().await;
+            state.apply_workflow_event(WorkflowEvent::new(test_run_id(6), status));
+            state.push_input("normal new run");
+            submit_input(&mut state, &runtime).await;
+            assert!(
+                state
+                    .event_entries()
+                    .last()
+                    .unwrap()
+                    .contains("Run · submitted run")
+            );
+            state.cancel_background_tasks();
+        }
+        println!(
+            "EVIDENCE tui-restart priorities=slash,pending_answer,active_agent,restart,new_run"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_restart_updates_active_run() {
+        let (dir, runtime, mut state) = test_runtime_state().await;
+        let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
+            .await
+            .unwrap();
+        let snapshot = cowboy_workflow_core::WorkflowSourceSnapshot {
+            root: None,
+            entry: "restartable.lua".to_string(),
+            files: [(
+                "restartable.lua".to_string(),
+                r#"
+local start = step("start")
+start.run = function(ctx) return action.status { status = "success" } end
+return workflow("restartable", start)
+"#
+                .to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let hash = store
+            .store_workflow_source_snapshot(&snapshot)
+            .await
+            .unwrap();
+        let source_id = test_run_id(7);
+        let mut source = workflow_run(&source_id, None, RunStatus::Completed, "start", None);
+        source.workflow = WorkflowSnapshot {
+            name: "restartable".to_string(),
+            api_version: 1,
+            hash,
+            sources: snapshot.files,
+        };
+        store.save_run(&source).await.unwrap();
+        state.apply_workflow_event(WorkflowEvent::new(
+            &source_id,
+            WorkflowEventKind::RunStarted {
+                workflow_name: "restartable".to_string(),
+                current_step: "start".to_string(),
+                request_topic: None,
+            },
+        ));
+        state.apply_workflow_event(WorkflowEvent::new(
+            &source_id,
+            WorkflowEventKind::RunCompleted,
+        ));
+        state.push_input("restart request");
+
+        submit_input(&mut state, &runtime).await;
+        drain_finished_background_task(&mut state).await;
+
+        let restarted_id = state.active_run_id().unwrap().to_string();
+        assert_ne!(restarted_id, source_id);
+        assert_eq!(
+            runtime
+                .load_run(&restarted_id)
+                .await
+                .unwrap()
+                .restart_source_run_id
+                .as_deref(),
+            Some(source_id.as_str())
+        );
+        assert_eq!(runtime.load_run(&source_id).await.unwrap(), source);
+        assert!(state.input().is_empty());
+        println!("EVIDENCE tui-restart source_retained=true active_run_switched=true");
     }
 
     #[tokio::test]

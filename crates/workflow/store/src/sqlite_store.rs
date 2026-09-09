@@ -23,6 +23,29 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
 pub type StoreWaitObserver = Arc<dyn Fn(&Path) + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartCreationOutcome {
+    Created,
+    SourceNotTerminal(RunStatus),
+    SourceWorkflowHashChanged { actual: ObjectHash },
+    TargetAlreadyExists,
+}
+
+#[derive(Debug, Clone)]
+pub struct RestartSeed {
+    pub source_run_id: RunId,
+    pub expected_source_workflow_hash: ObjectHash,
+    pub target_run: Run,
+    pub inherited_sessions: Vec<RoleSession>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub enum RestartFailurePoint {
+    AfterRunAndHead,
+    DuringSessionInsertion,
+}
+
 #[derive(Clone)]
 pub struct StoreWaitCancellation {
     receiver: watch::Receiver<u64>,
@@ -58,6 +81,8 @@ pub struct SqliteWorkflowStore {
     wait_cancellation: Option<StoreWaitCancellation>,
     #[cfg(test)]
     fail_completed_step_before_commit: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    fail_restart_creation_at: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for SqliteWorkflowStore {
@@ -80,6 +105,8 @@ impl SqliteWorkflowStore {
             wait_cancellation: None,
             #[cfg(test)]
             fail_completed_step_before_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_restart_creation_at: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -143,6 +170,83 @@ impl SqliteWorkflowStore {
             Ok(())
         })
         .await
+    }
+
+    pub async fn create_restart(&self, seed: &RestartSeed) -> Result<RestartCreationOutcome> {
+        self.retry_write(|| async {
+            let mut tx = self.pool.begin().await?;
+            let source = load_run_in_tx(&mut tx, &seed.source_run_id)
+                .await?
+                .ok_or_else(|| Error::RunNotFound(seed.source_run_id.clone()))?;
+            if !matches!(
+                source.status,
+                RunStatus::Completed | RunStatus::Failed { .. }
+            ) {
+                return Ok(RestartCreationOutcome::SourceNotTerminal(source.status));
+            }
+            if source.workflow.hash != seed.expected_source_workflow_hash {
+                return Ok(RestartCreationOutcome::SourceWorkflowHashChanged {
+                    actual: source.workflow.hash,
+                });
+            }
+            if load_run_in_tx(&mut tx, &seed.target_run.id)
+                .await?
+                .is_some()
+            {
+                return Ok(RestartCreationOutcome::TargetAlreadyExists);
+            }
+
+            insert_run_and_head(&mut tx, &seed.target_run).await?;
+            #[cfg(test)]
+            if self
+                .fail_restart_creation_at
+                .compare_exchange(
+                    1,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                return Err(Error::InjectedFailure);
+            }
+
+            for session in &seed.inherited_sessions {
+                if session.run_id != seed.target_run.id {
+                    return Err(Error::InvalidRestartSeed(format!(
+                        "inherited role session run id {:?} does not match target {:?}",
+                        session.run_id, seed.target_run.id
+                    )));
+                }
+                insert_role_session(&mut tx, session).await?;
+                #[cfg(test)]
+                if self
+                    .fail_restart_creation_at
+                    .compare_exchange(
+                        2,
+                        0,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+                {
+                    return Err(Error::InjectedFailure);
+                }
+            }
+            tx.commit().await?;
+            Ok(RestartCreationOutcome::Created)
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    pub fn inject_restart_failure(&self, point: RestartFailurePoint) {
+        let value = match point {
+            RestartFailurePoint::AfterRunAndHead => 1,
+            RestartFailurePoint::DuringSessionInsertion => 2,
+        };
+        self.fail_restart_creation_at
+            .store(value, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub async fn load_run(&self, run_id: &str) -> Result<Run> {
@@ -245,15 +349,7 @@ impl SqliteWorkflowStore {
     pub async fn save_role_session(&self, session: RoleSession) -> Result<()> {
         self.retry_write(|| async {
             let mut tx = self.pool.begin().await?;
-            sqlx::query(
-                "INSERT INTO role_sessions(run_id, role_id, data) VALUES(?, ?, ?) \
-                 ON CONFLICT(run_id, role_id) DO UPDATE SET data=excluded.data",
-            )
-            .bind(&session.run_id)
-            .bind(&session.role_id)
-            .bind(serde_json::to_vec(&session)?)
-            .execute(&mut *tx)
-            .await?;
+            upsert_role_session(&mut tx, &session).await?;
             tx.commit().await?;
             Ok(())
         })
@@ -590,6 +686,50 @@ async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Res
     Ok(())
 }
 
+async fn insert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
+    sqlx::query("INSERT INTO runs(run_id, data) VALUES(?, ?)")
+        .bind(&run.id)
+        .bind(serde_json::to_vec(run)?)
+        .execute(&mut **tx)
+        .await?;
+    let head = RunHead::from_run(run);
+    sqlx::query("INSERT INTO run_heads(run_id, data) VALUES(?, ?)")
+        .bind(&run.id)
+        .bind(serde_json::to_vec(&head)?)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn upsert_role_session(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: &RoleSession,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO role_sessions(run_id, role_id, data) VALUES(?, ?, ?) \
+         ON CONFLICT(run_id, role_id) DO UPDATE SET data=excluded.data",
+    )
+    .bind(&session.run_id)
+    .bind(&session.role_id)
+    .bind(serde_json::to_vec(session)?)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_role_session(
+    tx: &mut Transaction<'_, Sqlite>,
+    session: &RoleSession,
+) -> Result<()> {
+    sqlx::query("INSERT INTO role_sessions(run_id, role_id, data) VALUES(?, ?, ?)")
+        .bind(&session.run_id)
+        .bind(&session.role_id)
+        .bind(serde_json::to_vec(session)?)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn put_object_in_tx<T: Serialize>(
     tx: &mut Transaction<'_, Sqlite>,
     kind: ObjectKind,
@@ -901,6 +1041,115 @@ mod tests {
 
     use super::*;
     use crate::contract::tests::{record, run};
+
+    fn restart_seed(source: &Run, target_id: &str) -> RestartSeed {
+        let mut target = source.clone();
+        target.id = target_id.to_string();
+        target.original_request = "restart request".to_string();
+        target.restart_source_run_id = Some(source.id.clone());
+        target.status = RunStatus::Running;
+        target.step.head = None;
+        target.step.executed = 0;
+        target.step.visits.clear();
+        target.step.retries_used.clear();
+        target.retries_used = 0;
+        target.active_duration_ms = 0;
+        let session = RoleSession {
+            run_id: target.id.clone(),
+            role_id: "developer".to_string(),
+            backend: cowboy_workflow_core::PROVIDED_SESSION_BACKEND.to_string(),
+            session_id: "session-1".to_string(),
+            updated_at: target.created_at,
+            role_instructions_sent: true,
+            last_sent_input_sequence: None,
+            delivered_task_contracts: [("task".to_string(), "fingerprint".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        RestartSeed {
+            source_run_id: source.id.clone(),
+            expected_source_workflow_hash: source.workflow.hash.clone(),
+            target_run: target,
+            inherited_sessions: vec![session],
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_creation_inserts_run_head_and_sessions_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("data.db"))
+            .await
+            .unwrap();
+        let mut source = run("run-source");
+        source.status = RunStatus::Completed;
+        store.save_run(&source).await.unwrap();
+        let seed = restart_seed(&source, "run-target");
+
+        assert_eq!(
+            store.create_restart(&seed).await.unwrap(),
+            RestartCreationOutcome::Created
+        );
+        assert_eq!(store.load_run("run-target").await.unwrap(), seed.target_run);
+        assert_eq!(
+            store.load_run_head("run-target").await.unwrap(),
+            RunHead::from_run(&seed.target_run)
+        );
+        assert_eq!(
+            store
+                .load_role_session("run-target", "developer")
+                .await
+                .unwrap(),
+            seed.inherited_sessions.first().cloned()
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_creation_rolls_back_at_every_injected_boundary_and_reuses_pool() {
+        for (index, point) in [
+            RestartFailurePoint::AfterRunAndHead,
+            RestartFailurePoint::DuringSessionInsertion,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SqliteWorkflowStore::connect(dir.path().join("data.db"))
+                .await
+                .unwrap();
+            let mut source = run("run-source");
+            source.status = RunStatus::Failed {
+                reason: "failed".to_string(),
+            };
+            store.save_run(&source).await.unwrap();
+            let target_id = format!("run-target-{index}");
+            let seed = restart_seed(&source, &target_id);
+            store.inject_restart_failure(point);
+
+            assert!(matches!(
+                store.create_restart(&seed).await,
+                Err(Error::InjectedFailure)
+            ));
+            assert!(matches!(
+                store.load_run(&target_id).await,
+                Err(Error::RunNotFound(_))
+            ));
+            assert!(matches!(
+                store.load_run_head(&target_id).await,
+                Err(Error::RunNotFound(_))
+            ));
+            assert!(
+                store
+                    .load_role_session(&target_id, "developer")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let reusable = run(&format!("run-pool-{index}"));
+            store.save_run(&reusable).await.unwrap();
+            assert_eq!(store.load_run(&reusable.id).await.unwrap(), reusable);
+        }
+    }
 
     #[test]
     fn extended_busy_code_is_retryable() {

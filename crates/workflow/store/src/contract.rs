@@ -25,6 +25,7 @@ pub(crate) mod tests {
                 name: "careful".into(),
             },
             parent: None,
+            restart_source_run_id: None,
             status: RunStatus::Running,
             retries_used: 2,
             step: StepState {

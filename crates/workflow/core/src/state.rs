@@ -57,6 +57,9 @@ pub struct Run {
     /// Durable lineage when this run was invoked by a parent workflow action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ParentRun>,
+    /// Source run whose terminal workflow state was restarted into this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_source_run_id: Option<RunId>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
     /// Next-step cursor and cumulative step accounting.
@@ -144,24 +147,41 @@ pub struct UserInput {
 #[serde(rename_all = "snake_case")]
 pub enum UserInputKind {
     Initial,
+    Restart,
     FollowUp,
 }
 
 /// Build the complete ordered user-input history for one prompt snapshot.
 pub fn ordered_user_inputs(run: &Run, prompts: &[FollowUpPrompt]) -> Vec<UserInput> {
-    ordered_user_inputs_from_parts(&run.original_request, run.created_at, prompts)
+    ordered_user_inputs_from_parts(
+        &run.original_request,
+        run.created_at,
+        run.initial_input_kind(),
+        prompts,
+    )
+}
+
+impl Run {
+    pub fn initial_input_kind(&self) -> UserInputKind {
+        if self.restart_source_run_id.is_some() {
+            UserInputKind::Restart
+        } else {
+            UserInputKind::Initial
+        }
+    }
 }
 
 /// Build ordered inputs when execution context already carries the run's initial fields.
 pub fn ordered_user_inputs_from_parts(
     original_request: &str,
     created_at: DateTime<Utc>,
+    initial_input_kind: UserInputKind,
     prompts: &[FollowUpPrompt],
 ) -> Vec<UserInput> {
     let mut inputs = Vec::with_capacity(prompts.len() + 1);
     inputs.push(UserInput {
         sequence: 0,
-        kind: UserInputKind::Initial,
+        kind: initial_input_kind,
         content: original_request.to_string(),
         submitted_at: created_at,
     });
@@ -678,6 +698,7 @@ mod tests {
 
         assert_eq!(run.config_set, ConfigSetRef::default());
         assert_eq!(run.parent, None);
+        assert_eq!(run.restart_source_run_id, None);
         assert_eq!(run.retries_used, 0);
         assert!(run.step.retries_used.is_empty());
     }
@@ -874,6 +895,53 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn restart_lineage_deserializes_and_orders_restart_input() {
+        let legacy_json = serde_json::json!({
+            "id": "legacy-run",
+            "workflow": {
+                "name": "wf",
+                "api_version": 1,
+                "hash": "hash",
+                "sources": {}
+            },
+            "original_request": "  original\nrequest  ",
+            "status": { "status": "running" },
+            "step": { "next": "start", "head": null },
+            "created_at": "2026-01-02T03:04:05Z",
+            "updated_at": "2026-01-02T03:04:05Z"
+        });
+        let ordinary: Run = serde_json::from_value(legacy_json.clone()).unwrap();
+        assert_eq!(ordinary.restart_source_run_id, None);
+        assert_eq!(
+            ordered_user_inputs(&ordinary, &[])[0].kind,
+            UserInputKind::Initial
+        );
+
+        let mut restarted: Run = serde_json::from_value(legacy_json).unwrap();
+        restarted.id = "restart-run".to_string();
+        restarted.restart_source_run_id = Some("source-run".to_string());
+        let follow_up = FollowUpPrompt {
+            sequence: 1,
+            content: "follow up".to_string(),
+            submitted_at: DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let inputs = ordered_user_inputs(&restarted, &[follow_up]);
+        assert_eq!(inputs[0].kind, UserInputKind::Restart);
+        assert_eq!(inputs[0].content, "  original\nrequest  ");
+        assert_eq!(inputs[1].kind, UserInputKind::FollowUp);
+        assert_eq!(
+            serde_json::from_value::<Run>(serde_json::to_value(&restarted).unwrap())
+                .unwrap()
+                .restart_source_run_id
+                .as_deref(),
+            Some("source-run")
+        );
+        println!("EVIDENCE restart-core legacy=true initial=true restart=true");
     }
 
     #[test]

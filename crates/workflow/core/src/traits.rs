@@ -2,7 +2,7 @@ use crate::{
     AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome, Choice,
     CompareAndSealPromptWindowOutcome, FollowUpPrompt, ObjectHash, OpenAgentPromptWindowOutcome,
     Result, ResumeCallback, RoleDefinition, RoleSession, Run, RunHead, RunId, RunStatus,
-    StepAction, StepDefinition, StepId, StepRecord, TurnRecord, WorkflowCatalog,
+    StepAction, StepDefinition, StepId, StepRecord, TurnRecord, UserInputKind, WorkflowCatalog,
     WorkflowDefinition, WorkflowSource, WorkflowSourceSnapshot, WorkflowSummary,
 };
 use async_trait::async_trait;
@@ -45,6 +45,10 @@ pub struct ExecutionContext {
     pub attempt: u64,
     /// Reason the previous attempt failed, when this is a corrective retry.
     pub retry_reason: Option<String>,
+    /// Origin of the synthesized sequence-zero user input.
+    pub initial_input_kind: UserInputKind,
+    /// 1-based visit ordinal for this step id, stable across recoverable retries.
+    pub step_visit: u32,
     /// Original request that created the run.
     pub original_request: String,
     /// Timestamp of the initial request.

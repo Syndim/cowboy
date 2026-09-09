@@ -412,6 +412,8 @@ mod tests {
             role: None,
             attempt: 1,
             retry_reason: None,
+            initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
+            step_visit: 1,
             original_request: "request".to_string(),
             run_created_at: Utc::now(),
             user_prompts: Vec::new(),

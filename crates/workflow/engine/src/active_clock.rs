@@ -174,6 +174,7 @@ mod tests {
             request_topic: None,
             config_set: Default::default(),
             parent: None,
+            restart_source_run_id: None,
             status: RunStatus::Running,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {

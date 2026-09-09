@@ -105,7 +105,12 @@ pub(in crate::app) fn title(state: &AppState) -> String {
             " No agent accepting prompts · draft retained · Esc cancels ".to_string()
         }
         ComposerSubmissionMode::Idle => {
-            " Enter submits · Shift/Ctrl-Enter newline · type / for commands ".to_string()
+            if state.terminal_restart_target().is_some() {
+                " Enter restarts current workflow · Shift/Ctrl-Enter newline · type / for commands "
+                    .to_string()
+            } else {
+                " Enter submits · Shift/Ctrl-Enter newline · type / for commands ".to_string()
+            }
         }
     }
 }
@@ -1136,6 +1141,31 @@ mod tests {
                 .await
         });
         assert!(state.composer_accepts_edits());
+    }
+
+    #[test]
+    fn terminal_composer_advertises_restart_without_changing_other_copy() {
+        let mut completed = test_state();
+        completed.apply_workflow_event(WorkflowEvent::new(
+            "run-00000000-0000-0000-0000-000000000001",
+            WorkflowEventKind::RunCompleted,
+        ));
+        assert!(title(&completed).contains("Enter restarts current workflow"));
+
+        let mut failed = test_state();
+        failed.apply_workflow_event(WorkflowEvent::new(
+            "run-00000000-0000-0000-0000-000000000002",
+            WorkflowEventKind::RunFailed {
+                reason: "failed".to_string(),
+            },
+        ));
+        assert!(title(&failed).contains("Enter restarts current workflow"));
+
+        let idle = test_state();
+        assert_eq!(
+            title(&idle),
+            " Enter submits · Shift/Ctrl-Enter newline · type / for commands "
+        );
     }
 
     fn apply_waiting_prompt(state: &mut AppState) {

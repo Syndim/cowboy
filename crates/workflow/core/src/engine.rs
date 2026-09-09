@@ -136,6 +136,8 @@ where
         role,
         attempt,
         retry_reason,
+        initial_input_kind: run.initial_input_kind(),
+        step_visit: run.step.visits.get(&step.id).copied().unwrap_or(0),
         original_request: run.original_request.clone(),
         run_created_at: run.created_at,
         user_prompts,
@@ -714,6 +716,7 @@ mod tests {
             },
             config_set: crate::ConfigSetRef::default(),
             parent: None,
+            restart_source_run_id: None,
             retries_used: 0,
             active_duration_ms: 0,
             created_at: now,
@@ -783,6 +786,63 @@ mod tests {
         );
         assert_eq!(contexts[0].original_request, "do it");
         assert_eq!(contexts[1].attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn restart_execution_context_preserves_input_kind_and_visit() {
+        let store = MemoryStore::default();
+        let executor = NoopDispatcher::default();
+        let provider = StaticProvider::new(vec![
+            StepAction::Status(StatusAction {
+                status: "success".to_string(),
+                fields: Fields::new(),
+                body: String::new(),
+            }),
+            StepAction::Status(StatusAction {
+                status: "success".to_string(),
+                fields: Fields::new(),
+                body: String::new(),
+            }),
+        ]);
+        let mut restarted = run();
+        restarted.restart_source_run_id = Some("source-run".to_string());
+
+        execute_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut restarted,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap();
+        restarted.step.next = "start".to_string();
+        retry_current_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut restarted,
+            2,
+            Some("retry".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let contexts = executor.contexts.lock();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts[0].initial_input_kind,
+            crate::UserInputKind::Restart
+        );
+        assert_eq!(
+            contexts[1].initial_input_kind,
+            crate::UserInputKind::Restart
+        );
+        assert_eq!(contexts[0].step_visit, 1);
+        assert_eq!(contexts[1].step_visit, 1);
+        println!("EVIDENCE restart-context kind=restart visit=stable retry=stable");
     }
 
     #[tokio::test]

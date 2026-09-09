@@ -166,6 +166,14 @@ async fn validate_tables(connection: &mut SqliteConnection) -> Result<()> {
 }
 
 async fn establish_wal(connection: &mut SqliteConnection) -> Result<()> {
+    let current_mode: String = sqlx::query("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await?
+        .try_get(0)?;
+    if current_mode.eq_ignore_ascii_case("wal") {
+        return Ok(());
+    }
+
     let started = Instant::now();
     loop {
         match sqlx::query("PRAGMA journal_mode = WAL")

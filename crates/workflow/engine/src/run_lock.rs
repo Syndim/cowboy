@@ -7,6 +7,8 @@ use cowboy_workflow_core::{Result, WorkflowError};
 use fs2::FileExt;
 use uuid::Uuid;
 
+const LOCK_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
+
 static ACTIVE_RUN_LOCKS: LazyLock<Mutex<HashSet<String>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -84,6 +86,18 @@ impl RunExecutionLocks {
             Err(err) => {
                 release_in_process(&active_key)?;
                 Err(err)
+            }
+        }
+    }
+
+    pub(crate) async fn acquire_wait(&self, run_id: &str) -> Result<RunExecutionGuard> {
+        loop {
+            match self.acquire(run_id) {
+                Ok(guard) => return Ok(guard),
+                Err(err) if err.to_string().contains("already active") => {
+                    tokio::time::sleep(LOCK_RETRY_DELAY).await;
+                }
+                Err(err) => return Err(err),
             }
         }
     }
