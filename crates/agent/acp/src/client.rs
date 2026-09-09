@@ -1001,10 +1001,25 @@ impl Client {
         let _ = tokio::time::timeout(timeout, transport.force_terminate()).await;
     }
 
+    async fn invalidate_session_after_failed_recovery(&mut self, session_id: &str, reason: &str) {
+        self.cleanup_replacement().await;
+        self.session_id = None;
+        self.session_descriptor = None;
+        tracing::warn!(
+            event = "agent_watchdog_session_invalidated",
+            session_id,
+            reason,
+            "Agent watchdog invalidated a session that the replacement transport could not resume"
+        );
+    }
+
     async fn hard_recover_and_continue(&mut self, session_id: &str) -> anyhow::Result<u64> {
         let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
         let Some(mut old_transport) = self.transport.take() else {
-            anyhow::bail!("agent watchdog recovery found no active transport");
+            let reason = "agent watchdog recovery found no active transport".to_string();
+            self.invalidate_session_after_failed_recovery(session_id, &reason)
+                .await;
+            return Err(anyhow::anyhow!(reason));
         };
 
         match tokio::time::timeout(timeout, old_transport.force_terminate()).await {
@@ -1022,7 +1037,11 @@ impl Client {
                     error = %err,
                     "Agent watchdog force termination failed"
                 );
-                anyhow::bail!("agent watchdog force termination failed: {err}");
+                let reason = format!("agent watchdog force termination failed: {err}");
+                drop(old_transport);
+                self.invalidate_session_after_failed_recovery(session_id, &reason)
+                    .await;
+                return Err(anyhow::anyhow!(reason));
             }
             Err(_) => {
                 tracing::error!(
@@ -1030,25 +1049,47 @@ impl Client {
                     session_id,
                     "Agent watchdog force termination timed out"
                 );
-                anyhow::bail!("agent watchdog force termination timed out");
+                let reason = "agent watchdog force termination timed out".to_string();
+                drop(old_transport);
+                self.invalidate_session_after_failed_recovery(session_id, &reason)
+                    .await;
+                return Err(anyhow::anyhow!(reason));
             }
         }
         drop(old_transport);
 
-        let replacement =
-            tokio::time::timeout(timeout, self.create_replacement_transport(session_id))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!("agent watchdog replacement transport creation timed out")
-                })?
-                .map_err(|err| {
-                    anyhow::anyhow!("agent watchdog replacement transport creation failed: {err}")
-                })?;
+        let replacement = match tokio::time::timeout(
+            timeout,
+            self.create_replacement_transport(session_id),
+        )
+        .await
+        {
+            Ok(Ok(replacement)) => replacement,
+            Ok(Err(err)) => {
+                let reason = format!("agent watchdog replacement transport creation failed: {err}");
+                self.invalidate_session_after_failed_recovery(session_id, &reason)
+                    .await;
+                return Err(anyhow::anyhow!(reason));
+            }
+            Err(_) => {
+                let reason = "agent watchdog replacement transport creation timed out".to_string();
+                self.invalidate_session_after_failed_recovery(session_id, &reason)
+                    .await;
+                return Err(anyhow::anyhow!(reason));
+            }
+        };
         self.transport = Some(replacement);
         self.pushback.clear();
 
-        self.initialize_bounded("agent watchdog replacement initialization")
-            .await?;
+        if let Err(err) = self
+            .initialize_bounded("agent watchdog replacement initialization")
+            .await
+        {
+            let reason = format!("agent watchdog replacement initialization failed: {err}");
+            self.invalidate_session_after_failed_recovery(session_id, &reason)
+                .await;
+            return Err(anyhow::anyhow!(reason));
+        }
 
         tracing::warn!(
             event = "agent_watchdog_transport_resumed",
@@ -1058,8 +1099,10 @@ impl Client {
         match self.dispatch_watchdog_continuation(session_id).await {
             Ok(id) => Ok(id),
             Err(err) => {
-                self.cleanup_replacement().await;
-                Err(err)
+                let reason = err.to_string();
+                self.invalidate_session_after_failed_recovery(session_id, &reason)
+                    .await;
+                Err(anyhow::anyhow!(reason))
             }
         }
     }
@@ -1127,10 +1170,11 @@ impl Client {
                             return Err(err);
                         }
                         if replacement_continuation_active {
-                            self.cleanup_replacement().await;
-                            return Err(anyhow::anyhow!(
-                                "agent watchdog replacement continuation failed: {err}"
-                            ));
+                            let reason =
+                                format!("agent watchdog replacement continuation failed: {err}");
+                            self.invalidate_session_after_failed_recovery(session_id, &reason)
+                                .await;
+                            return Err(anyhow::anyhow!("{reason}"));
                         }
                         tracing::warn!(
                             event = "agent_watchdog_recovery_failed",
@@ -1380,10 +1424,11 @@ impl Client {
                 } if resp_id == id => {
                     if let Some(err) = error {
                         if replacement_continuation_active {
-                            self.cleanup_replacement().await;
-                            anyhow::bail!(
-                                "agent watchdog replacement continuation RPC error: {err}"
-                            );
+                            let reason =
+                                format!("agent watchdog replacement continuation RPC error: {err}");
+                            self.invalidate_session_after_failed_recovery(session_id, &reason)
+                                .await;
+                            anyhow::bail!("{reason}");
                         }
                         tracing::warn!(session_id, id = resp_id, error = %err, "ACP prompt response error");
                         anyhow::bail!("Agent error: {err}");
@@ -3825,6 +3870,7 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         )
         .await
         .unwrap();
+        client.session_id = Some("sess_1".to_string());
         let _initialize = next_outgoing(&mut initial_out_rx).await;
 
         let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
@@ -3875,10 +3921,11 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         assert!(matches!(result.unwrap(), StopReason::EndTurn));
         assert_eq!(initial_counters.force_terminated.load(Ordering::SeqCst), 1);
         assert_eq!(client.replacement_factory_calls(), 1);
+        assert_eq!(client.session_id(), Some("sess_1"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn watchdog_hard_replacement_rpc_error_disposes_transport() {
+    async fn watchdog_hard_replacement_missing_session_invalidates_client_session() {
         let replacement_counters = Arc::new(ControlledTransportCounters::default());
         let (initial_in_tx, initial_in_rx) = mpsc::unbounded_channel();
         let (initial_out_tx, mut initial_out_rx) = mpsc::unbounded_channel();
@@ -3899,6 +3946,7 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         )
         .await
         .unwrap();
+        client.session_id = Some("sess_1".to_string());
         let _initialize = next_outgoing(&mut initial_out_rx).await;
         let (replacement_in_tx, replacement_in_rx) = mpsc::unbounded_channel();
         let (replacement_out_tx, mut replacement_out_rx) = mpsc::unbounded_channel();
@@ -3929,8 +3977,8 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         replacement_in_tx
             .send(rpc_error(
                 continuation["id"].as_u64().unwrap(),
-                -32000,
-                "replacement failed",
+                -32602,
+                "Session sess_1 not found",
             ))
             .unwrap();
 
@@ -3947,6 +3995,7 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         );
         assert_eq!(client.replacement_factory_calls(), 1);
         assert!(!client.is_connected());
+        assert_eq!(client.session_id(), None);
     }
 
     #[tokio::test(start_paused = true)]
