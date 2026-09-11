@@ -816,6 +816,7 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
             step_id: "implement".to_string(),
             action: "agent".to_string(),
             status: Some("implemented".to_string()),
+            summary: None,
             body: "done".to_string(),
         },
     ));
