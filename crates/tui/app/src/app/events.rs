@@ -276,10 +276,11 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
             step_id,
             action,
             status,
+            summary,
             body,
         } => {
             let status_value = status.as_deref().unwrap_or("<none>");
-            workflow_card(
+            let mut card = workflow_card(
                 event,
                 status_icon("completed"),
                 "Step completed",
@@ -294,8 +295,15 @@ fn workflow_event_card(event: &WorkflowEvent) -> Card {
                 Span::styled(action.clone(), style_transcript_normal()),
                 Span::styled(" · Status: ", style_transcript_metadata()),
                 Span::styled(status_value.to_string(), style_for_run_state(status_value)),
-            ])]))
-            .section(CardSection::named(
+            ])]));
+            if let Some(summary) = summary.as_deref().filter(|summary| !summary.is_empty()) {
+                card = card.section(CardSection::named(
+                    "Summary",
+                    render_content(summary, style_transcript_normal()),
+                ));
+            }
+
+            card.section(CardSection::named(
                 "Body",
                 render_content(body, style_transcript_normal()),
             ))
@@ -1042,6 +1050,7 @@ mod tests {
             step_id: "review".to_string(),
             action: "status".to_string(),
             status: Some("approved".to_string()),
+            summary: Some("Review complete".to_string()),
             body: (1..=10)
                 .map(|index| format!("body line {index}"))
                 .collect::<Vec<_>>()
@@ -1058,6 +1067,8 @@ mod tests {
         assert!(waiting.lines()[1].to_string().starts_with('╭'));
         assert!(completed_text.contains("✓ Step completed · ↳ review · ▶ 170dc431"));
         assert!(completed_text.contains("├─── Body "));
+        assert!(completed_text.contains("├─── Summary "));
+        assert!(completed_text.contains("Review complete"));
         assert!(completed_text.contains("body line 1"));
         assert!(completed_text.contains("body line 10"));
         assert!(!completed_text.contains("more rows"), "{completed_text}");
@@ -1074,12 +1085,14 @@ mod tests {
             step_id: "review".to_string(),
             action: "status".to_string(),
             status: Some("approved".to_string()),
+            summary: None,
             body,
         }));
         let text = completed.text();
 
         assert!(text.contains("body line 10"), "{text}");
         assert!(!text.contains("more rows"), "{text}");
+        assert!(!text.contains("Summary"), "{text}");
     }
 
     #[test]
@@ -1095,6 +1108,7 @@ mod tests {
             step_id: "implement".to_string(),
             action: "agent".to_string(),
             status: Some("blocked".to_string()),
+            summary: None,
             body,
         }));
         let text = completed.text();
@@ -1111,6 +1125,7 @@ mod tests {
             step_id: "implement".to_string(),
             action: "agent".to_string(),
             status: Some("success".to_string()),
+            summary: None,
             body: "Completed **successfully**.".to_string(),
         }));
         let body_line = rendered
@@ -1313,6 +1328,7 @@ mod tests {
                 step_id: "implement".to_string(),
                 action: "command".to_string(),
                 status: Some("success".to_string()),
+                summary: None,
                 body: MARKDOWN_CARD_FIXTURE.to_string(),
             },
             style_transcript_normal(),
