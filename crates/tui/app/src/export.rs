@@ -272,46 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn export_html_escapes_blocked_summary_and_renders_legacy_completed_event() {
-        let created_at = "2026-01-02T03:04:05Z".parse().unwrap();
-        let legacy: WorkflowEvent = serde_json::from_value(serde_json::json!({
-            "run_id": "run-123",
-            "timestamp": "2026-01-02T03:04:06Z",
-            "kind": {
-                "kind": "step_completed",
-                "step_id": "legacy",
-                "action": "status",
-                "status": "success",
-                "body": "legacy body",
-            },
-        }))
-        .unwrap();
-        let blocked = WorkflowEvent::new(
-            "run-123",
-            WorkflowEventKind::StepCompleted {
-                step_id: "implement".to_string(),
-                action: "agent".to_string(),
-                status: Some("blocked".to_string()),
-                summary: Some("Blocked <script> & waiting".to_string()),
-                body: "Awaiting user input".to_string(),
-            },
-        );
-
-        let cards = projected_cards(
-            "run-123",
-            created_at,
-            "export request",
-            vec![legacy, blocked],
-        );
-        let html = render_html("run-123", &cards);
-
-        assert!(html.contains("<h2>Summary</h2><pre>Blocked &lt;script&gt; &amp; waiting</pre>"));
-        assert!(!html.contains("Blocked <script>"), "{html}");
-        assert!(html.contains("legacy body"), "{html}");
-        assert_eq!(html.matches("<h2>Summary</h2>").count(), 1, "{html}");
-    }
-
-    #[test]
     fn complete_file_replaces_existing_destination() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("export.html");

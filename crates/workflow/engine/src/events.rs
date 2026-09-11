@@ -103,13 +103,6 @@ impl WorkflowEvent {
             step_id: record.step.clone(),
             action: record.action.clone(),
             status: output.map(|output| output.status.clone()),
-            summary: output.and_then(|output| {
-                output
-                    .fields
-                    .get("summary")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            }),
             body: output.map(|output| output.body.clone()).unwrap_or_default(),
         }
     }
@@ -188,8 +181,6 @@ pub enum WorkflowEventKind {
         step_id: String,
         action: String,
         status: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
         body: String,
     },
     StepRetrying {
@@ -343,7 +334,7 @@ mod tests {
     #[test]
     fn maps_step_record_to_completed_event() {
         let now = Utc::now();
-        let mut record = StepRecord {
+        let record = StepRecord {
             id: "record-1".to_string(),
             prev: None,
             step: "implement".to_string(),
@@ -354,16 +345,9 @@ mod tests {
             },
             output: Some(StepOutput {
                 status: "success".to_string(),
-                fields: serde_json::json!({
-                    "summary": "Workflow completed safely",
-                    "files": ["src/lib.rs"],
-                    "internal": "must not persist in the event",
-                }),
+                fields: Value::Null,
                 body: "done".to_string(),
-                raw: serde_json::json!({
-                    "agent_stderr": "must not persist in the event",
-                    "acp": "must not persist in the event",
-                }),
+                raw: Value::Null,
             }),
             detail: StepDetail {
                 backend: None,
@@ -383,36 +367,9 @@ mod tests {
                 step_id: "implement".to_string(),
                 action: "status".to_string(),
                 status: Some("success".to_string()),
-                summary: Some("Workflow completed safely".to_string()),
                 body: "done".to_string(),
             }
         );
-        let serialized = serde_json::to_value(&event).unwrap();
-        assert_eq!(
-            serialized["kind"],
-            serde_json::json!({
-                "kind": "step_completed",
-                "step_id": "implement",
-                "action": "status",
-                "status": "success",
-                "summary": "Workflow completed safely",
-                "body": "done",
-            })
-        );
-        let reparsed: WorkflowEvent = serde_json::from_value(serialized).unwrap();
-        assert_eq!(reparsed, event);
-
-        record.output.as_mut().unwrap().fields = serde_json::json!({
-            "summary": ["not", "a string"],
-            "internal": "must not persist in the event",
-        });
-        let no_summary = WorkflowEvent::step_completed("run-1", &record);
-        assert!(matches!(
-            no_summary.kind,
-            WorkflowEventKind::StepCompleted { summary: None, .. }
-        ));
-        let serialized = serde_json::to_value(no_summary).unwrap();
-        assert!(serialized["kind"].get("summary").is_none(), "{serialized}");
     }
 
     #[test]
@@ -523,31 +480,6 @@ mod tests {
                 workflow_name: "agent/00-feature".to_string(),
                 current_step: "implement".to_string(),
                 request_topic: None,
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_step_completed_event_defaults_missing_summary() {
-        let raw = serde_json::json!({
-            "kind": "step_completed",
-            "step_id": "implement",
-            "action": "agent",
-            "status": "blocked",
-            "body": "Need an API key.",
-        })
-        .to_string();
-
-        let event: WorkflowEventKind = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(
-            event,
-            WorkflowEventKind::StepCompleted {
-                step_id: "implement".to_string(),
-                action: "agent".to_string(),
-                status: Some("blocked".to_string()),
-                summary: None,
-                body: "Need an API key.".to_string(),
             }
         );
     }

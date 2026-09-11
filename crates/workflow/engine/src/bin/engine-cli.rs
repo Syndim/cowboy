@@ -447,21 +447,13 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
             step_id,
             action,
             status,
-            summary,
             body,
-        } => {
-            let summary = summary
-                .as_deref()
-                .filter(|summary| !summary.is_empty())
-                .map(|summary| format!("\nSummary: {summary}"))
-                .unwrap_or_default();
-            format!(
-                "{} completed step {step_id} via {action} status={} {}{summary}",
-                event.run_id,
-                status.as_deref().unwrap_or("<none>"),
-                body
-            )
-        }
+        } => format!(
+            "{} completed step {step_id} via {action} status={} {}",
+            event.run_id,
+            status.as_deref().unwrap_or("<none>"),
+            body
+        ),
         WorkflowEventKind::WaitingForInput {
             step,
             prompt_id,
@@ -563,28 +555,4 @@ fn usage() -> ! {
     eprintln!("     COWBOY_ENGINE_BACKEND (copilot|omp), COWBOY_ENGINE_AGENT,");
     eprintln!("     COWBOY_ENGINE_AGENT_ARGS, COWBOY_ENGINE_MODEL, COWBOY_ENGINE_PROVIDER");
     std::process::exit(2);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn completed_event_renders_labeled_summary() {
-        let event = WorkflowEvent::new(
-            "run-1",
-            WorkflowEventKind::StepCompleted {
-                step_id: "implement".to_string(),
-                action: "agent".to_string(),
-                status: Some("blocked".to_string()),
-                summary: Some("Need approval".to_string()),
-                body: "Waiting for user input".to_string(),
-            },
-        );
-
-        assert_eq!(
-            render_workflow_event(&event),
-            "run-1 completed step implement via agent status=blocked Waiting for user input\nSummary: Need approval"
-        );
-    }
 }
