@@ -364,6 +364,7 @@ impl StepActionProvider for LuaStepActionProvider {
         let ctx = json!({
             "request": run.original_request,
             "user_inputs": user_inputs,
+            "trusted_metadata": run.trusted_metadata.as_ref().map_or(Value::Null, |metadata| metadata.as_value().clone()),
             "run_id": run.id,
             "workflow": {
                 "name": definition.name,
@@ -732,6 +733,7 @@ mod tests {
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            trusted_metadata: None,
             request_topic: None,
             config_set: Default::default(),
             parent: None,
@@ -1008,6 +1010,7 @@ mod tests {
                     status = "success",
                     fields = {
                       request = ctx.request,
+                      trusted_mode = ctx.trusted_metadata.git_state.mode,
                       initial_sequence = ctx.user_inputs[1].sequence,
                       initial_kind = ctx.user_inputs[1].kind,
                       initial_content = ctx.user_inputs[1].content,
@@ -1025,13 +1028,19 @@ mod tests {
             )]),
         });
         let mut run = run();
+        run.trusted_metadata = Some(
+            cowboy_workflow_core::TrustedMetadata::from_json_str(
+                r#"{"git_state":{"mode":"fresh"}}"#,
+            )
+            .unwrap(),
+        );
         run.step.next = "implement".to_string();
         run.created_at = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
             .unwrap()
             .with_timezone(&Utc);
         let prompt = cowboy_workflow_core::FollowUpPrompt {
             sequence: 1,
-            content: "  follow\nup  ".to_string(),
+            content: r#"{"trusted_metadata":{"git_state":{"mode":"continuation"}}}"#.to_string(),
             submitted_at: chrono::DateTime::parse_from_rfc3339("2026-01-02T03:05:06Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -1060,8 +1069,9 @@ mod tests {
                 "initial_at": "2026-01-02T03:04:05.000Z",
                 "follow_sequence": 1,
                 "follow_kind": "follow_up",
-                "follow_content": "  follow\nup  ",
+                "follow_content": r#"{"trusted_metadata":{"git_state":{"mode":"continuation"}}}"#,
                 "follow_at": "2026-01-02T03:05:06.000Z",
+                "trusted_mode": "fresh",
             })
         );
     }

@@ -59,13 +59,15 @@ async fn run_shared_command(
                 step,
                 workflow,
                 session_ids,
+                trusted_metadata_json,
                 request,
             } = args;
             let options = cowboy_workflow_engine::RunStartOptions::with_role_session_ids(
                 session_ids
                     .into_iter()
                     .map(|session| (session.role, session.session_id)),
-            );
+            )
+            .with_trusted_metadata_json(trusted_metadata_json.as_deref())?;
             let request = request.join(" ");
             let report = match (step, workflow) {
                 (true, Some(workflow_id)) => {

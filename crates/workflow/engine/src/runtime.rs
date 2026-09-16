@@ -205,10 +205,11 @@ impl From<RunnerLimitsConfig> for RunnerLimits {
     }
 }
 
-/// Externally supplied backend sessions that a new run should load by role.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Externally supplied sessions and metadata for a new workflow run.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RunStartOptions {
     role_session_ids: Vec<(String, String)>,
+    trusted_metadata: Option<cowboy_workflow_core::TrustedMetadata>,
 }
 
 impl RunStartOptions {
@@ -217,7 +218,25 @@ impl RunStartOptions {
     ) -> Self {
         Self {
             role_session_ids: role_session_ids.into_iter().collect(),
+            trusted_metadata: None,
         }
+    }
+
+    /// Attach already-validated metadata to a child workflow run.
+    pub fn with_trusted_metadata(
+        mut self,
+        trusted_metadata: Option<cowboy_workflow_core::TrustedMetadata>,
+    ) -> Self {
+        self.trusted_metadata = trusted_metadata;
+        self
+    }
+
+    /// Parse, validate, and attach caller-supplied non-secret metadata.
+    pub fn with_trusted_metadata_json(self, raw: Option<&str>) -> Result<Self> {
+        Ok(self.with_trusted_metadata(
+            raw.map(cowboy_workflow_core::TrustedMetadata::from_json_str)
+                .transpose()?,
+        ))
     }
 }
 
@@ -1020,6 +1039,7 @@ impl WorkflowRuntime {
             workflow: source.workflow.clone(),
             original_request: spec.request,
             request_topic: None,
+            trusted_metadata: source.trusted_metadata.clone(),
             config_set: source.config_set.clone(),
             parent: spec.parent,
             restart_source_run_id: Some(source.id.clone()),
@@ -1164,6 +1184,7 @@ impl WorkflowRuntime {
                         sources: snapshot.files.clone(),
                     },
                     original_request: spec.request,
+                    trusted_metadata: spec.start_options.trusted_metadata.clone(),
                     request_topic: None,
                     config_set,
                     parent: spec.parent,
@@ -1311,7 +1332,8 @@ impl WorkflowRuntime {
                     workflow_id: action.workflow,
                     request: action.request,
                     parent: Some(parent),
-                    start_options: RunStartOptions::default(),
+                    start_options: RunStartOptions::default()
+                        .with_trusted_metadata(context.trusted_metadata),
                 },
                 RunMode::UntilBlocked,
                 &catalog,
@@ -2047,6 +2069,7 @@ impl WorkflowRuntime {
             initial_input_kind: run.initial_input_kind(),
             step_visit: run.step.visits.get(&run.step.next).copied().unwrap_or(0),
             original_request: run.original_request.clone(),
+            trusted_metadata: run.trusted_metadata.clone(),
             run_created_at: run.created_at,
             user_prompts: store.load_user_prompts(&run.id).await?,
         };
@@ -4336,6 +4359,7 @@ done
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            trusted_metadata: None,
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
             parent: None,
@@ -8963,6 +8987,7 @@ Recovery implementation review"#
                 ]),
             },
             original_request: "do it".to_string(),
+            trusted_metadata: None,
             request_topic: None,
             config_set: Default::default(),
             parent: None,
@@ -9114,6 +9139,164 @@ return workflow("restartable", start)
             assert!(runtime.restart_run(&invalid.id, "no").await.is_err());
             assert_eq!(runtime.list_runs(None).await.unwrap().len(), before_count);
         }
+    }
+
+    #[tokio::test]
+    async fn trusted_metadata_is_durable_separate_context_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("metadata.lua"),
+            r#"
+local start = step("start")
+start.run = function(ctx)
+  assert(os == nil)
+  local metadata = ctx.trusted_metadata
+  if metadata == nil then
+    return action.status { status = "absent" }
+  end
+  return action.status {
+    status = "success",
+    fields = {
+      request = ctx.request,
+      initial_input = ctx.user_inputs[1].content,
+      mode = metadata.git_state.mode,
+      default_branch = metadata.git_state.default_branch,
+      branch = metadata.git_state.branch,
+      has_user_override = metadata.user_inputs ~= nil,
+    },
+  }
+end
+return workflow("metadata", start)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("legacy.lua"),
+            r#"
+local start = step("start")
+start.run = function(ctx)
+  return action.status { status = "success", body = ctx.request }
+end
+return workflow("legacy", start)
+"#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+        let legacy = runtime
+            .start_run_with_workflow("legacy", "ordinary user request")
+            .await
+            .unwrap();
+        assert_eq!(legacy.run.status, RunStatus::Completed);
+        assert!(legacy.run.trusted_metadata.is_none());
+        let metadata =
+            r#"{"git_state":{"mode":"fresh","default_branch":"main","branch":"feature/safe"}}"#;
+        let options = RunStartOptions::default()
+            .with_trusted_metadata_json(Some(metadata))
+            .unwrap();
+        let request =
+            r#"{"trusted_metadata":{"git_state":{"mode":"continuation","branch":"attacker"}}}"#;
+        let started = runtime
+            .start_run_with_workflow_and_options("metadata", request, options)
+            .await
+            .unwrap();
+        assert_eq!(
+            started.run.trusted_metadata.as_ref().unwrap().as_value(),
+            &serde_json::json!({
+                "git_state": {
+                    "mode": "fresh",
+                    "default_branch": "main",
+                    "branch": "feature/safe"
+                }
+            })
+        );
+        let started_record = command_output_record(&runtime, &started).await;
+        let started_fields = &started_record.output.unwrap().fields;
+        assert_eq!(started_fields["request"], request);
+        assert_eq!(started_fields["initial_input"], request);
+        assert_eq!(started_fields["mode"], "fresh");
+        assert_eq!(started_fields["default_branch"], "main");
+        assert_eq!(started_fields["branch"], "feature/safe");
+        assert_eq!(started_fields["has_user_override"], false);
+
+        let restarted_request = r#"{"git_state":{"mode":"continuation","branch":"attacker-two"}}"#;
+        let restarted = runtime
+            .restart_run(&started.run.id, restarted_request)
+            .await
+            .unwrap();
+        assert_eq!(restarted.run.trusted_metadata, started.run.trusted_metadata);
+        let restarted_record = command_output_record(&runtime, &restarted).await;
+        let restarted_fields = &restarted_record.output.unwrap().fields;
+        assert_eq!(restarted_fields["request"], restarted_request);
+        assert_eq!(restarted_fields["initial_input"], restarted_request);
+        assert_eq!(restarted_fields["mode"], "fresh");
+        assert_eq!(restarted_fields["branch"], "feature/safe");
+        assert_eq!(restarted_fields["has_user_override"], false);
+
+        let oversized = format!(r#"{{"note":"{}"}}"#, "x".repeat(16 * 1024));
+        assert!(
+            RunStartOptions::default()
+                .with_trusted_metadata_json(Some(&oversized))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_metadata_is_inherited_by_child_workflow_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("parent.lua"),
+            r#"
+local start = step("start")
+start.run = function(ctx)
+  return action.workflow { workflow = "child", request = ctx.request }
+end
+return workflow("parent", start)
+"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("child.lua"),
+            r#"
+local start = step("start")
+start.run = function(ctx)
+  return action.status {
+    status = "success",
+    fields = { mode = ctx.trusted_metadata.git_state.mode },
+  }
+end
+return workflow("child", start)
+"#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+        let report = runtime
+            .start_run_with_workflow_and_options(
+                "parent",
+                "untrusted request",
+                RunStartOptions::default()
+                    .with_trusted_metadata_json(Some(r#"{"git_state":{"mode":"fresh"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let child = runtime
+            .load_run(&child_run_id_for(&report.run.id, "start", None))
+            .await
+            .unwrap();
+        assert_eq!(child.trusted_metadata, report.run.trusted_metadata);
+        let child_record = command_output_record(
+            &runtime,
+            &RunReport {
+                run: child,
+                events: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(child_record.output.unwrap().fields["mode"], "fresh");
     }
 
     #[tokio::test]
@@ -10060,6 +10243,7 @@ return workflow("{label}", plan)
                 sources: BTreeMap::new(),
             },
             original_request: request.to_string(),
+            trusted_metadata: None,
             request_topic: None,
             config_set: Default::default(),
             parent,
@@ -10274,6 +10458,7 @@ return workflow("{label}", plan)
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: started.run.original_request.clone(),
+            trusted_metadata: started.run.trusted_metadata.clone(),
             run_created_at: started.run.created_at,
             user_prompts: Vec::new(),
         };

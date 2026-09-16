@@ -51,6 +51,8 @@ pub struct ExecutionContext {
     pub step_visit: u32,
     /// Original request that created the run.
     pub original_request: String,
+    /// Validated non-secret metadata inherited by durable child workflow runs.
+    pub trusted_metadata: Option<crate::TrustedMetadata>,
     /// Timestamp of the initial request.
     pub run_created_at: DateTime<Utc>,
     /// Ordered durable follow-up prompt snapshot used for this dispatch.

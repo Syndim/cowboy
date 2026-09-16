@@ -442,7 +442,7 @@ Current vertical layout:
 Slash commands:
 
 ```text
-/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>
+/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>
 /step <run-id>
 /resume <run-id>
 /answer <run-id> <prompt-id> <answer>

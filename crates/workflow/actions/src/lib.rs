@@ -173,6 +173,7 @@ mod tests {
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: "request".to_string(),
+            trusted_metadata: None,
             run_created_at: Utc::now(),
             user_prompts: Vec::new(),
         }

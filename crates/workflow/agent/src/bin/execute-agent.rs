@@ -84,6 +84,7 @@ fn execution_context(
         initial_input_kind: run.initial_input_kind(),
         step_visit: run.step.visits.get(&config.step_id).copied().unwrap_or(1),
         original_request: run.original_request.clone(),
+        trusted_metadata: run.trusted_metadata.clone(),
         run_created_at: run.created_at,
         user_prompts,
     }
@@ -106,6 +107,7 @@ async fn ensure_standalone_run(
                     sources: Default::default(),
                 },
                 original_request: config.prompt.clone(),
+                trusted_metadata: None,
                 request_topic: None,
                 config_set: Default::default(),
                 parent: None,

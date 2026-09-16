@@ -62,6 +62,23 @@ cowboy run add a /healthz route
 cowboy run --workflow <workflow-id> add a /healthz route
 ```
 
+### Trusted workflow metadata
+
+Trusted service callers can pass bounded, non-secret, server-derived JSON metadata
+to Lua separately from the user request. Put the option before the request because
+the request consumes all remaining arguments:
+
+```bash
+cowboy run --trusted-metadata-json '{"git_state":{"mode":"fresh","default_branch":"main","branch":"feature/safe"}}' add a /healthz route
+```
+
+The value must be a JSON object no larger than 16 KiB, at most eight levels deep,
+and containing at most 256 JSON values. Cowboy persists it with the run and
+preserves it through resume, restart, and nested workflow runs. Workflows read it
+only as `ctx.trusted_metadata`; absent metadata is `nil`. Do not pass secrets or
+ordinary GitHub/user request content through this option. The trusted caller owns
+validation of its metadata schema and values.
+
 Continue existing agent conversations by supplying one or more role-to-session
 pairs. Separate pairs with commas or repeat `--session-id`. Cowboy loads each
 supplied backend session, omits that role's static prompt, and sends the new
@@ -159,7 +176,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 ### TUI commands
 
 ```text
-/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>  start a workflow run
+/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>  start a workflow run
 /step <run-id>                                    execute exactly one more step
 /resume <run-id>                                  continue a run until blocked
 /answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly

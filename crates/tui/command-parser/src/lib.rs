@@ -162,6 +162,14 @@ pub struct RunArgs {
     )]
     pub session_ids: Vec<RoleSessionId>,
 
+    /// Bounded JSON object from a trusted caller, kept separate from user request text.
+    #[arg(
+        long,
+        value_name = "json",
+        value_parser = parse_trusted_metadata_json
+    )]
+    pub trusted_metadata_json: Option<String>,
+
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "request")]
     pub request: Vec<String>,
 }
@@ -170,6 +178,14 @@ impl RunArgs {
     /// Return the trailing request words normalized into the runtime request string.
     pub fn into_request(self) -> String {
         join_trailing_args(self.request)
+    }
+}
+
+fn parse_trusted_metadata_json(raw: &str) -> Result<String, String> {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(_)) => Ok(raw.to_string()),
+        Ok(_) => Err("trusted metadata must be a JSON object".to_string()),
+        Err(_) => Err("trusted metadata must be valid JSON".to_string()),
     }
 }
 
@@ -646,6 +662,45 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_trusted_metadata_separately_from_request() {
+        let metadata = r#"{"git_state":{"mode":"fresh","branch":"safe"}}"#;
+        for command in [
+            shared_cli_command([
+                "cowboy",
+                "run",
+                "--trusted-metadata-json",
+                metadata,
+                "user",
+                "request",
+            ]),
+            shared_slash_command(
+                "/run --trusted-metadata-json '{\"git_state\":{\"mode\":\"fresh\",\"branch\":\"safe\"}}' user request",
+            ),
+        ] {
+            let SharedCommand::Run(args) = command else {
+                panic!("expected run command");
+            };
+            assert_eq!(args.trusted_metadata_json.as_deref(), Some(metadata));
+            assert_eq!(args.into_request(), "user request");
+        }
+    }
+
+    #[test]
+    fn run_rejects_malformed_or_non_object_trusted_metadata() {
+        for metadata in ["{", "[]", "false"] {
+            let error = Cli::try_parse_from([
+                "cowboy",
+                "run",
+                "--trusted-metadata-json",
+                metadata,
+                "request",
+            ])
+            .unwrap_err();
+            assert!(error.to_string().contains("trusted metadata"));
+        }
+    }
+
+    #[test]
     fn run_rejects_malformed_role_session_id() {
         let error =
             Cli::try_parse_from(["cowboy", "run", "--session-id", "developer", "do"]).unwrap_err();
@@ -755,6 +810,7 @@ mod tests {
             step: false,
             workflow: None,
             session_ids: Vec::new(),
+            trusted_metadata_json: None,
             request: vec!["do work".to_string()],
         });
 
@@ -1138,7 +1194,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(
-            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>"
                 .to_string()
         ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
@@ -1170,7 +1226,7 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.name == "/run"
                 && row.usage
-                    == "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+                    == "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>"
                 && row.description == "start a workflow run"
                 && row.takes_arguments
         }));

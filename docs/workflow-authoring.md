@@ -113,6 +113,7 @@ Runtime context passed to `run(ctx)`:
 | --- | --- |
 | `ctx.request` | Original user request for the run. |
 | `ctx.user_inputs` | Ordered initial request plus every durably accepted on-the-fly prompt; see schema below. |
+| `ctx.trusted_metadata` | Bounded non-secret JSON object supplied by a trusted host caller, or `nil`; never derived from `ctx.request` or `ctx.user_inputs`. |
 | `ctx.run_id` | Stable run id. |
 | `ctx.workflow.name` | Current workflow name. |
 | `ctx.workflow.head` | Workflow head step id. |
@@ -160,6 +161,19 @@ Ordinary runs use `"kind": "initial"` for sequence `0`. A terminal TUI restart
 creates a new run whose sequence `0` uses `"kind": "restart"` and whose
 `content` is the exact restart submission, including leading/trailing whitespace
 and newlines. Restart does not expose inputs from the source run.
+
+Trusted callers pass this field with `cowboy run --trusted-metadata-json <json>`
+before the request arguments. The value is a JSON object only, capped at 16 KiB,
+eight nesting levels, and 256 JSON values. Cowboy persists the exact validated
+object with the run and carries it through resume, restart, and nested
+`action.workflow` runs. Workflow code may read it but cannot update it; user
+requests, user inputs, and `action.ask_user` answers cannot create or override it.
+Absent metadata is `nil`, so existing workflows continue unchanged.
+
+The caller must supply only server-derived, non-secret metadata and validate its
+own schema (for example, allowed `git_state.mode` and safe branch names). Cowboy
+does not treat ordinary request content as trusted and does not expose process
+environment, filesystem access, or arbitrary globals to Lua.
 
 Every fresh agent session receives the complete `ctx.user_inputs` history.
 Reused sessions receive only entries whose sequence has not already been

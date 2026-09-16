@@ -37,6 +37,118 @@ impl Default for ConfigSetRef {
         }
     }
 }
+/// Bounded, JSON-object metadata supplied by a caller trusted by the Cowboy host.
+///
+/// This channel is durable and intentionally separate from user-controlled request
+/// and prompt text. Callers must provide non-secret, server-derived values only.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrustedMetadata(Value);
+
+impl TrustedMetadata {
+    /// Largest accepted serialized metadata payload.
+    pub const MAX_BYTES: usize = 16 * 1024;
+    /// Largest accepted JSON nesting depth, including the root object.
+    pub const MAX_DEPTH: usize = 8;
+    /// Largest accepted count of JSON values, including containers.
+    pub const MAX_VALUES: usize = 256;
+
+    /// Parse and validate trusted metadata received from a command boundary.
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        if raw.len() > Self::MAX_BYTES {
+            return Err(WorkflowError::InvalidAction(format!(
+                "trusted metadata must be at most {} bytes",
+                Self::MAX_BYTES
+            )));
+        }
+
+        let value = serde_json::from_str(raw).map_err(|_| {
+            WorkflowError::InvalidAction("trusted metadata must be valid JSON".to_string())
+        })?;
+        Self::new(value)
+    }
+
+    /// Validate metadata received through a structured host API.
+    pub fn new(value: Value) -> Result<Self> {
+        if !value.is_object() {
+            return Err(WorkflowError::InvalidAction(
+                "trusted metadata must be a JSON object".to_string(),
+            ));
+        }
+
+        let encoded = serde_json::to_vec(&value).map_err(|_| {
+            WorkflowError::InvalidAction(
+                "trusted metadata could not be encoded as JSON".to_string(),
+            )
+        })?;
+        if encoded.len() > Self::MAX_BYTES {
+            return Err(WorkflowError::InvalidAction(format!(
+                "trusted metadata must be at most {} bytes",
+                Self::MAX_BYTES
+            )));
+        }
+
+        let mut values = 0;
+        validate_trusted_metadata_value(&value, 1, &mut values)?;
+        Ok(Self(value))
+    }
+
+    /// Return the validated JSON object exposed to Lua.
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl Serialize for TrustedMetadata {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TrustedMetadata {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn validate_trusted_metadata_value(value: &Value, depth: usize, values: &mut usize) -> Result<()> {
+    if depth > TrustedMetadata::MAX_DEPTH {
+        return Err(WorkflowError::InvalidAction(format!(
+            "trusted metadata must not exceed {} levels of nesting",
+            TrustedMetadata::MAX_DEPTH
+        )));
+    }
+
+    *values += 1;
+    if *values > TrustedMetadata::MAX_VALUES {
+        return Err(WorkflowError::InvalidAction(format!(
+            "trusted metadata must contain at most {} JSON values",
+            TrustedMetadata::MAX_VALUES
+        )));
+    }
+
+    match value {
+        Value::Array(values_in_array) => {
+            for value in values_in_array {
+                validate_trusted_metadata_value(value, depth + 1, values)?;
+            }
+        }
+        Value::Object(values_in_object) => {
+            for value in values_in_object.values() {
+                validate_trusted_metadata_value(value, depth + 1, values)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+
+    Ok(())
+}
 
 /// Durable state of a workflow run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -47,6 +159,10 @@ pub struct Run {
     pub workflow: WorkflowSnapshot,
     /// Original user request that started the run.
     pub original_request: String,
+    /// Bounded non-secret metadata from the trusted caller, exposed only as
+    /// `ctx.trusted_metadata` to Lua.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_metadata: Option<TrustedMetadata>,
     /// Short generated topic shown in run listings when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_topic: Option<String>,
@@ -601,6 +717,41 @@ mod tests {
     use crate::RunnerLimits;
 
     #[test]
+    fn trusted_metadata_requires_bounded_json_object() {
+        let metadata = TrustedMetadata::from_json_str(
+            r#"{"git_state":{"mode":"fresh","branch":"feature/safe"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.as_value(),
+            &serde_json::json!({
+                "git_state": { "mode": "fresh", "branch": "feature/safe" }
+            })
+        );
+
+        for raw in ["[\"not\", \"an object\"]", "false", "{"] {
+            let error = TrustedMetadata::from_json_str(raw).unwrap_err();
+            assert!(!error.to_string().contains(raw));
+        }
+
+        let oversized = format!(r#"{{"note":"{}"}}"#, "x".repeat(TrustedMetadata::MAX_BYTES));
+        assert!(
+            TrustedMetadata::from_json_str(&oversized)
+                .unwrap_err()
+                .to_string()
+                .contains("at most")
+        );
+
+        let too_deep = r#"{"a":{"b":{"c":{"d":{"e":{"f":{"g":{"h":1}}}}}}}}"#;
+        assert!(
+            TrustedMetadata::from_json_str(too_deep)
+                .unwrap_err()
+                .to_string()
+                .contains("nesting")
+        );
+    }
+
+    #[test]
     fn resume_callback_rejects_empty_kind() {
         let err = ResumeCallback::new("  ", Value::Null).unwrap_err();
         assert!(matches!(err, WorkflowError::InvalidAction(_)));
@@ -699,6 +850,7 @@ mod tests {
         assert_eq!(run.config_set, ConfigSetRef::default());
         assert_eq!(run.parent, None);
         assert_eq!(run.restart_source_run_id, None);
+        assert_eq!(run.trusted_metadata, None);
         assert_eq!(run.retries_used, 0);
         assert!(run.step.retries_used.is_empty());
     }

@@ -20,6 +20,7 @@ pub(crate) mod tests {
                 sources: Default::default(),
             },
             original_request: "do it".into(),
+            trusted_metadata: None,
             request_topic: Some("topic".into()),
             config_set: ConfigSetRef {
                 name: "careful".into(),

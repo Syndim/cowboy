@@ -139,6 +139,7 @@ where
         initial_input_kind: run.initial_input_kind(),
         step_visit: run.step.visits.get(&step.id).copied().unwrap_or(0),
         original_request: run.original_request.clone(),
+        trusted_metadata: run.trusted_metadata.clone(),
         run_created_at: run.created_at,
         user_prompts,
     };
@@ -705,6 +706,7 @@ mod tests {
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            trusted_metadata: None,
             request_topic: None,
             status: RunStatus::Running,
             step: StepState {

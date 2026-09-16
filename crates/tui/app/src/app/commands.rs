@@ -187,7 +187,7 @@ async fn dispatch_shared_command(
     command: SharedCommand,
 ) -> Result<()> {
     match command {
-        SharedCommand::Run(args) => spawn_start_run_from_args(state, runtime, args),
+        SharedCommand::Run(args) => spawn_start_run_from_args(state, runtime, args)?,
         SharedCommand::Step(args) => spawn_step_run(state, runtime, args.run_id),
         SharedCommand::Resume(args) => spawn_resume_run(state, runtime, args.run_id),
         SharedCommand::Answer(args) => {
@@ -232,15 +232,18 @@ fn spawn_start_run_from_args(
     state: &mut AppState,
     runtime: &WorkflowRuntime,
     args: cowboy_command_parser::RunArgs,
-) {
+) -> Result<()> {
     let cowboy_command_parser::RunArgs {
         step,
         workflow,
         session_ids,
+        trusted_metadata_json,
         request,
     } = args;
+    let has_sessions = !session_ids.is_empty();
+    let has_trusted_metadata = trusted_metadata_json.is_some();
     let request = request.join(" ");
-    if session_ids.is_empty() {
+    if !has_sessions && !has_trusted_metadata {
         match (step, workflow) {
             (true, Some(workflow_id)) => {
                 spawn_start_run_with_workflow_stepwise(state, runtime, workflow_id, request);
@@ -252,15 +255,23 @@ fn spawn_start_run_from_args(
             (false, None) => spawn_start_run(state, runtime, request),
         }
 
-        return;
+        return Ok(());
     }
 
     let options = cowboy_workflow_engine::RunStartOptions::with_role_session_ids(
         session_ids
             .into_iter()
             .map(|session| (session.role, session.session_id)),
-    );
-    spawn_start_run_with_options(state, runtime, step, workflow, request, options);
+    )
+    .with_trusted_metadata_json(trusted_metadata_json.as_deref())?;
+    let label = match (has_sessions, has_trusted_metadata) {
+        (true, true) => "submitted run with supplied sessions and trusted metadata",
+        (true, false) => "submitted run with supplied sessions",
+        (false, true) => "submitted run with trusted metadata",
+        (false, false) => unreachable!("unoptioned runs return above"),
+    };
+    spawn_start_run_with_options(state, runtime, step, workflow, request, options, label);
+    Ok(())
 }
 
 fn spawn_start_run_with_options(
@@ -270,14 +281,15 @@ fn spawn_start_run_with_options(
     workflow: Option<String>,
     request: String,
     options: cowboy_workflow_engine::RunStartOptions,
+    title: &str,
 ) {
     let runtime = runtime.clone();
-    let label = format!("submitted run with supplied sessions: {request}");
+    let label = format!("{title}: {request}");
     let body = request.clone();
     state.spawn_card_report_task(
         "Run",
         [current_wall_clock_prefix()],
-        ["submitted run with supplied sessions".to_string()],
+        [title.to_string()],
         label,
         [body],
         async move {
@@ -763,6 +775,7 @@ mod tests {
                 sources: Default::default(),
             },
             original_request: format!("request for {id}"),
+            trusted_metadata: None,
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
             parent: None,
@@ -2168,7 +2181,7 @@ return workflow("restartable", start)
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(
-            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>"
                 .to_string()
         ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
@@ -2255,7 +2268,7 @@ return workflow("restartable", start)
         for (input, usage) in [
             (
                 "/run",
-                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>",
             ),
             ("/step", "/step <run-id>"),
             ("/resume", "/resume <run-id>"),
@@ -2271,7 +2284,7 @@ return workflow("restartable", start)
             ),
             (
                 "/run --workflow review",
-                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--trusted-metadata-json <json>] <request>",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state().await;

@@ -88,6 +88,53 @@ mod tests {
     }
 
     #[test]
+    fn trusted_metadata_is_structured_context_not_a_global() {
+        let source = snapshot(
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              assert(os == nil)
+              if ctx.trusted_metadata == nil then
+                return action.status { status = "absent" }
+              end
+              return action.status {
+                status = "present",
+                fields = {
+                  mode = ctx.trusted_metadata.git_state.mode,
+                  branch = ctx.trusted_metadata.git_state.branch,
+                  has_request = ctx.trusted_metadata.request ~= nil,
+                },
+              }
+            end
+            return workflow("wf", start)
+            "#,
+        );
+        let present = run_step(
+            &source,
+            "start",
+            serde_json::json!({
+                "trusted_metadata": {
+                    "git_state": { "mode": "fresh", "branch": "safe" }
+                }
+            }),
+        )
+        .unwrap();
+        let StepAction::Status(present) = present.action else {
+            panic!("expected status action");
+        };
+        assert_eq!(present.status, "present");
+        assert_eq!(present.fields["mode"], "fresh");
+        assert_eq!(present.fields["branch"], "safe");
+        assert_eq!(present.fields["has_request"], false);
+
+        let absent = run_step(&source, "start", serde_json::json!({})).unwrap();
+        let StepAction::Status(absent) = absent.action else {
+            panic!("expected status action");
+        };
+        assert_eq!(absent.status, "absent");
+    }
+
+    #[test]
     fn converts_structured_agent_task_contract() {
         let source = snapshot(
             r#"
