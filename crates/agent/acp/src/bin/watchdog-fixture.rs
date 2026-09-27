@@ -156,7 +156,7 @@ struct EnvironmentServe {
 #[derive(Debug)]
 struct RequestState {
     session_id: Option<String>,
-    pending_prompt: Option<u64>,
+    pending_request_id: Option<u64>,
     environment: Option<EnvironmentServe>,
     environment_prompt_count: u64,
 }
@@ -164,7 +164,7 @@ struct RequestState {
 struct EnvironmentPrompt<'a> {
     text: &'a str,
     session_id: &'a str,
-    id: Option<u64>,
+    request_id: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -499,7 +499,7 @@ fn serve_inner(
     let mut output = BufWriter::new(stdout.lock());
     let mut request_state = RequestState {
         session_id: resume_session_id,
-        pending_prompt: None,
+        pending_request_id: None,
         environment,
         environment_prompt_count: 0,
     };
@@ -551,19 +551,19 @@ fn handle_request(
     request: &Value,
     mode: Mode,
     session_id: &mut Option<String>,
-    pending_prompt: &mut Option<u64>,
+    pending_request_id: &mut Option<u64>,
     output: &mut impl Write,
     events: &mut EventWriter,
 ) -> anyhow::Result<()> {
     let mut state = RequestState {
         session_id: session_id.clone(),
-        pending_prompt: *pending_prompt,
+        pending_request_id: *pending_request_id,
         environment: None,
         environment_prompt_count: 0,
     };
     handle_request_with_environment(request, mode, &mut state, output, events)?;
     *session_id = state.session_id;
-    *pending_prompt = state.pending_prompt;
+    *pending_request_id = state.pending_request_id;
     Ok(())
 }
 
@@ -642,7 +642,7 @@ fn handle_request_with_environment(
                     EnvironmentPrompt {
                         text,
                         session_id: &current,
-                        id,
+                        request_id: id,
                     },
                     &environment,
                     state,
@@ -715,7 +715,7 @@ fn handle_request_with_environment(
                         json!({ "session_id": current, "tool_call_id": "watchdog-tool-1" }),
                     )?;
                 }
-                state.pending_prompt = id;
+                state.pending_request_id = id;
             }
         }
         "session/cancel" => {
@@ -733,10 +733,10 @@ fn handle_request_with_environment(
                 }),
             )?;
             if mode == Mode::AcknowledgeCancel {
-                if let Some(prompt_id) = state.pending_prompt.take() {
+                if let Some(request_id) = state.pending_request_id.take() {
                     respond(
                         output,
-                        Some(prompt_id),
+                        Some(request_id),
                         json!({ "stopReason": "cancelled" }),
                     )?;
                 }
@@ -745,7 +745,7 @@ fn handle_request_with_environment(
                 // The real backend acknowledges a cancel by ending the turn
                 // normally with a trailing notice instead of reporting
                 // `cancelled`.
-                if let Some(prompt_id) = state.pending_prompt.take() {
+                if let Some(request_id) = state.pending_request_id.take() {
                     notify(
                         output,
                         "session/update",
@@ -754,7 +754,11 @@ fn handle_request_with_environment(
                             "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": "Info: Operation cancelled by user" } }
                         }),
                     )?;
-                    respond(output, Some(prompt_id), json!({ "stopReason": "end_turn" }))?;
+                    respond(
+                        output,
+                        Some(request_id),
+                        json!({ "stopReason": "end_turn" }),
+                    )?;
                 }
                 events.record("cancel_acknowledged", json!({ "session_id": current }))?;
             }
@@ -788,7 +792,11 @@ fn handle_environment_prompt(
                 "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": RECOVERY_TEXT } }
             }),
         )?;
-        respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+        respond(
+            output,
+            prompt.request_id,
+            json!({ "stopReason": "end_turn" }),
+        )?;
         events.record(
             "environment_continue_completed",
             json!({
@@ -811,7 +819,11 @@ fn handle_environment_prompt(
                 "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": "retry without required frontmatter" } }
             }),
         )?;
-        respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+        respond(
+            output,
+            prompt.request_id,
+            json!({ "stopReason": "end_turn" }),
+        )?;
         events.record(
             "environment_retry_requested",
             json!({
@@ -823,7 +835,7 @@ fn handle_environment_prompt(
         return Ok(());
     }
     if environment.agent == "planner" && prompt.text.contains("planner watchdog") {
-        state.pending_prompt = prompt.id;
+        state.pending_request_id = prompt.request_id;
         events.record(
             "environment_watchdog_stalled",
             json!({
@@ -846,7 +858,11 @@ fn handle_environment_prompt(
             "update": { "sessionUpdate": "agent_message_chunk", "content": { "text": body } }
         }),
     )?;
-    respond(output, prompt.id, json!({ "stopReason": "end_turn" }))?;
+    respond(
+        output,
+        prompt.request_id,
+        json!({ "stopReason": "end_turn" }),
+    )?;
     events.record(
         "environment_prompt_completed",
         json!({
@@ -903,11 +919,11 @@ fn environment_state_line(
         .join(" ")
 }
 
-fn respond(output: &mut impl Write, id: Option<u64>, result: Value) -> anyhow::Result<()> {
-    let id = id.ok_or_else(|| anyhow!("fixture request requires a numeric id"))?;
+fn respond(output: &mut impl Write, request_id: Option<u64>, result: Value) -> anyhow::Result<()> {
+    let request_id = request_id.ok_or_else(|| anyhow!("fixture request requires a numeric id"))?;
     write_json_line(
         output,
-        &json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+        &json!({ "jsonrpc": "2.0", "id": request_id, "result": result }),
     )
 }
 
@@ -989,8 +1005,8 @@ fn verify_environment(args: VerifyArgs) -> anyhow::Result<()> {
         run_cowboy(
             &args.cowboy,
             &args.workspace,
-            ["answer", &run_id, "continue", "continue"],
-            "cowboy-answer",
+            ["provide-input", &run_id, "continue", "continue"],
+            "cowboy-provide-input",
             &SYNTHETIC_ENVIRONMENT_VALUES,
             args.hard_deadline_seconds,
         )?;
@@ -1180,7 +1196,7 @@ fn write_allowed_environment_files(args: &VerifyArgs) -> anyhow::Result<()> {
     fs::write(
         workspace.join("workflows/allowed_env.lua"),
         format!(
-            "local planner = role(\"planner\", {{ agent = \"planner\", instructions = \"Return the requested result.\" }})\nlocal implementer = role(\"implementer\", {{ agent = \"implementer\", instructions = \"Return the requested result.\" }})\nlocal command = step(\"command\", {{ run = function(ctx) return action.command {{ program = {probe}, args = {{ \"probe-environment\", \"--output\", {matrix} }} }} end }})\nlocal retry = step(\"retry\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner retry\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal ask = step(\"ask\", {{ run = function(ctx) return action.ask_user {{ id = \"continue\", message = \"Continue?\", choices = {{ continue = \"Continue\" }} }} end }})\nlocal resumed = step(\"resumed\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner resumed\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal watchdog = step(\"watchdog\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner watchdog\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal implement = step(\"implement\", {{ role = implementer, run = function(ctx) return action.agent {{ role = implementer, prompt = \"implement\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal done = step(\"done\", {{ run = function(ctx) return action.status {{ status = \"success\", fields = ctx.prev.fields, body = ctx.prev.body }} end }})\ncommand:on(\"success\", retry)\nretry:on(\"success\", ask)\nask:on(\"answered\", resumed)\nresumed:on(\"success\", watchdog)\nwatchdog:on(\"success\", implement)\nimplement:on(\"success\", done)\nreturn workflow(\"allowed_env\", command)\n"
+            "local planner = role(\"planner\", {{ agent = \"planner\", instructions = \"Return the requested result.\" }})\nlocal implementer = role(\"implementer\", {{ agent = \"implementer\", instructions = \"Return the requested result.\" }})\nlocal command = step(\"command\", {{ run = function(ctx) return action.command {{ program = {probe}, args = {{ \"probe-environment\", \"--output\", {matrix} }} }} end }})\nlocal retry = step(\"retry\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner retry\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal ask = step(\"ask\", {{ run = function(ctx) return action.wait_for_input {{ id = \"continue\", message = \"Continue?\", choices = {{ continue = \"Continue\" }} }} end }})\nlocal resumed = step(\"resumed\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner resumed\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal watchdog = step(\"watchdog\", {{ role = planner, run = function(ctx) return action.agent {{ role = planner, prompt = \"planner watchdog\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal implement = step(\"implement\", {{ role = implementer, run = function(ctx) return action.agent {{ role = implementer, prompt = \"implement\", output = {{ status = {{ \"success\" }}, fields = {{ summary = \"string\" }}, required_fields = {{ \"summary\" }} }} }} end }})\nlocal done = step(\"done\", {{ run = function(ctx) return action.status {{ status = \"success\", fields = ctx.prev.fields, body = ctx.prev.body }} end }})\ncommand:on(\"success\", retry)\nretry:on(\"success\", ask)\nask:on(\"provided\", resumed)\nresumed:on(\"success\", watchdog)\nwatchdog:on(\"success\", implement)\nimplement:on(\"success\", done)\nreturn workflow(\"allowed_env\", command)\n"
         ),
     )?;
     Ok(())
@@ -1449,8 +1465,8 @@ fn assert_environment_artifacts_clean(workspace: &Path) -> anyhow::Result<()> {
             vec![
                 workspace.join("cowboy-run.stdout"),
                 workspace.join("cowboy-run.stderr"),
-                workspace.join("cowboy-answer.stdout"),
-                workspace.join("cowboy-answer.stderr"),
+                workspace.join("cowboy-provide-input.stdout"),
+                workspace.join("cowboy-provide-input.stderr"),
             ],
         ),
         ("export", vec![workspace.join("export.html")]),
@@ -2103,13 +2119,13 @@ mod tests {
         let mut events = EventWriter::new(&directory.path().join("events.jsonl")).unwrap();
         let mut output = Vec::new();
         let mut session_id = None;
-        let mut pending_prompt = None;
+        let mut pending_request_id = None;
 
         handle_request(
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             Mode::AcknowledgeCancel,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2118,7 +2134,7 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
             Mode::AcknowledgeCancel,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2133,7 +2149,7 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":current,"prompt":[{"text":"watchdog smoke"}]}}),
             Mode::AcknowledgeCancel,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2142,7 +2158,7 @@ mod tests {
             &json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":current}}),
             Mode::AcknowledgeCancel,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2160,18 +2176,18 @@ mod tests {
     }
 
     #[test]
-    fn watchdog_fixture_end_turn_cancel_mode_answers_prompt_with_end_turn() {
+    fn watchdog_fixture_end_turn_cancel_mode_inputs_prompt_with_end_turn() {
         let directory = tempfile::tempdir().unwrap();
         let mut events = EventWriter::new(&directory.path().join("events.jsonl")).unwrap();
         let mut output = Vec::new();
         let mut session_id = None;
-        let mut pending_prompt = None;
+        let mut pending_request_id = None;
 
         handle_request(
             &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
             Mode::CancelEndsTurn,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2180,7 +2196,7 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
             Mode::CancelEndsTurn,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2195,17 +2211,17 @@ mod tests {
             &json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":current,"prompt":[{"text":"watchdog smoke"}]}}),
             Mode::CancelEndsTurn,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
         .unwrap();
-        assert_eq!(pending_prompt, Some(3));
+        assert_eq!(pending_request_id, Some(3));
         handle_request(
             &json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":current}}),
             Mode::CancelEndsTurn,
             &mut session_id,
-            &mut pending_prompt,
+            &mut pending_request_id,
             &mut output,
             &mut events,
         )
@@ -2240,12 +2256,12 @@ mod tests {
             updates[2]["params"]["update"]["content"]["text"],
             "Info: Operation cancelled by user"
         );
-        let answer = messages
+        let response = messages
             .iter()
             .find(|message| message["id"] == 3 && message.get("result").is_some())
-            .expect("the pending prompt must be answered");
-        assert_eq!(answer["result"]["stopReason"], "end_turn");
-        assert_eq!(pending_prompt, None);
+            .expect("the pending prompt must receive a response");
+        assert_eq!(response["result"]["stopReason"], "end_turn");
+        assert_eq!(pending_request_id, None);
     }
 
     #[test]

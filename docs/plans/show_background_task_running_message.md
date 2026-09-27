@@ -12,7 +12,7 @@ Implement the feature in the TUI layer only. Keep workflow runtime, command pars
   - Prefer one shared helper for started-task presentation so future background task kinds cannot skip the main-section indicator accidentally.
 - In `crates/tui/app/src/app/state.rs`, update `app_card_status_and_tone` or the nearby card-rendering path to generalize the running tone/icon rule for submitted background-task cards.
   - Today only `Resolve` with `submitted resolve` gets the running icon/tone special case.
-  - Extend that contract to the workflow-execution submission cards that represent pending background work: `Run`, `Step`, `Resume`, `Answer`, and `Resolve` when their title suffix indicates a submitted background operation.
+  - Extend that contract to the workflow-execution submission cards that represent pending background work: `Run`, `Step`, `Resume`, `ProvideInput`, and `Resolve` when their title suffix indicates a submitted background operation.
   - Do not change completed result cards or `/runs` result-summary cards that do not represent a pending task.
 - In `crates/tui/app/src/app/commands.rs`, keep existing spawn semantics and labels, but pass or create presentation text that is safe for transcript rendering.
   - Plain-text run requests may be shown as user-provided command content as they are today, but do not add secrets, absolute private paths, or environment values to new diagnostic copy.
@@ -20,7 +20,7 @@ Implement the feature in the TUI layer only. Keep workflow runtime, command pars
 - Preserve active-run composer behavior from the recent draft-while-running work.
   - The composer should remain editable while workflow execution is active.
   - Plain `Enter` should still be blocked when no prompt is pending.
-  - Prompt-answer submission should still clear the prompt and show that the answer task is running.
+  - Prompt-input submission should still clear the prompt and show that the input task is running.
 - Keep the status strip unchanged unless required for consistency.
   - Existing status tests assert that ambiguous background task counts are omitted; the new feature should satisfy the request through the main transcript section instead.
 
@@ -34,12 +34,12 @@ Implement the feature in the TUI layer only. Keep workflow runtime, command pars
   - spawning the task immediately appends a main-section transcript card;
   - the card text clearly says the runs list is loading/running;
   - when the future completes, the final `Runs`/`Run` result cards still render as they do today.
-- Update card-rendering tests in `crates/tui/app/src/app/state.rs` or adjacent card tests so `Run`, `Step`, `Resume`, `Answer`, and `Resolve` submitted background cards all use the running status icon/tone, while ordinary run-summary cards remain neutral.
+- Update card-rendering tests in `crates/tui/app/src/app/state.rs` or adjacent card tests so `Run`, `Step`, `Resume`, `ProvideInput`, and `Resolve` submitted background cards all use the running status icon/tone, while ordinary run-summary cards remain neutral.
 - Add or update render-level coverage in `crates/tui/app/src/app/tests.rs`:
   - an active workflow background task renders a visible running/submitted-running message in the transcript/main section;
   - a pending `/runs` background task renders a visible loading/running message in the transcript/main section;
   - the composer and status strip still render without the old ambiguous task-count marker.
-- Keep existing composer/status tests passing, especially tests that cover editable active-run drafts, prompt-answer submit behavior, and omission of background-task counts from the status line.
+- Keep existing composer/status tests passing, especially tests that cover editable active-run drafts, prompt-input submit behavior, and omission of background-task counts from the status line.
 
 # How to verify
 
@@ -98,9 +98,9 @@ Implement the feature in the TUI layer only. Keep workflow runtime, command pars
   - Observed result: added `runs_list_background_task_records_loading_card`; `cargo test -p cowboy app::state::tests::runs_list_background_task_records_loading_card` passed and verified a synchronous `● Runs · loading runs` card with `Loading runs` body while one background task is pending, followed by the existing final `/runs` result card.
 
 - [x] TODO-04: Generalize running tone/icon rendering for submitted task cards.
-  - Procedure: add or update card-rendering assertions for `Run`, `Step`, `Resume`, `Answer`, and `Resolve` cards with submitted-task title suffixes, then run `cargo test -p cowboy app::state::tests` or the narrower card test filter if the assertions live elsewhere.
+  - Procedure: add or update card-rendering assertions for `Run`, `Step`, `Resume`, `ProvideInput`, and `Resolve` cards with submitted-task title suffixes, then run `cargo test -p cowboy app::state::tests` or the narrower card test filter if the assertions live elsewhere.
   - Expected result: submitted background-operation cards render with the running status icon/tone, while ordinary run-summary/result cards without submitted-task suffixes keep their existing non-running rendering.
-  - Observed result: added `submitted_background_task_cards_use_running_status`; `cargo test -p cowboy app::state::tests::submitted_background_task_cards_use_running_status` passed and verified submitted `Run`, `Step`, `Resume`, `Answer`, and `Resolve` cards use `●`, while ordinary `Run` and `Resolve` cards keep their previous non-running icons.
+  - Observed result: added `submitted_background_task_cards_use_running_status`; `cargo test -p cowboy app::state::tests::submitted_background_task_cards_use_running_status` passed and verified submitted `Run`, `Step`, `Resume`, `ProvideInput`, and `Resolve` cards use `●`, while ordinary `Run` and `Resolve` cards keep their previous non-running icons.
 
 - [x] TODO-05: Add render-level coverage for transcript running messages.
   - Procedure: add or update render tests such as `draw_active_background_task_shows_running_message_in_transcript` and `draw_runs_list_background_task_shows_loading_message_in_transcript`, then run `cargo test -p cowboy app::tests`.
@@ -111,7 +111,7 @@ Implement the feature in the TUI layer only. Keep workflow runtime, command pars
   - Procedure:
     1. Run `cargo test -p cowboy app::controls::composer::tests`.
     2. Run `cargo test -p cowboy app::controls::status::tests`.
-  - Expected result: both commands pass, confirming the new main-section indication did not regress active-run draft editing, prompt-answer affordances, or compact status metadata.
+  - Expected result: both commands pass, confirming the new main-section indication did not regress active-run draft editing, prompt-input affordances, or compact status metadata.
   - Observed result: `cargo test -p cowboy app::controls::composer::tests` and `cargo test -p cowboy app::controls::status::tests` passed; after the final warning fix, the same focused composer/status checks were rerun together and passed again.
 
 - [x] TODO-07: Run focused TUI verification and manual smoke check.

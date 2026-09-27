@@ -745,7 +745,7 @@ mod tests {
             Some(296_000),
             WorkflowEventKind::WaitingForInput {
                 step: "review".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {
@@ -1025,7 +1025,7 @@ mod tests {
     fn renders_waiting_and_completed_cards_with_sections() {
         let waiting = render_workflow_event(&event(WorkflowEventKind::WaitingForInput {
             step: "confirm_plan".to_string(),
-            prompt_id: "plan_confirmation_9".to_string(),
+            input_id: "plan_confirmation_9".to_string(),
             message: "Review `plan`\n- first item\n- second item".to_string(),
             choices: vec![
                 Choice {
@@ -1138,7 +1138,7 @@ mod tests {
         }));
         let waiting = render_workflow_event(&event(WorkflowEventKind::WaitingForInput {
             step: "plan".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: Vec::new(),
         }));
@@ -1326,7 +1326,7 @@ mod tests {
         assert_markdown_card_surface(
             WorkflowEventKind::WaitingForInput {
                 step: "confirm".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: MARKDOWN_CARD_FIXTURE.to_string(),
                 choices: Vec::new(),
             },

@@ -1,17 +1,17 @@
 # Plan
 
-Complete the TUI transcript card migration in `crates/tui/app` without changing command parsing, workflow execution, persisted events, CLI output, or composer/status-strip behavior. The remaining unframed transcript output is concentrated in `TranscriptEntry::Plain`: immediate labels from `AppState::spawn_report_task` and background-task error/cancellation results. Production command callers are the stepwise and workflow-specific `/run` variants plus `/step`, `/resume`, `/answer`, and the status-bearing `/resolve` path.
+Complete the TUI transcript card migration in `crates/tui/app` without changing command parsing, workflow execution, persisted events, CLI output, or composer/status-strip behavior. The remaining unframed transcript output is concentrated in `TranscriptEntry::Plain`: immediate labels from `AppState::spawn_report_task` and background-task error/cancellation results. Production command callers are the stepwise and workflow-specific `/run` variants plus `/step`, `/resume`, `/provide-input`, and the status-bearing `/resolve` path.
 
 Make cards the only non-workflow transcript representation. Preserve each existing full submission string in `AppState::status()` because the status strip and command behavior tests rely on it, but split transcript presentation into a concise card title/context and a body containing only the user-facing request or run/prompt/status identifiers. For example, `/run --workflow test-failure-fix Fix recent test failures` should produce a `Run` card whose title retains the submitted workflow context and whose framed body contains `Fix recent test failures`, rather than a bare `submitted run --workflow test-failure-fix: Fix recent test failures` line.
 
-Use the existing `Card`, `TranscriptEntry::Card`, `push_card`, and card-report-task path. Do not add another renderer or duplicate status glyph logic. Keep submitted answer text out of the immediate transcript card, matching the current behavior that displays only the run and prompt identifiers.
+Use the existing `Card`, `TranscriptEntry::Card`, `push_card`, and card-report-task path. Do not add another renderer or duplicate status glyph logic. Keep submitted input value out of the immediate transcript card, matching the current behavior that displays only the run and input identifiers.
 
 # Changes
 
 - Update `crates/tui/app/src/app/commands.rs` so every background command submission uses the card-report-task path:
   - render `/run --step`, `/run --workflow <workflow-id>`, and `/run --step --workflow <workflow-id>` as `Run` cards consistent with the existing plain/default `/run` card;
   - keep the fixed initial `00:00:00` title prefix, identify the selected flags/workflow in the title context, and place only the request text in the framed body;
-  - render `/step`, `/resume`, `/answer`, and status-bearing `/resolve` submissions as concise action cards with their run, prompt, and status identifiers in the card context/body instead of as bare labels;
+  - render `/step`, `/resume`, `/provide-input`, and status-bearing `/resolve` submissions as concise action cards with their run, prompt, and status identifiers in the card context/body instead of as bare labels;
   - preserve the exact existing `submitted ...` status strings, pending-prompt clearing, runtime method calls, arguments, task spawning, and background-task count semantics.
 - Update `crates/tui/app/src/app/state.rs` so background task completion feedback also uses cards:
   - map runtime-returned errors and failed task joins to `Error` cards;
@@ -24,7 +24,7 @@ Use the existing `Card`, `TranscriptEntry::Card`, `push_card`, and card-report-t
 
 # Tests to be added/updated
 
-- Expand command tests in `crates/tui/app/src/app/commands.rs` to cover every immediate submission path: plain/default `/run`, `/run --step`, `/run --workflow`, `/run --step --workflow`, `/step`, `/resume`, `/answer` (explicit and pending-prompt fallback), and status-bearing `/resolve`.
+- Expand command tests in `crates/tui/app/src/app/commands.rs` to cover every immediate submission path: plain/default `/run`, `/run --step`, `/run --workflow`, `/run --step --workflow`, `/step`, `/resume`, `/provide-input` (explicit and pending-prompt fallback), and status-bearing `/resolve`.
 - For each path, assert observable card output: a card title, rounded framed body rows, no bare leading `submitted ...` line, and retention of the relevant request/workflow/run/prompt/status information. Also assert the exact pre-existing `AppState::status()` value and one spawned background task.
 - Keep `plain_request_submission_renders_initial_input_as_card` as the baseline contract for the default run path, including its exact `00:00:00 · ◌ Run · submitted run` title and prefix-free request body.
 - Update state tests in `crates/tui/app/src/app/state.rs` to assert that a runtime error, cancelled join, and failed join render `Error`/`Cancelled` cards while preserving status and run-state behavior.
@@ -45,12 +45,12 @@ Use the existing `Card`, `TranscriptEntry::Card`, `push_card`, and card-report-t
 5. Check formatting and Rust warnings:
    `cargo fmt --check`
    `cargo clippy -p cowboy --all-targets -- -D warnings`
-6. Manually launch `cargo run -p cowboy` and submit representative commands for all migrated categories. Confirm each immediate transcript entry has a card title and rounded border, the workflow-specific run card shows the selected workflow and request without a bare `submitted run --workflow ...:` line, answer cards do not echo answer text, and runtime failures appear as `Error` cards.
+6. Manually launch `cargo run -p cowboy` and submit representative commands for all migrated categories. Confirm each immediate transcript entry has a card title and rounded border, the workflow-specific run card shows the selected workflow and request without a bare `submitted run --workflow ...:` line, answer cards do not echo input value, and runtime failures appear as `Error` cards.
 
 # TODO
 
 - [x] Migrate all stepwise and workflow-specific run submission paths to the existing card-report-task API.
-- [x] Migrate `/step`, `/resume`, explicit and fallback `/answer`, and status-bearing `/resolve` submissions to action cards.
+- [x] Migrate `/step`, `/resume`, explicit and fallback `/provide-input`, and status-bearing `/resolve` submissions to action cards.
 - [x] Preserve every existing submission status string, runtime call, argument, pending-prompt transition, and background-task state transition.
 - [x] Convert runtime errors, cancelled joins, and failed joins from plain transcript lines to `Error` or `Cancelled` cards.
 - [x] Remove `TranscriptEntry::Plain`, its renderer branches, `render_plain_lines`, and the plain-producing report-task API after all producers are migrated.
@@ -68,7 +68,7 @@ Executed `cargo run -p cowboy` on 2026-07-15 in a 120×40 pseudo-terminal with i
 - `/run --workflow test-failure-fix Fix recent test failures` rendered the workflow id in the `Run` title and the request in the rounded body, with no bare `submitted run --workflow ...:` body line.
 - `/step run-smoke` and `/resume run-smoke` rendered rounded action cards containing the run id.
 - `/resolve run-smoke accepted` rendered `● Resolve · submitted resolve`, not the completed glyph, with the run id and status in the rounded body.
-- `/answer run-redaction prompt-redaction answer-must-not-render` rendered the run and prompt ids after submission; `answer-must-not-render` was absent from post-submit output.
+- `/provide-input run-redaction prompt-redaction input-value-must-not-render` rendered the run and input ids after submission; `input-value-must-not-render` was absent from post-submit output.
 - Invalid workflow and run operations rendered rounded `Error` cards.
 
 All representative interactive scenarios passed, and the TUI exited normally.

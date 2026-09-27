@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use cowboy_workflow_core::{
-    AgentAction, AgentTaskContract, AskUserAction, Choice, CommandAction, FailAction, Field,
-    FieldType, Fields, OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition,
-    StepTransitions, WorkflowAction, WorkflowDefinition, default_command_status_map,
+    AgentAction, AgentTaskContract, Choice, CommandAction, FailAction, Field, FieldType, Fields,
+    OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions,
+    WaitForInputAction, WorkflowAction, WorkflowDefinition, default_command_status_map,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -146,11 +146,11 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             fields: action_fields(table.get::<Value>("fields")?, &action)?,
             body: optional_string(&table, "body")?.unwrap_or_default(),
         })),
-        "ask_user" => Ok(StepAction::AskUser(AskUserAction {
+        "wait_for_input" => Ok(StepAction::WaitForInput(WaitForInputAction {
             id: required_string(&table, &action, "id")?,
             message: required_string(&table, &action, "message")?,
             choices: choices_field(table.get::<Value>("choices")?)?,
-            status: optional_string(&table, "status")?.unwrap_or_else(|| "answered".to_string()),
+            status: optional_string(&table, "status")?.unwrap_or_else(|| "provided".to_string()),
             fields: action_fields(table.get::<Value>("fields")?, &action)?,
         })),
         "workflow" => Ok(StepAction::Workflow(WorkflowAction {
@@ -196,7 +196,7 @@ fn agent_task_contract(value: Value, default_turn: &str) -> Result<Option<AgentT
     }
 }
 
-/// Parse a `fields` table into a name/value map, e.g. for `status`/`ask_user`
+/// Parse a `fields` table into a name/value map, e.g. for `status`/`wait_for_input`
 /// actions. An absent or empty table yields an empty map; a non-empty
 /// non-object table (e.g. a plain array) is rejected.
 fn action_fields(value: Value, action: &str) -> Result<Fields> {
@@ -385,9 +385,9 @@ fn optional_string(table: &Table, field: &str) -> Result<Option<String>> {
     }
 }
 
-/// Parse the `ask_user` `choices` table into `Choice`s keyed by answer key.
+/// Parse the `wait_for_input` `choices` table into `Choice`s keyed by input key.
 ///
-/// Accepts a table mapping each accepted answer key to a human-readable
+/// Accepts a table mapping each accepted input key to a human-readable
 /// description string, e.g. `{ yes = "Approve the release", no = "Reject
 /// the release" }`. Choices are returned sorted by key for deterministic
 /// ordering. An absent table yields an empty (free-form) choice list.
@@ -397,7 +397,7 @@ fn choices_field(value: Value) -> Result<Vec<Choice>> {
         Value::Table(table) => table,
         _ => {
             return Err(Error::InvalidActionField {
-                action: "ask_user".to_string(),
+                action: "wait_for_input".to_string(),
                 field: "choices".to_string(),
                 reason: "must be a table of choice key/description pairs".to_string(),
             });
@@ -409,14 +409,14 @@ fn choices_field(value: Value) -> Result<Vec<Choice>> {
         let (key, description) = pair?;
         let Value::String(key) = key else {
             return Err(Error::InvalidActionField {
-                action: "ask_user".to_string(),
+                action: "wait_for_input".to_string(),
                 field: "choices".to_string(),
                 reason: "keys must be strings".to_string(),
             });
         };
         let Value::String(description) = description else {
             return Err(Error::InvalidActionField {
-                action: "ask_user".to_string(),
+                action: "wait_for_input".to_string(),
                 field: "choices".to_string(),
                 reason: "values must be strings".to_string(),
             });

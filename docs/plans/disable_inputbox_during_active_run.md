@@ -7,23 +7,23 @@ Treat `WaitingForInput` as explicitly enabled so users can answer the pending pr
 # Changes
 
 - Add an `AppState` query such as `composer_enabled()` / `input_enabled()` in `crates/tui/src/app/state.rs`.
-  - Return enabled when `pending_prompt().is_some()` so prompt answers can be typed.
+  - Return enabled when `pending_prompt().is_some()` so prompt input can be typed.
   - Return enabled when `background_task_count() == 0` so idle, completed, failed, and cancelled runs accept new input.
   - Return disabled while one or more `spawn_report_task` futures are active and no prompt is pending.
 - Route all input mutations through the same gate.
   - In `crates/tui/src/app.rs`, ignore `Event::Paste` while the composer is disabled.
   - In `crates/tui/src/app/input.rs`, make disabled-state handling allow only global controls that do not edit or submit the composer: `Ctrl+C` exits, `Esc` cancels active background tasks, `Ctrl+U`/`Ctrl+D` scroll, and `End` follows latest.
   - While disabled, printable characters, newline insertion, `Enter`, `Tab`, history navigation, cursor movement, `Backspace`, and `Delete` should be no-ops that return `KeyHandling::Continue`.
-- Keep prompt answers working.
-  - Do not change `commands::dispatch_submitted_input` prompt-answer routing through `pending_prompt_answer_target()`.
-  - After `spawn_answer_task` clears the prompt and starts the answer/resume background task, the composer becomes disabled again until that task blocks, completes, fails, or is cancelled.
+- Keep prompt input working.
+  - Do not change `commands::dispatch_submitted_input` prompt-input routing through `pending_prompt_input_target()`.
+  - After `spawn_input_task` clears the prompt and starts the answer/resume background task, the composer becomes disabled again until that task blocks, completes, fails, or is cancelled.
 - Update rendering to make the disabled state visible.
   - In `crates/tui/src/app/controls/composer.rs`, show a disabled title such as `Run active ─ input disabled ─ Esc cancels` when `composer_enabled()` is false.
   - Suppress slash suggestions while disabled.
   - Avoid placing the input cursor in the composer while disabled, or otherwise render an unmistakable disabled affordance so the box does not look editable.
 - Update status/help copy.
   - In `crates/tui/src/app/controls/status.rs`, mention that active background tasks disable input and that `Esc` cancels.
-  - README docs are intentionally left unchanged per `confirm_result_answer` feedback.
+  - README docs are intentionally left unchanged per `confirm_result_input` feedback.
 - Preserve existing cancellation behavior.
   - Keep `/cancel` unchanged for enabled states.
   - Keep `Esc` as the available cancellation path while the composer is disabled, because `/cancel` cannot be typed during the locked interval.
@@ -39,7 +39,7 @@ Treat `WaitingForInput` as explicitly enabled so users can answer the pending pr
 - Add state-level coverage in `crates/tui/src/app/state.rs` for the derived enabled/disabled rules:
   - idle state is enabled;
   - an active background task disables composer input;
-  - `WorkflowEventKind::WaitingForInput` re-enables prompt-answer input;
+  - `WorkflowEventKind::WaitingForInput` re-enables prompt-input input;
   - drained/cancelled background tasks re-enable input.
 - Add rendering tests in `crates/tui/src/app/controls/composer.rs` and/or `crates/tui/src/app/tests.rs` proving the disabled title/status is visible and slash-command suggestions are hidden while disabled.
 - Add or update status rendering assertions if existing tests cover the relevant status line text.
@@ -63,7 +63,7 @@ Treat `WaitingForInput` as explicitly enabled so users can answer the pending pr
 - 2026-07-07: Passed scripted TUI smoke using `cargo run -q -p cowboy -- --config <temp-config>` with a temporary `ask-agent` workflow and a `sleep 20` agent command to hold active runs.
   - Active-run input lock: disabled copy appeared; typed text, `Tab`, and `Enter` were ignored.
   - `Esc` cancellation unlock: `Esc` cancelled the active task; `/help` was accepted afterward.
-  - Prompt-answer unlock: `WaitingForInput` enabled answer entry and showed the answer-prompt title.
+  - Prompt-input unlock: `WaitingForInput` enabled answer entry and showed the answer-prompt title.
   - Post-answer re-lock: submitting `yes` resumed the run; composer locked again and ignored new typed text.
 
 # TODO
@@ -71,12 +71,12 @@ Treat `WaitingForInput` as explicitly enabled so users can answer the pending pr
 - [x] Add a derived composer-enabled/input-enabled query to `AppState`.
 - [x] Gate paste handling in the TUI event loop on the new query.
 - [x] Gate key handling so disabled composer input ignores edits/submission but keeps global controls.
-- [x] Preserve prompt-answer submission and re-disable after answer submission starts a background task.
+- [x] Preserve prompt-input submission and re-disable after input submission starts a background task.
 - [x] Render a visible disabled composer state and hide slash suggestions while disabled.
 - [x] Update status-line copy for active-run input locking.
-- [x] Leave README unchanged per `confirm_result_answer` feedback.
+- [x] Leave README unchanged per `confirm_result_input` feedback.
 - [x] Add disabled-state input-handler unit tests.
 - [x] Add AppState enabled/disabled transition unit tests.
 - [x] Add composer/status rendering tests for disabled state.
 - [x] Run focused TUI tests and, if needed, the full `cowboy` crate test suite.
-- [x] Manually smoke-test active-run locking, cancellation unlock, prompt-answer unlock, and post-answer re-lock.
+- [x] Manually smoke-test active-run locking, cancellation unlock, prompt-input unlock, and post-answer re-lock.

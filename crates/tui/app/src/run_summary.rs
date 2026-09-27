@@ -36,8 +36,8 @@ pub fn render_status_detail_lines(prefix: &str, status: &RunStatusDetail) -> Vec
         lines.push(format!("{prefix}status.waiting_step: {waiting_step}"));
     }
 
-    if let Some(prompt_id) = &status.prompt_id {
-        lines.push(format!("{prefix}status.prompt_id: {prompt_id}"));
+    if let Some(input_id) = &status.input_id {
+        lines.push(format!("{prefix}status.input_id: {input_id}"));
     }
 
     if let Some(message) = &status.message {
@@ -115,7 +115,7 @@ mod tests {
         let run = summary_with_status(
             RunStatus::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "prompt-42".to_string(),
+                input_id: "prompt-42".to_string(),
                 message: "Approve release?".to_string(),
                 choices: vec![
                     Choice {
@@ -128,8 +128,8 @@ mod tests {
                     },
                 ],
                 resume_callback: ResumeCallback::new(
-                    "ask_user",
-                    serde_json::json!({ "prompt_id": "prompt-42" }),
+                    "wait_for_input",
+                    serde_json::json!({ "input_id": "prompt-42" }),
                 )
                 .unwrap(),
             },
@@ -149,7 +149,7 @@ mod tests {
                 "  head: record-9",
                 "  status: waiting_for_input",
                 "  status.waiting_step: approve",
-                "  status.prompt_id: prompt-42",
+                "  status.input_id: prompt-42",
                 "  status.message: Approve release?",
                 "  status.choices: yes: Approve, no: Reject",
             ]

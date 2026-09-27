@@ -1,6 +1,6 @@
 ## Bug behavior
 
-When a workflow enters blocker review with a valid blocker statement but a one-sided optional evidence pair, the blocker-reviewer agent is not dispatched. The workflow classifies the malformed internal context as `user_required` and displays an ask-user prompt saying the blocker reviewer determined that user action is required.
+When a workflow enters blocker review with a valid blocker statement but a one-sided optional evidence pair, the blocker-reviewer agent is not dispatched. The workflow classifies the malformed internal context as `user_required` and displays an wait-for-input prompt saying the blocker reviewer determined that user action is required.
 
 The reported `dev-loop` run had `implementation_evidence` present while `implementation_commands` was missing. Instead of reviewing the actual active-build blocker, the UI asked the user to correct workflow-owned structured context.
 
@@ -8,7 +8,7 @@ The reported `dev-loop` run had `implementation_evidence` present while `impleme
 
 `examples/workflows/steps/review_blocker.lua` selects implementation evidence as optional blocker-review context, but the shared prompt builder rejects a selected evidence source whenever only one member of its command/evidence pair is present. When that validation returns no prompt, `review_blocker.lua` hardcodes the invalid-context fallback status to `user_required`.
 
-That classification is incorrect for this failure. The malformed pair is internal persisted workflow state, not a user-only decision, credential, permission, external resource, or manual action. The `user_required` status then routes directly to the ask-user step, so the UI attributes the fallback to the blocker reviewer even though the reviewer agent never ran.
+That classification is incorrect for this failure. The malformed pair is internal persisted workflow state, not a user-only decision, credential, permission, external resource, or manual action. The `user_required` status then routes directly to the wait-for-input step, so the UI attributes the fallback to the blocker reviewer even though the reviewer agent never ran.
 
 ## Root cause evidence
 
@@ -49,7 +49,7 @@ The following flow reconstructs the reported failure. Runtime-specific process i
    The blocker reviewer determined that user action is required.
    ```
 
-   `examples/workflows/workflows/dev-loop.lua:74-78` routes `review_blocker:user_required` to `blocked`. `examples/workflows/steps/blocked.lua:32-52` builds the ask-user message beginning with the quoted sentence. Thus a one-sided optional evidence pair deterministically advances from prompt validation failure, to hardcoded `user_required`, to the misleading user-facing blocked state.
+   `examples/workflows/workflows/dev-loop.lua:74-78` routes `review_blocker:user_required` to `blocked`. `examples/workflows/steps/blocked.lua:32-52` builds the wait-for-input message beginning with the quoted sentence. Thus a one-sided optional evidence pair deterministically advances from prompt validation failure, to hardcoded `user_required`, to the misleading user-facing blocked state.
 
 ## Reproduction steps
 
@@ -57,7 +57,7 @@ The following flow reconstructs the reported failure. Runtime-specific process i
 2. Run `review_blocker` with a captured blocker containing `blocker_statement`, `blocked_from_step`, and `blocked_from_status`.
 3. Include `implementation_evidence: []` but omit `implementation_commands`, matching the reported one-sided pair.
 4. Observe that the prompt builder rejects the pair and `review_blocker` returns a status action instead of dispatching the blocker-reviewer agent.
-5. Observe that the returned status is `user_required`, which the workflow routes to the ask-user `blocked` step.
+5. Observe that the returned status is `user_required`, which the workflow routes to the wait-for-input `blocked` step.
 6. Run the focused regression test below.
 
 ## Regression test
@@ -92,7 +92,7 @@ error: test failed, to rerun pass `-p cowboy-workflow-lua --lib`
 - Preserve the original named blocker and `blocked_from_step` / `blocked_from_status` while recovering from context validation failures.
 - Preserve `user_feedback` exactly when present. Do not add blocker-reviewer, agent, validation, or fallback-generated text to it.
 - Preserve every valid command/evidence array with semantic deep equality and unchanged order; do not invent the missing paired array or silently convert malformed data into valid-looking evidence.
-- Keep genuine external blockers routed to the existing ask-user step.
+- Keep genuine external blockers routed to the existing wait-for-input step.
 - Avoid a recovery route that immediately re-enters the same step with unchanged context known to fail validation.
 - Reconcile the existing malformed-context assertions in `crates/workflow/lua/src/loader.rs` that currently codify `user_required` as expected behavior.
 - Product code must remain unchanged during this investigation; only the focused failing test and this RCA are added.

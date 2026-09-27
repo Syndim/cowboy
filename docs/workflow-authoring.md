@@ -120,7 +120,7 @@ Runtime context passed to `run(ctx)`:
 | `ctx.step.id` | Current step id. |
 | `ctx.step.role` | Current step's configured role id, or `nil`. |
 | `ctx.step.properties` | Non-reserved fields from the step config. |
-| `ctx.prev` | Latest completed step output, including completed ask-user answers, or `nil` on the first step. |
+| `ctx.prev` | Latest completed step output, including completed wait-for-input inputs, or `nil` on the first step. |
 | `ctx.steps_executed` | Number of already-executed steps in the run. |
 | `ctx.system.os` | Host operating system (`std::env::consts::OS`), e.g. `linux`. |
 | `ctx.system.arch` | Host CPU architecture (`std::env::consts::ARCH`), e.g. `x86_64`. |
@@ -164,8 +164,8 @@ and newlines. Restart does not expose inputs from the source run.
 Every fresh agent session receives the complete `ctx.user_inputs` history.
 Reused sessions receive only entries whose sequence has not already been
 delivered, regardless of the workflow-authored `prompt`.
-Answers to `action.ask_user` are deliberately excluded: they remain available
-only through `ctx.prev.fields.answer` because they are workflow control-point
+Inputs to `action.wait_for_input` are deliberately excluded: they remain available
+only through `ctx.prev.fields.input` because they are workflow control-point
 answers rather than on-the-fly direction.
 
 ### Agent prompt layering
@@ -335,7 +335,7 @@ them under `[config_sets.default]`.
 
 ## Actions
 
-Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.ask_user`, `action.workflow`, or `action.fail`.
+Each `step.run(ctx)` must return exactly one action table created by `action.agent`, `action.command`, `action.status`, `action.wait_for_input`, `action.workflow`, or `action.fail`.
 
 ### `action.agent { role, prompt, task, output }`
 
@@ -504,16 +504,16 @@ Fields:
 
 Use this for deterministic branching, summaries, adapters around previous output, and final terminal records.
 
-### `action.ask_user { id, message, choices, status, fields }`
+### `action.wait_for_input { id, message, choices, status, fields }`
 
-Pauses the run and asks the user for input. When answered, the runtime completes the ask-user action into a normal step record. The following step receives `ctx.prev.action == "ask_user"`, `ctx.prev.status == "answered"` unless overridden, and `ctx.prev.fields.answer` plus any fields supplied on the ask action.
+Pauses the run until trusted external input arrives. When input is provided, the runtime completes the wait-for-input action into a normal step record. The following step receives `ctx.prev.action == "wait_for_input"`, `ctx.prev.status == "provided"` unless overridden, and `ctx.prev.fields.input` plus any fields supplied on the wait action.
 
-Internally, the waiting run stores prompt metadata plus a durable `ResumeCallback` descriptor. When an answer arrives, the runtime validates the prompt id and choices, dispatches the registered callback by kind, and applies the resulting ask-user `StepRecord` through normal status-based routing.
+Internally, the waiting run stores prompt metadata plus a durable `ResumeCallback` descriptor. When trusted external input arrives, the runtime validates the input id and finite choices, dispatches the registered callback by kind, and applies the resulting wait-for-input `StepRecord` through normal status-based routing. The supplied value is a hint, not proof that an external approval or condition is satisfied; route to a follow-up step that rechecks the authoritative condition.
 
 ```lua
 local ask_scope = step("ask_scope")
 ask_scope.run = function(ctx)
-  return action.ask_user {
+  return action.wait_for_input {
     id = "scope",
     message = "Should Cowboy update docs only or code and docs?",
     choices = { docs = "Update only the docs", ["code-and-docs"] = "Update code and docs" },
@@ -525,23 +525,23 @@ local route_scope = step("route_scope")
 route_scope.run = function(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
   return action.status {
-    status = tostring(fields.answer),
-    fields = { scope = fields.answer, source = fields.source }
+    status = tostring(fields.input),
+    fields = { scope = fields.input, source = fields.source }
   }
 end
 
-ask_scope:on("answered", route_scope)
+ask_scope:on("provided", route_scope)
 ```
 
 Fields:
 
-- `id` (required): stable prompt id used for validation and UI/event display.
-- `message` (required): text shown to the user.
-- `choices` (optional): finite allowed answers, given as a table mapping each accepted answer key to a human-readable description (e.g. `{ yes = "Approve the release", no = "Reject the release" }`). If present, answers outside the key set are rejected; each accepted choice carries both its key and description to the UI/event display.
-- `status` (optional): output status for the completed ask-user record; defaults to `"answered"`.
-- `fields` (optional): structured fields copied into the completed ask-user output before `fields.answer` is merged.
+- `id` (required): stable input id used for validation and UI/event display.
+- `message` (required): text shown to the user or trusted external system.
+- `choices` (optional): finite allowed input values, given as a table mapping each accepted input key to a human-readable description (e.g. `{ yes = "Approve the release", no = "Reject the release" }`). If present, values outside the key set are rejected; each accepted choice carries both its key and description to the UI/event display.
+- `status` (optional): output status for the completed wait-for-input record; defaults to `"provided"`.
+- `fields` (optional): structured fields copied into the completed wait-for-input output before `fields.input` is merged.
 
-Always route the ask-user step's `answered` status to a follow-up step that reads `ctx.prev.fields.answer`; otherwise the workflow will keep pausing on every visit.
+Always route the wait-for-input step's `provided` status to a follow-up step that reads `ctx.prev.fields.input`; otherwise the workflow will keep pausing on every visit.
 
 ### `action.fail { reason }`
 
@@ -594,8 +594,7 @@ Behavior:
   `"failed"` (carrying the child run id and reason). A child cancellation becomes
   status `"cancelled"`. Route these like any other status.
 - If the child waits for input, its prompt is mirrored on the parent's own
-  `WaitingForInput` state; answering the parent (`cowboy answer <parent-run-id>
-  ...`) answers and continues the child. If the child asks again, the parent
+  `WaitingForInput` state; providing the parent input (`cowboy provide-input <parent-run-id> <input-id> <input>`) forwards the value and continues the child. If the child asks again, the parent
   prompt refreshes; when the child becomes terminal, the parent workflow action
   completes and the parent continues automatically.
 - Child creation is idempotent across retries, resume, and process interruption:
@@ -611,7 +610,7 @@ Behavior:
 
 ## Transitions
 
-Transitions route completed `agent`, `command`, `status`, `workflow`, or answered `ask_user` step outputs by status.
+Transitions route completed `agent`, `command`, `status`, `workflow`, or provided `wait_for_input` step outputs by status.
 
 ```lua
 implement:on("success", finish)
@@ -628,7 +627,7 @@ Rules:
 - If a completed step declares no transitions at all, it is terminal: the workflow completes with whatever status the step returned (this is how a child workflow completes with a domain status such as the one its caller routes on).
 - If a completed step declares transitions and returns `success` without an explicit `success` transition, the workflow completes.
 - If a completed step declares transitions and returns any other status without a matching transition, the run errors with an unknown runtime transition.
-- `ask_user` and `fail` are run-state changes, not completed step outputs, so transition tables are not consulted when they initially block or fail the run. The completed ask-user record produced after an answer is routed by its output status.
+- `wait_for_input` and `fail` are run-state changes, not completed step outputs, so transition tables are not consulted when they initially block or fail the run. The completed wait-for-input record produced after an input is routed by its output status.
 
 A common pattern is to normalize agent outputs into terminal status steps:
 
@@ -804,12 +803,12 @@ return workflow("developer-flow", implement, {
 })
 ```
 
-### Ask-user branching workflow
+### Wait-for-input branching workflow
 
 ```lua
 local triage = step("triage")
 triage.run = function(ctx)
-  return action.ask_user {
+  return action.wait_for_input {
     id = "intent",
     message = "What kind of work is this?",
     choices = { feature = "New feature work", bug = "Bug fix", docs = "Documentation only" }
@@ -819,10 +818,10 @@ end
 local route = step("route")
 route.run = function(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
-  local answer = tostring(fields.answer)
+  local value = tostring(fields.input)
   return action.status {
-    status = answer,
-    fields = { intent = answer }
+    status = value,
+    fields = { intent = value }
   }
 end
 
@@ -841,12 +840,12 @@ docs.run = function(ctx)
   return action.status { status = "success", fields = { lane = "docs" } }
 end
 
-triage:on("answered", route)
+triage:on("provided", route)
 route:on("feature", feature)
 route:on("bug", bug)
 route:on("docs", docs)
 
-return workflow("triage", triage, "Ask the user once, then route by answer")
+return workflow("triage", triage, "Ask the user once, then route by input")
 ```
 
 ### Modular workflow with scoped `require`

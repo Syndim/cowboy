@@ -17,9 +17,9 @@ mod system;
 pub mod workflow;
 
 pub use cowboy_workflow_actions::{
-    AgentActionHandler, AgentActionRunner, AskUserActionRunner, CommandActionRunner,
-    EngineActionDispatcher, FailActionRunner, PendingAskUser, ResumeCallbackRegistry,
-    StatusActionRunner, WorkflowActionHandler,
+    AgentActionHandler, AgentActionRunner, CommandActionRunner, EngineActionDispatcher,
+    FailActionRunner, PendingWaitForInput, ResumeCallbackRegistry, StatusActionRunner,
+    WaitForInputActionRunner, WorkflowActionHandler,
 };
 pub use cowboy_workflow_core::Choice;
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};

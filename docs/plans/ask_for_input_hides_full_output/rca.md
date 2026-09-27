@@ -41,7 +41,7 @@ a `… {omitted} more rows` marker. `CardSection::capped(8)` overrides the defau
 
 This cap is appropriate for ordinary completed steps, but a step completing with
 status `blocked` is precisely the signal that the workflow is about to ask the
-user for direction (see `crates/workflow/actions/src/ask_user.rs` and the
+user for direction (see `crates/workflow/actions/src/wait_for_input.rs` and the
 `blocked` routing in `crates/workflow/engine/test_files/agent/00-feature.lua`,
 where the `blocked` status routes to a step that asks the user). In that case the
 body is the context the user must read to respond, so truncating it to 8 rows
@@ -110,7 +110,7 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 171 filtered out
 - When a step completes with a status that hands control back to the user for
   input (notably `blocked`), the `Body` section must show the full context
   rather than an 8-row cap. A reasonable approach is to not apply the tighter
-  `.capped(8)` for blocked/ask-user-bound completions, deferring to the default
+  `.capped(8)` for blocked/wait-for-input-bound completions, deferring to the default
   `SECTION_BODY_LIMIT`.
 - Preserve the existing behavior for ordinary completed steps (the current
   `renders_waiting_and_completed_cards_with_sections` test still expects the

@@ -10,7 +10,7 @@ Keep the behavior unchanged: while a background run task is active and no prompt
 - Render a styled, explicit notice in the input box body, for example `Input disabled while run active. Press Esc to cancel.`, using existing warning or muted styles from `crates/tui/src/app/styles.rs` rather than introducing a new palette.
 - Keep the disabled composer title focused on the active run/cancel affordance while the status-line copy and in-box notice explain that input is disabled.
 - Continue suppressing slash-command suggestions while disabled.
-- Do not change prompt-answer routing, workflow runtime state, background task lifecycle, or the existing input-lock semantics.
+- Do not change prompt-input routing, workflow runtime state, background task lifecycle, or the existing input-lock semantics.
 - Avoid adding README or workflow documentation changes; this is a TUI affordance change only.
 
 # Tests to be added/updated

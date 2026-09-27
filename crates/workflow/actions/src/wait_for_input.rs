@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cowboy_workflow_core::{
-    ActionResult, AskUserAction, ExecutionContext, Result, ResumeCallback, ResumeCallbackHandler,
-    ResumeInput, RunStatus, StepDetail, StepInput, StepOutput, StepRecord, WorkflowError,
+    ActionResult, ExecutionContext, Result, ResumeCallback, ResumeCallbackHandler, ResumeInput,
+    RunStatus, StepDetail, StepInput, StepOutput, StepRecord, WaitForInputAction, WorkflowError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const ASK_USER_CALLBACK_KIND: &str = "ask_user";
+pub const WAIT_FOR_INPUT_CALLBACK_KIND: &str = "wait_for_input";
 
 #[derive(Debug, Clone, Default)]
-pub struct AskUserActionRunner;
+pub struct WaitForInputActionRunner;
 
-impl AskUserActionRunner {
-    pub fn run(&self, action: AskUserAction, context: ExecutionContext) -> ActionResult {
-        let pending = PendingAskUser {
+impl WaitForInputActionRunner {
+    pub fn run(&self, action: WaitForInputAction, context: ExecutionContext) -> ActionResult {
+        let pending = PendingWaitForInput {
             record_id: context.step_record_id,
             prev: context.prev,
             started_at: Utc::now(),
@@ -22,43 +22,43 @@ impl AskUserActionRunner {
             output_fields: Value::Object(action.fields.into_iter().collect()),
         };
         let resume_callback = ResumeCallback::new(
-            ASK_USER_CALLBACK_KIND,
-            serde_json::to_value(pending).expect("pending ask-user payload serializes"),
+            WAIT_FOR_INPUT_CALLBACK_KIND,
+            serde_json::to_value(pending).expect("pending wait-for-input payload serializes"),
         )
-        .expect("ask-user resume callback kind is static and non-empty");
+        .expect("wait-for-input resume callback kind is static and non-empty");
 
         ActionResult::blocked(RunStatus::WaitingForInput {
             step: context.step_id,
-            prompt_id: action.id,
+            input_id: action.id,
             message: action.message,
             choices: action.choices,
             resume_callback,
         })
     }
 
-    pub fn complete(&self, pending: PendingAskUser, input: ResumeInput) -> StepRecord {
-        let fields = fields_with_answer(pending.output_fields, &input.answer);
+    pub fn complete(&self, pending: PendingWaitForInput, input: ResumeInput) -> StepRecord {
+        let fields = fields_with_input(pending.output_fields, &input.input);
         StepRecord {
             id: pending.record_id,
             prev: pending.prev,
             step: input.step,
-            action: "ask_user".to_string(),
+            action: "wait_for_input".to_string(),
             input: StepInput {
                 prompt: Some(input.message.clone()),
                 context: json!({
-                    "prompt_id": input.prompt_id,
+                    "input_id": input.input_id,
                     "choices": input.choices,
                 }),
             },
             output: Some(StepOutput {
                 status: pending.output_status,
                 fields,
-                body: input.answer.clone(),
+                body: input.input.clone(),
                 raw: json!({
-                    "prompt_id": input.prompt_id,
+                    "input_id": input.input_id,
                     "message": input.message,
                     "choices": input.choices,
-                    "answer": input.answer,
+                    "input": input.input,
                 }),
             }),
             detail: StepDetail {
@@ -77,15 +77,15 @@ impl AskUserActionRunner {
 }
 
 #[async_trait]
-impl ResumeCallbackHandler for AskUserActionRunner {
+impl ResumeCallbackHandler for WaitForInputActionRunner {
     async fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
-        let pending = PendingAskUser::from_callback(callback)?;
+        let pending = PendingWaitForInput::from_callback(callback)?;
         Ok(ActionResult::completed(self.complete(pending, input)))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PendingAskUser {
+pub struct PendingWaitForInput {
     pub record_id: String,
     pub prev: Option<String>,
     pub started_at: DateTime<Utc>,
@@ -93,35 +93,37 @@ pub struct PendingAskUser {
     pub output_fields: Value,
 }
 
-impl PendingAskUser {
+impl PendingWaitForInput {
     pub fn from_callback(callback: &ResumeCallback) -> Result<Self> {
-        if callback.kind() != ASK_USER_CALLBACK_KIND {
+        if callback.kind() != WAIT_FOR_INPUT_CALLBACK_KIND {
             return Err(WorkflowError::InvalidAction(format!(
-                "resume callback kind {:?} is not supported by ask_user",
+                "resume callback kind {:?} is not supported by wait_for_input",
                 callback.kind()
             )));
         }
         serde_json::from_value(callback.payload().clone()).map_err(|err| {
-            WorkflowError::InvalidAction(format!("invalid ask_user resume callback payload: {err}"))
+            WorkflowError::InvalidAction(format!(
+                "invalid wait_for_input resume callback payload: {err}"
+            ))
         })
     }
 }
 
-fn fields_with_answer(fields: Value, answer: &str) -> Value {
+fn fields_with_input(fields: Value, input: &str) -> Value {
     match fields {
         Value::Object(mut object) => {
-            object.insert("answer".to_string(), Value::String(answer.to_string()));
+            object.insert("input".to_string(), Value::String(input.to_string()));
             Value::Object(object)
         }
         Value::Null => {
             let mut object = Map::new();
-            object.insert("answer".to_string(), Value::String(answer.to_string()));
+            object.insert("input".to_string(), Value::String(input.to_string()));
             Value::Object(object)
         }
         other => {
             let mut object = Map::new();
             object.insert("value".to_string(), other);
-            object.insert("answer".to_string(), Value::String(answer.to_string()));
+            object.insert("input".to_string(), Value::String(input.to_string()));
             Value::Object(object)
         }
     }

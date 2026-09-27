@@ -58,7 +58,7 @@ enum ComposerVisualState {
 fn composer_visual_state(state: &AppState) -> ComposerVisualState {
     match state.composer_submission_mode() {
         ComposerSubmissionMode::Idle => ComposerVisualState::Idle,
-        ComposerSubmissionMode::PendingAnswer => ComposerVisualState::WaitingForInput,
+        ComposerSubmissionMode::PendingInput => ComposerVisualState::WaitingForInput,
         ComposerSubmissionMode::AgentPrompt => ComposerVisualState::AgentPrompt,
         ComposerSubmissionMode::ExecutionBlocked => ComposerVisualState::ExecutionBlocked,
     }
@@ -95,8 +95,8 @@ pub(in crate::app) fn render(frame: &mut Frame<'_>, area: Rect, state: &AppState
 
 pub(in crate::app) fn title(state: &AppState) -> String {
     match state.composer_submission_mode() {
-        ComposerSubmissionMode::PendingAnswer => {
-            " Enter answers active prompt · Shift/Ctrl-Enter newline ".to_string()
+        ComposerSubmissionMode::PendingInput => {
+            " Enter provides active input · Shift/Ctrl-Enter newline ".to_string()
         }
         ComposerSubmissionMode::AgentPrompt => {
             " Enter sends prompt · Shift/Ctrl-Enter newline · Esc cancels ".to_string()
@@ -1173,7 +1173,7 @@ mod tests {
             "run-1",
             WorkflowEventKind::WaitingForInput {
                 step: "confirm_result".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
             },
@@ -1340,7 +1340,7 @@ mod tests {
 
         assert_eq!(
             title,
-            " Enter answers active prompt · Shift/Ctrl-Enter newline "
+            " Enter provides active input · Shift/Ctrl-Enter newline "
         );
         assert!(title.contains("Shift/Ctrl-Enter"));
         assert!(!title.contains(" ─ "));

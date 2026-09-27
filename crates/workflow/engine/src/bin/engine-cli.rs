@@ -1,7 +1,7 @@
 //! `engine-cli` — a playground for the `cowboy-workflow-engine` runtime.
 //!
 //! It drives a real `WorkflowRuntime` (catalog selection, SQLite persistence,
-//! event projection, single-step / run-until-blocked, ask-user input) so the
+//! event projection, single-step / run-until-blocked, wait-for-input input) so the
 //! engine logic can be exercised from the shell without the full TUI.
 //!
 //! ```text
@@ -11,7 +11,7 @@
 //! engine-cli run-step <request...>           start a run, execute only the first step
 //! engine-cli step <run-id>                   execute exactly one further step
 //! engine-cli resume <run-id>                 run an existing run until it blocks/finishes
-//! engine-cli answer <run-id> <prompt> <val>  answer an ask-user prompt and continue
+//! engine-cli provide-input <run-id> <prompt> <val>  provide external input and continue
 //! engine-cli show <run-id>                   print a run's persisted state
 //! engine-cli events <run-id>                 print a run's persisted event log
 //! ```
@@ -92,12 +92,12 @@ async fn run() -> CliResult {
             let report = run_with_live_events(&rt, || rt.resume_run(run_id)).await?;
             print_report(&report);
         }
-        "answer" => {
-            let [run_id, prompt_id, value] = rest.as_slice() else {
+        "provide-input" => {
+            let [run_id, input_id, value] = rest.as_slice() else {
                 usage()
             };
             let report =
-                run_with_live_events(&rt, || rt.answer_run(run_id, prompt_id, value)).await?;
+                run_with_live_events(&rt, || rt.provide_input_run(run_id, input_id, value)).await?;
             print_report(&report);
         }
         "show" => {
@@ -269,8 +269,8 @@ fn print_run_summary(run: &RunSummaryLine) {
         println!("  status.waiting_step: {waiting_step}");
     }
 
-    if let Some(prompt_id) = &run.status_detail.prompt_id {
-        println!("  status.prompt_id: {prompt_id}");
+    if let Some(input_id) = &run.status_detail.input_id {
+        println!("  status.input_id: {input_id}");
     }
 
     if let Some(message) = &run.status_detail.message {
@@ -305,13 +305,13 @@ async fn show(rt: &WorkflowRuntime, run_id: &str) -> CliResult {
     );
     println!("request:        {}", run.original_request);
     if let RunStatus::WaitingForInput {
-        prompt_id,
+        input_id,
         message,
         choices,
         ..
     } = &run.status
     {
-        println!("waiting prompt: {prompt_id} ({message}) choices={choices:?}");
+        println!("waiting prompt: {input_id} ({message}) choices={choices:?}");
     }
     Ok(())
 }
@@ -456,11 +456,11 @@ fn render_workflow_event(event: &WorkflowEvent) -> String {
         ),
         WorkflowEventKind::WaitingForInput {
             step,
-            prompt_id,
+            input_id,
             message,
             choices,
         } => format!(
-            "{} waiting for input {prompt_id} at {step}: {message} [{}]",
+            "{} waiting for input {input_id} at {step}: {message} [{}]",
             event.run_id,
             choices
                 .iter()
@@ -501,14 +501,17 @@ fn print_report(report: &RunReport) {
         run.step.executed,
     );
     if let RunStatus::WaitingForInput {
-        prompt_id,
+        input_id,
         message,
         choices,
         ..
     } = &run.status
     {
-        println!("  waiting: prompt={prompt_id:?} message={message:?} choices={choices:?}");
-        println!("  -> engine-cli answer {} {} <value>", run.id, prompt_id);
+        println!("  waiting: prompt={input_id:?} message={message:?} choices={choices:?}");
+        println!(
+            "  -> engine-cli provide-input {} {} <value>",
+            run.id, input_id
+        );
     }
     for event in &report.events {
         println!("  event={}", render_workflow_event(event));
@@ -518,7 +521,7 @@ fn print_report(report: &RunReport) {
 fn status_label(status: &RunStatus) -> String {
     match status {
         RunStatus::Running => "Running".to_string(),
-        RunStatus::WaitingForInput { prompt_id, .. } => format!("WaitingForInput({prompt_id})"),
+        RunStatus::WaitingForInput { input_id, .. } => format!("WaitingForInput({input_id})"),
         RunStatus::Completed => "Completed".to_string(),
         RunStatus::Failed { reason } => format!("Failed({reason})"),
         RunStatus::Cancelled => "Cancelled".to_string(),
@@ -546,7 +549,7 @@ fn usage() -> ! {
     eprintln!("  engine-cli run-step <request...>           start + run only the first step");
     eprintln!("  engine-cli step <run-id>                   run exactly one further step");
     eprintln!("  engine-cli resume <run-id>                 run an existing run until blocked");
-    eprintln!("  engine-cli answer <run-id> <prompt> <val>  answer an ask-user prompt");
+    eprintln!("  engine-cli provide-input <run-id> <prompt> <val>  provide external input");
     eprintln!("  engine-cli show <run-id>                   print persisted run state");
     eprintln!("  engine-cli events <run-id>                 print persisted event log");
     eprintln!();

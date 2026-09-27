@@ -27,7 +27,7 @@ valid implementation command/evidence pair.
   contract carries, including absent fields remaining absent.
 - Reconcile existing loader assertions that encode the old malformed-context
   behavior. Keep genuine blocker-reviewer `user_required` results routed to the
-  existing ask-user step.
+  existing wait-for-input step.
 
 # Tests to be added/updated
 
@@ -47,7 +47,7 @@ valid implementation command/evidence pair.
   blocker metadata, raw `user_feedback`, diagnostics, and evidence fields, and
   then deterministically triages to `implement`.
 - Retain the same named-blocker test's genuine external-access case, which must
-  still produce an ask-user action containing the blocker statement, reviewer
+  still produce an wait-for-input action containing the blocker statement, reviewer
   reason, and required user action.
 - Retain
   `loader::tests::examples_workflows_route_all_blockers_through_reviewer` as the
@@ -69,7 +69,7 @@ valid implementation command/evidence pair.
    and
    `cargo test -p cowboy-workflow-lua loader::tests::examples_workflows_route_all_blockers_through_reviewer -- --exact --nocapture`.
    Malformed internal context must follow recoverable triage, while a genuine
-   external prerequisite must still follow the ask-user route.
+   external prerequisite must still follow the wait-for-input route.
 4. Run `cargo test -p cowboy-workflow-lua`, `cargo fmt --all -- --check`, and
    `cargo clippy -p cowboy-workflow-lua --all-targets -- -D warnings`. Every
    command must exit successfully.
@@ -153,14 +153,14 @@ valid implementation command/evidence pair.
     for every carried field. The three valid controls retained their original
     statuses and fields.
 
-- [x] TODO-03: Verify deterministic malformed-context recovery, genuine external ask-user behavior, and graph routing.
+- [x] TODO-03: Verify deterministic malformed-context recovery, genuine external wait-for-input behavior, and graph routing.
   - Procedure:
     1. In
        `loader::tests::examples_workflows_capture_review_and_triage_named_blockers`,
        retain the valid recoverable case and assert it returns status `test` with
        its blocker resolution and planning paths unchanged.
     2. Retain the genuine external-access case and assert it produces
-       `StepAction::AskUser`; assert the prompt contains the exact blocker
+       `StepAction::WaitForInput`; assert the prompt contains the exact blocker
        statement, blocker reason, and blocker resolution supplied by the
        blocker-reviewer result.
     3. For the malformed reviewer-assessment case, preserve an input snapshot and
@@ -185,14 +185,14 @@ valid implementation command/evidence pair.
        dev-loop workflows.
   - Expected result: The focused named-blocker test proves malformed internal
     context preserves all declared state and reaches deterministic `implement`
-    recovery without constructing an ask-user action; the genuine external case
-    still constructs the expected ask-user prompt; and the graph test proves the
+    recovery without constructing an wait-for-input action; the genuine external case
+    still constructs the expected wait-for-input prompt; and the graph test proves the
     two statuses retain their distinct routes in all three workflows.
   - Implementer observed result: The named-blocker test passed with malformed
     reviewer context preserving blocker metadata, raw `user_feedback`, exact
     diagnostics, and all evidence fields through `recoverable` review and
     deterministic `implement` triage. The external-access case still produced the
-    expected ask-user prompt. The graph test passed for feature, bug-fix, and
+    expected wait-for-input prompt. The graph test passed for feature, bug-fix, and
     dev-loop routes.
 
 - [x] TODO-04: Run the crate suite, formatting check, and warning-denying Clippy.

@@ -39,7 +39,7 @@ cowboy run <request...>                 # start a run; --step runs only the firs
 cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue a run until it blocks, fails, or completes
-cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
+cowboy provide-input <run-id> <input-id> <input>  # provide waiting external input
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
 cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
@@ -68,7 +68,7 @@ the failed step current so `cowboy resolve` can continue the run.
 ## TUI Interface
 
 The TUI accepts plain requests by default. When a workflow is waiting for
-`ask_user`, type the answer directly and press `Enter`.
+`wait_for_input`, type the input directly and press `Enter`.
 
 Slash command parsing and suggestions come from `cowboy-command-parser`; the TUI
 app crate owns dispatch, pending-prompt fallback, rendering, and background task
@@ -80,7 +80,7 @@ Built-in slash commands:
 /run [--step] [--workflow <workflow-id>] <request>
 /step <run-id>
 /resume <run-id>
-/answer <run-id> <prompt-id> <answer>
+/provide-input <run-id> <input-id> <input>
 /improve <run-id>
 /resolve <run-id>
 /resolve <run-id> <status> [--field <name> <value>]... [--body <text>]
@@ -156,7 +156,7 @@ Current modules:
 - `app/commands.rs` — slash command dispatch, runtime task spawning, help/status rendering, plain-text submission, and pending-prompt fallback.
 - `app/input.rs` — keyboard handling, multiline input editing, history movement, scroll keys, and cancellation keys.
 - `app/history.rs` — locked append-only JSON-lines composer history under `state_dir`.
-- `app/state.rs` — active run, current step, pending prompt, reusable event-card coalescing, transcript entries, command history, scroll offset, and background task state.
+- `app/state.rs` — active run, current step, pending input, reusable event-card coalescing, transcript entries, command history, scroll offset, and background task state.
 - `app/events.rs` — workflow event projection into shared semantic cards and terminal text.
 - `app/card.rs` — semantic card model plus width-aware ratatui rendering.
 - `app/markup.rs` — lightweight transcript markup parsing/rendering helpers.
@@ -198,13 +198,13 @@ Owns:
 
 - `WorkflowRuntime`
 - workflow event projection and event logs
-- ask-user answer routing through `ResumeRouter`
+- wait-for-input input routing through `ResumeRouter`
 - selector/summarizer adapters
 - runtime wiring for catalog, Lua, SQLite store, action dispatch, and ACP-backed agent execution
 
 Important modules:
 
-- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default name resolution, live per-operation limit resolution (`resolve_limits`), start/resume/step/answer/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
+- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default name resolution, live per-operation limit resolution (`resolve_limits`), start/resume/step/provide-input/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
 - `runner.rs` — `WorkflowRunner<S, D, P>` over `cowboy-workflow-core::execute_step`; owns event emission and cumulative run/per-step retry enforcement, reserves retry counters before dispatch, and persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`.
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `ResumeRouter` for `RunStatus::WaitingForInput` answers and persisted resume callbacks.
@@ -218,15 +218,15 @@ Owns:
 
 - `EngineActionDispatcher`
 - `ResumeCallbackRegistry`
-- action runners for `agent`, `command`, `status`, `ask_user`, `workflow`, and `fail`
-- `ask_user` resume callback payloads and callback-to-`StepRecord` handling
+- action runners for `agent`, `command`, `status`, `wait_for_input`, `workflow`, and `fail`
+- `wait_for_input` resume callback payloads and callback-to-`StepRecord` handling
 
 Important modules:
 
 - `lib.rs` — dispatcher, resume callback registry, and public runner exports.
 - `agent.rs` — `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`.
 - `command.rs` — `CommandActionRunner` for direct non-shell process execution from runtime cwd.
-- `ask_user.rs` — `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`.
+- `wait_for_input.rs` — `WaitForInputActionRunner`, callback payload metadata, and resume handling into `StepRecord`.
 - `status.rs` — `StatusActionRunner` for immediate completed records.
 - `fail.rs` — `FailActionRunner` for failed run statuses.
 
@@ -254,7 +254,7 @@ Owns:
 
 - `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition`
 - `RoleDefinition`, `StepDefinition`, `StepTransitions`
-- `StepAction`: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`
+- `StepAction`: `agent`, `command`, `status`, `wait_for_input`, `workflow`, `fail`
 - `WorkflowRun`, durable name-only config-set pointer (`ConfigSetRef`) and retry counters, `RunStatus`, `RunHead`, `StepRecord`, `TurnRecord`
 - `RunnerLimits`, `ResumeCallback`, `ActionResult`, `ExecutionContext`, async typed store capabilities and composite `WorkflowStore`, `ActionDispatcher`, `StepActionProvider`, `WorkflowSelector`, `WorkflowSummarizer`
 - `execute_step`, `next_step` routing, step/visit budget enforcement, and step-record/status application helpers
@@ -405,25 +405,25 @@ WorkflowRun.current_step
        agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> StepRecord
        command  -> CommandActionRunner -> tokio::process::Command -> StepRecord
        status   -> StatusActionRunner -> StepRecord
-       ask_user -> AskUserActionRunner -> RunStatus::WaitingForInput + ResumeCallback
+       wait_for_input -> WaitForInputActionRunner -> RunStatus::WaitingForInput + ResumeCallback
        fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed stores a StepRecord and routes by output.status
   -> ActionResult::Blocked stores the run status
   -> WorkflowStore transactions save WorkflowRun + RunHead + objects
 ```
 
-### Resume / answer
+### Resume / input
 
 ```text
-cowboy answer <run-id> <prompt-id> <answer>
-  -> ResumeRouter validates RunStatus::WaitingForInput, prompt id, and choices
+cowboy provide-input <run-id> <input-id> <input>
+  -> ResumeRouter validates RunStatus::WaitingForInput, input id, and choices
   -> ResumeRouter dispatches the persisted ResumeCallback
   -> callback produces an ActionResult through the same record-routing path
-  -> ask-user StepRecord is stored and surfaced as ctx.prev to the next Lua step
+  -> wait-for-input StepRecord is stored and surfaced as ctx.prev to the next Lua step
 ```
 
-Answering does not mutate `run.resume` or increment step budgets. New workflows
-should read ask-user answers from `ctx.prev.fields.answer`; `ctx.resume` is only
+Providing input does not mutate `run.resume` or increment step budgets. New workflows
+should read wait-for-input inputs from `ctx.prev.fields.input`; `ctx.resume` is only
 legacy serialized state.
 
 ### Retry / resolve
@@ -484,7 +484,7 @@ Blank names and unknown fields are rejected. Workflows select a set with
 and unknown names fail before a run is persisted.
 
 A run persists only the resolved set **name**; effective limits are resolved
-from current config on every operation (resume, step, answer, resolve, and
+from current config on every operation (resume, step, input, resolve, and
 resolution-options). Resuming or stepping an existing run after a config edit —
 including a raised retry budget — applies the current limits, and a deleted set
 falls back to `default` limits (a warning is logged; if `default` is also

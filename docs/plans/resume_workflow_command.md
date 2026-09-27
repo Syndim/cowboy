@@ -2,7 +2,7 @@
 
 Add a first-class resume command that continues an existing `Running` workflow run until it blocks, fails, or completes. The workflow engine already exposes this behavior as `WorkflowRuntime::resume_run`, and the diagnostic `engine-cli` already has a `resume <run-id>` command. The product surfaces are missing it: the `cowboy` CLI only exposes `step`, and the TUI slash commands only expose `/step`.
 
-Keep the engine behavior unchanged. Reuse the existing `WorkflowRuntime::resume_run` interface and `RunReport` rendering so resume has the same event persistence, run locking, status handling, and output formatting as `run`, `answer`, `resolve`, and `step`. Do not add a new workflow state, store table, Lua action, or run-selection policy.
+Keep the engine behavior unchanged. Reuse the existing `WorkflowRuntime::resume_run` interface and `RunReport` rendering so resume has the same event persistence, run locking, status handling, and output formatting as `run`, `provide-input`, `resolve`, and `step`. Do not add a new workflow state, store table, Lua action, or run-selection policy.
 
 Expose resume in both user-facing interfaces:
 
@@ -27,7 +27,7 @@ The optional TUI run id matches the phrase "current workflow" without inventing 
   - `/step <run-id>` still executes exactly one step;
   - `/run-step <request>` still starts only the first step;
   - plain text still starts a new workflow unless the TUI is waiting for prompt input;
-  - prompt answers still take precedence after explicit slash-command handling.
+  - prompt input still take precedence after explicit slash-command handling.
 - Update `crates/tui/src/app/markup.rs` so `/resume` and `/resume <run-id>` are treated as command lines where command-line rendering is applied.
 - Update `README.md`:
   - add `cowboy resume <run-id>` to the CLI quick-start/command section near `cowboy step <run-id>`;
@@ -80,7 +80,7 @@ The optional TUI run id matches the phrase "current workflow" without inventing 
 - [x] Dispatch `/resume <run-id>` to a new TUI background resume task.
 - [x] Dispatch `/resume` with no argument to the current `AppState::active_run_id()` when available.
 - [x] Show a non-fatal TUI usage/status card for `/resume` when no run id is available.
-- [x] Keep `/step`, `/run-step`, plain request submission, and prompt answer routing behavior unchanged.
+- [x] Keep `/step`, `/run-step`, plain request submission, and prompt input routing behavior unchanged.
 - [x] Update command-line rendering recognition for `/resume` in `crates/tui/src/app/markup.rs`.
 - [x] Update README CLI and TUI command documentation for `resume` and the `step` versus `resume` distinction.
 - [x] Add focused engine coverage proving `resume_run` continues a stepwise running workflow until blocked or terminal.

@@ -4,7 +4,7 @@ Persist the TUI composer input history in a TUI-owned append-only history file u
 
 Use a line-oriented append file instead of rewriting one whole JSON document. A whole-file JSON array/object has a read-modify-write race when multiple Cowboy TUI instances submit input at the same time. Name the file `<state_dir>/input_history`, with no `.log` extension. This follows the convention used by command-line tools where the filename names the data, not the storage implementation: Bash defaults to `.bash_history`, fish defaults to `fish_history`, and zsh uses the user-configured `HISTFILE` path. Use `<state_dir>/input_history.lock` as the advisory lock file. Each accepted input appends one complete versioned JSON-line record while holding the exclusive lock; loading holds a shared lock and reads the newest valid records. This preserves cross-run history without introducing redb schema/runtime responsibility for UI-only line-editor state.
 
-`AppState::new(config)` should load persisted history from the configured state directory. Accepted non-empty submissions should update the in-memory history and append one locked history record. Loading and saving should be best-effort: missing, corrupt, locked, or temporarily unwritable history files must not prevent Cowboy from launching, submitting prompt answers, or starting workflow requests.
+`AppState::new(config)` should load persisted history from the configured state directory. Accepted non-empty submissions should update the in-memory history and append one locked history record. Loading and saving should be best-effort: missing, corrupt, locked, or temporarily unwritable history files must not prevent Cowboy from launching, submitting prompt input, or starting workflow requests.
 
 # Changes
 
@@ -105,7 +105,7 @@ Use a line-oriented append file instead of rewriting one whole JSON document. A 
 - [x] Wire `AppState::new(config)` to load persisted history from the configured state directory.
 - [x] Wire accepted non-empty submissions to append updated history without changing dispatch behavior.
 - [x] Synchronize `AppState` history from the history module after successful append or duplicate skip.
-- [x] Preserve existing `↑` / `↓`, empty-submit, slash-command, prompt-answer, and workflow-dispatch behavior.
+- [x] Preserve existing `↑` / `↓`, empty-submit, slash-command, prompt-input, and workflow-dispatch behavior.
 - [x] Make lock, load, append, and compaction failures non-fatal in the TUI and log warnings.
 - [x] Add focused history module tests for missing, valid, corrupt, multiline, append, filename, duplicate, truncation, compaction, concurrent-append, and path-separation cases.
 - [x] Add focused TUI state or input tests for restored `↑` / `↓` navigation across fresh `AppState` instances.

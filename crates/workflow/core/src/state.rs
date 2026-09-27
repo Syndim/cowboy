@@ -328,7 +328,7 @@ mod optional_rfc3339_millis {
 ///
 /// Workflow state stores this small serializable descriptor at external input
 /// boundaries. A runtime rebuilds process-local handlers by `kind` when the
-/// user answer arrives.
+/// user input arrives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumeCallback {
     kind: String,
@@ -366,13 +366,13 @@ pub enum RunStatus {
     WaitingForInput {
         /// Step that requested input.
         step: StepId,
-        /// Prompt/input id used to validate the answer.
-        prompt_id: String,
+        /// Input id used to validate the supplied input.
+        input_id: String,
         /// Message shown to the user.
         message: String,
         /// Accepted choices, empty when free-form input is allowed.
         choices: Vec<Choice>,
-        /// Durable descriptor used to resume the blocked action after answer.
+        /// Durable descriptor used to resume the blocked action after input.
         resume_callback: ResumeCallback,
     },
     /// Run completed successfully.
@@ -608,10 +608,13 @@ mod tests {
 
     #[test]
     fn resume_callback_serializes_kind_and_payload() {
-        let callback =
-            ResumeCallback::new("ask_user", serde_json::json!({ "record_id": "record" })).unwrap();
+        let callback = ResumeCallback::new(
+            "wait_for_input",
+            serde_json::json!({ "record_id": "record" }),
+        )
+        .unwrap();
         let value = serde_json::to_value(callback).unwrap();
-        assert_eq!(value["kind"], "ask_user");
+        assert_eq!(value["kind"], "wait_for_input");
         assert_eq!(value["payload"]["record_id"], "record");
     }
 
@@ -619,7 +622,7 @@ mod tests {
     fn waiting_for_input_keeps_prompt_fields_and_callback() {
         let status = RunStatus::WaitingForInput {
             step: "approve".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec![
                 Choice {
@@ -632,12 +635,12 @@ mod tests {
                 },
             ],
             resume_callback: ResumeCallback::new(
-                "ask_user",
+                "wait_for_input",
                 serde_json::json!({
                     "record_id": "run-1",
                     "prev": "prev",
                     "started_at": Utc::now(),
-                    "output_status": "answered",
+                    "output_status": "provided",
                     "output_fields": { "plan": "ship" }
                 }),
             )
@@ -646,7 +649,7 @@ mod tests {
         let value = serde_json::to_value(status).unwrap();
         assert_eq!(value["status"], "waiting_for_input");
         assert_eq!(value["step"], "approve");
-        assert_eq!(value["resume_callback"]["kind"], "ask_user");
+        assert_eq!(value["resume_callback"]["kind"], "wait_for_input");
         assert!(value.get("record_id").is_none());
         assert!(value.get("output_fields").is_none());
     }

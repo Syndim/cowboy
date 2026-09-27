@@ -17,7 +17,7 @@ Target command model:
   - `Run { step: bool, workflow: Option<String>, request: Vec<String> }`, normalized by parser helpers into a request string for dispatch
   - `Step { run_id: String }`
   - `Resume { run_id: String }`
-  - `Answer { run_id: String, prompt_id: String, answer: Vec<String> }`, normalized by parser helpers into an answer string for dispatch
+  - `ProvideInput { run_id: String, input_id: String, answer: Vec<String> }`, normalized by parser helpers into an answer string for dispatch
   - `Improve { run_id: String }`
   - `Runs`
   - `Resolve { run_id: String, status: Option<String>, fields: Option<String>, body: Option<String> }`
@@ -27,7 +27,7 @@ Target command model:
   - Do not implement `TryFrom<CliCommand>` / `TryFrom<SlashCommand>` as the sharing mechanism; the shared runtime commands should be declared once and flattened into both parser surfaces.
 - Align argument shapes for shared commands so the flattened enum can be reused directly. In particular, `/resume` should align with `cowboy resume <run-id>` as `/resume <run-id>`; if the active-run resume shortcut is still desired, keep it as an explicitly TUI-only command rather than weakening the shared `resume` command.
 - Redesign the advertised command list around aligned command definitions, not a separate metadata table:
-  - Shared in both CLI and TUI: `run`, `step`, `resume`, `answer`, `runs`, `improve`, `resolve`.
+  - Shared in both CLI and TUI: `run`, `step`, `resume`, `provide-input`, `runs`, `improve`, `resolve`.
   - Canonical TUI slash run form: `/run [--step] [--workflow <workflow-id>] <request>` to match `cowboy run [--step] [--workflow <workflow-id>] <request...>`.
   - Remove `/run-step` and `/run-workflow` from slash help, suggestions, parser tests, and product docs as separate command names.
   - Keep TUI-only commands documented separately in the TUI command enum: `/workflows`, `/cancel`, `/exit`, `/help`.
@@ -60,7 +60,7 @@ Target command model:
   - flattened shared command parsing from CLI `cowboy run`, `cowboy run --step`, and `cowboy run --workflow <id>`;
   - flattened shared command parsing from TUI `/run`, `/run --step`, and `/run --workflow <id>`;
   - `/run "do work"` and `/run do work` preserve the same request string;
-  - `#123` remains ordinary payload text in `/run` and `/answer`;
+  - `#123` remains ordinary payload text in `/run` and `/provide-input`;
   - hyphen-leading requests such as `/run -- --dry-run now` or the chosen canonical clap-compatible form preserve request text;
   - `/resume <run-id>` parses through the flattened shared command for both CLI and TUI, and bare `/resume` fails with clap usage instead of relying on a TUI-specific shared-command shape;
   - `/resolve <run-id>`, `/resolve <run-id> <status>`, and `/resolve <run-id> <status> <fields-json>` keep their current TUI behavior;
@@ -73,7 +73,7 @@ Target command model:
   - suggestions no longer include `/run-workflow` or `/run-step`;
   - `/run --workflow review do work` spawns the named-workflow runtime task;
   - `/run --step do work` spawns the stepwise runtime task;
-  - `/run do work`, plain text submission, prompt answers, `/resume <run-id>`, `/answer`, `/resolve`, `/cancel`, `/exit`, and `/help` keep their behavior.
+  - `/run do work`, plain text submission, prompt input, `/resume <run-id>`, `/provide-input`, `/resolve`, `/cancel`, `/exit`, and `/help` keep their behavior.
 - Update markup tests in `crates/tui/app/src/app/markup.rs` for the canonical aligned slash command forms.
 - Update any README/docs snapshot-style tests if present after documentation changes.
 

@@ -18,7 +18,7 @@ process argv / slash composer input
             -> ACP-backed agent action executor / input router
             -> StepRecord + RunHead persistence
             -> workflow events + event log
-       -> TUI renders workflow events and accepts plain text/prompt answers
+       -> TUI renders workflow events and accepts plain text/prompt input
 ```
 
 ## Workspace crates
@@ -27,7 +27,7 @@ process argv / slash composer input
 | --- | --- |
 | `cowboy` (`crates/tui/app`) | Config loading, logging setup, runtime dispatch, and ratatui rendering only. Uses `cowboy-command-parser` for command grammar. |
 | `cowboy-command-parser` (`crates/tui/command-parser`) | Runtime/UI-independent clap-backed parsing for product CLI commands and interactive slash commands, plus metadata/suggestions. |
-| `cowboy-workflow-engine` | Product runtime: starts/resumes/answers/improves workflow runs, emits events, wires ACP agent execution. |
+| `cowboy-workflow-engine` | Product runtime: starts/resumes/provides input for/improves workflow runs, emits events, wires ACP agent execution. |
 | `cowboy-workflow-catalog` | Built-in workflow source plus project/user `.lua` workflow catalog loading and update application. |
 | `cowboy-workflow-core` | Serializable workflow domain model, graph validation, `execute_step`, runner traits. |
 | `cowboy-workflow-lua` | Sandboxed Lua workflow loader and one-step runtime. |
@@ -79,7 +79,7 @@ The compiled definition is durable data. The Lua VM is not durable; step code is
 - resolved config-set name (a name-only pointer; effective runner limits are resolved live from current config per operation)
 - current step
 - latest step-record hash
-- run status, including pending ask-user metadata when blocked for input
+- run status, including pending wait-for-input metadata when blocked for input
 - inactive legacy resume data retained for old serialized runs
 - step/visit counters and durable total/per-step retry counters
 
@@ -95,7 +95,7 @@ composite.
 
 - `start_run(request)`
 - `resume_run(run_id)` / `step_run(run_id)`
-- `answer_run(run_id, prompt_id, answer)`
+- `provide_input_run(run_id, input_id, input)`
 - `submit_user_prompt(run_id, window_id, content)`
 - `improve_run(run_id)`
 - `list_runs()` / `load_events(run_id)`
@@ -111,7 +111,7 @@ current `Run`
       agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
       command  -> CommandActionRunner -> tokio::process::Command -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
-      ask_user -> AskUserActionRunner -> WaitingForInput with ResumeCallback descriptor
+      wait_for_input -> WaitForInputActionRunner -> WaitingForInput with ResumeCallback descriptor
       workflow -> WorkflowActionRunner -> WorkflowRuntime child run -> completed StepRecord (or mirrored WaitingForInput)
       fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed -> one transaction stores the record and advances run/head
@@ -131,7 +131,7 @@ After Lua compilation, `WorkflowRuntime` resolves the workflow's optional
 `config_set` name (or `default`) before persisting a new `Run`. Unknown
 sets fail before run persistence. Only the name is durable run state; effective
 `RunnerLimits` are resolved live from current config on every resume, step,
-answer, resolve, and resolution-options path. A config edit (for example a
+input, resolve, and resolution-options path. A config edit (for example a
 raised retry budget) therefore applies to an existing run, and a deleted set
 falls back to `default` limits with a warning (or the built-in defaults when
 `default` is also absent). This is a breaking persisted-shape change with no
@@ -244,7 +244,7 @@ Every Lua dispatch reloads the full history and exposes it as
 followed by durable `follow_up` entries. `ctx.request` remains the original
 request. Fresh sessions receive the full ordered history; reused sessions
 receive only sequences above their durable delivery watermark. Explicit
-`ask_user` answers are excluded and remain in `ctx.prev.fields.answer`.
+`wait_for_input` supplied values are excluded from agent prompts and remain in `ctx.prev.fields.input`.
 
 For a restarted run, sequence `0` has `kind = "restart"` instead of
 `kind = "initial"` while preserving the submitted request and timestamp exactly.
@@ -255,15 +255,15 @@ The canonical previous-step view is `ctx.prev.output = { status, fields, body,
 raw }`. Flattened `ctx.prev.status`, `fields`, `body`, and `raw` aliases remain
 for snapshotted-workflow compatibility.
 
-`cowboy-workflow-engine::ResumeRouter` handles `action.ask_user` answers:
+`cowboy-workflow-engine::ResumeRouter` handles `action.wait_for_input` completion:
 
 1. validates the run is in `RunStatus::WaitingForInput`
-2. validates prompt id and allowed choices
+2. validates input id and allowed choices
 3. dispatches the persisted `ResumeCallback` through `ResumeCallbackRegistry`
 4. applies the callback-produced `ActionResult` through the same `apply_step_record` / `apply_run_status` paths as other actions
-5. emits and persists the ask-user `StepCompleted` event before resumed-step events
+5. emits and persists the wait-for-input `StepCompleted` event before resumed-step events
 
-Answering does not increment step budgets. The next Lua step receives the answer as `ctx.prev.fields.answer` with `ctx.prev.action == "ask_user"`.
+Providing input does not increment step budgets. The supplied value is a hint rather than proof of approval or completion; the next Lua step receives it as `ctx.prev.fields.input` with `ctx.prev.action == "wait_for_input"` and should recheck the authoritative condition.
 
 No Lua coroutine or host-call replay cache is persisted.
 
@@ -287,7 +287,7 @@ On a terminal child, the parent workflow step record copies the child terminal
 status. A failed child maps to a `"failed"` output, a cancelled child to
 `"cancelled"`. When a child waits for input, the parent mirrors the child prompt
 through its own `WaitingForInput` with a durable workflow-child resume callback;
-answering the parent answers and continues the child through the shared executor.
+providing the parent inputs and continues the child through the shared executor.
 Parent and child keep isolated per-run event logs, and the active parent emits
 `child workflow <id> started/waiting for input/resumed/finished` progress.
 
@@ -357,7 +357,7 @@ cowboy run --workflow <workflow-id> <request...>  # start a specific catalog wor
 cowboy run --session-id <role=session-id> <request...>  # load an existing role session
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
-cowboy answer <run-id> <prompt-id> <answer>  # answer an ask-user prompt
+cowboy provide-input <run-id> <input-id> <input>  # provide waiting external input
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
 cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
@@ -391,7 +391,7 @@ step` re-execute the retained current step for every non-terminal run status —
 `Running`, `Failed`, and `WaitingForInput`: for a `Failed` step this grants one
 fresh initial attempt that can succeed or deterministically re-fail on an
 exhausted budget, and for a `WaitingForInput` run it re-prompts the retained
-`ask_user` step and safely replaces the durable pending resume callback. Only
+`wait_for_input` step and safely replaces the durable pending resume callback. Only
 `Completed` and `Cancelled` runs are non-resumable no-ops. `cowboy resolve`
 forces a manual status on a failed run.
 
@@ -401,7 +401,7 @@ The TUI accepts plain requests and slash commands in its composer. Slash command
 
 Idle plain text after a durable `Completed` or `Failed` active run calls
 `WorkflowRuntime::restart_run` and follows the returned new run id. Dispatch
-precedence is slash command, pending answer, active-agent prompt, terminal
+precedence is slash command, pending input, active-agent prompt, terminal
 restart, then normal new-run selection. `Cancelled`, missing, and unknown
 durable states keep normal new-run behavior.
 
@@ -416,17 +416,17 @@ open agent prompt window, and the latest durable run status.
 | running | open | `Running` | Submit the exact draft to the current agent; clear/history it only after durable acceptance. |
 | running | absent/closed | any | Block Enter and retain the exact draft because no agent can accept it. |
 | idle | absent | `Running` | Normal idle behavior; `/step` and `/resume` remain available. |
-| idle | absent | `WaitingForInput` | Route plain text through the pending-answer fallback; explicit `/answer` remains available, and `/step`/`/resume` re-prompt the retained `ask_user` step. |
+| idle | absent | `WaitingForInput` | Route plain text through the pending-input fallback; explicit `/provide-input` remains available, and `/step`/`/resume` re-prompt the retained `wait_for_input` step. |
 | idle | absent | `Failed` | Plain text restarts the visible workflow as a new run; `/step` and `/resume` retry the retained failed step, and read-only and mutating `/resolve` remain available. |
 | idle | absent | `Completed` | Plain text restarts the visible workflow as a new run. |
 | idle | absent | `Cancelled` or unknown | Normal new-request and command behavior. |
 
 While execution is running, `/cancel`, `/help`, `/exit`, `/runs`, `/export`,
 `/workflows`, and read-only `/resolve <run-id>` remain available. `/run`, `/step`, `/resume`,
-`/answer`, `/improve`, and mutating `/resolve` are rejected before dispatch and
+`/provide-input`, `/improve`, and mutating `/resolve` are rejected before dispatch and
 retain the draft. This conflict list is never applied merely because an active
 run id exists: stepwise `Running`, waiting, failed, and terminal runs are idle
-after their background task returns. A pending `ask_user` answer has priority
+after their background task returns. A pending `wait_for_input` input has priority
 over agent-prompt submission, and leading-slash input is always parsed as a
 command rather than forwarded to an agent.
 
@@ -437,7 +437,7 @@ Current vertical layout:
 | Header | Active Cowboy state, step, run id, workflow name, and background task count. |
 | Transcript | Workflow event stream: lifecycle events, exact agent prompt, agent thinking, agent responses, tool calls, tool updates, prompt cards, failures, suspensions, and completion. |
 | Status strip | Context-sensitive state and key hints. |
-| Composer | Plain requests, prompt answers, multiline input, and slash-command suggestions. |
+| Composer | Plain requests, prompt input, multiline input, and slash-command suggestions. |
 
 Slash commands:
 
@@ -445,7 +445,7 @@ Slash commands:
 /run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>
 /step <run-id>
 /resume <run-id>
-/answer <run-id> <prompt-id> <answer>
+/provide-input <run-id> <input-id> <input>
 /runs
 /export <run-id>
 /workflows

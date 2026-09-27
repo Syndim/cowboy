@@ -24,10 +24,10 @@ Current grounding:
   - expose slash completion/query helpers or metadata enough for the app crate to implement suggestions without duplicating the registry;
   - keep parser outputs runtime-agnostic strings/options only, not closures or workflow-runtime calls.
 - Move CLI clap definitions out of `crates/tui/app/src/main.rs` into `cowboy-command-parser`:
-  - preserve current user-facing CLI behavior: `cowboy`, `cowboy tui`, `cowboy run [--step] [--workflow <id>] <request...>`, `cowboy step <run-id>`, `cowboy resume <run-id>`, `cowboy answer <run-id> <prompt-id> <answer>`, `cowboy improve <run-id>`, `cowboy runs`, and `cowboy resolve <run-id> [status] [--fields <json>] [--body <text>]`;
+  - preserve current user-facing CLI behavior: `cowboy`, `cowboy tui`, `cowboy run [--step] [--workflow <id>] <request...>`, `cowboy step <run-id>`, `cowboy resume <run-id>`, `cowboy provide-input <run-id> <input-id> <value>`, `cowboy improve <run-id>`, `cowboy runs`, and `cowboy resolve <run-id> [status] [--fields <json>] [--body <text>]`;
   - keep the global `--config` option defaulting through a callback supplied by, or re-exported from, the app crate without making the parser crate depend on app config loading.
 - Move slash command parsing out of `crates/tui/app/src/app/commands.rs` into `cowboy-command-parser`:
-  - preserve current slash behavior for `/run`, `/run-workflow`, `/run-step`, `/step`, `/resume`, `/answer`, `/runs`, `/workflows`, `/improve`, `/resolve`, `/cancel`, `/exit`, and `/help`;
+  - preserve current slash behavior for `/run`, `/run-workflow`, `/run-step`, `/step`, `/resume`, `/provide-input`, `/runs`, `/workflows`, `/improve`, `/resolve`, `/cancel`, `/exit`, and `/help`;
   - preserve required-argument usage strings shown by the TUI;
   - preserve quoted multi-word arguments, issue-style `#123` text, hyphen-leading requests such as `/run-step --dry-run now`, optional `/resume`, and optional `/resolve` fields-json behavior;
   - use clap for the command grammar for both CLI and slash commands;
@@ -54,10 +54,10 @@ Current grounding:
 - Add parser-crate unit tests for existing slash parser behavior currently in `crates/tui/src/app/commands.rs`:
   - quoted and unquoted `/run` requests parse equivalently;
   - `/run-workflow` captures workflow id and trailing request;
-  - `#123` text is preserved in `/run`, `/run-workflow`, and `/answer`;
+  - `#123` text is preserved in `/run`, `/run-workflow`, and `/provide-input`;
   - `/run-step --dry-run now` preserves the hyphen-leading request;
   - bare and explicit `/resume` parse correctly;
-  - `/answer` preserves quoted/unquoted multi-word answers;
+  - `/provide-input` preserves quoted/unquoted multi-word answers;
   - `/resolve` parses list, status-only, and quoted fields-json forms;
   - malformed quotes return `SlashParseError::UnmatchedQuote`;
   - every advertised slash command has a parse sample and metadata.
@@ -66,7 +66,7 @@ Current grounding:
   - slash suggestions filter by command prefix and include `/resume [run-id]`;
   - missing slash args show usage without spawning background tasks;
   - parser errors show usage without starting a plain-text run;
-  - dispatch tests for `/run`, `/run-workflow`, `/resume`, `/answer`, `/resolve`, `/cancel`, `/exit`, and plain text still pass.
+  - dispatch tests for `/run`, `/run-workflow`, `/resume`, `/provide-input`, `/resolve`, `/cancel`, `/exit`, and plain text still pass.
 - Add a compile-level guard if practical: `cowboy-command-parser` should not depend on `cowboy-workflow-engine`, `ratatui`, `crossterm`, or `tui-input`.
 
 # How to verify
@@ -121,7 +121,7 @@ cargo run -p cowboy -- run --step --workflow default smoke request
 - [x] Remove direct command parsing dependencies and parser internals from the app crate where the parser crate now owns them.
 - [x] Refactor app `main.rs` to consume `cowboy-command-parser` CLI outputs and keep runtime dispatch local.
 - [x] Refactor app `app/commands.rs` and composer controls to consume `cowboy-command-parser` slash outputs and metadata while keeping runtime dispatch local.
-- [x] Keep plain text submission and pending prompt fallback in the app crate.
+- [x] Keep plain text submission and pending input fallback in the app crate.
 - [x] Move or recreate existing CLI parser tests in `cowboy-command-parser`.
 - [x] Move or recreate existing slash parser tests in `cowboy-command-parser`.
 - [x] Update app dispatch, suggestion, usage, and help tests to use the parser crate interface.

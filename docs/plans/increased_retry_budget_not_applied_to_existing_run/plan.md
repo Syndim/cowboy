@@ -28,7 +28,7 @@ Cumulative user direction:
    change and pre-existing runs may be discarded.
 
 This supersedes the earlier snapshot-refresh design. There is **no snapshot to
-refresh**: limits are never frozen into the run, so resume/step/answer/resolve
+refresh**: limits are never frozen into the run, so resume/step/provide-input/resolve
 all use live config. The previous "preserve in-flight snapshot semantics"
 constraint is intentionally dropped. Retired TODOs from prior revisions are
 listed at the end of the TODO section; their IDs are not reused.
@@ -78,7 +78,7 @@ loads config once per process (RCA Layer B), consistent with the user's
 - **Persist only the name.** `WorkflowRun.config_set` becomes a name-only
   reference (the selected set name), not resolved limits.
 - **Resolve limits live at one seam.** `start_run`, `resume_run`, `step_run`,
-  `answer_run`, and `resolve_run` all funnel execution through
+  `provide_input_run`, and `resolve_run` all funnel execution through
   `run_existing_with_events` (`runtime.rs:1165-1214`). Resolving
   `ResolvedRuntimePolicy` there and passing it into the runner covers all five
   paths in one place.
@@ -142,7 +142,7 @@ restart caveat).
   - In `run_existing_with_events` (`runtime.rs:1165-1214`), before building the
     runner, `let policy = self.resolve_limits(&run.config_set.name);` and pass it
     as the required `WorkflowRunner::new` argument. Because resolution is
-    infallible, its placement relative to the `resume_with`/`answer_run`/
+    infallible, its placement relative to the `resume_with`/`provide_input_run`/
     `resolve_run` durable mutations is immaterial — no run can be persisted as
     advanced/`Running` without an acquired policy.
   - Update runtime tests reading `run.config_set.limits`
@@ -175,7 +175,7 @@ restart caveat).
     → renamed `changed_config_set_limits_apply_live_on_resume_and_step`.
   - `answer_resolve_and_options_use_snapshot_after_set_deletion`
     (`runtime.rs:2955`) → renamed
-    `deleted_set_answer_and_resolve_fall_back_to_default_limits`.
+    `deleted_set_input_and_resolve_fall_back_to_default_limits`.
 
 - **Added:**
   - `resume_of_failed_run_advances_cumulative_retry_counters` (TODO-08).
@@ -209,7 +209,7 @@ restart caveat).
 3. Rewritten + preserved guards pass (one filter per command):
    ```
    cargo test -p cowboy-workflow-engine changed_config_set_limits_apply_live_on_resume_and_step
-   cargo test -p cowboy-workflow-engine deleted_set_answer_and_resolve_fall_back_to_default_limits
+   cargo test -p cowboy-workflow-engine deleted_set_input_and_resolve_fall_back_to_default_limits
    cargo test -p cowboy-workflow-engine unknown_config_set_fails_before_run_persistence
    cargo test -p cowboy-workflow-engine resume_refails_when_fresh_attempt_fails_with_exhausted_step_budget
    ```
@@ -387,7 +387,7 @@ restart caveat).
        (`runtime.rs:1165-1214`) call `let policy =
        self.resolve_limits(&run.config_set.name);` and pass it into
        `WorkflowRunner::new`. Because `resolve_limits` cannot fail, no durable
-       lifecycle mutation in `resume_with`/`answer_run`/`resolve_run` can be
+       lifecycle mutation in `resume_with`/`provide_input_run`/`resolve_run` can be
        stranded by a later resolution failure.
     3. Add three `#[tokio::test]` (or sync) unit tests for `resolve_limits` and
        run each with its exact command:
@@ -435,24 +435,24 @@ restart caveat).
        `increment_budget`, so the count does not advance). Remove all
        `.config_set.limits` field access. Run
        `cargo test -p cowboy-workflow-engine changed_config_set_limits_apply_live_on_resume_and_step`.
-    2. **Deleted-set answer/resolve fallback, with persisted-state reload.**
+    2. **Deleted-set input/resolve fallback, with persisted-state reload.**
        Rename `answer_resolve_and_options_use_snapshot_after_set_deletion`
        (`runtime.rs:2955`) to
-       `deleted_set_answer_and_resolve_fall_back_to_default_limits`, keeping the
-       `answer` and `resolve` workflows (both `config_set = "careful"`). Start
+       `deleted_set_input_and_resolve_fall_back_to_default_limits`, keeping the
+       `provide-input` and `resolve` workflows (both `config_set = "careful"`). Start
        both under a creator runtime with `default { max_steps_per_run: 5 }` and
-       `careful { max_steps_per_run: 2 }` (assert the `answer` run reaches
+       `careful { max_steps_per_run: 2 }` (assert the `provide-input` run reaches
        `WaitingForInput` with `steps_executed == 1` and the `resolve` run reaches
        `Failed` with `steps_executed == 1`). Build a second runtime that
        **omits** `careful` and sets `default { max_steps_per_run: 1 }`. Assert
-       `answer_run(&waiting.id, "approval", "yes").await.unwrap_err()
+       `provide_input_run(&waiting.id, "approval", "yes").await.unwrap_err()
        .to_string().contains("run exceeded max step count (1)")` and
        `resolve_run(&failed.id, "fixed", None, None).await.unwrap_err()
        .to_string().contains("run exceeded max step count (1)")` — proving the
        deleted set falls back to `default` limit `1` (careful's `2` would have
        completed both). Then **reload each run** and assert the exact durable
        state produced by the source mutation order — `apply_step_record` writes
-       the answer/manual-resolution record, advances `current_step` to `done`
+       the input/manual-resolution record, advances `current_step` to `done`
        and sets a new head, *then* the live `default.max_steps_per_run == 1`
        rejects executing `done` and the runner persists `Failed` (the budget
        check at `engine.rs:151` fires before `increment_budget`, so
@@ -460,11 +460,11 @@ restart caveat).
        of: `matches!(loaded.status, RunStatus::Failed { .. })`; `loaded.status !=
        RunStatus::Completed`; `loaded.current_step == "done"`; `loaded.steps_
        executed == 1`; and `loaded.head != pre_operation_head` where the new
-       `loaded.head` resolves to the answer record (answer run) / the
+       `loaded.head` resolves to the input record (input delivery) / the
        `manual_resolution` record (resolve run) — capture each run's head before
-       calling `answer_run`/`resolve_run` to compare. Remove all
+       calling `provide_input_run`/`resolve_run` to compare. Remove all
        `.config_set.limits` field access. Run
-       `cargo test -p cowboy-workflow-engine deleted_set_answer_and_resolve_fall_back_to_default_limits`.
+       `cargo test -p cowboy-workflow-engine deleted_set_input_and_resolve_fall_back_to_default_limits`.
     3. Update start-time assertions at `runtime.rs:2856-2864` to keep `.name`
        checks and drop `.limits` checks.
   - Expected result: both renamed tests print `1 passed; 0 failed`. Assertion 1
@@ -473,10 +473,10 @@ restart caveat).
     "second"` / unadvanced `steps_executed == 1` durable state; assertion 2
     proves a deleted set uses `default` fallback limits, with each run reloaded
     as `Failed`, `current_step == "done"`, `steps_executed == 1`, and a new head
-    resolving to the answer / `manual_resolution` record (never `Completed`). No
+    resolving to the input / `manual_resolution` record (never `Completed`). No
     reference to a removed `.config_set.limits` field remains anywhere in the
     module.
-  - Implementer observed result: `cargo test -p cowboy-workflow-engine changed_config_set_limits_apply_live_on_resume_and_step` and `deleted_set_answer_and_resolve_fall_back_to_default_limits` each printed `1 passed; 0 failed`; start-time assertions keep `.name` only; no `.config_set.limits` reference remains in the module.
+  - Implementer observed result: `cargo test -p cowboy-workflow-engine changed_config_set_limits_apply_live_on_resume_and_step` and `deleted_set_input_and_resolve_fall_back_to_default_limits` each printed `1 passed; 0 failed`; start-time assertions keep `.name` only; no `.config_set.limits` reference remains in the module.
 
 - [x] TODO-16: Document the breaking persisted-shape change and store reset
   allowance.
@@ -570,4 +570,4 @@ restart caveat).
   accurate fallback subject/test name; TODO-05's ID is not reused.
 - **TODO-12** ("Add a `WaitingForInput`-through-`resume_with` snapshot-retention
   guard …") — obsolete: `WaitingForInput` runs also resolve live; deleted-set
-  answer/resolve fallback is covered by TODO-15.
+  input/resolve fallback is covered by TODO-15.

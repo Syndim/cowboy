@@ -173,7 +173,7 @@ Keep `StepOutput` as the persisted source of truth and expose it canonically to 
     1. Add `ctx.prev.output` in `LuaStepActionProvider` from the persisted `StepOutput`.
     2. Preserve the existing flattened aliases.
     3. Run `cargo test -p cowboy-workflow-engine lua_provider_exposes_previous_step_output`.
-  - Expected result: Lua observes identical status, fields, body, and raw values through both the canonical nested object and compatibility aliases, including ask-user and non-agent outputs.
+  - Expected result: Lua observes identical status, fields, body, and raw values through both the canonical nested object and compatibility aliases, including wait-for-input and non-agent outputs.
   - Observed result: `ctx.prev.output` now contains the persisted status, fields, body, and raw value while flattened aliases remain unchanged; the exact runner regression test compared both views and exited with status 0.
 
 - [x] TODO-04: Add structured change handoffs and minimal revision prompt helpers to the example workflow library.

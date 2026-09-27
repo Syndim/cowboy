@@ -823,7 +823,7 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
         "run-170dc431-abc",
         WorkflowEventKind::WaitingForInput {
             step: "review".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec![
                 Choice {
@@ -874,7 +874,7 @@ fn draw_smoke_covers_workflow_tool_cards_and_resize() {
     assert!(
         wide_rows
             .iter()
-            .any(|row| row.contains("┌ Enter answers active prompt")),
+            .any(|row| row.contains("┌ Enter provides active input")),
         "{wide}"
     );
 
@@ -977,7 +977,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
         "run-1",
         WorkflowEventKind::WaitingForInput {
             step: "confirm_result".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: Vec::new(),
         },
@@ -990,7 +990,7 @@ fn draw_narrow_short_terminal_keeps_tail_status_and_composer_borders() {
     assert!(rendered.contains("Waiting for input"), "{rendered}");
     assert!(
         rows.iter()
-            .any(|row| row.contains("┌ Enter answers active prompt")),
+            .any(|row| row.contains("┌ Enter provides active input")),
         "{rendered}"
     );
     assert!(
@@ -1084,13 +1084,13 @@ async fn draw_composer_border_color_tracks_visual_state() {
         "run-1",
         WorkflowEventKind::WaitingForInput {
             step: "confirm_result".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: Vec::new(),
         },
     ));
     assert_eq!(
-        composer_border_fg_for_title(&state, 100, 14, "Enter answers active prompt"),
+        composer_border_fg_for_title(&state, 100, 14, "Enter provides active input"),
         style_warning().fg.unwrap()
     );
 
@@ -1098,7 +1098,7 @@ async fn draw_composer_border_color_tracks_visual_state() {
 }
 
 #[tokio::test]
-async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_runs() {
+async fn pending_input_submission_clears_prompt_and_locks_composer_while_provide_input_runs() {
     let dir = tempfile::tempdir().unwrap();
     let workflow_dir = dir.path().join("workflows");
     std::fs::create_dir(&workflow_dir).unwrap();
@@ -1107,7 +1107,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         r#"
         local confirm = step("confirm")
         confirm.run = function(ctx)
-          return action.ask_user {
+          return action.wait_for_input {
             id = "approval",
             message = "Approve?",
             choices = { yes = "Approve", no = "Reject" },
@@ -1117,10 +1117,10 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         local done = step("done")
         done.run = function(ctx)
           local fields = (ctx.prev and ctx.prev.fields) or {}
-          return action.status { status = "success", body = "answer=" .. tostring(fields.answer) }
+          return action.status { status = "success", body = "answer=" .. tostring(fields.input) }
         end
 
-        confirm:on("answered", done)
+        confirm:on("provided", done)
         return workflow("ask", confirm)
         "#,
     )
@@ -1150,7 +1150,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
     let run_id = start.run.id.clone();
     assert!(start.events.iter().any(|event| matches!(
         &event.kind,
-        WorkflowEventKind::WaitingForInput { prompt_id, .. } if prompt_id == "approval"
+        WorkflowEventKind::WaitingForInput { input_id, .. } if input_id == "approval"
     )));
     let mut state = AppState::new(config);
     state.spawn_test_card_report_task("seed waiting run".to_string(), async move { Ok(start) });
@@ -1164,9 +1164,9 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         }
     })
     .await
-    .expect("answer task should complete");
+    .expect("input task should complete");
     assert_eq!(
-        state.pending_prompt_answer_target(),
+        state.pending_input_target(),
         Some((run_id.clone(), "approval".to_string()))
     );
     assert!(state.composer_accepts_edits());
@@ -1179,7 +1179,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
     assert!(state.pending_prompt().is_none());
     assert_eq!(
         state.status(),
-        format!("submitted answer: {run_id} approval")
+        format!("submitted input: {run_id} approval")
     );
     assert_eq!(state.background_task_count(), 1);
     assert!(state.composer_accepts_edits());
@@ -1194,7 +1194,7 @@ async fn prompt_answer_submission_clears_prompt_and_locks_composer_while_answer_
         }
     })
     .await
-    .expect("answer task should complete");
+    .expect("input task should complete");
     assert_eq!(state.background_task_count(), 0);
     assert_eq!(state.display_state(), "completed");
     assert!(state.composer_accepts_submit());
@@ -1251,7 +1251,7 @@ fn status_animation_tick_marks_dirty_only_while_running() {
         "run-1",
         WorkflowEventKind::WaitingForInput {
             step: "confirm".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec![Choice {
                 key: "yes".to_string(),

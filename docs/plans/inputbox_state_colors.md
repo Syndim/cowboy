@@ -1,6 +1,6 @@
 # Plan
 
-Use the TUI composer state that already drives input behavior to choose the input box color at render time. The color applies to the composer `Block` border, and the title should use the same style if Ratatui does not inherit the border style into the title. Keep input behavior unchanged: normal idle composer submits as today, an active background run without a pending prompt accepts draft edits but disables submit, and `WaitingForInput` enables prompt answers.
+Use the TUI composer state that already drives input behavior to choose the input box color at render time. The color applies to the composer `Block` border, and the title should use the same style if Ratatui does not inherit the border style into the title. Keep input behavior unchanged: normal idle composer submits as today, an active background run without a pending prompt accepts draft edits but disables submit, and `WaitingForInput` enables prompt input.
 
 State precedence:
 
@@ -14,7 +14,7 @@ State precedence:
 - Add a composer style helper that maps the visual state to existing palette functions: initial to blue accent, submit-disabled to muted gray, waiting-for-input to warning orange.
 - Use that helper in `composer::render` for `Block::border_style(...)`; style the composer title with the same state color if the current Ratatui title rendering otherwise stays uncolored.
 - Leave `composer::title`, `height`, wrapping, cursor placement, slash suggestions, and input handling semantics unchanged except where tests need to inspect the title as a styled span.
-- Do not change workflow runtime state, prompt-answer routing, background task lifecycle, or status/header/transcript styling.
+- Do not change workflow runtime state, prompt-input routing, background task lifecycle, or status/header/transcript styling.
 
 # Tests to be added/updated
 
@@ -38,7 +38,7 @@ State precedence:
 - [x] Add a local composer visual-state helper in `crates/tui/app/src/app/controls/composer.rs`.
 - [x] Map composer visual states to existing blue, gray, and orange style functions.
 - [x] Apply the state style to the composer border and title rendering.
-- [x] Preserve existing composer behavior for submit gating, draft editing, prompt answers, slash suggestions, wrapping, and cursor placement.
+- [x] Preserve existing composer behavior for submit gating, draft editing, prompt input, slash suggestions, wrapping, and cursor placement.
 - [x] Add focused composer state/style tests.
 - [x] Add full TUI render coverage for the three composer colors.
 - [x] Run the focused composer tests.

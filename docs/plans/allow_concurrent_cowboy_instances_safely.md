@@ -11,9 +11,9 @@ The fix has two parts:
 
 Keep the configured `workflow_store` path and current redb schema. Do not shard the database for this bug fix. Refactor `RedbRunStore` into a cloneable path-backed store that opens redb inside each store method, performs one short transaction, commits, and drops the database handle before returning. Add bounded retry/backoff around `DatabaseAlreadyOpen` during open/create so overlapping quick operations wait briefly instead of surfacing a database-lock error.
 
-Add a run execution guard in the engine layer. The store remains a persistence primitive; it should not know which calls are workflow execution. `WorkflowRuntime` should acquire a guard before operations that can advance a run: `start_run`, `start_run_stepwise`, `resume_run`, `step_run`, and `answer_run`. The guard should combine process-wide active-run tracking with an OS file lock under a sidecar lock directory derived from the configured `workflow_store`, held for the full execution window including agent calls.
+Add a run execution guard in the engine layer. The store remains a persistence primitive; it should not know which calls are workflow execution. `WorkflowRuntime` should acquire a guard before operations that can advance a run: `start_run`, `start_run_stepwise`, `resume_run`, `step_run`, and `provide_input_run`. The guard should combine process-wide active-run tracking with an OS file lock under a sidecar lock directory derived from the configured `workflow_store`, held for the full execution window including agent calls.
 
-Do not build lock paths from raw user input. `resume_run`, `step_run`, and `answer_run` accept user-supplied run ids, so the guard must first validate the id as the generated `run-<uuid>` format and then build the lock filename from the parsed UUID's canonical string, e.g. `<workflow_store>.locks/run-<canonical-uuid>.lock`. Invalid/path-like ids such as `../run-x`, `/tmp/run-x`, or `run-../../x` must fail before any lock path is created and before database loading. This prevents path traversal through lock filenames while preserving current generated run ids from `format!("run-{}", Uuid::new_v4())`.
+Do not build lock paths from raw user input. `resume_run`, `step_run`, and `provide_input_run` accept user-supplied run ids, so the guard must first validate the id as the generated `run-<uuid>` format and then build the lock filename from the parsed UUID's canonical string, e.g. `<workflow_store>.locks/run-<canonical-uuid>.lock`. Invalid/path-like ids such as `../run-x`, `/tmp/run-x`, or `run-../../x` must fail before any lock path is created and before database loading. This prevents path traversal through lock filenames while preserving current generated run ids from `format!("run-{}", Uuid::new_v4())`.
 
 Read-only operations should remain lock-free at the run-execution layer: `list_runs`, `load_run`, catalog loading, event loading, and display paths can open redb transiently but should not acquire per-run execution locks. Event log writes are per-run JSON files; the run execution guard prevents same-run event-log races during advancement.
 
@@ -53,7 +53,7 @@ Read-only operations should remain lock-free at the run-execution layer: `list_r
 - Hold the run execution guard around run-advancing runtime paths:
   - in `start_with`, generate the new `run-<uuid>` first, acquire its guard, then persist and execute the run;
   - in `resume_with`, validate and acquire the guard before loading or executing the run;
-  - in `answer_run`, validate and acquire the guard before mutating the waiting run and keep it through any automatic resume;
+  - in `provide_input_run`, validate and acquire the guard before mutating the waiting run and keep it through any automatic resume;
   - keep `list_runs`, `load_run`, `catalog`, `load_events`, and read-only display paths guard-free.
 - Ensure `AgentExecutor` continues to receive a cloneable store, but that store opens redb only inside role-session methods.
 - Preserve persisted table names and serialized `WorkflowRun`, `RunHead`, object, role-session, and turn formats; no migration should be required.
@@ -80,7 +80,7 @@ Read-only operations should remain lock-free at the run-execution layer: `list_r
   - `/tmp/run-00000000-0000-0000-0000-000000000000`;
   - `run-../../00000000-0000-0000-0000-000000000000`;
   - `run-not-a-uuid`.
-- Add an engine/runtime test proving `step_run` or `answer_run` with an invalid/path-like run id returns the validation error and does not create files outside the workflow-store sidecar lock directory.
+- Add an engine/runtime test proving `step_run` or `provide_input_run` with an invalid/path-like run id returns the validation error and does not create files outside the workflow-store sidecar lock directory.
 - Add an engine/runtime same-run contention test returning the clear `already active` workflow error instead of `Database already open`. If full async runtime contention is awkward, test the guard directly and one runtime path's error mapping.
 - Update existing store tests only where they assumed `RedbRunStore::open` owns a long-lived database handle. `committed_data_survives_reopen` should keep the same behavioral assertions.
 - No TUI rendering tests should need changes unless the user-facing error status formatting changes; if it does, update only focused affected assertions.
@@ -147,7 +147,7 @@ The manual smoke checks were run with deterministic `engine-cli` against one sha
 - [x] Map same-run lock contention to a clear workflow error that does not mention redb.
 - [x] Acquire the run execution guard for newly generated run ids in `start_with`.
 - [x] Acquire the run execution guard before loading or executing existing runs in `resume_with`.
-- [x] Acquire the run execution guard around answer mutation and automatic resume in `answer_run`.
+- [x] Acquire the run execution guard around answer mutation and automatic resume in `provide_input_run`.
 - [x] Keep list/load/catalog/event read paths free of run execution locks.
 - [x] Keep `AgentExecutor` role-session access working with the path-backed store.
 - [x] Update comments and module documentation that describe a long-lived open redb handle.

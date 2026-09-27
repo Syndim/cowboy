@@ -25,7 +25,7 @@ Topic lifecycle contract:
 - `crates/workflow/engine/src/runtime.rs`
   - Generate the request topic from the default configured agent for new-run entry points before handing the run to the runner: `start_run`, `start_run_stepwise`, `start_run_with_workflow`, and `start_run_with_workflow_stepwise`.
   - Use best-effort semantics for UI chrome: a topic-generation failure should be logged and should leave the topic absent, but it should not fail the workflow run.
-  - Thread `Option<String>` topic data into `run_existing` / `run_existing_with_events` only for new-run calls. Existing-run paths (`step_run`, `resume_run`, `answer_run`, `resolve_run`) should pass `None` and rely on the TUI same-run preservation contract.
+  - Thread `Option<String>` topic data into `run_existing` / `run_existing_with_events` only for new-run calls. Existing-run paths (`step_run`, `resume_run`, `provide_input_run`, `resolve_run`) should pass `None` and rely on the TUI same-run preservation contract.
   - Do not emit a second synthetic `RunStarted` event from runtime. The runner remains the single source of `RunStarted` events.
 
 - `crates/workflow/engine/src/runner.rs`

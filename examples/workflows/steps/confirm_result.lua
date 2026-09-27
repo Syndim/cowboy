@@ -18,10 +18,10 @@ return function(id)
 
   confirm.run = function(ctx)
     local fields = (ctx.prev and ctx.prev.fields) or {}
-    if ctx.prev and ctx.prev.action == "ask_user" then
-      local answer = fields.answer
-      if answer and tostring(answer) ~= "" then
-        local normalized = string.lower(tostring(answer))
+    if ctx.prev and ctx.prev.action == "wait_for_input" then
+      local value = fields.input
+      if value and tostring(value) ~= "" then
+        local normalized = string.lower(tostring(value))
         if normalized == "yes" or normalized == "y" or normalized == "approve" or normalized == "approved" then
           return action.status {
             status = "confirmed",
@@ -30,9 +30,9 @@ return function(id)
           }
         end
 
-        local copied = result_fields(fields, context.append_user_feedback(fields, "Result confirmation", answer))
-        copied.feedback = tostring(answer)
-        copied.changes_needed = { tostring(answer) }
+        local copied = result_fields(fields, context.append_user_feedback(fields, "Result confirmation", value))
+        copied.feedback = tostring(value)
+        copied.changes_needed = { tostring(value) }
         copied.change_context = "The user requested these implementation changes during result confirmation."
         return action.status {
           status = "changes_requested",
@@ -43,9 +43,9 @@ return function(id)
     end
 
     local review = context.previous_step_context(ctx, "Approved review:")
-    local prompt_id = "result_confirmation_" .. tostring(ctx.steps_executed or 0)
-    return action.ask_user {
-      id = prompt_id,
+    local input_id = "result_confirmation_" .. tostring(ctx.steps_executed or 0)
+    return action.wait_for_input {
+      id = input_id,
       message = "Review the implementation summary below. Type 'yes' to approve and commit it, or describe the changes you want before committing.\n" .. tostring(review),
       choices = {},
       fields = result_fields(fields, context.copy_user_feedback(fields)),

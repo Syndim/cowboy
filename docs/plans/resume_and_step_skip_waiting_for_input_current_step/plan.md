@@ -5,7 +5,7 @@ Bug-fix plan grounded in the reviewed RCA:
 (PR #1) so `resume`/`step` retry the retained current step for **every**
 non-terminal run status. The prior step already added the failing regression
 test
-`crates/workflow/engine/src/runtime.rs::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`;
+`crates/workflow/engine/src/runtime.rs::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`;
 that test is an input to this fix and must not be rewritten or replaced.
 
 ## Plan
@@ -21,21 +21,21 @@ still lumped into the early-return no-op arm of `WorkflowRuntime::resume_with`.
 Root cause (per RCA): the status match in `resume_with`
 (`crates/workflow/engine/src/runtime.rs`) puts `WaitingForInput` in the same arm
 as `Completed`/`Cancelled` and returns early, so the runner never re-executes
-the retained `ask_user` step. The downstream runner only executes while
+the retained `wait_for_input` step. The downstream runner only executes while
 `run.status == Running`, so the fix must flip a waiting run back to `Running`
 before re-entering `run_existing`, exactly as the `Failed` arm already does.
 
 Approach: make the smallest centralized change in `resume_with`. Move
 `WaitingForInput { .. }` out of the early-return arm and treat it like the
 `Failed` arm — flip it to `RunStatus::Running` via `apply_run_status`, persist,
-and re-enter `run_existing`. Re-executing the `ask_user` step increments
+and re-enter `run_existing`. Re-executing the `wait_for_input` step increments
 `steps_executed`, mints a fresh `record_id`, and overwrites the prior
 `WaitingForInput` status, so the durable pending resume callback is safely
-replaced (not duplicated or orphaned). `answer_run` is unchanged: after resume,
+replaced (not duplicated or orphaned). `provide_input_run` is unchanged: after resume,
 the run is again `WaitingForInput` with a fresh callback and remains answerable.
 
 Non-goals / invariants to preserve:
-- Do not change `answer_run`; answering must still route through the (possibly
+- Do not change `provide_input_run`; answering must still route through the (possibly
   replaced) pending callback and advance the run.
 - Do not add divergent status handling in the CLI (`crates/tui/app/src/main.rs`)
   or TUI (`crates/tui/app/src/app/commands.rs`); both already delegate to
@@ -63,13 +63,13 @@ Non-goals / invariants to preserve:
     are non-resumable no-ops, and that `WaitingForInput` (like `Failed`) flips
     to `Running` so the retained current step is re-executed and the durable
     pending resume callback is safely replaced.
-  - Do not touch `answer_run`, `run_existing`, or the `Running`/`Failed`
+  - Do not touch `provide_input_run`, `run_existing`, or the `Running`/`Failed`
     execution mechanics beyond the match arm.
 - `README.md` (~line 141) — replace "`Completed`, `Cancelled`, and
-  waiting-for-input runs are left unchanged; answer a waiting run with `answer`
+  waiting-for-input runs are left unchanged; provide input to a waiting run with `provide-input`
   instead." Only `Completed` and `Cancelled` are left unchanged; `resume`/`step`
-  re-execute (re-prompt) a `WaitingForInput` run's retained `ask_user` step, and
-  `answer` remains the way to supply a prompt answer.
+  re-execute (re-prompt) a `WaitingForInput` run's retained `wait_for_input` step, and
+  `provide-input` remains the way to supply a prompt input.
 - `docs/architecture.md` — align any wording that implies `WaitingForInput` is
   non-resumable. Update the retry paragraph (~lines 225–229) and, if needed, the
   idle-status table (~line 244) so they state only `Completed`/`Cancelled` are
@@ -87,13 +87,13 @@ Non-goals / invariants to preserve:
 ## Tests to be added/updated
 
 - Keep (input, do not rewrite): the prior step's failing regression test
-  `crates/workflow/engine/src/runtime.rs::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`.
+  `crates/workflow/engine/src/runtime.rs::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`.
   It must fail before the code change and pass after. It asserts the run stays
   `WaitingForInput` on `ask`/`approval`, a fresh `StepStarted { step_id: "ask"
   }` event is emitted, the durable pending callback `record_id` changes, and the
   run remains answerable to `Completed`.
 - Update/remove the contradicting existing test
-  `crates/workflow/engine/src/runtime.rs::resume_is_noop_for_waiting_run_and_prompt_stays_answerable`.
+  `crates/workflow/engine/src/runtime.rs::resume_is_noop_for_waiting_run_and_prompt_stays_inputable`.
   It encodes the pre-clarification "resume is a no-op on a waiting run"
   expectation (asserts no events and an unchanged run) and will contradict the
   new behavior. Remove it (its answerability coverage is subsumed by the
@@ -103,23 +103,23 @@ Non-goals / invariants to preserve:
   `resume_is_noop_for_cancelled_run` — these remain valid because only
   `Completed`/`Cancelled` are no-ops.
 - Confirm no other resume/step tests (e.g. the `Failed`/`Running` resume and
-  `answer_run` tests) regress; adjust only if the new match arm changes their
+  `provide_input_run` tests) regress; adjust only if the new match arm changes their
   observed events.
 
 ## How to verify
 
 - Focused repro test (must pass after the fix):
-  - `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`
-- Focused resume/answer tests in the engine crate:
+  - `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`
+- Focused resume/provide-input tests in the engine crate:
   - `cargo test -p cowboy-workflow-engine resume`
-  - `cargo test -p cowboy-workflow-engine answer_run`
+  - `cargo test -p cowboy-workflow-engine provide_input_run`
 - Formatting: `cargo fmt --check`
 - Full workspace tests: `cargo test --workspace`
 - Lints: `cargo clippy --workspace --all-targets -- -D warnings`
-- Manual sanity (optional): start a run whose current step is an `ask_user`
+- Manual sanity (optional): start a run whose current step is an `wait_for_input`
   step so it blocks `WaitingForInput`, run `cowboy resume <run-id>`, and confirm
   the run is re-prompted (still `WaitingForInput`, new `StepStarted` event) and
-  still answerable via `cowboy answer <run-id> approval yes`.
+  still answerable via `cowboy provide-input <run-id> approval yes`.
 - Amend the change onto the current `fix/resume-failed-step` branch (e.g.
   `git commit --amend` or a fixup folded into the branch tip); do not create a
   new branch or PR and do not push.
@@ -127,9 +127,9 @@ Non-goals / invariants to preserve:
 ## TODO
 
 - [x] Confirm the repro test
-  `resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback` fails
+  `resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback` fails
   before any product-code change
-  (`cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`).
+  (`cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`).
 - [x] In `crates/workflow/engine/src/runtime.rs`, edit `resume_with` to move
   `RunStatus::WaitingForInput { .. }` out of the `Completed | Cancelled`
   early-return arm and into the arm that flips the run to `RunStatus::Running`
@@ -139,10 +139,10 @@ Non-goals / invariants to preserve:
 - [x] Update the `resume_with` code comment to state only `Completed`/`Cancelled`
   are non-resumable and that `WaitingForInput` is re-executed (re-prompted) with
   its durable pending callback safely replaced.
-- [x] Verify `answer_run`, `run_existing`, and the `Running`/`Failed` paths are
+- [x] Verify `provide_input_run`, `run_existing`, and the `Running`/`Failed` paths are
   otherwise unchanged.
 - [x] Remove or repurpose
-  `resume_is_noop_for_waiting_run_and_prompt_stays_answerable` so no test asserts
+  `resume_is_noop_for_waiting_run_and_prompt_stays_inputable` so no test asserts
   resume no-ops on `WaitingForInput`.
 - [x] Keep `resume_is_noop_for_completed_run` and
   `resume_is_noop_for_cancelled_run` unchanged.
@@ -156,7 +156,7 @@ Non-goals / invariants to preserve:
   `WaitingForInput` from the no-op list).
 - [x] Ensure `user_feedback` output fields are preserved exactly (cumulative raw
   user direction, not augmented).
-- [x] Run `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`
+- [x] Run `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`
   and confirm it now passes.
 - [x] Run `cargo fmt --check`.
 - [x] Run `cargo test --workspace`.

@@ -144,13 +144,13 @@ Two consequences make this a good fit for the requested features:
     persists no `StepRecord`, so the action must be recomputed). When the action
     is an `Agent` action with an `OutputSpec`, expose its declared `statuses`
     and `fields` schema as the required/optional fields for resolution; when it
-    is a `Status`/`AskUser`/`Fail` action, expose that shape instead.
+    is a `Status`/`WaitForInput`/`Fail` action, expose that shape instead.
   - Return a serializable `ResolutionOptions { failed_step, failure_reason,
     statuses: Vec<ResolutionStatus { status, target_step, required_fields,
     optional_fields, body_expected }> }` value (new type in the engine crate or
     `cowboy-workflow-core`).
 - Add a runtime operation `WorkflowRuntime::resolve_run(run_id, status, fields?,
-  body?)` in `crates/workflow/engine/src/runtime.rs`, modeled on `answer_run`:
+  body?)` in `crates/workflow/engine/src/runtime.rs`, modeled on `provide_input_run`:
   - Load the run; require it to be `Failed` (or `Running` left on a failed step).
   - Validate that `status` is an allowed transition out of the failed
     `current_step` using the same routing used by `next_step`
@@ -168,7 +168,7 @@ Two consequences make this a good fit for the requested features:
   - Apply it through `apply_step_record`, flip the run back to `Running`, emit
     `StepCompleted` + status events, persist events, and continue the run via
     `run_existing_with_events` when the resulting status is `Running` (matching
-    the `answer_run` tail).
+    the `provide_input_run` tail).
 - Add CLI subcommands in `crates/tui/src/main.rs`:
   - `cowboy resolve <run-id>` (no status) prints the guided
     `resolution_options`: the failed step, failure reason, and a table of
@@ -239,11 +239,11 @@ Two consequences make this a good fit for the requested features:
   step as `ctx.prev`.
 - **Event persistence:** assert `StepRetrying` and the manual-resolution
   completion events are persisted in the run event log in the correct order
-  (mirroring existing `answer_run` persistence-order tests).
+  (mirroring existing `provide_input_run` persistence-order tests).
 - **CLI wiring:** a smoke test (or manual verification note) that
   `cowboy resolve <run-id>` prints options and `cowboy resolve <run-id> <status>`
   parses and dispatches; update any clap argument tests.
-- Regression: existing `execute_step`, `answer_run`, budget-limit, and
+- Regression: existing `execute_step`, `provide_input_run`, budget-limit, and
   action-serialization tests must continue to pass unchanged.
 
 # How to verify
@@ -292,7 +292,7 @@ Two consequences make this a good fit for the requested features:
       required/optional fields) by recomputing the failed step's action via
       `LuaStepActionProvider` and reading its transitions/`OutputSpec`.
 - [x] Add `WorkflowRuntime::resolve_run(run_id, status, fields?, body?)`
-      modeled on `answer_run`, with transition validation via `next_step`,
+      modeled on `provide_input_run`, with transition validation via `next_step`,
       required-field validation against the chosen status's `OutputSpec`, and a
       synthesized `StepRecord` (reuse `StatusActionRunner`); errors must list
       valid statuses and required fields.

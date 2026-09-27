@@ -35,6 +35,6 @@ Do not change workflow runtime behavior, Lua workflow behavior, catalog selectio
 - [x] Read `docs/plans/initial_user_input_lacks_card_ui/rca.md` and the existing repro test before editing.
 - [x] Add or refactor an `AppState` background report-task path that can push a `TranscriptEntry::Card` while preserving current status, run-state, and task-spawn semantics.
 - [x] Update only the plain initial request `spawn_start_run` path to use a `Run` card for `submitted run: {request}`.
-- [x] Preserve existing non-targeted dispatch behavior for slash commands, pending prompt answers, resolve/step/resume actions, workflow events, and background task draining.
+- [x] Preserve existing non-targeted dispatch behavior for slash commands, pending prompt input, resolve/step/resume actions, workflow events, and background task draining.
 - [x] Keep `plain_request_submission_renders_initial_input_as_card` unchanged and make it pass.
 - [x] Run the focused verification commands and fix any Rust compiler or Clippy warnings they surface.

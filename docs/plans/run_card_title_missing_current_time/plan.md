@@ -150,7 +150,7 @@ Use `current_wall_clock_prefix` and replace the prefix argument in every
 - `spawn_start_run_with_workflow_stepwise` (~L320): same replacement.
 - `spawn_step_run` (~L339): `[]` → `[current_wall_clock_prefix()]`.
 - `spawn_resume_run` (~L358): `[]` → `[current_wall_clock_prefix()]`.
-- `spawn_answer_task` (~L384): `[]` → `[current_wall_clock_prefix()]`.
+- `spawn_input_task` (~L384): `[]` → `[current_wall_clock_prefix()]`.
 - `resolve_run` `Some(status)` branch (~L465): `[]` →
   `[current_wall_clock_prefix()]`.
 
@@ -218,9 +218,9 @@ Tests by owning TODO:
 - TODO-02 (new): add the strict helper and one new **parameterized**
   action-boundary test `card_wall_clock_action_cards_show_current_time` that
   drives all eight action paths (plain Run, `--step`, `--workflow`,
-  `--step --workflow`, Step, Resume, Answer, Resolve — the Answer path seeded via
+  `--step --workflow`, Step, Resume, ProvideInput, Resolve — the ProvideInput path seeded via
   a `WaitingForInput` prompt as in
-  `pending_prompt_answer_fallback_spawns_answer_task_and_clears_target`, ~L1764)
+  `pending_prompt_input_fallback_spawns_input_task_and_clears_target`, ~L1764)
   and asserts each rendered card title via `assert_card_title_current_time`.
   TODO-02 does not modify the three pre-existing tests.
 - TODO-03 (new): three state-path behavioral tests, all in the `commands.rs` test
@@ -390,7 +390,7 @@ first in this rework; the remaining unchecked TODOs execute in numeric order; an
     `cargo test -p cowboy --lib card_wall_clock_action_cards_show_current_time`.
   - Expected result: The new parameterized test passes and asserts, for each of
     the eight action cards (plain Run, `--step`, `--workflow`,
-    `--step --workflow`, Step, Resume, Answer, Resolve), a **present** leading
+    `--step --workflow`, Step, Resume, ProvideInput, Resolve), a **present** leading
     prefix equal to exactly the captured current `%H:%M` wall clock (never
     `00:00:00`, never a seconds value, never absent) plus the exact non-time
     remainder.
@@ -399,7 +399,7 @@ first in this rework; the remaining unchecked TODOs execute in numeric order; an
     created in the `commands.rs` test module.
     `cargo test -p cowboy --lib card_wall_clock_action_cards_show_current_time`
     passed (1/0); each of the eight action cards (plain Run, `--step`,
-    `--workflow`, `--step --workflow`, Step, Resume, Answer, Resolve) asserted a
+    `--workflow`, `--step --workflow`, Step, Resume, ProvideInput, Resolve) asserted a
     present current-`%H:%M` prefix plus its exact remainder.
 
 - [x] TODO-03: Timestamp `push_card`, `spawn_runs_list_task`, and the pending-prompt card in `state.rs`.
@@ -480,7 +480,7 @@ first in this rework; the remaining unchecked TODOs execute in numeric order; an
     dynamic exact-`%H:%M` prefix.
   - Observed result: `assert_last_entry_is_card` was rewired to the strict helper
     and the three pre-existing card tests migrated to the time-free remainder plus
-    captured `before`/`after` instants (further callers at the resolve/answer/error
+    captured `before`/`after` instants (further callers at the resolve/provide-input/error
     sites and the `state.rs` helper were migrated too, since they now carry a time
     prefix). `card_wall_clock_helper_rejects_missing_and_nontime_prefix` passed,
     rejecting `◔ Notice` (missing prefix), `00:00:00`, and `● Runs` (non-`%H:%M`).

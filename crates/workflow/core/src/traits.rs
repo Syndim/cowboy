@@ -57,20 +57,20 @@ pub struct ExecutionContext {
     pub user_prompts: Vec<FollowUpPrompt>,
 }
 
-/// User answer and prompt metadata supplied to a registered resume callback.
+/// User input and prompt metadata supplied to a registered resume callback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeInput {
     /// Step that registered the callback.
     pub step: StepId,
-    /// Prompt id being answered.
-    pub prompt_id: String,
+    /// Input id being supplied.
+    pub input_id: String,
     /// Prompt message originally shown to the user.
     pub message: String,
     /// Accepted choices originally shown to the user.
     pub choices: Vec<Choice>,
-    /// User-provided answer text.
-    pub answer: String,
-    /// Timestamp captured when the answer was accepted.
+    /// User-provided input text.
+    pub input: String,
+    /// Timestamp captured when the input was accepted.
     pub completed_at: DateTime<Utc>,
 }
 

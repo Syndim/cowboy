@@ -19,7 +19,7 @@ Scope this to workflow transcript events. Do not change diagnostic log timestamp
   - `StepCompleted` after a new head is saved;
   - `RunStatusChanged`, `WaitingForInput`, `RunCompleted`, and `RunCancelled` status events.
 - Update `crates/workflow/engine/src/runtime.rs` event emission outside the runner:
-  - in `answer_run`, use the waiting run's original `created_at` for resume-completion and status events before continuing execution;
+  - in `provide_input_run`, use the waiting run's original `created_at` for resume-completion and status events before continuing execution;
   - in `run_existing_with_events`, capture the run's original `created_at` beside `run_id` and use it when converting `AgentProgress` into workflow events;
   - keep persisted prefix events and collected events in one chronological list.
 - Update `crates/tui/src/app/events.rs`:
@@ -43,7 +43,7 @@ Scope this to workflow transcript events. Do not change diagnostic log timestamp
   - legacy JSON without `run_started_at` deserializes with `None`.
 - Update `crates/workflow/engine/src/runner.rs` tests to assert all runner-emitted events for a run have `run_started_at == Some(run.created_at)`.
 - Add or update `crates/workflow/engine/src/runtime.rs` tests for non-runner event paths:
-  - `answer_run` events preserve the waiting run's original `created_at`;
+  - `provide_input_run` events preserve the waiting run's original `created_at`;
   - runtime-created agent progress events preserve the current run's original `created_at`.
 
 # How to verify
@@ -51,7 +51,7 @@ Scope this to workflow transcript events. Do not change diagnostic log timestamp
 - Run `cargo test -p cowboy app::events::tests`.
 - Run `cargo test -p cowboy-workflow-engine events::tests`.
 - Run `cargo test -p cowboy-workflow-engine runner::tests`.
-- Run the focused `cowboy-workflow-engine` runtime test(s) added for `answer_run` and agent progress event baselines.
+- Run the focused `cowboy-workflow-engine` runtime test(s) added for `provide_input_run` and agent progress event baselines.
 - Run `cargo test -p cowboy -p cowboy-workflow-engine` as the focused regression pass.
 - Manual TUI smoke check with a workflow that emits multiple events over at least one second:
   - confirm transcript headers show elapsed values such as `00:00:00`, `00:00:01`, and later durations;
@@ -70,7 +70,7 @@ Scope this to workflow transcript events. Do not change diagnostic log timestamp
 - [x] Add optional `run_started_at` to `WorkflowEvent` with serde default compatibility.
 - [x] Add run-aware `WorkflowEvent` constructor/helper APIs using `WorkflowRun::created_at`.
 - [x] Update runner-created events to populate `run_started_at` from the active run.
-- [x] Update `answer_run` resume/status events to populate `run_started_at` from the waiting run.
+- [x] Update `provide_input_run` resume/status events to populate `run_started_at` from the waiting run.
 - [x] Update runtime-created agent progress events to populate `run_started_at` from the active run.
 - [x] Replace UTC stamp formatting in `crates/tui/src/app/events.rs` with elapsed `HH:MM:SS` formatting.
 - [x] Add TUI renderer tests for elapsed time, UTC omission, long durations, and missing-baseline fallback.

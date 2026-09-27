@@ -1,5 +1,5 @@
 -- A status-only workflow (no agent backend needed) that exercises the engine:
--- multiple steps, single-stepping, an ask_user boundary, branching, completion.
+-- multiple steps, single-stepping, an wait_for_input boundary, branching, completion.
 --
 -- The id "00-demo" sorts before the built-in "default", so the engine's
 -- deterministic selector picks it for `engine-cli run`.
@@ -11,7 +11,7 @@ end
 
 local confirm = step("confirm")
 confirm.run = function(ctx)
-  return action.ask_user {
+  return action.wait_for_input {
     id = "proceed",
     message = "Apply the plan?",
     choices = { yes = "Apply the plan", no = "Cancel and leave things as they are" },
@@ -21,8 +21,8 @@ end
 local decide = step("decide")
 decide.run = function(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
-  local answer = fields.answer
-  return action.status { status = tostring(answer), body = "user chose " .. tostring(answer) }
+  local value = fields.input
+  return action.status { status = tostring(value), body = "user chose " .. tostring(value) }
 end
 
 local apply = step("apply")
@@ -36,7 +36,7 @@ cancelled.run = function(ctx)
 end
 
 plan:on("ready", confirm)
-confirm:on("answered", decide)
+confirm:on("provided", decide)
 decide:on("yes", apply)
 decide:on("no", cancelled)
 

@@ -23,6 +23,6 @@ async fn copilot_acp_initializes() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires authenticated GitHub Copilot CLI (`copilot --acp`) on PATH; run with --ignored"]
-async fn copilot_acp_creates_session_and_answers_prompt() -> anyhow::Result<()> {
+async fn copilot_acp_creates_session_and_inputs_prompt() -> anyhow::Result<()> {
     run_session_prompt(&COPILOT).await
 }

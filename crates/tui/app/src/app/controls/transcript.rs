@@ -377,18 +377,18 @@ fn bounded_tail_visual_rows(
     let mut row_count = 0usize;
     let mut older_unmeasured = false;
 
-    let mut prompt_id_to_skip = None;
+    let mut input_id_to_skip = None;
     if let Some(prompt) = state.pending_prompt()
-        && !pending_prompt_is_latest(state, prompt.prompt_id())
+        && !pending_prompt_is_latest(state, prompt.input_id())
     {
         let rows = render_pending_prompt_lines(prompt, wrap_width);
         row_count = row_count.saturating_add(rows.len());
         chunks.push(rows);
-        prompt_id_to_skip = Some(prompt.prompt_id());
+        input_id_to_skip = Some(prompt.input_id());
     }
 
     for entry in state.event_entries().iter().rev() {
-        if prompt_id_to_skip.is_some_and(|prompt_id| entry_is_waiting_prompt(entry, prompt_id)) {
+        if input_id_to_skip.is_some_and(|input_id| entry_is_waiting_prompt(entry, input_id)) {
             continue;
         }
         if row_count >= target_rows {
@@ -415,30 +415,30 @@ fn bounded_tail_visual_rows(
     }
 }
 
-fn pending_prompt_is_latest(state: &AppState, prompt_id: &str) -> bool {
+fn pending_prompt_is_latest(state: &AppState, input_id: &str) -> bool {
     state
         .event_entries()
         .last()
         .is_some_and(|entry| match entry {
             TranscriptEntry::Workflow { event, .. } => matches!(
                 &event.kind,
-                WorkflowEventKind::WaitingForInput { prompt_id: id, .. } if id == prompt_id
+                WorkflowEventKind::WaitingForInput { input_id: id, .. } if id == input_id
             ),
             _ => false,
         })
 }
 
-fn entry_is_waiting_prompt(entry: &TranscriptEntry, prompt_id: &str) -> bool {
+fn entry_is_waiting_prompt(entry: &TranscriptEntry, input_id: &str) -> bool {
     matches!(
         entry,
         TranscriptEntry::Workflow {
             event:
                 WorkflowEvent {
-                    kind: WorkflowEventKind::WaitingForInput { prompt_id: id, .. },
+                    kind: WorkflowEventKind::WaitingForInput { input_id: id, .. },
                     ..
                 },
             ..
-        } if id == prompt_id
+        } if id == input_id
     )
 }
 
@@ -905,7 +905,7 @@ mod tests {
             "run-2",
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {
@@ -943,7 +943,7 @@ mod tests {
             "run-2",
             WorkflowEventKind::WaitingForInput {
                 step: "confirm_plan".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Review plan\n- first item\n- second item".to_string(),
                 choices: Vec::new(),
             },

@@ -3,14 +3,14 @@ local context = require("utils/context.lua")
 return function(id)
   local clarify = step(id or "clarify")
   clarify.run = function(ctx)
-    if ctx.prev and ctx.prev.action == "ask_user" then
+    if ctx.prev and ctx.prev.action == "wait_for_input" then
       local fields = ctx.prev.fields or {}
-      local answer = fields.answer
-      if answer and tostring(answer) ~= "" then
+      local value = fields.input
+      if value and tostring(value) ~= "" then
         return action.status {
           status = "clarified",
           fields = {
-            clarification = tostring(answer),
+            clarification = tostring(value),
             user_feedback = context.copy_user_feedback(fields),
             goal = fields.goal,
             validation = fields.validation,
@@ -26,9 +26,9 @@ return function(id)
     end
 
     local previous_fields = (ctx.prev and ctx.prev.fields) or {}
-    local prompt_id = "clarification_" .. tostring(ctx.steps_executed or 0)
-    return action.ask_user {
-      id = prompt_id,
+    local input_id = "clarification_" .. tostring(ctx.steps_executed or 0)
+    return action.wait_for_input {
+      id = input_id,
       message = "Please provide enough context to plan this work: desired behavior, entrypoint, expected output/state changes, constraints, and verification criteria.",
       choices = {},
       fields = { user_feedback = context.copy_user_feedback(previous_fields), goal = previous_fields.goal, validation = previous_fields.validation, work_dir = previous_fields.work_dir, plan_doc = previous_fields.plan_doc, validation_doc = previous_fields.validation_doc, rca_doc = previous_fields.rca_doc, repro_test = previous_fields.repro_test },

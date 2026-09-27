@@ -34,7 +34,7 @@ The same layout must be used when the current pending prompt is rendered as a fo
 - Update `crates/tui/src/app/controls/transcript.rs` so `prompt_card_lines` mirrors the new waiting-for-input event layout:
   - first line: `Waiting for input` plus inline `step=...`, `prompt=...`, and `choices=...` metadata;
   - following lines: `prompt.message()` rendered through `markup::render_markup` starting at column 0;
-  - remove the separate padded `message:`, `choices:`, and `Type an answer below...` lines from the prompt card.
+  - remove the separate padded `message:`, `choices:`, and `Provide input below...` lines from the prompt card.
 - Update `crates/tui/src/app/state.rs` `transcript_line_count` so the pending-prompt contribution is computed from `prompt_card_lines(prompt).len()` or an equivalent shared helper instead of the current fixed `7`, because rendered prompt height will depend on markdown/body line count.
 - Preserve existing styles from `crates/tui/src/app/styles.rs`: metadata spans stay metadata-colored, warning/status spans keep their existing semantic colors, and body spans keep the same normal/thought/prompt/plan/tool styles they use today.
 

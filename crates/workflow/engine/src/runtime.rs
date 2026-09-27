@@ -266,7 +266,7 @@ pub struct RunStatusDetail {
     pub state: RunStatusState,
     pub reason: Option<String>,
     pub waiting_step: Option<String>,
-    pub prompt_id: Option<String>,
+    pub input_id: Option<String>,
     pub message: Option<String>,
     pub choices: Vec<Choice>,
 }
@@ -278,13 +278,13 @@ impl RunStatusDetail {
                 state: RunStatusState::Running,
                 reason: None,
                 waiting_step: None,
-                prompt_id: None,
+                input_id: None,
                 message: None,
                 choices: Vec::new(),
             },
             RunStatus::WaitingForInput {
                 step,
-                prompt_id,
+                input_id,
                 message,
                 choices,
                 ..
@@ -292,7 +292,7 @@ impl RunStatusDetail {
                 state: RunStatusState::WaitingForInput,
                 reason: None,
                 waiting_step: Some(step.clone()),
-                prompt_id: Some(prompt_id.clone()),
+                input_id: Some(input_id.clone()),
                 message: Some(message.clone()),
                 choices: choices.clone(),
             },
@@ -300,7 +300,7 @@ impl RunStatusDetail {
                 state: RunStatusState::Completed,
                 reason: None,
                 waiting_step: None,
-                prompt_id: None,
+                input_id: None,
                 message: None,
                 choices: Vec::new(),
             },
@@ -308,7 +308,7 @@ impl RunStatusDetail {
                 state: RunStatusState::Failed,
                 reason: Some(reason.clone()),
                 waiting_step: None,
-                prompt_id: None,
+                input_id: None,
                 message: None,
                 choices: Vec::new(),
             },
@@ -316,7 +316,7 @@ impl RunStatusDetail {
                 state: RunStatusState::Cancelled,
                 reason: None,
                 waiting_step: None,
-                prompt_id: None,
+                input_id: None,
                 message: None,
                 choices: Vec::new(),
             },
@@ -1459,7 +1459,7 @@ impl WorkflowRuntime {
             ),
         );
         let result = self
-            .answer_run(&pending.child_run_id, &input.prompt_id, &input.answer)
+            .provide_input_run(&pending.child_run_id, &input.input_id, &input.input)
             .await;
         let child = self
             .child_report_or_failed_run(&pending.child_run_id, result)
@@ -1494,7 +1494,7 @@ impl WorkflowRuntime {
     ) -> Result<ActionResult> {
         match &child.status {
             RunStatus::WaitingForInput {
-                prompt_id,
+                input_id,
                 message,
                 choices,
                 ..
@@ -1516,7 +1516,7 @@ impl WorkflowRuntime {
                 )?;
                 Ok(ActionResult::blocked(RunStatus::WaitingForInput {
                     step: pending.parent_step_id.clone(),
-                    prompt_id: prompt_id.clone(),
+                    input_id: input_id.clone(),
                     message: message.clone(),
                     choices: choices.clone(),
                     resume_callback,
@@ -1798,7 +1798,7 @@ impl WorkflowRuntime {
         let mut run = store.load_run(run_id).await?;
         tracing::debug!(
             run_id = %run.id,
-            status = ?run.status,
+            status = %run_status_kind(&run.status),
             current_step = %run.step.next,
             steps_executed = run.step.executed,
             "loaded workflow run"
@@ -1810,23 +1810,23 @@ impl WorkflowRuntime {
                 // re-executed on resume; only Completed and Cancelled runs are
                 // non-resumable no-ops. A Failed run gave up after exhausting its
                 // recoverable retry budget, and a WaitingForInput run is blocked
-                // on its retained ask_user step. Flip the status back to Running
+                // on its retained wait_for_input step. Flip the status back to Running
                 // and persist it so the retained current step is re-executed
                 // through the normal execution path; the runner persists the
-                // resulting terminal status. Re-executing an ask_user step mints
+                // resulting terminal status. Re-executing an wait_for_input step mints
                 // a fresh record id and overwrites the prior WaitingForInput
                 // status, so the durable pending resume callback is safely
                 // replaced rather than duplicated or orphaned.
                 tracing::debug!(
                     run_id = %run.id,
-                    status = ?run.status,
+                    status = %run_status_kind(&run.status),
                     current_step = %run.step.next,
                     "resuming non-terminal run; re-executing the retained current step"
                 );
                 apply_run_status(&store, &mut run, RunStatus::Running).await?;
             }
             RunStatus::Completed | RunStatus::Cancelled => {
-                tracing::debug!(run_id = %run.id, status = ?run.status, "workflow run is not resumable; returning without execution");
+                tracing::debug!(run_id = %run.id, status = %run_status_kind(&run.status), "workflow run is not resumable; returning without execution");
                 return Ok(RunReport {
                     run,
                     events: Vec::new(),
@@ -1837,26 +1837,26 @@ impl WorkflowRuntime {
             .await
     }
 
-    pub async fn answer_run(
+    pub async fn provide_input_run(
         &self,
         run_id: &str,
-        prompt_id: &str,
-        answer: &str,
+        input_id: &str,
+        input: &str,
     ) -> Result<RunReport> {
         tracing::info!(
             run_id,
-            prompt_id,
-            answer_chars = answer.chars().count(),
-            "answering workflow prompt"
+            input_id,
+            input_chars = input.chars().count(),
+            "providing workflow input"
         );
         let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
         let router = self.resume_router();
-        let answer = router.validate_answer(&run, prompt_id, answer)?;
+        let input = router.validate_input(&run, input_id, input)?;
         let active_clock = ActiveRunClock::open(&run);
         let mut rx = self.events.subscribe();
-        let result = router.dispatch_validated_answer(answer).await?;
+        let result = router.dispatch_validated_input(input).await?;
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -1882,7 +1882,7 @@ impl WorkflowRuntime {
         for event in &events {
             self.events.emit(event.clone());
         }
-        tracing::debug!(run_id = %run.id, prompt_id, status = ?run.status, "workflow prompt answer completed");
+        tracing::debug!(run_id = %run.id, input_id, status = %run_status_kind(&run.status), "workflow input provided");
 
         if matches!(status, RunStatus::Running) {
             let request_topic = run.request_topic.clone();
@@ -2452,6 +2452,16 @@ impl WorkflowActionHandler for WorkflowRuntime {
 impl ResumeCallbackHandler for WorkflowChildResumeHandler {
     async fn resume(&self, callback: &ResumeCallback, input: ResumeInput) -> Result<ActionResult> {
         self.runtime.resume_workflow_child(callback, input).await
+    }
+}
+
+fn run_status_kind(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Running => "running",
+        RunStatus::WaitingForInput { .. } => "waiting_for_input",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed { .. } => "failed",
+        RunStatus::Cancelled => "cancelled",
     }
 }
 
@@ -3760,9 +3770,9 @@ implementation_evidence: []
         factory.assert_exhausted();
     }
 
-    fn waiting_prompt_id(report: &RunReport) -> &str {
+    fn waiting_input_id(report: &RunReport) -> &str {
         match &report.run.status {
-            RunStatus::WaitingForInput { prompt_id, .. } => prompt_id,
+            RunStatus::WaitingForInput { input_id, .. } => input_id,
             status => panic!("expected waiting run, got {status:?}"),
         }
     }
@@ -3987,7 +3997,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
 
     fn write_descriptor_stub(path: &std::path::Path) {
         // Line-oriented ACP stub: one JSON-RPC message per line in, exactly one
-        // JSON object per line out. Answers by method so any session (topic
+        // JSON object per line out. Inputs by method so any session (topic
         // generation plus the workflow step) is served. `session/new` returns
         // agent-owned configOptions for model, context_size, and thought_level.
         fs::write(
@@ -4982,21 +4992,21 @@ exit 0
     }
 
     #[tokio::test]
-    async fn deleted_set_answer_and_resolve_fall_back_to_default_limits() {
+    async fn deleted_set_input_and_resolve_fall_back_to_default_limits() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
         fs::write(
-            workflow_dir.join("answer.lua"),
+            workflow_dir.join("input.lua"),
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
+              return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
             end
             local done = step("done")
             done.run = function(ctx) return action.status { status = "success" } end
-            ask:on("answered", done)
-            return workflow("answer", ask, { config_set = "careful" })
+            ask:on("provided", done)
+            return workflow("input", ask, { config_set = "careful" })
             "#,
         )
         .unwrap();
@@ -5030,7 +5040,7 @@ exit 0
         )
         .await;
         let waiting = creator
-            .start_run_with_workflow("answer", "do it")
+            .start_run_with_workflow("input", "do it")
             .await
             .unwrap();
         assert!(matches!(
@@ -5063,28 +5073,28 @@ exit 0
         .await;
         let store = without_careful.store().unwrap();
 
-        let answered_err = without_careful
-            .answer_run(&waiting.run.id, "approval", "yes")
+        let provided_err = without_careful
+            .provide_input_run(&waiting.run.id, "approval", "yes")
             .await
             .unwrap_err();
         assert!(
-            answered_err
+            provided_err
                 .to_string()
                 .contains("run exceeded max step count (1)"),
-            "{answered_err}"
+            "{provided_err}"
         );
-        let loaded_answer = without_careful.load_run(&waiting.run.id).await.unwrap();
-        assert!(matches!(loaded_answer.status, RunStatus::Failed { .. }));
-        assert_ne!(loaded_answer.status, RunStatus::Completed);
-        assert_eq!(loaded_answer.step.next, "done");
-        assert_eq!(loaded_answer.step.executed, 1);
-        assert_ne!(loaded_answer.step.head, waiting_head);
-        let answer_record = store
-            .load_step_record(loaded_answer.step.head.as_ref().unwrap())
+        let loaded_provided = without_careful.load_run(&waiting.run.id).await.unwrap();
+        assert!(matches!(loaded_provided.status, RunStatus::Failed { .. }));
+        assert_ne!(loaded_provided.status, RunStatus::Completed);
+        assert_eq!(loaded_provided.step.next, "done");
+        assert_eq!(loaded_provided.step.executed, 1);
+        assert_ne!(loaded_provided.step.head, waiting_head);
+        let input_record = store
+            .load_step_record(loaded_provided.step.head.as_ref().unwrap())
             .await
             .unwrap();
-        assert_eq!(answer_record.step, "ask");
-        assert_eq!(answer_record.output.unwrap().fields["answer"], "yes");
+        assert_eq!(input_record.step, "ask");
+        assert_eq!(input_record.output.unwrap().fields["input"], "yes");
 
         let options = without_careful
             .resolution_options(&failed.run.id)
@@ -5123,7 +5133,7 @@ exit 0
         r#"
         local ask = step("ask")
         ask.run = function(ctx)
-          return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
+          return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
         end
 
         local decide = step("decide")
@@ -5131,7 +5141,7 @@ exit 0
           local total = 0
           for i = 1, 5000000 do total = total + i end
           local fields = (ctx.prev and ctx.prev.fields) or {}
-          return action.status { status = tostring(fields.answer), fields = { answer = fields.answer, carried = fields.carried, total = tostring(total) }, body = "decided" }
+          return action.status { status = tostring(fields.input), fields = { input = fields.input, carried = fields.carried, total = tostring(total) }, body = "decided" }
         end
 
         local done = step("done")
@@ -5139,7 +5149,7 @@ exit 0
           return action.status { status = "success", body = "done" }
         end
 
-        ask:on("answered", decide)
+        ask:on("provided", decide)
         decide:on("yes", done)
         return workflow("aaa", ask)
         "#
@@ -5272,7 +5282,7 @@ exit 0
         let store = runtime.store().unwrap();
         let waiting = RunStatus::WaitingForInput {
             step: "review".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve deployment?".to_string(),
             choices: vec![
                 Choice {
@@ -5285,8 +5295,8 @@ exit 0
                 },
             ],
             resume_callback: ResumeCallback::new(
-                "ask_user",
-                serde_json::json!({ "prompt_id": "approval" }),
+                "wait_for_input",
+                serde_json::json!({ "input_id": "approval" }),
             )
             .unwrap(),
         };
@@ -5298,7 +5308,7 @@ exit 0
                     "state": "running",
                     "reason": null,
                     "waiting_step": null,
-                    "prompt_id": null,
+                    "input_id": null,
                     "message": null,
                     "choices": [],
                 }),
@@ -5310,7 +5320,7 @@ exit 0
                     "state": "completed",
                     "reason": null,
                     "waiting_step": null,
-                    "prompt_id": null,
+                    "input_id": null,
                     "message": null,
                     "choices": [],
                 }),
@@ -5324,7 +5334,7 @@ exit 0
                     "state": "failed",
                     "reason": "agent exited 2",
                     "waiting_step": null,
-                    "prompt_id": null,
+                    "input_id": null,
                     "message": null,
                     "choices": [],
                 }),
@@ -5336,7 +5346,7 @@ exit 0
                     "state": "cancelled",
                     "reason": null,
                     "waiting_step": null,
-                    "prompt_id": null,
+                    "input_id": null,
                     "message": null,
                     "choices": [],
                 }),
@@ -5348,7 +5358,7 @@ exit 0
                     "state": "waiting_for_input",
                     "reason": null,
                     "waiting_step": "review",
-                    "prompt_id": "approval",
+                    "input_id": "approval",
                     "message": "Approve deployment?",
                     "choices": [
                         { "key": "yes", "description": "Approve" },
@@ -5394,12 +5404,12 @@ exit 0
                 "alpha-wait-run",
                 RunStatus::WaitingForInput {
                     step: "review".to_string(),
-                    prompt_id: "approval".to_string(),
+                    input_id: "approval".to_string(),
                     message: "Approve?".to_string(),
                     choices: Vec::new(),
                     resume_callback: ResumeCallback::new(
-                        "ask_user",
-                        serde_json::json!({ "prompt_id": "approval" }),
+                        "wait_for_input",
+                        serde_json::json!({ "input_id": "approval" }),
                     )
                     .unwrap(),
                 },
@@ -5785,7 +5795,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn answer_run_counts_answer_execution_without_counting_prompt_wait() {
+    async fn provide_input_run_counts_resume_execution_without_counting_wait_time() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source()).await;
         let start = runtime.start_run("request").await.unwrap();
@@ -5804,7 +5814,7 @@ exit 0
         .await;
 
         let report = runtime
-            .answer_run(&start.run.id, "approval", "yes")
+            .provide_input_run(&start.run.id, "approval", "yes")
             .await
             .unwrap();
 
@@ -5813,7 +5823,7 @@ exit 0
         assert_eq!(stored.active_duration_ms, report.run.active_duration_ms);
         assert!(
             stored.active_duration_ms > active_before_wait_ms,
-            "active time must include answer/resume execution: {stored:#?}"
+            "active time must include input/resume execution: {stored:#?}"
         );
         assert!(
             stored.active_duration_ms < active_before_wait_ms + 60_000,
@@ -5822,7 +5832,7 @@ exit 0
         for event in &report.events {
             let active_ms = event
                 .run_active_duration_ms
-                .expect("answer/resume event active duration");
+                .expect("input/resume event active duration");
             assert!(active_ms >= active_before_wait_ms, "{event:#?}");
             assert!(
                 active_ms < active_before_wait_ms + 60_000,
@@ -5832,7 +5842,35 @@ exit 0
     }
 
     #[tokio::test]
-    async fn invalid_prompt_answers_do_not_advance_active_duration() {
+    async fn duplicate_input_delivery_is_rejected_without_a_new_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source()).await;
+        let start = runtime.start_run("request").await.unwrap();
+        let first = runtime
+            .provide_input_run(&start.run.id, "approval", "yes")
+            .await
+            .unwrap();
+        assert_eq!(first.run.status, RunStatus::Completed);
+        let completed = runtime.load_run(&start.run.id).await.unwrap();
+        let completed_head = completed.step.head.clone();
+
+        let duplicate_err = runtime
+            .provide_input_run(&start.run.id, "approval", "yes")
+            .await
+            .unwrap_err();
+        assert!(
+            duplicate_err.to_string().contains("not waiting for input"),
+            "{duplicate_err}"
+        );
+
+        let unchanged = runtime.load_run(&start.run.id).await.unwrap();
+        assert_eq!(unchanged.status, RunStatus::Completed);
+        assert_eq!(unchanged.step.head, completed_head);
+        assert_eq!(unchanged.step.executed, completed.step.executed);
+    }
+
+    #[tokio::test]
+    async fn invalid_input_deliveries_do_not_advance_active_duration() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_inline_workflow(&dir, prompt_workflow_source()).await;
         let start = runtime.start_run("request").await.unwrap();
@@ -5850,7 +5888,7 @@ exit 0
         .await;
 
         let err = runtime
-            .answer_run(&start.run.id, "other-prompt", "yes")
+            .provide_input_run(&start.run.id, "other-prompt", "yes")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("prompt"), "{err}");
@@ -5864,7 +5902,7 @@ exit 0
         );
 
         let err = runtime
-            .answer_run(&start.run.id, "approval", "maybe")
+            .provide_input_run(&start.run.id, "approval", "maybe")
             .await
             .unwrap_err();
         assert!(err.to_string().contains("choice"), "{err}");
@@ -6807,8 +6845,8 @@ exit 0
         assert_eq!(runtime.load_run(&run.id).await.unwrap(), run);
     }
 
-    /// Extract the durable ask-user resume-callback `record_id` from a
-    /// `WaitingForInput` status. Each fresh execution of the ask-user step mints
+    /// Extract the durable wait-for-input resume-callback `record_id` from a
+    /// `WaitingForInput` status. Each fresh execution of the wait-for-input step mints
     /// a new record id, so this uniquely identifies the pending callback.
     fn waiting_callback_record_id(status: &RunStatus) -> String {
         match status {
@@ -6818,14 +6856,14 @@ exit 0
                 .payload()
                 .get("record_id")
                 .and_then(|value| value.as_str())
-                .expect("ask_user resume callback payload carries a record_id")
+                .expect("wait_for_input resume callback payload carries a record_id")
                 .to_string(),
             other => panic!("expected WaitingForInput status, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback() {
+    async fn resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -6834,11 +6872,11 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
+              return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve" } }
             end
             local done = step("done")
             done.run = function(ctx) return action.status { status = "success" } end
-            ask:on("answered", done)
+            ask:on("provided", done)
             return workflow("aaa", ask)
             "#,
         )
@@ -6846,7 +6884,7 @@ exit 0
         let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
 
         let started = runtime.start_run("do work").await.unwrap();
-        // The ask_user step blocks the run, retaining "ask" as the current step
+        // The wait_for_input step blocks the run, retaining "ask" as the current step
         // with a durable pending resume callback.
         assert!(matches!(
             started.run.status,
@@ -6855,24 +6893,24 @@ exit 0
         assert_eq!(started.run.step.next, "ask");
         let first_callback_record = waiting_callback_record_id(&started.run.status);
 
-        // Resume must re-execute (re-prompt) the retained ask_user step rather
+        // Resume must re-execute (re-prompt) the retained wait_for_input step rather
         // than treating a WaitingForInput run as a no-op. Only Completed and
         // Cancelled runs are non-resumable.
         let report = runtime.resume_run(&started.run.id).await.unwrap();
 
         // The run is re-prompted: still WaitingForInput on the same step, and
-        // the ask_user step ran again (a fresh StepStarted event was emitted).
+        // the wait_for_input step ran again (a fresh StepStarted event was emitted).
         assert!(matches!(
             &report.run.status,
-            RunStatus::WaitingForInput { step, prompt_id, .. }
-                if step == "ask" && prompt_id == "approval"
+            RunStatus::WaitingForInput { step, input_id, .. }
+                if step == "ask" && input_id == "approval"
         ));
         assert!(
             report.events.iter().any(|event| matches!(
                 &event.kind,
                 WorkflowEventKind::StepStarted { step_id } if step_id == "ask"
             )),
-            "resume must re-execute the waiting ask_user step, emitting StepStarted for it"
+            "resume must re-execute the waiting wait_for_input step, emitting StepStarted for it"
         );
 
         // The durable pending callback is safely replaced by the fresh
@@ -6881,16 +6919,16 @@ exit 0
         let second_callback_record = waiting_callback_record_id(&reloaded.status);
         assert_ne!(
             first_callback_record, second_callback_record,
-            "re-executing the ask_user step must replace the durable pending resume callback"
+            "re-executing the wait_for_input step must replace the durable pending resume callback"
         );
 
-        // The freshly re-prompted run stays answerable to completion, and
-        // answering routes through the replaced callback.
-        let answered = runtime
-            .answer_run(&started.run.id, "approval", "yes")
+        // The freshly re-prompted run remains able to receive input, and
+        // provision routes through the replaced callback.
+        let provided = runtime
+            .provide_input_run(&started.run.id, "approval", "yes")
             .await
             .unwrap();
-        assert_eq!(answered.run.status, RunStatus::Completed);
+        assert_eq!(provided.run.status, RunStatus::Completed);
     }
 
     #[tokio::test]
@@ -7541,7 +7579,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn answer_run_restores_persisted_request_topic_before_resumed_events() {
+    async fn provide_input_run_restores_persisted_request_topic_before_resumed_events() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -7550,13 +7588,13 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-          return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
+          return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" }, fields = { carried = "ok" } }
             end
 
             local decide = step("decide")
             decide.run = function(ctx)
               local fields = (ctx.prev and ctx.prev.fields) or {}
-              return action.status { status = tostring(fields.answer), fields = { answer = fields.answer, carried = fields.carried }, body = "decided" }
+              return action.status { status = tostring(fields.input), fields = { input = fields.input, carried = fields.carried }, body = "decided" }
             end
 
             local done = step("done")
@@ -7564,7 +7602,7 @@ exit 0
               return action.status { status = "success", body = "done" }
             end
 
-            ask:on("answered", decide)
+            ask:on("provided", decide)
             decide:on("yes", done)
             return workflow("aaa", ask)
             "#,
@@ -7601,22 +7639,22 @@ exit 0
             start.run.status,
             RunStatus::WaitingForInput { .. }
         ));
-        let steps_before_answer = start.run.step.executed;
+        let steps_before_input = start.run.step.executed;
         assert_eq!(
             first_run_started_topic(&start),
             Some("Initial prompt topic")
         );
         let report = runtime
-            .answer_run(&start.run.id, "approval", "yes")
+            .provide_input_run(&start.run.id, "approval", "yes")
             .await
             .unwrap();
 
         assert_eq!(report.run.status, RunStatus::Completed);
-        assert_eq!(report.run.step.executed, steps_before_answer + 2);
+        assert_eq!(report.run.step.executed, steps_before_input + 2);
         assert!(matches!(
             &report.events[0].kind,
             WorkflowEventKind::StepCompleted { step_id, action, status, .. }
-                if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
+                if step_id == "ask" && action == "wait_for_input" && status.as_deref() == Some("provided")
         ));
         assert!(matches!(
             &report.events[1].kind,
@@ -7644,7 +7682,7 @@ exit 0
     }
 
     #[tokio::test]
-    async fn answer_run_persists_ask_user_completion_when_resumed_step_fails() {
+    async fn provide_input_run_persists_wait_for_input_completion_when_resumed_step_fails() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -7653,7 +7691,7 @@ exit 0
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" } }
+              return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve", no = "Reject" } }
             end
 
             local broken = step("broken")
@@ -7661,7 +7699,7 @@ exit 0
               return action.status { body = "missing status" }
             end
 
-            ask:on("answered", broken)
+            ask:on("provided", broken)
             return workflow("aaa", ask)
             "#,
         )
@@ -7689,7 +7727,7 @@ exit 0
 
         let start = runtime.start_run("request").await.unwrap();
         let err = runtime
-            .answer_run(&start.run.id, "approval", "yes")
+            .provide_input_run(&start.run.id, "approval", "yes")
             .await
             .unwrap_err();
 
@@ -7698,13 +7736,13 @@ exit 0
         assert!(matches!(
             &persisted[0].kind,
             WorkflowEventKind::StepCompleted { step_id, action, status, .. }
-                if step_id == "ask" && action == "ask_user" && status.as_deref() == Some("answered")
+                if step_id == "ask" && action == "wait_for_input" && status.as_deref() == Some("provided")
         ));
         assert!(matches!(
             &persisted[1].kind,
             WorkflowEventKind::RunStatusChanged { status } if status == "running"
         ));
-        println!("EVIDENCE runtime-answer prompt_completion=persisted resumed_step=failed");
+        println!("EVIDENCE runtime-provide-input prompt_completion=persisted resumed_step=failed");
     }
 
     #[tokio::test]
@@ -7718,11 +7756,11 @@ exit 0
 
         let definition = cowboy_workflow_lua::compile_snapshot(&bundle).unwrap();
         assert_eq!(
-            definition.steps["unclear"].transitions.by_status["answered"],
-            "unclear_answer"
+            definition.steps["unclear"].transitions.by_status["provided"],
+            "unclear_input"
         );
         assert_eq!(
-            definition.steps["unclear_answer"].transitions.by_status["clarified"],
+            definition.steps["unclear_input"].transitions.by_status["clarified"],
             "plan"
         );
 
@@ -7732,7 +7770,7 @@ exit 0
             serde_json::json!({ "steps_executed": 2, "resume": {} }),
         )
         .unwrap();
-        let StepAction::AskUser(action) = result.action else {
+        let StepAction::WaitForInput(action) = result.action else {
             panic!("expected unclear step to ask the user")
         };
         assert_eq!(action.id, "clarification_2");
@@ -7741,20 +7779,20 @@ exit 0
 
         let result = cowboy_workflow_lua::run_step(
             &bundle,
-            "unclear_answer",
+            "unclear_input",
             serde_json::json!({
                 "steps_executed": 3,
                 "prev": {
                     "step": "unclear",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": { "answer": "Add a status command" },
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": { "input": "Add a status command" },
                 },
             }),
         )
         .unwrap();
         let StepAction::Status(action) = result.action else {
-            panic!("expected clarified status after answer")
+            panic!("expected clarified status after input")
         };
         assert_eq!(action.status, "clarified");
 
@@ -7782,7 +7820,7 @@ exit 0
             );
             assert!(
                 action.prompt.contains("- Add a status command"),
-                "{step} prompt should include the clarification answer"
+                "{step} prompt should include the clarification input"
             );
             match step {
                 "plan" => {
@@ -7994,14 +8032,14 @@ exit 0
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "confirm_plan_answer",
+            "confirm_plan_input",
             serde_json::json!({
                 "steps_executed": 6,
                 "prev": {
                     "step": "confirm_plan",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": { "answer": "yes", "plan": reviewed_plan, "plan_doc": plan_doc },
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": { "input": "yes", "plan": reviewed_plan, "plan_doc": plan_doc },
                 },
             }),
         )
@@ -8151,14 +8189,14 @@ exit 0
 
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "confirm_result_answer",
+            "confirm_result_input",
             serde_json::json!({
                 "steps_executed": 9,
                 "prev": {
                     "step": "confirm_result",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": { "answer": "fix one more thing", "plan_doc": plan_doc },
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": { "input": "fix one more thing", "plan_doc": plan_doc },
                 },
             }),
         )
@@ -8231,9 +8269,9 @@ Revised review body"#
             .await
             .unwrap();
         let run_id = start.run.id.clone();
-        let prompt_id = waiting_prompt_id(&start).to_string();
+        let input_id = waiting_input_id(&start).to_string();
         let revised = runtime
-            .answer_run(&run_id, &prompt_id, "Keep the existing command syntax")
+            .provide_input_run(&run_id, &input_id, "Keep the existing command syntax")
             .await
             .unwrap();
 
@@ -8491,15 +8529,15 @@ Recovery implementation review"#
             .await
             .unwrap();
         let run_id = report.run.id.clone();
-        let prompt_id = waiting_prompt_id(&report).to_string();
+        let input_id = waiting_input_id(&report).to_string();
         report = runtime
-            .answer_run(&run_id, &prompt_id, "yes")
+            .provide_input_run(&run_id, &input_id, "yes")
             .await
             .unwrap();
 
-        let prompt_id = waiting_prompt_id(&report).to_string();
+        let input_id = waiting_input_id(&report).to_string();
         report = runtime
-            .answer_run(&run_id, &prompt_id, result_feedback)
+            .provide_input_run(&run_id, &input_id, result_feedback)
             .await
             .unwrap();
 
@@ -8522,9 +8560,9 @@ Recovery implementation review"#
             "cargo test -p cowboy-workflow-engine"
         );
 
-        let prompt_id = waiting_prompt_id(&report).to_string();
+        let input_id = waiting_input_id(&report).to_string();
         report = runtime
-            .answer_run(&run_id, &prompt_id, "yes")
+            .provide_input_run(&run_id, &input_id, "yes")
             .await
             .unwrap();
         assert!(matches!(
@@ -8556,9 +8594,9 @@ Recovery implementation review"#
             );
         }
 
-        let prompt_id = waiting_prompt_id(&report).to_string();
+        let input_id = waiting_input_id(&report).to_string();
         report = runtime
-            .answer_run(&run_id, &prompt_id, "/route implement")
+            .provide_input_run(&run_id, &input_id, "/route implement")
             .await
             .unwrap();
 
@@ -8635,11 +8673,11 @@ Recovery implementation review"#
         let source_ref = catalog.workflows.get("workflows/feature").unwrap();
         let compiled = cowboy_workflow_lua::load(source_ref).unwrap();
         assert_eq!(
-            compiled.definition.steps["blocked"].transitions.by_status["answered"],
-            "blocked_answer"
+            compiled.definition.steps["blocked"].transitions.by_status["provided"],
+            "blocked_input"
         );
         assert_eq!(
-            compiled.definition.steps["blocked_answer"]
+            compiled.definition.steps["blocked_input"]
                 .transitions
                 .by_status["triaged"],
             "triage_blocked"
@@ -8678,7 +8716,7 @@ Recovery implementation review"#
             }),
         )
         .unwrap();
-        let StepAction::AskUser(action) = result.action else {
+        let StepAction::WaitForInput(action) = result.action else {
             panic!("expected blocked step to ask the user")
         };
         assert_eq!(action.id, "blocked_10");
@@ -8694,15 +8732,15 @@ Recovery implementation review"#
         let blocked_response = "Credentials are available now; continue implementation.";
         let result = cowboy_workflow_lua::run_step(
             &compiled.source_bundle,
-            "blocked_answer",
+            "blocked_input",
             serde_json::json!({
                 "steps_executed": 11,
                 "prev": {
                     "step": "blocked",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": blocked_response,
+                        "input": blocked_response,
                         "summary": "Need credentials",
                         "plan_doc": "docs/plans/example.md",
                         "blocked_from_step": "implement",
@@ -8714,7 +8752,7 @@ Recovery implementation review"#
         )
         .unwrap();
         let StepAction::Status(action) = result.action else {
-            panic!("expected blocked answer to be recorded")
+            panic!("expected blocked input to be recorded")
         };
         assert_eq!(action.status, "triaged");
         assert_eq!(action.fields["summary"], "Need credentials");
@@ -8783,7 +8821,7 @@ Recovery implementation review"#
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "status": "answered",
+                    "status": "provided",
                     "fields": {
                         "blocked_response": "/route plan",
                         "blocked_from_step": "implement"
@@ -8803,7 +8841,7 @@ Recovery implementation review"#
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "status": "answered",
+                    "status": "provided",
                     "fields": {
                         "blocked_response": "The dependency is fixed; continue.",
                         "blocked_from_step": "revise",
@@ -8868,7 +8906,7 @@ Recovery implementation review"#
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "status": "answered",
+                    "status": "provided",
                     "fields": {
                         "blocked_response": "The dependency is fixed; continue.",
                         "blocked_from_step": "revise"
@@ -9099,7 +9137,7 @@ return workflow("restartable", start)
             RunStatus::Running,
             RunStatus::WaitingForInput {
                 step: "start".to_string(),
-                prompt_id: "prompt".to_string(),
+                input_id: "prompt".to_string(),
                 message: "wait".to_string(),
                 choices: Vec::new(),
                 resume_callback: ResumeCallback::new("test", serde_json::json!({})).unwrap(),
@@ -9892,11 +9930,11 @@ return workflow("{label}", plan)
             ),
             (
                 progress(AgentProgressKind::Response {
-                    content: "answer".to_string(),
+                    content: "input".to_string(),
                 }),
                 WorkflowEventKind::AgentResponse {
                     step_id: "implement".to_string(),
-                    content: "answer".to_string(),
+                    content: "input".to_string(),
                 },
             ),
             (
@@ -9968,7 +10006,7 @@ return workflow("{label}", plan)
         let active_clock = ActiveRunClock::open_at(&run, Utc::now());
         let event = WorkflowRuntime::workflow_event_from_agent_progress(
             progress(AgentProgressKind::Response {
-                content: "answer".to_string(),
+                content: "input".to_string(),
             }),
             &active_clock,
         );
@@ -9982,7 +10020,7 @@ return workflow("{label}", plan)
         assert!(active_ms < 7_000, "{event:#?}");
         assert!(matches!(
             &event.kind,
-            WorkflowEventKind::AgentResponse { content, .. } if content == "answer"
+            WorkflowEventKind::AgentResponse { content, .. } if content == "input"
         ));
     }
 
@@ -10202,13 +10240,13 @@ return workflow("{label}", plan)
             r#"
             local finish = step("finish")
             finish.run = function(ctx)
-              return action.status {{ status = "child_ok", fields = {{ answer = ctx.prev.fields.answer }} }}
+              return action.status {{ status = "child_ok", fields = {{ input = ctx.prev.fields.input }} }}
             end
             local confirm = step("confirm")
             confirm.run = function(ctx)
-              return action.ask_user {{ id = "confirm", message = "Go?", choices = {{ yes = "Approve" }} }}
+              return action.wait_for_input {{ id = "confirm", message = "Go?", choices = {{ yes = "Approve" }} }}
             end
-            confirm:on("answered", finish)
+            confirm:on("provided", finish)
             return workflow("{name}", confirm)
             "#
         )
@@ -10319,11 +10357,11 @@ return workflow("{label}", plan)
             default_config_sets(),
         )
         .await;
-        let answered = rebuilt
-            .answer_run(&parent_id, "confirm", "yes")
+        let provided = rebuilt
+            .provide_input_run(&parent_id, "confirm", "yes")
             .await
             .unwrap();
-        assert_eq!(answered.run.status, RunStatus::Completed);
+        assert_eq!(provided.run.status, RunStatus::Completed);
         assert_eq!(rebuilt.list_runs(None).await.unwrap().len(), 2);
         let child_final = rebuilt.load_run(&expected_child_id).await.unwrap();
         assert_eq!(child_final.status, RunStatus::Completed);
@@ -10649,7 +10687,7 @@ return workflow("{label}", plan)
     }
 
     #[tokio::test]
-    async fn workflow_action_parent_answers_repeated_child_prompts() {
+    async fn workflow_action_parent_inputs_repeated_child_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = runtime_for_workflow_files(
             &dir,
@@ -10659,18 +10697,18 @@ return workflow("{label}", plan)
                     r#"
                     local finish = step("finish")
                     finish.run = function(ctx)
-                      return action.status { status = "child_ok", fields = { answer = ctx.prev.fields.answer } }
+                      return action.status { status = "child_ok", fields = { input = ctx.prev.fields.input } }
                     end
                     local second = step("second")
                     second.run = function(ctx)
-                      return action.ask_user { id = "second-confirm", message = "Second?", choices = { b1 = "Option B1", b2 = "Option B2" } }
+                      return action.wait_for_input { id = "second-confirm", message = "Second?", choices = { b1 = "Option B1", b2 = "Option B2" } }
                     end
-                    second:on("answered", finish)
+                    second:on("provided", finish)
                     local first = step("first")
                     first.run = function(ctx)
-                    return action.ask_user { id = "first-confirm", message = "First?", choices = { a1 = "Option A1", a2 = "Option A2" } }
+                    return action.wait_for_input { id = "first-confirm", message = "First?", choices = { a1 = "Option A1", a2 = "Option A2" } }
                     end
-                    first:on("answered", second)
+                    first:on("provided", second)
                     return workflow("child", first)
                     "#,
                 ),
@@ -10689,12 +10727,12 @@ return workflow("{label}", plan)
 
         match &started.run.status {
             RunStatus::WaitingForInput {
-                prompt_id,
+                input_id,
                 message,
                 choices,
                 ..
             } => {
-                assert_eq!(prompt_id, "first-confirm");
+                assert_eq!(input_id, "first-confirm");
                 assert_eq!(message, "First?");
                 assert_eq!(
                     choices,
@@ -10713,18 +10751,18 @@ return workflow("{label}", plan)
             other => panic!("expected first prompt, got {other:?}"),
         }
 
-        let answered_first = runtime
-            .answer_run(&parent_id, "first-confirm", "a1")
+        let provided_first = runtime
+            .provide_input_run(&parent_id, "first-confirm", "a1")
             .await
             .unwrap();
-        match &answered_first.run.status {
+        match &provided_first.run.status {
             RunStatus::WaitingForInput {
-                prompt_id,
+                input_id,
                 message,
                 choices,
                 ..
             } => {
-                assert_eq!(prompt_id, "second-confirm");
+                assert_eq!(input_id, "second-confirm");
                 assert_eq!(message, "Second?");
                 assert_eq!(
                     choices,
@@ -10745,12 +10783,12 @@ return workflow("{label}", plan)
         // Child id is unchanged between prompts.
         assert_eq!(runtime.load_run(&child_id).await.unwrap().id, child_id);
 
-        let answered_second = runtime
-            .answer_run(&parent_id, "second-confirm", "b1")
+        let provided_second = runtime
+            .provide_input_run(&parent_id, "second-confirm", "b1")
             .await
             .unwrap();
-        assert_eq!(answered_second.run.status, RunStatus::Completed);
-        assert_eq!(answered_second.run.id, parent_id);
+        assert_eq!(provided_second.run.status, RunStatus::Completed);
+        assert_eq!(provided_second.run.id, parent_id);
         assert_eq!(
             runtime.load_run(&child_id).await.unwrap().status,
             RunStatus::Completed
@@ -10803,11 +10841,11 @@ return workflow("{label}", plan)
         )
         .await;
 
-        let answered = rebuilt
-            .answer_run(&parent_id, "confirm", "yes")
+        let provided = rebuilt
+            .provide_input_run(&parent_id, "confirm", "yes")
             .await
             .unwrap();
-        assert_eq!(answered.run.status, RunStatus::Completed);
+        assert_eq!(provided.run.status, RunStatus::Completed);
         let child = rebuilt.load_run(&child_id).await.unwrap();
         assert_eq!(child.status, RunStatus::Completed);
         assert_eq!(child.parent.as_ref().unwrap().run_id, parent_id);
@@ -10837,14 +10875,14 @@ return workflow("{label}", plan)
             RunStatus::WaitingForInput { .. }
         ));
 
-        let report_answer = runtime
-            .answer_run(&parent_id, "confirm", "yes")
+        let report_input = runtime
+            .provide_input_run(&parent_id, "confirm", "yes")
             .await
             .unwrap();
-        assert_eq!(report_answer.run.status, RunStatus::Completed);
+        assert_eq!(report_input.run.status, RunStatus::Completed);
 
         // Every event in each parent operation report carries the parent run id.
-        for report in [&report_start, &report_answer] {
+        for report in [&report_start, &report_input] {
             assert!(
                 report.events.iter().all(|e| e.run_id == parent_id),
                 "parent report leaked non-parent events"
@@ -10854,11 +10892,7 @@ return workflow("{label}", plan)
         // Concatenated parent operation reports contain the four lifecycle
         // progress messages in order.
         let mut child_progress = Vec::new();
-        for event in report_start
-            .events
-            .iter()
-            .chain(report_answer.events.iter())
-        {
+        for event in report_start.events.iter().chain(report_input.events.iter()) {
             if let WorkflowEventKind::StepProgress { message, .. } = &event.kind
                 && message.starts_with("child workflow ")
             {

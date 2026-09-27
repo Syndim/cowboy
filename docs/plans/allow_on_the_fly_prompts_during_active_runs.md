@@ -2,7 +2,7 @@
 
 Turn the TUI composer into a prompt channel only while a workflow agent action has an explicitly open prompt window. Plain text accepted through that window belongs to the current run: Cowboy persists it in order, sends it to the same active agent session before that action can finalize, exposes it to every later Lua step, and includes it in every later agent prompt. It must never start a second run.
 
-The workflow engine owns this interface. After Lua evaluates the current step to `StepAction::Agent`, the agent executor opens a durable prompt window identified by an opaque `window_id` and the current `run_id`, `step_record_id`, step, and role. A new `AgentPromptWindowOpened` workflow event gives that token to the TUI. `WorkflowRuntime::submit_user_prompt(run_id, window_id, content)` accepts input only while that exact window is open; it does not infer “queued” versus “stored” from `WorkflowRun::status`. If no window is open (startup, a command/status/ask-user/fail action, between agent actions, after sealing, or after the run ends), plain-text submission is rejected and the composer draft remains intact.
+The workflow engine owns this interface. After Lua evaluates the current step to `StepAction::Agent`, the agent executor opens a durable prompt window identified by an opaque `window_id` and the current `run_id`, `step_record_id`, step, and role. A new `AgentPromptWindowOpened` workflow event gives that token to the TUI. `WorkflowRuntime::submit_user_prompt(run_id, window_id, content)` accepts input only while that exact window is open; it does not infer “queued” versus “stored” from `WorkflowRun::status`. If no window is open (startup, a command/status/wait-for-input/fail action, between agent actions, after sealing, or after the run ends), plain-text submission is rejected and the composer draft remains intact.
 
 Close the final-drain race with a transactional handoff protocol in the run store:
 
@@ -33,7 +33,7 @@ ctx.user_inputs = {
 }
 ```
 
-Sequence `0` is synthesized from `WorkflowRun::original_request`; its timestamp is `WorkflowRun::created_at`. Durable follow-ups start at `1`; their timestamp is captured when the store accepts them. Serialize timestamps as UTC RFC 3339 with millisecond precision and a `Z` suffix. Preserve `ctx.request` as the unchanged original request. `ask_user` answers remain in `ctx.prev.fields.answer` and are deliberately excluded from `ctx.user_inputs`: this collection covers the initial request and on-the-fly prompts named by this feature, not answers to explicit workflow control points.
+Sequence `0` is synthesized from `WorkflowRun::original_request`; its timestamp is `WorkflowRun::created_at`. Durable follow-ups start at `1`; their timestamp is captured when the store accepts them. Serialize timestamps as UTC RFC 3339 with millisecond precision and a `Z` suffix. Preserve `ctx.request` as the unchanged original request. `wait_for_input` answers remain in `ctx.prev.fields.input` and are deliberately excluded from `ctx.user_inputs`: this collection covers the initial request and on-the-fly prompts named by this feature, not answers to explicit workflow control points.
 
 Validate emptiness with `content.trim().is_empty()`, but persist and forward the original accepted string byte-for-byte, including leading/trailing whitespace and newlines. Do not truncate, normalize, or reconstruct accepted text.
 
@@ -76,19 +76,19 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
     | running | open | `Running` | Submit losslessly to the current agent window. | Allow non-conflicting observation/control commands; reject commands that start or mutate workflow execution. |
     | running | closed/absent | any status | Keep the draft; no agent can accept it. | Apply the same execution-conflict policy. |
     | idle | absent | `Running` | Preserve normal idle behavior (a plain request may start a new run). | Allow `/step` and `/resume`; dispatch other commands normally and let runtime status validation remain authoritative. |
-    | idle | absent | `WaitingForInput` | Submit through the existing pending-answer fallback. | Allow explicit `/answer` and all other commands; runtime validation remains authoritative. |
+    | idle | absent | `WaitingForInput` | Submit through the existing pending-input fallback. | Allow explicit `/provide-input` and all other commands; runtime validation remains authoritative. |
     | idle | absent | `Failed` | Preserve normal idle behavior. | Allow `/resolve` (option listing or resolution) and all other commands; runtime validation remains authoritative. |
     | idle | absent | `Completed` or `Cancelled` | Preserve normal idle behavior. | Allow normal command dispatch. |
 
   - Define “workflow execution task running” from typed background-task metadata, not from active run id or durable `Running` alone. A stepwise run may be durably `Running` with no task executing; waiting and failed runs also retain an active run id while idle.
-  - While execution is running, allow `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`, and read-only `/resolve <run-id>` with no status. Reject `/run`, `/step`, `/resume`, `/answer`, `/improve`, and mutating `/resolve <run-id> <status> ...` without dispatch, task creation, or draft clearing. When execution is idle, do not apply this deny list: `/step`, `/resume`, `/answer`, and `/resolve` must remain available in their valid lifecycle states.
+  - While execution is running, allow `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`, and read-only `/resolve <run-id>` with no status. Reject `/run`, `/step`, `/resume`, `/provide-input`, `/improve`, and mutating `/resolve <run-id> <status> ...` without dispatch, task creation, or draft clearing. When execution is idle, do not apply this deny list: `/step`, `/resume`, `/provide-input`, and `/resolve` must remain available in their valid lifecycle states.
   - Classify a submission before mutating the composer. Use a trimmed view only for empty/slash detection. For an on-the-fly prompt, call the runtime with the original draft; clear it and append the original text to history only after durable acceptance. On stale-window, sealed-window, terminal-run, or other rejection, retain the exact draft and show an actionable status.
-  - Keep pending `ask_user` answers higher priority than on-the-fly prompts. A leading slash continues to mean a slash command and is never forwarded as agent prompt text.
+  - Keep pending `wait_for_input` answers higher priority than on-the-fly prompts. A leading slash continues to mean a slash command and is never forwarded as agent prompt text.
 - `crates/tui/app/src/app/controls/composer.rs` and event projection/rendering
-  - Show `Enter sends prompt · Esc cancels` only when a workflow task is executing with an open agent window. During executing-without-agent, keep plain Enter blocked and explain that no agent is accepting prompts. During idle `Running`, `WaitingForInput`, `Failed`, and terminal states, render the existing lifecycle-appropriate idle/answer affordance rather than an active-execution restriction.
+  - Show `Enter sends prompt · Esc cancels` only when a workflow task is executing with an open agent window. During executing-without-agent, keep plain Enter blocked and explain that no agent is accepting prompts. During idle `Running`, `WaitingForInput`, `Failed`, and terminal states, render the existing lifecycle-appropriate idle/provide-input affordance rather than an active-execution restriction.
   - Preserve the distinct warning state for `WaitingForInput`, cursor/edit/paste behavior, multiline input, and cancellation.
 - `docs/workflow-authoring.md` and `docs/architecture.md`
-  - Document the exact `ctx.user_inputs` schema, sequence/timestamp rules, whitespace preservation, `ask_user` exclusion, automatic agent-prompt inclusion, durable window handoff, and ACP serial-turn semantics.
+  - Document the exact `ctx.user_inputs` schema, sequence/timestamp rules, whitespace preservation, `wait_for_input` exclusion, automatic agent-prompt inclusion, durable window handoff, and ACP serial-turn semantics.
   - Document the execution/lifecycle state matrix, including stepwise idle `Running`, `WaitingForInput`, `Failed`, and terminal behavior, plus conflict rejection and draft retention only while execution is actually in progress.
 
 # Tests to be added/updated
@@ -104,7 +104,7 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
 - Core/runner context tests:
   - provider and dispatcher receive the same prompt baseline on initial dispatch and retry;
   - Lua observes the exact schema, sequence, kind, content, timestamps, and order; `ctx.request` remains original;
-  - later steps see every accepted follow-up without `ctx.prev` forwarding, while `ask_user` answers remain only in `ctx.prev.fields.answer`.
+  - later steps see every accepted follow-up without `ctx.prev` forwarding, while `wait_for_input` answers remain only in `ctx.prev.fields.input`.
 - Agent prompt/executor tests:
   - every role's base prompt contains sequence `0` plus all prior follow-ups exactly once;
   - prompts accepted during initial and correction turns cause serial same-session correction turns until compare-and-seal succeeds;
@@ -121,11 +121,11 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
 - TUI input/command/state/render tests:
   - open-window Enter submits the original draft, records history only after acceptance, clears it, renders a prompt card, and creates no second background run;
   - an executing task with a stale/sealed/no-agent window leaves draft/history untouched and shows the correct composer state;
-  - pending `ask_user` still routes plain text through `answer_run` before active-prompt handling;
+  - pending `wait_for_input` still routes plain text through `provide_input_run` before active-prompt handling;
   - while execution is in progress, `/cancel`, `/help`, `/exit`, `/runs`, `/workflows`, and read-only `/resolve <run-id>` remain available;
-  - while execution is in progress, `/run`, `/step`, `/resume`, `/answer`, `/improve`, and mutating `/resolve` are rejected without dispatch, background-task creation, or draft loss;
+  - while execution is in progress, `/run`, `/step`, `/resume`, `/provide-input`, `/improve`, and mutating `/resolve` are rejected without dispatch, background-task creation, or draft loss;
   - after a stepwise task returns a durably `Running` run to idle, `/step` and `/resume` dispatch successfully;
-  - while idle in `WaitingForInput`, both plain-answer fallback and explicit `/answer` dispatch successfully;
+  - while idle in `WaitingForInput`, both plain-answer fallback and explicit `/provide-input` dispatch successfully;
   - while idle in `Failed`, read-only and mutating `/resolve` dispatch successfully;
   - completed/cancelled idle states retain normal new-request and slash-command behavior;
   - active-window copy advertises prompt submission, executing-no-agent copy blocks plain Enter, and idle lifecycle states do not show an execution-only restriction; cursor, edits, paste, modified Enter, history, and Esc retain their behavior.
@@ -136,7 +136,7 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
 - Run focused redb/core tests for exact schema, verbatim content, token validation, compare-and-seal ordering, stale cleanup, and the final-drain/terminal-finalization race.
 - Run focused agent tests for correction content blocks, separate response buffers, same-session serial turns, final output parsing, and cleanup paths.
 - Run `cargo test -p cowboy-workflow-engine --features test-support append_at_ -- --nocapture` for deterministic hooks on both sides of the seal transaction and submission through a second runtime/store handle.
-- Run focused Cowboy TUI state, input, command, composer, event, and render tests for every row in the execution/window/durable-status matrix, including positive idle `/step`, `/resume`, `/answer`, and `/resolve` cases and executing-task conflict rejection.
+- Run focused Cowboy TUI state, input, command, composer, event, and render tests for every row in the execution/window/durable-status matrix, including positive idle `/step`, `/resume`, `/provide-input`, and `/resolve` cases and executing-task conflict rejection.
 - `cargo test -p cowboy-workflow-core -p cowboy-workflow-store -p cowboy-workflow-agent -p cowboy-workflow-actions -p cowboy-workflow-engine`
 - `cargo test -p cowboy`
 - `cargo clippy -p cowboy-workflow-core -p cowboy-workflow-store -p cowboy-workflow-agent -p cowboy-workflow-actions -p cowboy-workflow-engine -p cowboy --all-targets -- -D warnings`
@@ -144,22 +144,22 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
   - submit two corrections during initial/correction turns and confirm both affect the current agent's replacement result before it finalizes;
   - press Enter immediately as the agent finishes and confirm the prompt is either accepted and applied or rejected with the exact draft retained—never accepted and lost;
   - confirm later steps receive the complete ordered history;
-  - confirm plain text is blocked only while a task executes without an agent window; then verify idle stepwise `/step`/`/resume`, waiting plain answer and `/answer`, failed `/resolve`, normal terminal commands, and cancellation/window cleanup.
+  - confirm plain text is blocked only while a task executes without an agent window; then verify idle stepwise `/step`/`/resume`, waiting plain answer and `/provide-input`, failed `/resolve`, normal terminal commands, and cancellation/window cleanup.
 
 # Verification evidence
 
 - `cargo test -p cowboy-workflow-store prompt_append_and_compare_and_seal_are_totally_ordered` — passed; the accepted timestamp is generated inside the write transaction and bounded by the store call.
 - `cargo test -p cowboy-workflow-agent --bin execute-agent existing_run_context_uses_durable_request_timestamp_and_follow_ups` — passed with durable sequence-zero request/timestamp data and a nonzero follow-up baseline.
 - `cargo test -p cowboy-workflow-engine --features test-support append_at_ -- --nocapture` — 2 passed. Test-support-only hooks pause immediately before and after compare-and-seal. The pre-seal test submits through a second `WorkflowRuntime`/redb handle, forces a same-session correction, and proves subsequent Lua and agent steps each receive the initial request and follow-up exactly once. The post-seal test receives exact `SealedWindow` while the run remains `Running` before `StepRecord` application.
-- `cargo test -p cowboy valid_idle_lifecycle_states_dispatch_step_resume_answers_and_terminal_requests` and `cargo test -p cowboy slash_resolve_forwards_typed_fields_and_renders_commands` — passed for valid idle `/step`, `/resume`, plain answer, `/answer`, failed `/resolve`, and completed/cancelled new-request dispatch.
-- `cargo test -p cowboy idle_requests_answers_and_allowed_slash_history_remain_trimmed`, `active_agent_prompt_is_persisted_verbatim_without_starting_another_task`, and `rejected_active_prompt_retains_exact_draft_and_history` — passed. Idle request, pending-answer, and allowed slash history use trimmed text; accepted active-agent prompts and rejected drafts retain exact surrounding whitespace.
+- `cargo test -p cowboy valid_idle_lifecycle_states_dispatch_step_resume_inputs_and_terminal_requests` and `cargo test -p cowboy slash_resolve_forwards_typed_fields_and_renders_commands` — passed for valid idle `/step`, `/resume`, plain answer, `/provide-input`, failed `/resolve`, and completed/cancelled new-request dispatch.
+- `cargo test -p cowboy idle_requests_inputs_and_allowed_slash_history_remain_trimmed`, `active_agent_prompt_is_persisted_verbatim_without_starting_another_task`, and `rejected_active_prompt_retains_exact_draft_and_history` — passed. Idle request, pending-input, and allowed slash history use trimmed text; accepted active-agent prompts and rejected drafts retain exact surrounding whitespace.
 - `cargo test -p cowboy synchronous_idle_dispatch_error_clears_and_records_trimmed_submission` — passed. A padded missing-run `/resolve` renders the synchronous error, clears the composer, and records only the trimmed command in history.
 - `cargo test -p cowboy-workflow-agent correction_turns_use_verbatim_blocks_and_replace_the_initial_response` — passed with ids `record-turn-1` through `record-turn-3` and `prev` values `[None, record-turn-1, record-turn-2]` across the initial response and two corrections.
 - Default affected backend suites — 208 passed, 3 ignored. Engine suite with `test-support` — 115 passed. Cowboy TUI suite — 222 passed, 2 ignored.
 - `cargo fmt --all -- --check`, default warnings-denied Clippy including `cowboy-workflow-actions`, and warnings-denied engine Clippy with `test-support` passed.
 - Manual PTY TUI agent smoke accepted `correction one` during the initial turn and `correction two` during the first correction turn on one ACP session. The final replacement was `second correction result`, and a later step rendered `later=correction one|correction two`.
 - A timed manual finish-boundary submission landed after sealing: `finish-boundary-edge-2` was absent from input history and the correction event stream, no second agent turn ran, and the window-closed event was persisted. A separate five-second command-action run retained `blocked draft`, omitted it from history, cancelled successfully, and `/exit` returned 0.
-- Manual idle-lifecycle TUI runs advanced seeded `Running` runs with `/step` and `/resume`, completed a TUI-created waiting run through plain text, completed another through `/answer`, completed a failed run through `/resolve`, and started/completed a new terminal-state request; the final terminal session exited with code 0.
+- Manual idle-lifecycle TUI runs advanced seeded `Running` runs with `/step` and `/resume`, completed a TUI-created waiting run through plain text, completed another through `/provide-input`, completed a failed run through `/resolve`, and started/completed a new terminal-state request; the final terminal session exited with code 0.
 
 # TODO
 
@@ -169,14 +169,14 @@ Validate emptiness with `content.trim().is_empty()`, but persist and forward the
 - [x] Pass one prompt baseline through core provider/dispatch/retry context without changing workflow budgets or transitions.
 - [x] Add runtime prompt submission and prompt-window lifecycle events with durable-acceptance-only results.
 - [x] Implement execution-guard stale-window cleanup and cancellation/error/drop cleanup.
-- [x] Materialize and document the exact `ctx.user_inputs` schema while preserving `ctx.request` and excluding `ask_user` answers.
+- [x] Materialize and document the exact `ctx.user_inputs` schema while preserving `ctx.request` and excluding `wait_for_input` answers.
 - [x] Include complete ordered user input in every initial agent prompt.
 - [x] Implement transactional compare-and-seal correction loops on the same session with separate response buffers.
 - [x] Build correction turns from instruction, ordered label/verbatim-content blocks, and regenerated original output requirements.
 - [x] Preserve initial `StepInput.prompt` and persist exact correction-turn blocks plus applied sequence metadata in `StepInput.context`.
 - [x] Replace the TUI boolean gate with typed background-execution, prompt-window, and durable-lifecycle submission modes.
 - [x] Preserve original drafts/history transactionally across acceptance and rejection, including whitespace.
-- [x] Enforce the execution-state command conflict policy without restricting valid idle `/step`, `/resume`, `/answer`, or `/resolve` flows.
+- [x] Enforce the execution-state command conflict policy without restricting valid idle `/step`, `/resume`, `/provide-input`, or `/resolve` flows.
 - [x] Update composer/event/status rendering for open-agent, executing-no-agent, idle-running, waiting, failed, terminal, rejected, and cancelled states.
 - [x] Update workflow-authoring and architecture documentation for the context and handoff contracts.
 - [x] Add all deterministic store, core, runner, agent, runtime, and TUI behavioral tests listed above.

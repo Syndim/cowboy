@@ -94,9 +94,9 @@ pub enum SharedCommand {
     #[command(about = "continue a run until blocked")]
     Resume(RunIdArgs),
 
-    /// Answer a workflow input prompt and continue the run.
-    #[command(about = "answer a waiting prompt")]
-    Answer(AnswerArgs),
+    /// Provide external input to a waiting workflow and continue the run.
+    #[command(about = "provide waiting input")]
+    ProvideInput(ProvideInputArgs),
 
     /// Summarize a completed run and apply proposed workflow file updates.
     #[command(about = "improve workflow source")]
@@ -194,23 +194,23 @@ pub struct ExportArgs {
     pub run_id: String,
 }
 
-/// Arguments for answering a workflow prompt.
+/// Arguments for providing a workflow prompt.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-pub struct AnswerArgs {
+pub struct ProvideInputArgs {
     #[arg(value_name = "run-id")]
     pub run_id: String,
 
-    #[arg(value_name = "prompt-id")]
-    pub prompt_id: String,
+    #[arg(value_name = "input-id")]
+    pub input_id: String,
 
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "answer")]
-    pub answer: Vec<String>,
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "input")]
+    pub input: Vec<String>,
 }
 
-impl AnswerArgs {
-    /// Return the trailing answer words normalized into the runtime answer string.
-    pub fn into_answer(self) -> String {
-        join_trailing_args(self.answer)
+impl ProvideInputArgs {
+    /// Return the trailing input words normalized into the runtime input string.
+    pub fn into_input(self) -> String {
+        join_trailing_args(self.input)
     }
 }
 
@@ -461,7 +461,7 @@ fn arg_usage(arg: &Arg) -> Option<String> {
 
     let usage = match arg.get_id().as_str() {
         "request" => "<request>".to_string(),
-        "answer" => "<answer>".to_string(),
+        "input" => "<input>".to_string(),
         id => format!("<{}>", id.replace('_', "-")),
     };
 
@@ -772,13 +772,13 @@ mod tests {
             other => panic!("expected run command, got {other:?}"),
         }
 
-        match shared_slash_command("/answer run-1 prompt-1 see #123") {
-            SharedCommand::Answer(args) => {
+        match shared_slash_command("/provide-input run-1 prompt-1 see #123") {
+            SharedCommand::ProvideInput(args) => {
                 assert_eq!(args.run_id, "run-1");
-                assert_eq!(args.prompt_id, "prompt-1");
-                assert_eq!(args.into_answer(), "see #123");
+                assert_eq!(args.input_id, "prompt-1");
+                assert_eq!(args.into_input(), "see #123");
             }
-            other => panic!("expected answer command, got {other:?}"),
+            other => panic!("expected provide-input command, got {other:?}"),
         }
     }
 
@@ -815,20 +815,20 @@ mod tests {
     }
 
     #[test]
-    fn answer_parses_unquoted_and_quoted_multi_word_answers() {
-        let expected = SharedCommand::Answer(AnswerArgs {
+    fn provide_input_parses_unquoted_and_quoted_multi_word_input() {
+        let expected = SharedCommand::ProvideInput(ProvideInputArgs {
             run_id: "run-1".to_string(),
-            prompt_id: "prompt-1".to_string(),
-            answer: vec!["ship it".to_string()],
+            input_id: "prompt-1".to_string(),
+            input: vec!["ship it".to_string()],
         });
 
         assert_eq!(
-            shared_slash_command("/answer run-1 prompt-1 \"ship it\""),
+            shared_slash_command("/provide-input run-1 prompt-1 \"ship it\""),
             expected
         );
-        match shared_slash_command("/answer run-1 prompt-1 ship it") {
-            SharedCommand::Answer(args) => assert_eq!(args.into_answer(), "ship it"),
-            other => panic!("expected answer command, got {other:?}"),
+        match shared_slash_command("/provide-input run-1 prompt-1 ship it") {
+            SharedCommand::ProvideInput(args) => assert_eq!(args.into_input(), "ship it"),
+            other => panic!("expected provide-input command, got {other:?}"),
         }
     }
 
@@ -1131,6 +1131,46 @@ mod tests {
     }
 
     #[test]
+    fn removed_input_command_name_is_unknown_and_not_advertised() {
+        assert_eq!(
+            Cli::try_parse_from(["cowboy", "answer", "run-1", "input-1", "yes"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::InvalidSubcommand
+        );
+        assert!(matches!(
+            parse_slash_command("/answer run-1 input-1 yes"),
+            Err(SlashParseError::Validation { .. })
+        ));
+
+        let names = slash_command_names();
+        assert!(!names.contains(&"answer".to_string()));
+        assert!(
+            !slash_help_rows()
+                .iter()
+                .any(|row| row.name == "/answer" || row.usage.contains("/answer"))
+        );
+    }
+
+    #[test]
+    fn provide_input_is_advertised_in_generated_help_and_suggestions() {
+        let suggestions = slash_suggestions("/provide");
+        assert!(suggestions.iter().any(|command| {
+            command.name == "/provide-input"
+                && command.usage == "/provide-input <run-id> <input-id> <input>"
+                && command.description == "provide waiting input"
+                && command.takes_arguments
+        }));
+
+        let rows = slash_help_rows();
+        assert!(rows.iter().any(|row| {
+            row.name == "/provide-input"
+                && row.usage == "/provide-input <run-id> <input-id> <input>"
+                && row.description == "provide waiting input"
+        }));
+    }
+
+    #[test]
     fn slash_suggestions_are_generated_from_clap_commands() {
         let suggestions = slash_suggestions("/run")
             .into_iter()
@@ -1148,7 +1188,11 @@ mod tests {
                 .iter()
                 .any(|usage| usage.contains("run-workflow"))
         );
-        assert!(!suggestions.iter().any(|usage| usage.starts_with("/answer")));
+        assert!(
+            !suggestions
+                .iter()
+                .any(|usage| usage.starts_with("/provide-input"))
+        );
     }
 
     #[test]

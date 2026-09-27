@@ -23,6 +23,6 @@ async fn omp_acp_initializes() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires authenticated Oh My Pi CLI (`omp acp`) on PATH; run with --ignored"]
-async fn omp_acp_creates_session_and_answers_prompt() -> anyhow::Result<()> {
+async fn omp_acp_creates_session_and_inputs_prompt() -> anyhow::Result<()> {
     run_session_prompt(&OMP).await
 }

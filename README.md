@@ -7,7 +7,7 @@ It has one binary with two interfaces:
 - `cowboy` launches the interactive terminal UI.
 - `cowboy <subcommand>` runs non-interactive CLI commands against the same workflow runtime and persisted state.
 
-Workflows are Lua files. A workflow step can run an agent, return a status, request input, or fail. Waiting input stores a durable resume descriptor so answers can continue through the same runtime path as other actions. Runs, step outputs, agent turns, role sessions, source snapshots, and event logs are persisted so the TUI and CLI see the same state.
+Workflows are Lua files. A workflow step can run an agent, return a status, request input, or fail. Waiting input stores a durable resume descriptor so input can continue through the same runtime path as other actions. Runs, step outputs, agent turns, role sessions, source snapshots, and event logs are persisted so the TUI and CLI see the same state.
 
 ## Project status
 
@@ -100,10 +100,10 @@ cowboy step <run-id>
 cowboy resume <run-id>
 ```
 
-Answer a waiting prompt:
+Provide waiting input:
 
 ```bash
-cowboy answer <run-id> <prompt-id> <answer>
+cowboy provide-input <run-id> <input-id> <input>
 ```
 
 Ask Cowboy to summarize and apply workflow-file improvements from a completed run:
@@ -151,10 +151,10 @@ config-set name; it never mutates the source run or reselects from the current
 catalog. Root and nested workflow-action runs inherit their corresponding
 backend role sessions. Already delivered role/task contracts are not replayed,
 and a copied session must load exactly or the restarted run fails without
-creating a replacement session. Slash commands, pending `ask_user` answers, and
+creating a replacement session. Slash commands, pending `wait_for_input` inputs, and
 active-agent prompts retain priority over terminal restart.
 
-Plain text submitted in the composer starts a workflow run. When a workflow is waiting for input, typing the answer directly submits it to the pending prompt; `/answer` remains available for explicit answers.
+Plain text submitted in the composer starts a workflow run. When a workflow is waiting for input, typing the input directly submits it as a trusted hint to the pending wait; `/provide-input` remains available for explicit input. The next workflow step should recheck the authoritative external condition before treating work as complete.
 
 ### TUI commands
 
@@ -162,7 +162,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>  start a workflow run
 /step <run-id>                                    execute exactly one more step
 /resume <run-id>                                  continue a run until blocked
-/answer <run-id> <prompt-id> <answer>             answer a waiting prompt explicitly
+/provide-input <run-id> <input-id> <input>             provide waiting input explicitly
 /runs [partial-run-id]                            list workflow runs
 /export <run-id>                                  export searchable HTML transcript
 /workflows                                        list known workflows
@@ -174,7 +174,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /exit                                             quit Cowboy
 ```
 
-`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes. Both also re-execute the retained current step of any non-terminal run — `Running`, `Failed` (for example one that gave up after exhausting its recoverable-retry budget), and `WaitingForInput`: `step` takes one fresh attempt and `resume` continues until the run blocks, fails, or completes. Re-executing a `WaitingForInput` run re-prompts its retained `ask_user` step and safely replaces the durable pending callback. Only `Completed` and `Cancelled` runs are non-resumable no-ops and left unchanged; `answer` remains the way to supply a prompt answer.
+`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes. Both also re-execute the retained current step of any non-terminal run — `Running`, `Failed` (for example one that gave up after exhausting its recoverable-retry budget), and `WaitingForInput`: `step` takes one fresh attempt and `resume` continues until the run blocks, fails, or completes. Re-executing a `WaitingForInput` run re-prompts its retained `wait_for_input` step and safely replaces the durable pending callback. Only `Completed` and `Cancelled` runs are non-resumable no-ops and left unchanged; `provide-input` remains the way to supply input explicitly.
 
 `/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
