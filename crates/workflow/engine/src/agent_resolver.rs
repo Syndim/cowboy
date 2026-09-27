@@ -102,6 +102,7 @@ mod tests {
             args: Vec::new(),
             model: Some(ModelInfo::default()),
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -125,6 +126,21 @@ mod tests {
     }
 
     #[test]
+    fn explicit_agent_name_preserves_its_tool_policy_without_affecting_default() {
+        let mut restricted = agent("reviewer");
+        restricted.allow_tools = false;
+        let resolver = AgentResolver::new(vec![agent("default"), restricted]).unwrap();
+
+        assert!(
+            !resolver
+                .resolve(&role(Some("reviewer")))
+                .unwrap()
+                .allow_tools
+        );
+        assert!(resolver.resolve(&role(None)).unwrap().allow_tools);
+    }
+
+    #[test]
     fn resolve_selects_named_committer_agent_with_low_cost_args() {
         let committer = AgentRuntimeConfig {
             name: "committer".to_string(),
@@ -136,6 +152,7 @@ mod tests {
             ],
             model: Some(ModelInfo::default()),
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         };
         let resolver =

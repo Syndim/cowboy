@@ -103,6 +103,8 @@ pub struct AgentConfig {
     pub model: Option<ModelConfig>,
     #[serde(default)]
     pub allowed_env: Vec<String>,
+    #[serde(default = "default_allow_tools")]
+    pub allow_tools: bool,
     #[serde(default)]
     pub watchdog: AgentWatchdogConfig,
 }
@@ -127,6 +129,10 @@ impl Default for AgentWatchdogConfig {
 
 fn default_agent_command() -> String {
     "copilot".to_string()
+}
+
+fn default_allow_tools() -> bool {
+    true
 }
 
 fn default_agent_args() -> Vec<String> {
@@ -157,6 +163,7 @@ impl Default for AgentConfig {
             args: default_agent_args(),
             model: None,
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogConfig::default(),
         }
     }
@@ -367,6 +374,7 @@ impl AppConfig {
                             provider: model.provider,
                         }),
                     );
+                    runtime.allow_tools = agent.allow_tools;
                     runtime.watchdog = AgentWatchdogRuntimeConfig {
                         response_timeout_seconds: agent.watchdog.response_timeout_seconds,
                         cancel_timeout_seconds: agent.watchdog.cancel_timeout_seconds,
@@ -445,6 +453,42 @@ provider = "configured-provider"
         assert_eq!(runtime.allowed_env, ["COWBOY_TEST_GLOBAL", "PATH"]);
         assert_eq!(runtime.agents[0].allowed_env, ["COWBOY_TEST_DEFAULT"]);
         assert_eq!(runtime.agents[1].allowed_env, ["COWBOY_TEST_PLANNER"]);
+    }
+
+    #[test]
+    fn named_agent_tool_policy_parses_and_reaches_runtime_without_changing_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"[[agents]]
+name = "default"
+
+[[agents]]
+name = "reviewer"
+allow_tools = false
+[agents.model]
+id = "review-model"
+provider = "configured-provider"
+
+[[agents]]
+name = "implementer"
+allow_tools = true
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert!(config.agents[0].allow_tools);
+        assert!(!config.agents[1].allow_tools);
+        assert!(config.agents[2].allow_tools);
+        assert_eq!(config.agents[1].model.as_ref().unwrap().id, "review-model");
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert!(runtime.agents[0].allow_tools);
+        assert!(!runtime.agents[1].allow_tools);
+        assert!(runtime.agents[2].allow_tools);
+        assert_eq!(runtime.agents[1].model.as_ref().unwrap().id, "review-model");
     }
 
     #[test]
@@ -1185,6 +1229,17 @@ args = ["--acp"]
 
         assert!(err.to_string().contains("failed to parse config"));
         assert!(format!("{err:#}").contains("unknown field `agent`"));
+    }
+
+    #[test]
+    fn rejects_legacy_deny_tools_agent_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[[agents]]\nname = \"default\"\ndeny_tools = true\n").unwrap();
+
+        let err = load_config(&path).unwrap_err();
+        assert!(err.to_string().contains("failed to parse config"));
+        assert!(format!("{err:#}").contains("unknown field `deny_tools`"));
     }
 
     #[test]

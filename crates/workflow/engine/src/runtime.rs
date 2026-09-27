@@ -103,7 +103,12 @@ pub struct RuntimeConfig {
     pub config_sets: BTreeMap<String, RunnerLimitsConfig>,
 }
 
+fn allow_tools_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentRuntimeConfig {
     pub name: String,
     pub command: String,
@@ -112,6 +117,8 @@ pub struct AgentRuntimeConfig {
     pub model: Option<ModelInfo>,
     #[serde(default)]
     pub allowed_env: Vec<String>,
+    #[serde(default = "allow_tools_by_default")]
+    pub allow_tools: bool,
     #[serde(default)]
     pub watchdog: AgentWatchdogRuntimeConfig,
 }
@@ -167,6 +174,7 @@ impl AgentRuntimeConfig {
             args,
             model,
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -1750,7 +1758,7 @@ impl WorkflowRuntime {
             SelectorMode::Agent => {
                 let resolver = AgentResolver::new(self.config.agents.clone())?;
                 let agent = resolver.resolve_default()?;
-                let client = self
+                let mut client = self
                     .acp_connector
                     .connect(
                         transport_for(&self.config.allowed_env, agent),
@@ -1758,6 +1766,7 @@ impl WorkflowRuntime {
                     )
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+                client.set_allow_tools(agent.allow_tools);
                 let selector = crate::AgentWorkflowSelector::new(
                     client,
                     self.config.cwd.to_string_lossy().to_string(),
@@ -2108,7 +2117,7 @@ impl WorkflowRuntime {
         let run = self.load_run(run_id).await?;
         let resolver = AgentResolver::new(self.config.agents.clone())?;
         let agent = resolver.resolve_default()?;
-        let client = self
+        let mut client = self
             .acp_connector
             .connect(
                 transport_for(&self.config.allowed_env, agent),
@@ -2116,6 +2125,7 @@ impl WorkflowRuntime {
             )
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+        client.set_allow_tools(agent.allow_tools);
         let summarizer = crate::AgentWorkflowSummarizer::new(
             client,
             self.config.cwd.to_string_lossy().to_string(),
@@ -2725,6 +2735,7 @@ mod tests {
             args: Vec::new(),
             model: Some(ModelInfo::default()),
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -3084,6 +3095,7 @@ mod tests {
                 args: Vec::new(),
                 model: None,
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig {
                     response_timeout_seconds: 31,
                     cancel_timeout_seconds: 32,
@@ -3918,6 +3930,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                 ],
                 model: Some(ModelInfo::default()),
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 // Generous watchdog timeouts: this test drives a real
                 // subprocess (fork/exec + several JSON-RPC round trips)
                 // whose scheduling can be slow under heavy parallel-test CPU
@@ -4048,6 +4061,7 @@ done
                 args: Vec::new(),
                 model: None,
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
         )
@@ -6016,6 +6030,7 @@ exit 0
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -6305,6 +6320,7 @@ exit 0
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -8950,6 +8966,7 @@ Recovery implementation review"#
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -9874,6 +9891,7 @@ return workflow("{label}", plan)
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
                 allowed_env: Vec::new(),
+                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
