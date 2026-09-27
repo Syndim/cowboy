@@ -13,7 +13,7 @@ The placeholders are not introduced by presentation code. `build_agent_prompt` i
 ## Reproduction steps
 
 1. Load the example `bugfix` workflow.
-2. Execute `review_result_feedback` with a `confirm_result_answer` previous record containing concrete `work_dir`, `plan_doc`, `rca_doc`, and `repro_test` fields.
+2. Execute `review_result_feedback` with a `confirm_result_input` previous record containing concrete `work_dir`, `plan_doc`, `rca_doc`, and `repro_test` fields.
 3. Inspect the resulting agent action prompt.
 4. Observe that it contains both the concrete artifact references and the literal placeholder references from the static instruction.
 

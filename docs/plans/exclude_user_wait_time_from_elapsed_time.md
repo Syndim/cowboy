@@ -26,13 +26,13 @@ Keep the scope to workflow transcript elapsed stamps. Do not change diagnostic l
 - Update active runtime entry points in `crates/workflow/engine/src/runtime.rs`:
   - `start_catalog_workflow` opens the first active window after the run is created and before topic generation / runner execution;
   - `resume_with` opens an active window only when the loaded run is `RunStatus::Running`; returning a non-running run with no events must not add active time;
-  - `answer_run` opens an active window only after `ResumeRouter::answer` validates the prompt and answer, so prior waiting time remains inactive while applying the accepted answer and any continuation counts as active;
+  - `provide_input_run` opens an active window only after `ResumeRouter::answer` validates the prompt and answer, so prior waiting time remains inactive while applying the accepted answer and any continuation counts as active;
   - `resolve_run` opens an active window only after resolution inputs validate and before synthesizing/emitting the manual-resolution step;
-  - invalid prompt ids, invalid choices, invalid resolution fields, and no-op commands do not mutate `active_duration_ms`.
+  - invalid input ids, invalid choices, invalid resolution fields, and no-op commands do not mutate `active_duration_ms`.
 - Update `crates/workflow/engine/src/runner.rs` event emission to carry the active clock through runner-created events:
   - `RunStarted`, `StepStarted`, `StepCompleted`, retry events, failure give-up events, and status events all use active elapsed from the current active window;
   - when `step_once` returns while the run is still `Running`, close and persist the active window so idle time until the next `/step` or `resume` command is excluded;
-  - when the runner stops at `WaitingForInput`, close and persist active time at the block point so time spent reading/answering the prompt is excluded.
+  - when the runner stops at `WaitingForInput`, close and persist active time at the block point so time spent reading/provide-inputing the prompt is excluded.
 - Update `crates/workflow/engine/src/runtime.rs` agent progress conversion:
   - capture the same active-clock base/window in the progress callback used by `run_existing_with_events`;
   - emit prompt, thought, response, tool, and plan progress events with `run_active_duration_ms` populated from the current active window.
@@ -51,7 +51,7 @@ Keep the scope to workflow transcript elapsed stamps. Do not change diagnostic l
   - starting a run emits events whose active duration advances while Cowboy is executing;
   - answering a waiting run does not include the time between the persisted `WaitingForInput` state and the accepted answer, but does include applying the answer and subsequent execution;
   - `step_run` / single-step execution closes the active window even when the persisted run remains `Running`, and a later `step_run` resumes from the previous active total without counting idle wall time between commands;
-  - invalid prompt id, invalid choice, and invalid manual resolution do not increment `active_duration_ms`.
+  - invalid input id, invalid choice, and invalid manual resolution do not increment `active_duration_ms`.
 - Update `crates/workflow/engine/src/runner.rs` tests so runner-emitted events still carry the run start baseline and now also carry active elapsed duration from the injected active clock.
 - Add deterministic `crates/tui/app/src/app/events.rs` renderer tests:
   - an event with `run_active_duration_ms = 296000` renders `00:04:56` even when wall-clock elapsed from `run_started_at` is larger;

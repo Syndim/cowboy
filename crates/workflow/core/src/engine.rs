@@ -255,9 +255,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        ActionDispatcher, ActionResult, AgentAction, AskUserAction, Choice, CommandAction,
-        FailAction, Fields, ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput,
-        StepOutput, StepState, StepTransitions, WorkflowDefinition, WorkflowSnapshot,
+        ActionDispatcher, ActionResult, AgentAction, Choice, CommandAction, FailAction, Fields,
+        ResumeCallback, StatusAction, StepDefinition, StepDetail, StepInput, StepOutput, StepState,
+        StepTransitions, WaitForInputAction, WorkflowDefinition, WorkflowSnapshot,
         default_command_status_map,
     };
 
@@ -383,9 +383,9 @@ mod tests {
                     started_at: now,
                     completed_at: Some(now),
                 })),
-                StepAction::AskUser(action) => {
+                StepAction::WaitForInput(action) => {
                     let resume_callback = ResumeCallback::new(
-                        "ask_user",
+                        "wait_for_input",
                         serde_json::json!({
                             "record_id": context.step_record_id,
                             "prev": context.prev,
@@ -396,7 +396,7 @@ mod tests {
                     )?;
                     Ok(ActionResult::blocked(RunStatus::WaitingForInput {
                         step: context.step_id,
-                        prompt_id: action.id,
+                        input_id: action.id,
                         message: action.message,
                         choices: action.choices,
                         resume_callback,
@@ -900,10 +900,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_sets_waiting_status() {
+    async fn wait_for_input_sets_waiting_status() {
         let store = MemoryStore::default();
         let executor = NoopDispatcher::default();
-        let provider = StaticProvider::new(vec![StepAction::AskUser(AskUserAction {
+        let provider = StaticProvider::new(vec![StepAction::WaitForInput(WaitForInputAction {
             id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec![
@@ -916,7 +916,7 @@ mod tests {
                     description: "Reject".to_string(),
                 },
             ],
-            status: "answered".to_string(),
+            status: "provided".to_string(),
             fields: Fields::new(),
         })]);
         let mut run = run();
@@ -934,7 +934,7 @@ mod tests {
 
         let RunStatus::WaitingForInput {
             step,
-            prompt_id,
+            input_id,
             message,
             choices,
             resume_callback,
@@ -943,7 +943,7 @@ mod tests {
             panic!("expected waiting status")
         };
         assert_eq!(step, "start");
-        assert_eq!(prompt_id, "approval");
+        assert_eq!(input_id, "approval");
         assert_eq!(message, "Approve?");
         assert_eq!(
             choices,
@@ -958,10 +958,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(resume_callback.kind(), "ask_user");
+        assert_eq!(resume_callback.kind(), "wait_for_input");
         assert_eq!(resume_callback.payload()["record_id"], "run-2");
         assert_eq!(resume_callback.payload()["prev"], Value::Null);
-        assert_eq!(resume_callback.payload()["output_status"], "answered");
+        assert_eq!(resume_callback.payload()["output_status"], "provided");
         assert_eq!(
             resume_callback.payload()["output_fields"],
             serde_json::json!({})
@@ -1039,11 +1039,11 @@ mod tests {
                 status_map: default_command_status_map(),
                 timeout_ms: None,
             }),
-            StepAction::AskUser(AskUserAction {
+            StepAction::WaitForInput(WaitForInputAction {
                 id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
-                status: "answered".to_string(),
+                status: "provided".to_string(),
                 fields: Fields::new(),
             }),
             StepAction::Fail(FailAction {

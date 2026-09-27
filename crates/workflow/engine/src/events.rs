@@ -195,7 +195,7 @@ pub enum WorkflowEventKind {
     },
     WaitingForInput {
         step: String,
-        prompt_id: String,
+        input_id: String,
         message: String,
         choices: Vec<Choice>,
     },
@@ -217,13 +217,13 @@ impl From<&RunStatus> for WorkflowEventKind {
             },
             RunStatus::WaitingForInput {
                 step,
-                prompt_id,
+                input_id,
                 message,
                 choices,
                 ..
             } => Self::WaitingForInput {
                 step: step.clone(),
-                prompt_id: prompt_id.clone(),
+                input_id: input_id.clone(),
                 message: message.clone(),
                 choices: choices.clone(),
             },
@@ -291,7 +291,7 @@ mod tests {
             "run-1",
             &RunStatus::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {
@@ -304,7 +304,7 @@ mod tests {
                     },
                 ],
                 resume_callback: cowboy_workflow_core::ResumeCallback::new(
-                    "ask_user",
+                    "wait_for_input",
                     serde_json::json!({ "secret": "internal" }),
                 )
                 .unwrap(),
@@ -315,7 +315,7 @@ mod tests {
             event.kind,
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {

@@ -25,7 +25,7 @@ Use a clean data boundary: the workflow engine should expose a complete run summ
   - Add a small status projection type near `RunSummaryLine`, for example:
     - `state: "running" | "waiting_for_input" | "completed" | "failed" | "cancelled"`.
     - `reason: Option<String>` for failed runs.
-    - `waiting_step`, `prompt_id`, `message`, and `choices` for waiting runs.
+    - `waiting_step`, `input_id`, `message`, and `choices` for waiting runs.
   - Populate `WorkflowRun.request_topic` when `generate_request_topic` succeeds for new-run entry points, persist the updated run before workflow execution continues, and continue to pass the same topic into `WorkflowRunner` for the first `RunStarted` event.
   - Preserve best-effort topic semantics: topic generation failure should still log and leave `topic` absent, not fail the run.
   - In `list_runs`, load each run as it already does, return `topic` from `run.request_topic`, and optionally fall back to the first persisted `RunStarted.request_topic` event for existing runs created after topic events existed but before the new run field existed.
@@ -39,7 +39,7 @@ Use a clean data boundary: the workflow engine should expose a complete run summ
 - `crates/tui/app/src/app/commands.rs`
   - Replace the `/runs` card details with the same user-facing fields as the CLI path.
   - Show `topic: <topic>` when present.
-  - Render status as structured lines, such as `status: waiting_for_input`, `status.prompt_id: approval`, and `status.choices: yes, no`, instead of `status: WaitingForInput { ... }`.
+  - Render status as structured lines, such as `status: waiting_for_input`, `status.input_id: approval`, and `status.choices: yes, no`, instead of `status: WaitingForInput { ... }`.
   - Keep the status-bar summary (`N run(s)`) behavior unchanged unless the new summary count wording needs to match CLI output.
 
 - `crates/workflow/engine/src/bin/engine-cli.rs`
@@ -60,7 +60,7 @@ Use a clean data boundary: the workflow engine should expose a complete run summ
 
 - Add or update `crates/tui/app/src/app/commands.rs` tests for `/runs` card rendering:
   - completed run with topic shows `topic:` and structured `status: completed`;
-  - waiting run shows prompt id, message, choices, and waiting step as separate lines;
+  - waiting run shows input id, message, choices, and waiting step as separate lines;
   - failed run shows `status: failed` and a separate reason line;
   - rendered output does not contain Rust debug fragments such as `WaitingForInput {`, `Failed {`, or `resume_callback:`.
 

@@ -1,8 +1,8 @@
 mod agent;
-mod ask_user;
 mod command;
 mod fail;
 mod status;
+mod wait_for_input;
 mod workflow;
 
 use std::collections::BTreeMap;
@@ -16,10 +16,12 @@ use cowboy_workflow_core::{
 };
 
 pub use agent::{AgentActionHandler, AgentActionRunner};
-pub use ask_user::{ASK_USER_CALLBACK_KIND, AskUserActionRunner, PendingAskUser};
 pub use command::CommandActionRunner;
 pub use fail::FailActionRunner;
 pub use status::StatusActionRunner;
+pub use wait_for_input::{
+    PendingWaitForInput, WAIT_FOR_INPUT_CALLBACK_KIND, WaitForInputActionRunner,
+};
 pub use workflow::{UnsupportedWorkflowActionHandler, WorkflowActionHandler, WorkflowActionRunner};
 
 #[derive(Debug, Clone)]
@@ -29,7 +31,7 @@ pub struct EngineActionDispatcher<A, W = UnsupportedWorkflowActionHandler> {
     command: CommandActionRunner,
     status: StatusActionRunner,
     fail: FailActionRunner,
-    ask_user: AskUserActionRunner,
+    wait_for_input: WaitForInputActionRunner,
 }
 
 impl<A> EngineActionDispatcher<A, UnsupportedWorkflowActionHandler> {
@@ -40,7 +42,7 @@ impl<A> EngineActionDispatcher<A, UnsupportedWorkflowActionHandler> {
             command: CommandActionRunner::new(cwd, allowed_env),
             status: StatusActionRunner,
             fail: FailActionRunner,
-            ask_user: AskUserActionRunner,
+            wait_for_input: WaitForInputActionRunner,
         }
     }
 }
@@ -58,7 +60,7 @@ impl<A, W> EngineActionDispatcher<A, W> {
             command: CommandActionRunner::new(cwd, allowed_env),
             status: StatusActionRunner,
             fail: FailActionRunner,
-            ask_user: AskUserActionRunner,
+            wait_for_input: WaitForInputActionRunner,
         }
     }
 }
@@ -78,7 +80,7 @@ where
             StepAction::Command(action) => self.command.run(action, context).await,
             StepAction::Status(action) => Ok(self.status.run(action, context)),
             StepAction::Fail(action) => Ok(self.fail.run(action)),
-            StepAction::AskUser(action) => Ok(self.ask_user.run(action, context)),
+            StepAction::WaitForInput(action) => Ok(self.wait_for_input.run(action, context)),
             StepAction::Agent(action) => self.agent.run(action, context).await,
             StepAction::Workflow(action) => self.workflow.run(action, context).await,
         }
@@ -100,8 +102,8 @@ impl ResumeCallbackRegistry {
     pub fn with_default_handlers() -> Self {
         let mut registry = Self::new();
         registry
-            .register(ASK_USER_CALLBACK_KIND, AskUserActionRunner)
-            .expect("default ask-user callback kind is valid");
+            .register(WAIT_FOR_INPUT_CALLBACK_KIND, WaitForInputActionRunner)
+            .expect("default wait-for-input callback kind is valid");
         registry
     }
 
@@ -153,9 +155,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use cowboy_workflow_core::{
-        ActionDispatcher, AgentAction, AskUserAction, Choice, CommandAction, ExecutionContext,
-        FailAction, Fields, ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus,
-        StatusAction, StepDetail, StepInput, StepOutput, StepRecord, WorkflowAction,
+        ActionDispatcher, AgentAction, Choice, CommandAction, ExecutionContext, FailAction, Fields,
+        ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail,
+        StepInput, StepOutput, StepRecord, WaitForInputAction, WorkflowAction,
     };
     use serde_json::{Value, json};
 
@@ -178,10 +180,10 @@ mod tests {
         }
     }
 
-    fn resume_input(answer: &str) -> ResumeInput {
+    fn resume_input(input: &str) -> ResumeInput {
         ResumeInput {
             step: "confirm".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "Approve?".to_string(),
             choices: vec![
                 Choice {
@@ -193,7 +195,7 @@ mod tests {
                     description: "Reject".to_string(),
                 },
             ],
-            answer: answer.to_string(),
+            input: input.to_string(),
             completed_at: Utc::now(),
         }
     }
@@ -229,9 +231,9 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_initial_dispatch_registers_resume_callback() {
-        let result = AskUserActionRunner.run(
-            AskUserAction {
+    fn wait_for_input_initial_dispatch_registers_resume_callback() {
+        let result = WaitForInputActionRunner.run(
+            WaitForInputAction {
                 id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![Choice {
@@ -246,7 +248,7 @@ mod tests {
 
         let ActionResult::Blocked(RunStatus::WaitingForInput {
             step,
-            prompt_id,
+            input_id,
             message,
             choices,
             resume_callback,
@@ -255,7 +257,7 @@ mod tests {
             panic!("expected waiting status")
         };
         assert_eq!(step, "step");
-        assert_eq!(prompt_id, "approval");
+        assert_eq!(input_id, "approval");
         assert_eq!(message, "Approve?");
         assert_eq!(
             choices,
@@ -264,8 +266,8 @@ mod tests {
                 description: "Approve".to_string(),
             }]
         );
-        assert_eq!(resume_callback.kind(), ASK_USER_CALLBACK_KIND);
-        let pending = PendingAskUser::from_callback(&resume_callback).unwrap();
+        assert_eq!(resume_callback.kind(), WAIT_FOR_INPUT_CALLBACK_KIND);
+        let pending = PendingWaitForInput::from_callback(&resume_callback).unwrap();
         assert_eq!(pending.record_id, "record");
         assert_eq!(pending.prev, Some("prev-hash".to_string()));
         assert_eq!(pending.output_status, "accepted");
@@ -273,39 +275,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_callback_completion_merges_answer() {
+    async fn wait_for_input_callback_completion_merges_input() {
         let started_at = Utc::now();
-        let pending = PendingAskUser {
+        let pending = PendingWaitForInput {
             record_id: "record".to_string(),
             prev: Some("prev".to_string()),
             started_at,
-            output_status: "answered".to_string(),
+            output_status: "provided".to_string(),
             output_fields: json!({ "plan": "p" }),
         };
         let callback = ResumeCallback::new(
-            ASK_USER_CALLBACK_KIND,
+            WAIT_FOR_INPUT_CALLBACK_KIND,
             serde_json::to_value(pending).unwrap(),
         )
         .unwrap();
 
-        let ActionResult::Completed(record) = AskUserActionRunner
+        let ActionResult::Completed(record) = WaitForInputActionRunner
             .resume(&callback, resume_input("yes"))
             .await
             .unwrap()
         else {
-            panic!("expected completed ask-user record")
+            panic!("expected completed wait-for-input record")
         };
 
         assert_eq!(record.id, "record");
         assert_eq!(record.prev, Some("prev".to_string()));
         assert_eq!(record.step, "confirm");
-        assert_eq!(record.action, "ask_user");
+        assert_eq!(record.action, "wait_for_input");
         let output = record.output.unwrap();
-        assert_eq!(output.status, "answered");
+        assert_eq!(output.status, "provided");
         assert_eq!(output.fields["plan"], "p");
-        assert_eq!(output.fields["answer"], "yes");
+        assert_eq!(output.fields["input"], "yes");
         assert_eq!(output.body, "yes");
-        assert_eq!(output.raw["prompt_id"], "approval");
+        assert_eq!(output.raw["input_id"], "approval");
         assert_eq!(output.raw["message"], "Approve?");
     }
 
@@ -313,12 +315,12 @@ mod tests {
     async fn registry_dispatches_known_callback_and_rejects_unknown() {
         let started_at = Utc::now();
         let callback = ResumeCallback::new(
-            ASK_USER_CALLBACK_KIND,
-            serde_json::to_value(PendingAskUser {
+            WAIT_FOR_INPUT_CALLBACK_KIND,
+            serde_json::to_value(PendingWaitForInput {
                 record_id: "record".to_string(),
                 prev: None,
                 started_at,
-                output_status: "answered".to_string(),
+                output_status: "provided".to_string(),
                 output_fields: Value::Null,
             })
             .unwrap(),
@@ -340,11 +342,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_ask_user_resume_callback_preserves_behavior() {
+    async fn async_wait_for_input_resume_callback_preserves_behavior() {
         let started_at = Utc::now();
         let callback = ResumeCallback::new(
-            ASK_USER_CALLBACK_KIND,
-            serde_json::to_value(PendingAskUser {
+            WAIT_FOR_INPUT_CALLBACK_KIND,
+            serde_json::to_value(PendingWaitForInput {
                 record_id: "record".to_string(),
                 prev: Some("previous".to_string()),
                 started_at,
@@ -360,13 +362,13 @@ mod tests {
             .await
             .unwrap()
         else {
-            panic!("expected completed ask-user record")
+            panic!("expected completed wait-for-input record")
         };
         assert_eq!(record.id, "record");
         assert_eq!(record.prev.as_deref(), Some("previous"));
         assert_eq!(record.step, "confirm");
         assert_eq!(record.input.prompt.as_deref(), Some("Approve?"));
-        assert_eq!(record.input.context["prompt_id"], "approval");
+        assert_eq!(record.input.context["input_id"], "approval");
         assert_eq!(
             record.input.context["choices"],
             json!([
@@ -375,7 +377,7 @@ mod tests {
             ])
         );
         assert_eq!(record.output.as_ref().unwrap().status, "accepted");
-        assert_eq!(record.output.as_ref().unwrap().fields["answer"], "yes");
+        assert_eq!(record.output.as_ref().unwrap().fields["input"], "yes");
     }
 
     #[derive(Debug, Clone, Default)]
@@ -428,7 +430,7 @@ mod tests {
             completed,
             ActionResult::blocked(RunStatus::WaitingForInput {
                 step: "delegate".to_string(),
-                prompt_id: "child-prompt".to_string(),
+                input_id: "child-prompt".to_string(),
                 message: "Continue?".to_string(),
                 choices: vec![Choice {
                     key: "yes".to_string(),
@@ -545,13 +547,13 @@ mod tests {
         };
         assert_eq!(record.action, "command");
 
-        let ActionResult::Blocked(RunStatus::WaitingForInput { prompt_id, .. }) = dispatcher
+        let ActionResult::Blocked(RunStatus::WaitingForInput { input_id, .. }) = dispatcher
             .dispatch(
-                StepAction::AskUser(AskUserAction {
+                StepAction::WaitForInput(WaitForInputAction {
                     id: "approval".to_string(),
                     message: "Approve?".to_string(),
                     choices: Vec::new(),
-                    status: "answered".to_string(),
+                    status: "provided".to_string(),
                     fields: Fields::new(),
                 }),
                 context(),
@@ -561,7 +563,7 @@ mod tests {
         else {
             panic!("expected waiting status")
         };
-        assert_eq!(prompt_id, "approval");
+        assert_eq!(input_id, "approval");
 
         assert!(matches!(
             dispatcher

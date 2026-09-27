@@ -31,7 +31,7 @@ cowboy-workflow-engine	runtime::tests::workflow_store_wait_event_emits_once_duri
 cowboy-workflow-engine	runtime::tests::cancelling_runtime_store_wait_interrupts_contended_operation	EVIDENCE runtime-wait-cancel cancelled=true bounded=true
 cowboy-workflow-engine	runtime::tests::cancellation_cleanup_retains_run_lock_until_persistence_finishes	EVIDENCE runtime-cancel lock_retained_until_persisted=true
 cowboy-workflow-engine	runtime::tests::list_runs_reads_persisted_head_summaries_without_full_runs	EVIDENCE runtime-list source=heads full_run_loads=0
-cowboy-workflow-engine	runtime::tests::answer_run_persists_ask_user_completion_when_resumed_step_fails	EVIDENCE runtime-answer prompt_completion=persisted resumed_step=failed
+cowboy-workflow-engine	runtime::tests::provide_input_run_persists_wait_for_input_completion_when_resumed_step_fails	EVIDENCE runtime-provide-input prompt_completion=persisted resumed_step=failed
 cowboy-workflow-engine	runtime::tests::resolve_run_restores_persisted_request_topic_and_exposes_fields_to_next_step	EVIDENCE runtime-resolve topic_restored=true fields_exposed=true
 cowboy-workflow-engine	runtime::tests::failed_runner_events_are_persisted_with_active_duration	EVIDENCE runtime-events persisted=true active_duration=true
 cowboy-workflow-engine	run_lock::tests::run_lock_rejects_same_run_in_process	EVIDENCE run-lock same_run=rejected

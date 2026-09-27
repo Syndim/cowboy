@@ -236,7 +236,7 @@ mod tests {
                     "prev": {
                         "record_id": "plan-record",
                         "step": "confirm_plan",
-                        "action": "ask_user",
+                        "action": "wait_for_input",
                         "output": {
                             "status": "confirmed",
                             "fields": {
@@ -359,39 +359,40 @@ mod tests {
         workflow_name: &str,
         definition: &'a WorkflowDefinition,
     ) -> &'a str {
-        let confirm_result_answer = definition
-            .steps
-            .get("confirm_result_answer")
-            .unwrap_or_else(|| {
-                panic!("{workflow_name} workflow should include confirm_result_answer step")
-            });
+        let confirm_result_input =
+            definition
+                .steps
+                .get("confirm_result_input")
+                .unwrap_or_else(|| {
+                    panic!("{workflow_name} workflow should include confirm_result_input step")
+                });
 
         assert_eq!(
-            confirm_result_answer
+            confirm_result_input
                 .transitions
                 .by_status
                 .get("confirmed")
                 .map(String::as_str),
             Some("commit"),
-            "{workflow_name} confirm_result_answer should still route confirmed results to commit"
+            "{workflow_name} confirm_result_input should still route confirmed results to commit"
         );
 
-        let review_step = confirm_result_answer
+        let review_step = confirm_result_input
             .transitions
             .by_status
             .get("changes_requested")
             .unwrap_or_else(|| {
                 panic!(
-                    "{workflow_name} confirm_result_answer should route user change requests through a reviewer step"
+                    "{workflow_name} confirm_result_input should route user change requests through a reviewer step"
                 )
             });
         assert_ne!(
             review_step, "revise",
-            "{workflow_name} confirm_result_answer changes_requested should not bypass reviewer triage"
+            "{workflow_name} confirm_result_input changes_requested should not bypass reviewer triage"
         );
         assert!(
             definition.steps.contains_key(review_step),
-            "{workflow_name} confirm_result_answer changes_requested should target an existing step; got {review_step}"
+            "{workflow_name} confirm_result_input changes_requested should target an existing step; got {review_step}"
         );
 
         review_step
@@ -399,7 +400,7 @@ mod tests {
 
     fn assert_result_feedback_prompt_guidance(prompt: &str, workflow_name: &str) {
         assert_prompt_contains(prompt, "User result feedback:", workflow_name);
-        assert_prompt_contains(prompt, "Step: confirm_result_answer", workflow_name);
+        assert_prompt_contains(prompt, "Step: confirm_result_input", workflow_name);
         assert_prompt_contains(prompt, "Status: changes_requested", workflow_name);
         assert_prompt_contains(
             prompt,
@@ -1006,7 +1007,7 @@ mod tests {
                 serde_json::json!({
                     "request": "Preserve revision context",
                     "prev": {
-                        "step": "confirm_result_answer",
+                        "step": "confirm_result_input",
                         "action": "status",
                         "status": "changes_requested",
                         "fields": fields.clone()
@@ -1588,7 +1589,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(confirmation) = confirmation.action else {
+        let StepAction::WaitForInput(confirmation) = confirmation.action else {
             panic!("confirm_result should ask the user")
         };
         for field in EVIDENCE_FIELD_NAMES {
@@ -1610,7 +1611,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(missing_confirmation) = missing_confirmation.action else {
+        let StepAction::WaitForInput(missing_confirmation) = missing_confirmation.action else {
             panic!("confirm_result should ask the user")
         };
         assert!(
@@ -1629,7 +1630,7 @@ mod tests {
             "review_result_feedback",
             serde_json::json!({
                 "prev": {
-                    "step": "confirm_result_answer",
+                    "step": "confirm_result_input",
                     "action": "status",
                     "status": "changes_requested",
                     "fields": {
@@ -1667,7 +1668,7 @@ mod tests {
                 "review_result_feedback",
                 serde_json::json!({
                     "prev": {
-                        "step": "confirm_result_answer",
+                        "step": "confirm_result_input",
                         "action": "status",
                         "status": "changes_requested",
                         "fields": fields
@@ -1829,7 +1830,7 @@ mod tests {
             "review_result_feedback",
             serde_json::json!({
                 "request": "Keep typed issues separate",
-                "prev": { "step": "confirm_result_answer", "action": "status", "status": "changes_requested", "fields": issue_fields }
+                "prev": { "step": "confirm_result_input", "action": "status", "status": "changes_requested", "fields": issue_fields }
             }),
         )
         .unwrap();
@@ -1871,7 +1872,7 @@ mod tests {
             serde_json::json!({
                 "request": "Reject duplicate reviewer assessments",
                 "prev": {
-                    "step": "confirm_result_answer",
+                    "step": "confirm_result_input",
                     "action": "status",
                     "status": "changes_requested",
                     "fields": duplicate_assessments
@@ -1973,31 +1974,31 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(blocked) = blocked_result.action else {
+        let StepAction::WaitForInput(blocked) = blocked_result.action else {
             panic!("blocked should ask the user")
         };
         assert_evidence_fields_equal(&blocked.fields, &expected);
 
-        let mut answered_fields = blocked.fields;
-        answered_fields.insert(
-            "answer".to_string(),
+        let mut input_fields = blocked.fields;
+        input_fields.insert(
+            "input".to_string(),
             serde_json::json!("Fixture generated; retry"),
         );
         let answer_result = run_step(
             &compiled.source_bundle,
-            "blocked_answer",
+            "blocked_input",
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": answered_fields
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": input_fields
                 }
             }),
         )
         .unwrap();
         let StepAction::Status(answered) = answer_result.action else {
-            panic!("blocked answer should return a status action")
+            panic!("blocked input should return a status action")
         };
         assert_evidence_fields_equal(&answered.fields, &expected);
 
@@ -2006,7 +2007,7 @@ mod tests {
             "triage_blocked",
             serde_json::json!({
                 "prev": {
-                    "step": "blocked_answer",
+                    "step": "blocked_input",
                     "action": "status",
                     "status": "triaged",
                     "fields": answered.fields
@@ -2117,19 +2118,19 @@ mod tests {
     }
 
     #[test]
-    fn bugfix_blocker_answer_becomes_cumulative_user_feedback() {
+    fn bugfix_blocker_input_becomes_cumulative_user_feedback() {
         let compiled = load_example_compiled_workflow("bugfix");
-        let user_answer = "skip TODO-13";
+        let user_input = "skip TODO-13";
         let answer_result = run_step(
             &compiled.source_bundle,
-            "blocked_answer",
+            "blocked_input",
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": user_answer,
+                        "input": user_input,
                         "user_feedback": ["keep the original raw request"],
                         "blocker_statement": "TODO evidence needs a manual smoke test",
                         "blocked_from_step": "revise",
@@ -2142,12 +2143,12 @@ mod tests {
         )
         .unwrap();
         let StepAction::Status(answered) = answer_result.action else {
-            panic!("blocked_answer should return a status action")
+            panic!("blocked_input should return a status action")
         };
 
         assert_eq!(
             answered.fields["blocked_response"],
-            serde_json::json!(user_answer)
+            serde_json::json!(user_input)
         );
 
         let triage_result = run_step(
@@ -2155,7 +2156,7 @@ mod tests {
             "triage_blocked",
             serde_json::json!({
                 "prev": {
-                    "step": "blocked_answer",
+                    "step": "blocked_input",
                     "action": "status",
                     "status": "triaged",
                     "fields": answered.fields
@@ -2176,7 +2177,7 @@ mod tests {
         );
         assert_eq!(
             triaged.fields["user_feedback"],
-            serde_json::json!(["keep the original raw request", user_answer]),
+            serde_json::json!(["keep the original raw request", user_input]),
             "blocker answers must travel as raw cumulative user feedback so downstream reviewers can distinguish user waivers from agent or reviewer feedback"
         );
     }
@@ -2341,32 +2342,32 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(pending) = confirm_result.action else {
+        let StepAction::WaitForInput(pending) = confirm_result.action else {
             panic!("confirm_result should ask the user")
         };
         assert_evidence_fields_equal(&pending.fields, &all_evidence);
 
-        for (answer, expected_status) in [
+        for (value, expected_status) in [
             ("approved", "confirmed"),
             ("Please include the manual screenshot", "changes_requested"),
         ] {
-            let mut answered_fields = pending.fields.clone();
-            answered_fields.insert("answer".to_string(), serde_json::json!(answer));
+            let mut input_fields = pending.fields.clone();
+            input_fields.insert("input".to_string(), serde_json::json!(value));
             let answer_result = run_step(
                 &compiled.source_bundle,
-                "confirm_result_answer",
+                "confirm_result_input",
                 serde_json::json!({
                     "prev": {
                         "step": "confirm_result",
-                        "action": "ask_user",
-                        "status": "answered",
-                        "fields": answered_fields
+                        "action": "wait_for_input",
+                        "status": "provided",
+                        "fields": input_fields
                     }
                 }),
             )
             .unwrap();
             let StepAction::Status(answered) = answer_result.action else {
-                panic!("confirm_result_answer should return a status action")
+                panic!("confirm_result_input should return a status action")
             };
             assert_eq!(answered.status, expected_status);
             assert_evidence_fields_equal(&answered.fields, &all_evidence);
@@ -2385,7 +2386,7 @@ mod tests {
                     serde_json::json!({
                         "request": "Provide reproducible evidence",
                         "prev": {
-                            "step": "confirm_result_answer",
+                            "step": "confirm_result_input",
                             "action": "status",
                             "status": "changes_requested",
                             "fields": answered.fields
@@ -2655,14 +2656,14 @@ mod tests {
         let feature = load_example_compiled_workflow("feature");
         let result = run_step(
             &feature.source_bundle,
-            "confirm_plan_answer",
+            "confirm_plan_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_plan",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "Keep the command syntax stable",
+                        "input": "Keep the command syntax stable",
                         "plan": "Reviewed plan body",
                         "user_feedback": existing,
                         "goal": "Keep command behavior stable",
@@ -2694,14 +2695,14 @@ mod tests {
 
         let result = run_step(
             &feature.source_bundle,
-            "confirm_plan_answer",
+            "confirm_plan_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_plan",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "yes",
+                        "input": "yes",
                         "plan": "Reviewed plan body",
                         "user_feedback": existing,
                         "goal": "Keep command behavior stable",
@@ -2726,14 +2727,14 @@ mod tests {
 
         let result = run_step(
             &feature.source_bundle,
-            "confirm_result_answer",
+            "confirm_result_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_result",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "Also update the interactive help",
+                        "input": "Also update the interactive help",
                         "user_feedback": existing,
                         "goal": "Keep command behavior stable",
                         "validation": "cargo test -p cowboy",
@@ -2767,14 +2768,14 @@ mod tests {
 
         let result = run_step(
             &feature.source_bundle,
-            "confirm_result_answer",
+            "confirm_result_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_result",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "approved",
+                        "input": "approved",
                         "user_feedback": existing,
                         "goal": "Keep command behavior stable",
                         "validation": "cargo test -p cowboy",
@@ -2798,14 +2799,14 @@ mod tests {
         let bugfix = load_example_compiled_workflow("bugfix");
         let result = run_step(
             &bugfix.source_bundle,
-            "confirm_rca_answer",
+            "confirm_rca_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_rca",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "Explain why the race is deterministic",
+                        "input": "Explain why the race is deterministic",
                         "user_feedback": existing,
                         "summary": "Race reproduced",
                         "work_dir": "docs/plans/example",
@@ -2842,14 +2843,14 @@ mod tests {
 
         let result = run_step(
             &bugfix.source_bundle,
-            "confirm_rca_answer",
+            "confirm_rca_input",
             serde_json::json!({
                 "prev": {
                     "step": "confirm_rca",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
-                        "answer": "y",
+                        "input": "y",
                         "user_feedback": existing,
                         "summary": "Race reproduced",
                         "work_dir": "docs/plans/example",
@@ -3151,33 +3152,33 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(action) = result.action else {
+        let StepAction::WaitForInput(action) = result.action else {
             panic!("clarify should ask the user for context")
         };
 
         assert_eq!(action.fields["user_feedback"], existing);
         assert_artifact_context(&action.fields);
-        let mut answered_fields = action.fields.clone();
-        answered_fields.insert(
-            "answer".to_string(),
+        let mut input_fields = action.fields.clone();
+        input_fields.insert(
+            "input".to_string(),
             serde_json::json!("The entrypoint is the TUI composer"),
         );
 
         let result = run_step(
             &compiled.source_bundle,
-            "clarify_answer",
+            "clarify_input",
             serde_json::json!({
                 "prev": {
                     "step": "clarify",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": answered_fields
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": input_fields
                 }
             }),
         )
         .unwrap();
         let StepAction::Status(action) = result.action else {
-            panic!("clarify_answer should record the clarification")
+            panic!("clarify_input should record the clarification")
         };
 
         assert_eq!(action.fields["user_feedback"], existing);
@@ -3192,7 +3193,7 @@ mod tests {
             "triage_blocked",
             serde_json::json!({
                 "prev": {
-                    "step": "blocked_answer",
+                    "step": "blocked_input",
                     "status": "triaged",
                     "fields": {
                         "blocked_response": "Credentials are available; continue implementation",
@@ -3352,7 +3353,7 @@ mod tests {
                 serde_json::json!({
                     "request": "Finish result feedback gate coverage",
                     "prev": {
-                        "step": "confirm_result_answer",
+                        "step": "confirm_result_input",
                         "status": "changes_requested",
                         "fields": {
                             "feedback": "User says the implementation missed the CLI flag",
@@ -3400,7 +3401,7 @@ mod tests {
             serde_json::json!({
                 "request": "Check document path handoff",
                 "prev": {
-                    "step": "confirm_result_answer",
+                    "step": "confirm_result_input",
                     "status": "changes_requested",
                     "fields": {
                         "feedback": "Inspect the approved artifacts",
@@ -3502,13 +3503,13 @@ mod tests {
                 workflow_name,
                 &definition,
                 "blocked",
-                "answered",
-                "blocked_answer",
+                "provided",
+                "blocked_input",
             );
             assert_step_transition(
                 workflow_name,
                 &definition,
-                "blocked_answer",
+                "blocked_input",
                 "triaged",
                 "triage_blocked",
             );
@@ -3682,7 +3683,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let StepAction::AskUser(prompt) = blocked_result.action else {
+        let StepAction::WaitForInput(prompt) = blocked_result.action else {
             panic!("user-required blocker should ask the user")
         };
 
@@ -3785,26 +3786,26 @@ mod tests {
         );
         assert_evidence_fields_equal(&malformed_recovery.fields, &malformed_snapshot);
 
-        let mut answered_fields = prompt.fields;
-        answered_fields.insert(
-            "answer".to_string(),
+        let mut input_fields = prompt.fields;
+        input_fields.insert(
+            "input".to_string(),
             serde_json::json!("Access granted; retry the original step"),
         );
         let answer_result = run_step(
             &compiled.source_bundle,
-            "blocked_answer",
+            "blocked_input",
             serde_json::json!({
                 "prev": {
                     "step": "blocked",
-                    "action": "ask_user",
-                    "status": "answered",
-                    "fields": answered_fields
+                    "action": "wait_for_input",
+                    "status": "provided",
+                    "fields": input_fields
                 }
             }),
         )
         .unwrap();
         let StepAction::Status(answered) = answer_result.action else {
-            panic!("blocked answer should record the user response")
+            panic!("blocked input should record the user response")
         };
 
         assert_eq!(answered.fields["blocked_from_step"], "implement");
@@ -3821,7 +3822,7 @@ mod tests {
             "triage_blocked",
             serde_json::json!({
                 "prev": {
-                    "step": "blocked_answer",
+                    "step": "blocked_input",
                     "action": "status",
                     "status": "triaged",
                     "fields": answered.fields
@@ -3869,7 +3870,7 @@ mod tests {
                 "triage_blocked",
                 serde_json::json!({
                     "prev": {
-                        "step": "blocked_answer",
+                        "step": "blocked_input",
                         "action": "status",
                         "status": "triaged",
                         "fields": fields
@@ -3925,8 +3926,8 @@ mod tests {
                 }),
             )
             .unwrap();
-            let StepAction::AskUser(action) = result.action else {
-                panic!("{step_id} should preserve artifacts in an ask-user action")
+            let StepAction::WaitForInput(action) = result.action else {
+                panic!("{step_id} should preserve artifacts in an wait-for-input action")
             };
 
             assert_eq!(action.fields["work_dir"], work_dir);
@@ -3950,7 +3951,7 @@ mod tests {
             serde_json::json!({
                 "request": goal,
                 "prev": {
-                    "step": "collect_validation_answer",
+                    "step": "collect_validation_input",
                     "action": "status",
                     "status": "captured",
                     "fields": {
@@ -4020,7 +4021,7 @@ mod tests {
             serde_json::json!({
                 "request": goal,
                 "prev": {
-                    "step": "confirm_plan_answer",
+                    "step": "confirm_plan_input",
                     "action": "status",
                     "status": "changes_requested",
                     "fields": {
@@ -4190,7 +4191,7 @@ mod tests {
             serde_json::json!({
                 "request": goal,
                 "prev": {
-                    "step": "confirm_result_answer",
+                    "step": "confirm_result_input",
                     "action": "status",
                     "status": "confirmed",
                     "fields": {
@@ -4407,13 +4408,13 @@ mod tests {
             "dev-loop",
             &definition,
             "collect_validation",
-            "answered",
-            "collect_validation_answer",
+            "provided",
+            "collect_validation_input",
         );
         assert_step_transition(
             "dev-loop",
             &definition,
-            "collect_validation_answer",
+            "collect_validation_input",
             "captured",
             "plan",
         );
@@ -4459,7 +4460,7 @@ mod tests {
         )
         .unwrap();
 
-        let StepAction::AskUser(action) = result.action else {
+        let StepAction::WaitForInput(action) = result.action else {
             panic!("dev-loop should ask for the user's validation method")
         };
         assert!(action.message.contains(goal));
@@ -4467,16 +4468,16 @@ mod tests {
 
         let result = run_step(
             &compiled.source_bundle,
-            "collect_validation_answer",
+            "collect_validation_input",
             serde_json::json!({
                 "request": goal,
                 "prev": {
                     "step": "collect_validation",
-                    "action": "ask_user",
-                    "status": "answered",
+                    "action": "wait_for_input",
+                    "status": "provided",
                     "fields": {
                         "goal": goal,
-                        "answer": validation
+                        "input": validation
                     }
                 }
             }),
@@ -4499,7 +4500,7 @@ mod tests {
         let context = serde_json::json!({
             "request": goal,
             "prev": {
-                "step": "collect_validation_answer",
+                "step": "collect_validation_input",
                 "action": "status",
                 "status": "captured",
                 "fields": {

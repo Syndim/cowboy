@@ -101,7 +101,7 @@ mod tests {
             "run-170dc431-7a35-49a5-b4db-9f1219431a1d",
             WorkflowEventKind::WaitingForInput {
                 step: "confirm".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {

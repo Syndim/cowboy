@@ -11,10 +11,10 @@ Preserve the current command surface:
 - `/run-step <request>` starts only the first workflow step.
 - `/step <run-id>` executes exactly one further step.
 - `/resume [run-id]` resumes the active run when no run id is supplied.
-- `/answer <run-id> <prompt-id> <answer>` answers a prompt, with the answer allowed to contain spaces.
+- `/provide-input <run-id> <input-id> <value>` supplies input, with the value allowed to contain spaces.
 - `/improve <run-id>`, `/resolve <run-id> [status] [fields-json]`, `/cancel`, `/runs`, `/workflows`, `/help`, and `/exit` keep their existing meanings.
 
-Parse failures should become non-fatal usage/status cards and must not silently fall through to starting a new workflow run. Plain non-slash text should still start a workflow run, and pending prompt answers should still be routed after explicit slash commands.
+Parse failures should become non-fatal usage/status cards and must not silently fall through to starting a new workflow run. Plain non-slash text should still start a workflow run, and pending input answers should still be routed after explicit slash commands.
 
 # Changes
 
@@ -25,7 +25,7 @@ Parse failures should become non-fatal usage/status cards and must not silently 
   - tokenize slash inputs with `shlex` 2.x, treating an unmatched quote as an actionable parse error;
   - normalize the first token from `/command` to `command` before passing argv to `clap`;
   - model trailing text commands with clap settings such as `num_args = 1..`, `trailing_var_arg = true`, and `allow_hyphen_values = true` where needed so requests and answers can start with `-` and can contain spaces;
-  - replace `strip_prefix`, `split_once`, and `splitn` command-argument parsing in `dispatch_submitted_input`, `submit_start_workflow`, `submit_explicit_answer`, and `resolve_run` with a match on the typed parsed command;
+  - replace `strip_prefix`, `split_once`, and `splitn` command-argument parsing in `dispatch_submitted_input`, `submit_start_workflow`, `submit_explicit_input`, and `resolve_run` with a match on the typed parsed command;
   - keep the existing background-task spawning helpers and runtime calls so orchestration remains delegated to `WorkflowRuntime`;
   - convert clap/shlex tokenization errors into the existing `state.set_status(...)` plus `state.push_card("Usage", ...)` pattern;
   - keep `SLASH_COMMANDS`, suggestions, completion, and help output aligned with the parser, either by deriving metadata from the parser or by adding a test that every advertised slash command parses.
@@ -40,15 +40,15 @@ Parse failures should become non-fatal usage/status cards and must not silently 
   - `/run-workflow review do work` producing workflow id `review` and request `do work`;
   - `/run-step -- investigate` or an equivalent hyphen-leading request being accepted as request text rather than a clap option;
   - `/resume` producing the no-argument resume variant and `/resume run-1` producing the explicit run id variant;
-  - `/answer run-1 prompt-1 answer with spaces` preserving the full answer text;
-  - `/answer run-1 prompt-1 "answer with spaces"` preserving the quoted answer text;
+  - `/provide-input run-1 prompt-1 answer with spaces` preserving the full input value;
+  - `/provide-input run-1 prompt-1 "input with spaces"` preserving the quoted input value;
   - `/resolve run-1`, `/resolve run-1 approved`, and `/resolve run-1 approved '{"summary":"done"}'` producing the expected typed fields;
   - malformed input such as `/run "unterminated` returning a parse error instead of panicking or dispatching a run;
   - advertised commands in `SLASH_COMMANDS` all parse or intentionally map to metadata-only suggestion behavior.
 - Update existing dispatch tests in `crates/tui/src/app/commands.rs`:
   - keep coverage that valid `/run-workflow` dispatch spawns the named-workflow task;
   - keep coverage that missing `/run-workflow` arguments show usage and spawn no task;
-  - add or update coverage that missing required arguments for `/run`, `/run-step`, `/step`, `/answer`, `/improve`, and `/resolve` show usage and spawn no task;
+  - add or update coverage that missing required arguments for `/run`, `/run-step`, `/step`, `/provide-input`, `/improve`, and `/resolve` show usage and spawn no task;
   - add coverage that a parser error does not fall through to plain workflow start;
   - keep coverage that plain text still starts a selector-backed run;
   - keep coverage that bare `/resume` uses the active run id when present and shows usage when absent.
@@ -63,7 +63,7 @@ Parse failures should become non-fatal usage/status cards and must not silently 
 - Run `cargo test -p cowboy` after focused tests pass.
 - Manual TUI smoke test:
   - submit `/run "request with spaces"` and confirm a run starts with the dequoted request;
-  - submit `/answer <run-id> <prompt-id> "answer with spaces"` against a waiting prompt and confirm the answer is delivered as one value;
+  - submit `/provide-input <run-id> <input-id> "input with spaces"` against a waiting input and confirm the input is delivered as one value;
   - submit malformed `/run "unterminated` and confirm the TUI shows a usage/error card and does not start a run.
 
 # TODO
@@ -73,11 +73,11 @@ Parse failures should become non-fatal usage/status cards and must not silently 
 - [x] Add a `shlex` tokenization helper that reports unmatched quotes as slash parse errors.
 - [x] Normalize slash command names before handing argv to `clap`.
 - [x] Replace manual `/run-workflow` argument splitting with typed parser output.
-- [x] Replace manual `/answer` argument splitting with typed parser output.
+- [x] Replace manual `/provide-input` argument splitting with typed parser output.
 - [x] Replace manual `/resolve` argument splitting with typed parser output.
 - [x] Replace the top-level `strip_prefix` slash dispatch chain with a match on parsed commands.
 - [x] Preserve plain-text workflow submission for non-slash input.
-- [x] Preserve pending prompt answer fallback after explicit slash-command handling.
+- [x] Preserve pending input answer fallback after explicit slash-command handling.
 - [x] Convert slash parse and validation errors into non-fatal usage/status cards.
 - [x] Keep slash suggestions and help metadata aligned with parser-supported commands.
 - [x] Add parser unit tests for quoted, unquoted, trailing, hyphen-leading, missing-argument, and malformed slash inputs.
@@ -86,7 +86,7 @@ Parse failures should become non-fatal usage/status cards and must not silently 
 - [x] Run the focused `cowboy` TUI command and parser tests.
 - [x] Run the full `cargo test -p cowboy` verification command.
 - [x] Preserve `#` as ordinary slash-command payload text instead of shell comments.
-- [x] Add regression tests for `#` in `/run`, `/run-workflow`, and `/answer` payloads.
+- [x] Add regression tests for `#` in `/run`, `/run-workflow`, and `/provide-input` payloads.
 - [x] Re-run the focused `cowboy` TUI command and parser tests after reviewer feedback.
 - [x] Re-run the full `cargo test -p cowboy` verification command after reviewer feedback.
 - [x] Align `/resolve` slash metadata, usage errors, and README with `[fields-json]` support.

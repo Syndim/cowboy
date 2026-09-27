@@ -22,7 +22,7 @@ Initial semantics:
 
 - In `crates/workflow/core/src/action.rs`, add `StepAction::Command(CommandAction)`, a serializable `CommandAction` struct, default status helpers, and the `"command"` branch in `StepAction::action_name`.
 - Update core action tests in `crates/workflow/core/src/action.rs` and core engine test dispatchers in `crates/workflow/core/src/engine.rs` so action variant coverage includes `command`.
-- In `crates/workflow/lua/src/api.rs`, register `command` in the `action` helper table alongside `agent`, `status`, `ask_user`, and `fail`.
+- In `crates/workflow/lua/src/api.rs`, register `command` in the `action` helper table alongside `agent`, `status`, `wait_for_input`, and `fail`.
 - In `crates/workflow/lua/src/convert.rs`, add a `"command"` conversion branch that validates `program`, converts `args` with the existing string-array pattern, accepts optional `success_status`, `failure_status`, and `timeout_ms`, and reports invalid values through `Error::InvalidActionField`.
 - Update Lua runtime/conversion tests in `crates/workflow/lua/src/runtime.rs` for successful command conversion and validation failures for missing program, non-string args, and invalid timeout values.
 - In `crates/workflow/actions/src/command.rs`, add `CommandActionRunner` that uses `tokio::process::Command`, `kill_on_drop(true)`, explicit `args`, configured `cwd`, bounded stdout/stderr capture, optional timeout handling, and conversion into a completed `StepRecord`.

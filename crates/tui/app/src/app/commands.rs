@@ -97,7 +97,7 @@ pub(in crate::app) async fn submit_input(state: &mut AppState, runtime: &Workflo
                 state.push_card("Notice", [state.status().to_string()]);
                 return;
             }
-            ComposerSubmissionMode::PendingAnswer | ComposerSubmissionMode::Idle => {}
+            ComposerSubmissionMode::PendingInput | ComposerSubmissionMode::Idle => {}
         }
     }
 
@@ -132,8 +132,8 @@ async fn dispatch_submitted_input(
         }
 
         dispatch_slash_command(state, runtime, command).await?;
-    } else if let Some((run_id, prompt_id)) = state.pending_prompt_answer_target() {
-        spawn_answer_task(state, runtime, run_id, prompt_id, input.to_string());
+    } else if let Some((run_id, input_id)) = state.pending_input_target() {
+        spawn_provide_input_task(state, runtime, run_id, input_id, input.to_string());
     } else if let Some(run_id) = state.terminal_restart_target() {
         spawn_restart_run(state, runtime, run_id, input.to_string());
     } else {
@@ -190,13 +190,13 @@ async fn dispatch_shared_command(
         SharedCommand::Run(args) => spawn_start_run_from_args(state, runtime, args),
         SharedCommand::Step(args) => spawn_step_run(state, runtime, args.run_id),
         SharedCommand::Resume(args) => spawn_resume_run(state, runtime, args.run_id),
-        SharedCommand::Answer(args) => {
-            let cowboy_command_parser::AnswerArgs {
+        SharedCommand::ProvideInput(args) => {
+            let cowboy_command_parser::ProvideInputArgs {
                 run_id,
-                prompt_id,
-                answer,
+                input_id,
+                input,
             } = args;
-            spawn_answer_task(state, runtime, run_id, prompt_id, answer.join(" "));
+            spawn_provide_input_task(state, runtime, run_id, input_id, input.join(" "));
         }
         SharedCommand::Runs(args) => spawn_runs_list(state, runtime, args.partial_run_id),
         SharedCommand::Export(args) => spawn_export(state, runtime, args.run_id),
@@ -454,26 +454,26 @@ fn spawn_resume_run(state: &mut AppState, runtime: &WorkflowRuntime, run_id: Str
     );
 }
 
-fn spawn_answer_task(
+fn spawn_provide_input_task(
     state: &mut AppState,
     runtime: &WorkflowRuntime,
     run_id: String,
-    prompt_id: String,
-    answer: String,
+    input_id: String,
+    input: String,
 ) {
     let runtime = runtime.clone();
-    let label = format!("submitted answer: {run_id} {prompt_id}");
-    let details = [run_id.clone(), prompt_id.clone()];
+    let label = format!("submitted input: {run_id} {input_id}");
+    let details = [run_id.clone(), input_id.clone()];
     state.clear_pending_prompt();
     state.spawn_card_report_task(
-        "Answer",
+        "Provide input",
         [current_wall_clock_prefix()],
-        ["submitted answer".to_string()],
+        ["submitted input".to_string()],
         label,
         details,
         async move {
             runtime
-                .answer_run(&run_id, &prompt_id, &answer)
+                .provide_input_run(&run_id, &input_id, &input)
                 .await
                 .map_err(|err| err.to_string())
         },
@@ -863,27 +863,27 @@ mod tests {
         assert!(slash_state.event_entries().last().unwrap().contains("Help"));
         assert_eq!(slash_state.background_task_count(), 0);
 
-        let (_dir, runtime, mut answer_state) = test_runtime_state().await;
-        let answer_run = test_run_id(4);
-        answer_state.apply_workflow_event(WorkflowEvent::new(
-            &answer_run,
+        let (_dir, runtime, mut input_state) = test_runtime_state().await;
+        let provide_input_run = test_run_id(4);
+        input_state.apply_workflow_event(WorkflowEvent::new(
+            &provide_input_run,
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "prompt".to_string(),
+                input_id: "prompt".to_string(),
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
             },
         ));
-        answer_state.push_input("yes");
-        submit_input(&mut answer_state, &runtime).await;
+        input_state.push_input("yes");
+        submit_input(&mut input_state, &runtime).await;
         assert!(
-            answer_state
+            input_state
                 .event_entries()
                 .last()
                 .unwrap()
-                .contains("submitted answer")
+                .contains("submitted input")
         );
-        answer_state.cancel_background_tasks();
+        input_state.cancel_background_tasks();
 
         let (_dir, runtime, mut agent_state) = test_runtime_state().await;
         let agent_run = test_run_id(5);
@@ -936,7 +936,7 @@ mod tests {
             state.cancel_background_tasks();
         }
         println!(
-            "EVIDENCE tui-restart priorities=slash,pending_answer,active_agent,restart,new_run"
+            "EVIDENCE tui-restart priorities=slash,pending_input,active_agent,restart,new_run"
         );
     }
 
@@ -1198,7 +1198,7 @@ return workflow("restartable", start)
                 "pending-run",
                 WorkflowEventKind::WaitingForInput {
                     step: "approve".to_string(),
-                    prompt_id: "prompt-1".to_string(),
+                    input_id: "prompt-1".to_string(),
                     message: "Approve?".to_string(),
                     choices: vec![],
                 },
@@ -1295,7 +1295,7 @@ return workflow("restartable", start)
             Case {
                 input: "approve please",
                 seed_pending: true,
-                remainder: "● Answer · submitted answer",
+                remainder: "● Provide input · submitted input",
             },
             Case {
                 input: "/resolve run-123 accepted",
@@ -1311,7 +1311,7 @@ return workflow("restartable", start)
                     "pending-run",
                     WorkflowEventKind::WaitingForInput {
                         step: "approve".to_string(),
-                        prompt_id: "prompt-1".to_string(),
+                        input_id: "prompt-1".to_string(),
                         message: "Approve?".to_string(),
                         choices: vec![],
                     },
@@ -1453,7 +1453,7 @@ return workflow("restartable", start)
             "pending-run",
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "prompt-1".to_string(),
+                input_id: "prompt-1".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![],
             },
@@ -1491,7 +1491,7 @@ return workflow("restartable", start)
             None,
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "prompt-1".to_string(),
+                input_id: "prompt-1".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![],
             },
@@ -1780,7 +1780,7 @@ return workflow("restartable", start)
                 Some("Approve release"),
                 RunStatus::WaitingForInput {
                     step: "approval".to_string(),
-                    prompt_id: "prompt-42".to_string(),
+                    input_id: "prompt-42".to_string(),
                     message: "Approve the deployment?".to_string(),
                     choices: vec![
                         Choice {
@@ -1793,8 +1793,8 @@ return workflow("restartable", start)
                         },
                     ],
                     resume_callback: ResumeCallback::new(
-                        "ask_user",
-                        serde_json::json!({ "prompt_id": "prompt-42" }),
+                        "wait_for_input",
+                        serde_json::json!({ "input_id": "prompt-42" }),
                     )
                     .unwrap(),
                 },
@@ -1879,7 +1879,7 @@ return workflow("restartable", start)
             "head: record-waiting",
             "status: waiting_for_input",
             "status.waiting_step: approval",
-            "status.prompt_id: prompt-42",
+            "status.input_id: prompt-42",
             "status.message: Approve the deployment?",
             "status.choices: yes: Approve, no: Reject",
         ] {
@@ -1958,7 +1958,7 @@ return workflow("restartable", start)
             "active-run",
             WorkflowEventKind::WaitingForInput {
                 step: "approval".to_string(),
-                prompt_id: "prompt-1".to_string(),
+                input_id: "prompt-1".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![Choice {
                     key: "yes".to_string(),
@@ -1966,7 +1966,7 @@ return workflow("restartable", start)
                 }],
             },
         ));
-        let expected_prompt = state.pending_prompt_answer_target();
+        let expected_prompt = state.pending_input_target();
         state.spawn_test_card_report_task("workflow still running".to_string(), async {
             std::future::pending::<std::result::Result<RunReport, String>>().await
         });
@@ -1977,14 +1977,14 @@ return workflow("restartable", start)
         assert_eq!(state.background_task_count(), 2);
         assert!(state.workflow_execution_running());
         assert_eq!(state.active_run_id(), Some("active-run"));
-        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+        assert_eq!(state.pending_input_target(), expected_prompt);
 
         drain_finished_background_task(&mut state).await;
 
         assert_eq!(state.background_task_count(), 1);
         assert!(state.workflow_execution_running());
         assert_eq!(state.active_run_id(), Some("active-run"));
-        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+        assert_eq!(state.pending_input_target(), expected_prompt);
         let rendered = rendered_entries(&state);
         assert!(rendered.contains("✓ Export"), "{rendered}");
         assert!(rendered.contains("run: run-export"), "{rendered}");
@@ -2009,12 +2009,12 @@ return workflow("restartable", start)
             "active-run",
             WorkflowEventKind::WaitingForInput {
                 step: "approval".to_string(),
-                prompt_id: "prompt-1".to_string(),
+                input_id: "prompt-1".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![],
             },
         ));
-        let expected_prompt = state.pending_prompt_answer_target();
+        let expected_prompt = state.pending_input_target();
         state.spawn_test_card_report_task("workflow still running".to_string(), async {
             std::future::pending::<std::result::Result<RunReport, String>>().await
         });
@@ -2026,7 +2026,7 @@ return workflow("restartable", start)
         assert_eq!(state.background_task_count(), 1);
         assert!(state.workflow_execution_running());
         assert_eq!(state.active_run_id(), Some("active-run"));
-        assert_eq!(state.pending_prompt_answer_target(), expected_prompt);
+        assert_eq!(state.pending_input_target(), expected_prompt);
         let rendered = rendered_entries(&state);
         assert!(rendered.contains("✗ Error"), "{rendered}");
         assert!(
@@ -2079,7 +2079,7 @@ return workflow("restartable", start)
                 Some("Approve release"),
                 RunStatus::WaitingForInput {
                     step: "approval".to_string(),
-                    prompt_id: "prompt-42".to_string(),
+                    input_id: "prompt-42".to_string(),
                     message: "Approve the deployment?".to_string(),
                     choices: vec![
                         Choice {
@@ -2092,8 +2092,8 @@ return workflow("restartable", start)
                         },
                     ],
                     resume_callback: ResumeCallback::new(
-                        "ask_user",
-                        serde_json::json!({ "prompt_id": "prompt-42" }),
+                        "wait_for_input",
+                        serde_json::json!({ "input_id": "prompt-42" }),
                     )
                     .unwrap(),
                 },
@@ -2179,7 +2179,11 @@ return workflow("restartable", start)
                 .iter()
                 .any(|usage| usage.contains("run-workflow"))
         );
-        assert!(!suggestions.iter().any(|usage| usage.starts_with("/answer")));
+        assert!(
+            !suggestions
+                .iter()
+                .any(|usage| usage.starts_with("/provide-input"))
+        );
     }
 
     #[tokio::test]
@@ -2259,10 +2263,13 @@ return workflow("restartable", start)
             ),
             ("/step", "/step <run-id>"),
             ("/resume", "/resume <run-id>"),
-            ("/answer", "/answer <run-id> <prompt-id> <answer>"),
             (
-                "/answer run-1 prompt-1",
-                "/answer <run-id> <prompt-id> <answer>",
+                "/provide-input",
+                "/provide-input <run-id> <input-id> <input>",
+            ),
+            (
+                "/provide-input run-1 prompt-1",
+                "/provide-input <run-id> <input-id> <input>",
             ),
             ("/improve", "/improve <run-id>"),
             (
@@ -2610,19 +2617,19 @@ return workflow("restartable", start)
     }
 
     #[tokio::test]
-    async fn pending_prompt_answer_fallback_spawns_answer_task_and_clears_target() {
+    async fn pending_input_fallback_spawns_provide_input_task_and_clears_target() {
         let (_dir, runtime, mut state) = test_runtime_state().await;
         state.apply_workflow_event(WorkflowEvent::new(
             "pending-run",
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "prompt-42".to_string(),
+                input_id: "prompt-42".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![],
             },
         ));
         assert_eq!(
-            state.pending_prompt_answer_target(),
+            state.pending_input_target(),
             Some(("pending-run".to_string(), "prompt-42".to_string()))
         );
 
@@ -2631,14 +2638,14 @@ return workflow("restartable", start)
         submit_input(&mut state, &runtime).await;
         let after = chrono::Local::now();
 
-        assert_eq!(state.status(), "submitted answer: pending-run prompt-42");
+        assert_eq!(state.status(), "submitted input: pending-run prompt-42");
         assert_eq!(state.background_task_count(), 1);
-        assert_eq!(state.pending_prompt_answer_target(), None);
+        assert_eq!(state.pending_input_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
             before,
             after,
-            "● Answer · submitted answer",
+            "● Provide input · submitted input",
             &["pending-run", "prompt-42"],
         );
         assert!(!rendered.contains("answer with spaces"), "{rendered}");
@@ -2646,34 +2653,34 @@ return workflow("restartable", start)
     }
 
     #[tokio::test]
-    async fn explicit_answer_slash_command_preempts_pending_prompt_fallback() {
+    async fn explicit_provide_input_slash_command_preempts_pending_prompt_fallback() {
         let (_dir, runtime, mut state) = test_runtime_state().await;
         state.apply_workflow_event(WorkflowEvent::new(
             "pending-run",
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "pending-prompt".to_string(),
+                input_id: "pending-prompt".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![],
             },
         ));
 
-        state.push_input("/answer explicit-run explicit-prompt \"answer with spaces\"");
+        state.push_input("/provide-input explicit-run explicit-prompt \"answer with spaces\"");
         let before = chrono::Local::now();
         submit_input(&mut state, &runtime).await;
         let after = chrono::Local::now();
 
         assert_eq!(
             state.status(),
-            "submitted answer: explicit-run explicit-prompt"
+            "submitted input: explicit-run explicit-prompt"
         );
         assert_eq!(state.background_task_count(), 1);
-        assert_eq!(state.pending_prompt_answer_target(), None);
+        assert_eq!(state.pending_input_target(), None);
         let rendered = assert_last_entry_is_card(
             &state,
             before,
             after,
-            "● Answer · submitted answer",
+            "● Provide input · submitted input",
             &["explicit-run", "explicit-prompt"],
         );
         assert!(!rendered.contains("answer with spaces"), "{rendered}");
@@ -2758,7 +2765,7 @@ return workflow("restartable", start)
     }
 
     #[tokio::test]
-    async fn valid_idle_lifecycle_states_dispatch_step_resume_answers_and_terminal_requests() {
+    async fn valid_idle_lifecycle_states_dispatch_step_resume_inputs_and_terminal_requests() {
         async fn apply_finished_report(state: &mut AppState, report: RunReport) {
             state.spawn_test_card_report_task("seed report".to_string(), async move { Ok(report) });
             tokio::task::yield_now().await;
@@ -2790,13 +2797,13 @@ return workflow("restartable", start)
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", status = "answered" }
+              return action.wait_for_input { id = "approval", message = "Approve?", status = "provided" }
             end
             local finish = step("finish")
             finish.run = function(ctx)
-              return action.status { status = "success", body = ctx.prev.fields.answer }
+              return action.status { status = "success", body = ctx.prev.fields.input }
             end
-            ask:on("answered", finish)
+            ask:on("provided", finish)
             return workflow("ask", ask)
             "#,
         )
@@ -2861,42 +2868,50 @@ return workflow("restartable", start)
         );
 
         let waiting = runtime
-            .start_run_with_workflow("ask", "plain answer request")
+            .start_run_with_workflow("ask", "plain input request")
             .await
             .unwrap();
-        let plain_answer_run = waiting.run.id.clone();
-        let mut answer_state = AppState::new(config.clone());
-        apply_finished_report(&mut answer_state, waiting).await;
-        answer_state.push_input("yes");
-        submit_input(&mut answer_state, &runtime).await;
-        assert_eq!(answer_state.background_task_count(), 1);
+        let plain_provide_input_run = waiting.run.id.clone();
+        let mut input_state = AppState::new(config.clone());
+        apply_finished_report(&mut input_state, waiting).await;
+        input_state.push_input("yes");
+        submit_input(&mut input_state, &runtime).await;
+        assert_eq!(input_state.background_task_count(), 1);
         tokio::task::yield_now().await;
-        drain_finished_background_task(&mut answer_state).await;
+        drain_finished_background_task(&mut input_state).await;
         assert_eq!(
-            runtime.load_run(&plain_answer_run).await.unwrap().status,
+            runtime
+                .load_run(&plain_provide_input_run)
+                .await
+                .unwrap()
+                .status,
             RunStatus::Completed
         );
 
         let waiting = runtime
-            .start_run_with_workflow("ask", "explicit answer request")
+            .start_run_with_workflow("ask", "explicit input request")
             .await
             .unwrap();
-        let explicit_answer_run = waiting.run.id.clone();
-        let prompt_id = match &waiting.run.status {
-            RunStatus::WaitingForInput { prompt_id, .. } => prompt_id.clone(),
+        let explicit_provide_input_run = waiting.run.id.clone();
+        let input_id = match &waiting.run.status {
+            RunStatus::WaitingForInput { input_id, .. } => input_id.clone(),
             status => panic!("expected waiting run, got {status:?}"),
         };
         let mut explicit_state = AppState::new(config.clone());
         apply_finished_report(&mut explicit_state, waiting).await;
         explicit_state.push_input(&format!(
-            "/answer {explicit_answer_run} {prompt_id} explicit"
+            "/provide-input {explicit_provide_input_run} {input_id} explicit"
         ));
         submit_input(&mut explicit_state, &runtime).await;
         assert_eq!(explicit_state.background_task_count(), 1);
         tokio::task::yield_now().await;
         drain_finished_background_task(&mut explicit_state).await;
         assert_eq!(
-            runtime.load_run(&explicit_answer_run).await.unwrap().status,
+            runtime
+                .load_run(&explicit_provide_input_run)
+                .await
+                .unwrap()
+                .status,
             RunStatus::Completed
         );
 
@@ -2915,7 +2930,7 @@ return workflow("restartable", start)
     }
 
     #[tokio::test]
-    async fn idle_requests_answers_and_allowed_slash_history_remain_trimmed() {
+    async fn idle_requests_inputs_and_allowed_slash_history_remain_trimmed() {
         async fn apply_finished_report(state: &mut AppState, report: RunReport) {
             state.spawn_test_card_report_task("seed report".to_string(), async move { Ok(report) });
             tokio::task::yield_now().await;
@@ -2941,13 +2956,13 @@ return workflow("restartable", start)
             r#"
             local ask = step("ask")
             ask.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", status = "answered" }
+              return action.wait_for_input { id = "approval", message = "Approve?", status = "provided" }
             end
             local finish = step("finish")
             finish.run = function(ctx)
-              return action.status { status = "success", body = ctx.prev.fields.answer }
+              return action.status { status = "success", body = ctx.prev.fields.input }
             end
-            ask:on("answered", finish)
+            ask:on("provided", finish)
             return workflow("ask", ask)
             "#,
         )
@@ -2987,29 +3002,29 @@ return workflow("restartable", start)
             .start_run_with_workflow("ask", "ask request")
             .await
             .unwrap();
-        let answered_run_id = waiting.run.id.clone();
-        let mut answer_state = AppState::new(config.clone());
-        apply_finished_report(&mut answer_state, waiting).await;
-        answer_state.push_input("  yes  ");
+        let provided_run_id = waiting.run.id.clone();
+        let mut input_state = AppState::new(config.clone());
+        apply_finished_report(&mut input_state, waiting).await;
+        input_state.push_input("  yes  ");
 
-        submit_input(&mut answer_state, &runtime).await;
+        submit_input(&mut input_state, &runtime).await;
         tokio::task::yield_now().await;
-        drain_finished_background_task(&mut answer_state).await;
+        drain_finished_background_task(&mut input_state).await;
 
-        let answered = runtime.load_run(&answered_run_id).await.unwrap();
+        let provided = runtime.load_run(&provided_run_id).await.unwrap();
         let store = SqliteWorkflowStore::connect(dir.path().join("state/data.db"))
             .await
             .unwrap();
         let record = store
-            .load_step_record(answered.step.head.as_ref().unwrap())
+            .load_step_record(provided.step.head.as_ref().unwrap())
             .await
             .unwrap();
         assert_eq!(record.output.unwrap().body, "yes");
 
-        answer_state.push_input("  /runs  ");
-        submit_input(&mut answer_state, &runtime).await;
-        assert_eq!(answer_state.background_task_count(), 1);
-        drain_finished_background_task(&mut answer_state).await;
+        input_state.push_input("  /runs  ");
+        submit_input(&mut input_state, &runtime).await;
+        assert_eq!(input_state.background_task_count(), 1);
+        drain_finished_background_task(&mut input_state).await;
 
         let mut history_state = AppState::new(config);
         history_state.history_previous();
@@ -3200,7 +3215,7 @@ return workflow("restartable", start)
             "/run do work",
             "/step run-1",
             "/resume run-1",
-            "/answer run-1 prompt answer",
+            "/provide-input run-1 prompt answer",
             "/improve run-1",
             "/resolve run-1 success",
         ] {

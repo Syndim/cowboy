@@ -99,14 +99,15 @@ async fn run_shared_command(
             print_report(&report);
             Ok(())
         }
-        SharedCommand::Answer(args) => {
-            let cowboy_command_parser::AnswerArgs {
+        SharedCommand::ProvideInput(args) => {
+            let cowboy_command_parser::ProvideInputArgs {
                 run_id,
-                prompt_id,
-                answer,
+                input_id,
+                input,
             } = args;
-            let answer = answer.join(" ");
-            let report = runtime.answer_run(&run_id, &prompt_id, &answer).await?;
+            let report = runtime
+                .provide_input_run(&run_id, &input_id, &input.join(" "))
+                .await?;
             print_report(&report);
             Ok(())
         }

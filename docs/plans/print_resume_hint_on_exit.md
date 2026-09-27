@@ -22,7 +22,7 @@ Rationale and grounding:
 - `AppState` already carries the needed data: `active_run_id: Option<String>`,
   `durable_run_status: Option<RunStatusState>`, and
   `pending_prompt: Option<PendingPrompt>` (which exposes `run_id()` and
-  `prompt_id()`).
+  `input_id()`).
 - `RunStatusState` (`cowboy-workflow-engine`) variants: `Running`,
   `WaitingForInput`, `Completed`, `Failed`, `Cancelled`.
 
@@ -36,7 +36,7 @@ no-ops. The hint therefore maps:
 | durable status | hint command | notes |
 |---|---|---|
 | `Running` | `cowboy resume <run-id>` | |
-| `WaitingForInput` | `cowboy answer <run-id> <prompt-id> <answer>` when a pending prompt for **that** run id is known; otherwise `cowboy resume <run-id>` | fallback when prompt is absent or belongs to a different run |
+| `WaitingForInput` | `cowboy provide-input <run-id> <input-id> <value>` when a pending input for **that** run id is known; otherwise `cowboy resume <run-id>` | fallback when prompt is absent or belongs to a different run |
 | `Failed` | `cowboy resolve <run-id>` | |
 | `Completed` | none (terminal) | |
 | `Cancelled` | none (terminal, non-resumable per `runtime.rs:786`) | |
@@ -45,7 +45,7 @@ no-ops. The hint therefore maps:
 
 Full rendered line format (printed verbatim), e.g.:
 `Run <id> is not complete. Resume with: cowboy resume <id>`
-with the `answer`/`resolve` command substituted per the table. The feature does
+with the `provide-input`/`resolve` command substituted per the table. The feature does
 **not** expand scope to make cancelled runs resumable; `Cancelled` is terminal.
 
 ## Test-filter collision avoidance (authoritative)
@@ -93,9 +93,9 @@ and error/`None` cases suppress the hint.
     Otherwise returns the full user-facing line per the status-mapping table:
     - `Running` -> `resume` command.
     - `Failed` -> `resolve` command.
-    - `WaitingForInput` -> `answer` command **only if** `pending_prompt` is
+    - `WaitingForInput` -> `provide-input` command **only if** `pending_prompt` is
       `Some` and its `run_id()` equals the active run id, using its
-      `prompt_id()`; otherwise the `resume` command.
+      `input_id()`; otherwise the `resume` command.
 
 - `crates/tui/app/src/app.rs`
   - Add `print_resume_hint`, the `TerminalRestore` trait + `TerminalModeGuard`
@@ -120,12 +120,12 @@ and error/`None` cases suppress the hint.
   `resume_hint_*` so the module-qualified filter `state::tests::resume_hint`
   selects exactly these nine:
   - `Running`: `RunStarted{...}` on `run-a` -> `Run run-a is not complete. Resume with: cowboy resume run-a`.
-  - `WaitingForInput` matching prompt: `WaitingForInput{step,prompt_id:"approval",...}` on `run-a` -> `Run run-a is not complete. Resume with: cowboy answer run-a approval <answer>`.
-  - `WaitingForInput` no pending prompt: set durable status to `WaitingForInput`
+  - `WaitingForInput` matching prompt: `WaitingForInput{step,input_id:"approval",...}` on `run-a` -> `Run run-a is not complete. Resume with: cowboy provide-input run-a approval <answer>`.
+  - `WaitingForInput` no pending input: set durable status to `WaitingForInput`
     with no prompt by emitting `RunStatusChanged{status:"waiting_for_input"}` on
     `run-a` (arm at `state.rs:1386`; `run_status_state_from_str("waiting_for_input")` -> `WaitingForInput`, and this arm never sets `pending_prompt`) -> `resume` fallback line for `run-a`.
   - `WaitingForInput` prompt belongs to a different run: (1) emit
-    `WaitingForInput{step,prompt_id:"approval",...}` on `run-a` (sets
+    `WaitingForInput{step,input_id:"approval",...}` on `run-a` (sets
     `pending_prompt{run_id:"run-a"}`, `durable=WaitingForInput`,
     `active_run_id="run-a"`); (2) emit `StepStarted{step_id:"start"}` on `run-b`
     (arm at `state.rs:1252` sets `active_run_id="run-b"` via the unconditional
@@ -185,7 +185,7 @@ mkdir -p "$T/state" "$T/workflows"
 cat > "$T/workflows/ask.lua" <<'LUA'
 local confirm = step("confirm")
 confirm.run = function(ctx)
-  return action.ask_user {
+  return action.wait_for_input {
     id = "approval",
     message = "Approve?",
     choices = { "yes", "no" },
@@ -195,7 +195,7 @@ local done = step("done")
 done.run = function(ctx)
   return action.status { status = "success", body = "ok" }
 end
-confirm:on("answered", done)
+confirm:on("provided", done)
 return workflow("ask", confirm)
 LUA
 
@@ -338,7 +338,7 @@ rm -rf "$T"
 Scenario 1 (`ask-ctrlc`) exercises the `KeyHandling::Exit` clean-exit path;
 scenario 2 (`fail-exit`) exercises the `exit_requested` clean-exit path.
 Expected: scenario 1 prints
-`Run <id> is not complete. Resume with: cowboy answer <id> approval <answer>`;
+`Run <id> is not complete. Resume with: cowboy provide-input <id> approval <answer>`;
 scenario 2 prints `Run <id> is not complete. Resume with: cowboy resolve <id>`;
 scenarios 3 and 4 print no `not complete` / `Resume with` line.
 
@@ -364,7 +364,7 @@ cancel and cannot be produced by the instant fixtures above.
     acceptance.
   - Observed result: `AppState::resume_hint()` added after `active_run_id()` in
     `state.rs`, mapping Running->`cowboy resume`, Failed->`cowboy resolve`,
-    WaitingForInput->`cowboy answer <id> <prompt-id> <answer>` when the pending
+    WaitingForInput->`cowboy provide-input <id> <input-id> <value>` when the pending
     prompt matches the active run id else the resume fallback, and
     Completed/Cancelled/None/no-active-run->`None`.
     `cargo test -p cowboy state::tests::resume_hint -- --list` reported
@@ -430,7 +430,7 @@ cancel and cannot be produced by the instant fixtures above.
        cat > "$T/workflows/ask.lua" <<'LUA'
        local confirm = step("confirm")
        confirm.run = function(ctx)
-         return action.ask_user {
+         return action.wait_for_input {
            id = "approval",
            message = "Approve?",
            choices = { "yes", "no" },
@@ -440,7 +440,7 @@ cancel and cannot be produced by the instant fixtures above.
        done.run = function(ctx)
          return action.status { status = "success", body = "ok" }
        end
-       confirm:on("answered", done)
+       confirm:on("provided", done)
        return workflow("ask", confirm)
        LUA
        ```
@@ -579,7 +579,7 @@ cancel and cannot be produced by the instant fixtures above.
     the TUI under a PTY, performs that scenario's run/wait/exit, and prints the
     post-restoration line; no scenario bundles another scenario's step.
   - Expected result: step 9 prints
-    `Run <id> is not complete. Resume with: cowboy answer <id> approval <answer>`;
+    `Run <id> is not complete. Resume with: cowboy provide-input <id> approval <answer>`;
     step 10 prints `Run <id> is not complete. Resume with: cowboy resolve <id>`;
     steps 11 and 12 print no `not complete` / `Resume with` line. Step 9
     exercises the `Ctrl+C` (`KeyHandling::Exit`) clean-exit path and step 10 the
@@ -589,7 +589,7 @@ cancel and cannot be produced by the instant fixtures above.
     `ask`, `complete`, `fail`, used directly in the driver's `/run --workflow`
     commands. Step 9 (`ask-ctrlc`) printed `MODE: ask-ctrlc / EXIT: 0 / HINT:
     Run run-a8802180-eb00-4524-bdd6-0a26b58c568e is not complete. Resume with:
-    cowboy answer run-a8802180-eb00-4524-bdd6-0a26b58c568e approval <answer>`.
+    cowboy provide-input run-a8802180-eb00-4524-bdd6-0a26b58c568e approval <answer>`.
     Step 10 (`fail-exit`) printed `MODE: fail-exit / EXIT: 0 / HINT: Run
     run-d0d449c5-07fd-4cf0-bb96-98ab480994f1 is not complete. Resume with:
     cowboy resolve run-d0d449c5-07fd-4cf0-bb96-98ab480994f1`. Step 11

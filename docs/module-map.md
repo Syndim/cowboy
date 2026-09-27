@@ -78,7 +78,7 @@ Owns reusable host-action runners and the dispatcher that maps `StepAction` vari
 | `lib.rs` | `EngineActionDispatcher`, `ResumeCallbackRegistry`, and public runner exports. |
 | `agent.rs` | `AgentActionRunner` adapter over `cowboy-workflow-agent::AgentExecutor`. |
 | `command.rs` | `CommandActionRunner` for direct non-shell process execution from runtime cwd. |
-| `ask_user.rs` | `AskUserActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
+| `wait_for_input.rs` | `WaitForInputActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
 | `status.rs` | `StatusActionRunner` for immediate completed records. |
 | `workflow.rs` | `WorkflowActionHandler` trait and `WorkflowActionRunner` adapter for `StepAction::Workflow`; routed to the engine's runtime handler. |
 | `fail.rs` | `FailActionRunner` for failed run statuses. |
@@ -91,9 +91,9 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/answer/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
-| `input.rs` | `ResumeRouter`; validates answers for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
+| `input.rs` | `ResumeRouter`; validates supplied input for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, persists `Failed` on give-up, and exposes canonical `ctx.prev.output` plus compatibility aliases through `LuaStepActionProvider`. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
@@ -102,8 +102,8 @@ Important seams:
 
 - `WorkflowRuntime` is the high-level application interface.
 - `WorkflowRunner<S, D, P>` depends on the async typed store capabilities it uses, plus `ActionDispatcher` and `StepActionProvider`.
-- `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers ask-user answers through `ctx.prev.fields.answer`.
-- `ResumeRouter` validates a waiting prompt answer and dispatches the stored resume callback for the common record-routing path without mutating step counters.
+- `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers wait-for-input inputs through `ctx.prev.fields.input`.
+- `ResumeRouter` validates a waiting prompt input and dispatches the stored resume callback for the common record-routing path without mutating step counters.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
 
 Runner-policy contract: TOML uses `[config_sets.<name>]` with
@@ -135,7 +135,7 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `ask_user`, `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
+| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `wait_for_input`, `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
 | `state.rs` | Durable `Run`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
@@ -244,7 +244,7 @@ CLI/TUI command
   -> WorkflowRunner loops execute_step
   -> LuaStepActionProvider returns StepAction
   -> ActionDispatcher/action runners handle initial StepAction values
-  -> ResumeRouter dispatches waiting answers through ResumeCallbackRegistry
+  -> ResumeRouter dispatches waiting inputs through ResumeCallbackRegistry
   -> WorkflowStore transactions save run/head/objects
   -> EventBus emits WorkflowEvent
   -> TUI renders events or CLI prints report

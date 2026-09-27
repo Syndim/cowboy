@@ -11,16 +11,16 @@ and `WaitingForInput` must all proceed through execution.
 The current branch (`fix/resume-failed-step`, PR #1) handles `Running` and
 `Failed`, but still treats `RunStatus::WaitingForInput` as a resume no-op:
 
-- Resuming a run whose current step is an `ask_user` step returns the run
+- Resuming a run whose current step is an `wait_for_input` step returns the run
   unchanged, still `WaitingForInput`.
 - It emits/persists no workflow events (no `StepStarted` for the waiting step).
-- The retained `ask_user` current step is never re-executed, so the run is
+- The retained `wait_for_input` current step is never re-executed, so the run is
   never re-prompted and its durable pending resume callback is never refreshed.
 
 Expected behavior: resuming (or stepping) a `WaitingForInput` run re-executes
-the retained `ask_user` step, re-prompts the user, and safely replaces the
+the retained `wait_for_input` step, re-prompts the user, and safely replaces the
 durable pending resume callback with the freshly minted one. The run stays
-answerable, and `answer` behavior is unchanged.
+input-providable, and `provide-input` behavior is unchanged.
 
 ## Root cause
 
@@ -55,8 +55,8 @@ CLI (`crates/tui/app/src/main.rs`) and TUI
 (`crates/tui/app/src/app/commands.rs`) resume/step paths add no status filtering
 of their own.
 
-Re-executing the `ask_user` step is safe and idempotent for the durable state:
-`AskUserActionRunner::run` (`crates/workflow/actions/src/ask_user.rs`) builds a
+Re-executing the `wait_for_input` step is safe and idempotent for the durable state:
+`WaitForInputActionRunner::run` (`crates/workflow/actions/src/wait_for_input.rs`) builds a
 fresh `ResumeCallback` whose payload `record_id` is derived from
 `ExecutionContext::step_record_id` (`{run_id}-{steps_executed + 1}` in
 `crates/workflow/core/src/engine.rs`). A fresh execution increments
@@ -66,15 +66,15 @@ duplicated or left dangling.
 
 ## Reproduction steps
 
-1. Author a workflow whose current step is an `ask_user` step (for example a
-   step returning `action.ask_user { id = "approval", message = "Approve?",
+1. Author a workflow whose current step is an `wait_for_input` step (for example a
+   step returning `action.wait_for_input { id = "approval", message = "Approve?",
    choices = { "yes" } }`).
 2. Start a run. It reaches `RunStatus::WaitingForInput`, retaining the
-   `ask_user` step as the current step with a durable pending resume callback.
+   `wait_for_input` step as the current step with a durable pending resume callback.
 3. Run `cowboy resume <run-id>` (or `cowboy step <run-id>`, or the TUI
    `/resume` / `/step`).
 4. Observe that the run is returned unchanged: still `WaitingForInput`, no new
-   events emitted, the `ask_user` step is not re-executed/re-prompted, and the
+   events emitted, the `wait_for_input` step is not re-executed/re-prompted, and the
    durable pending callback is not refreshed.
 
 This sequence is encoded deterministically in the regression test below, so no
@@ -84,10 +84,10 @@ real ACP agent or network access is required.
 
 - Test file path: `crates/workflow/engine/src/runtime.rs`
 - Test name:
-  `runtime::tests::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`
+  `runtime::tests::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`
 - Command:
-  `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback`
-- Expected result before the fix: FAIL. The test starts a single-`ask_user`-step
+  `cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback`
+- Expected result before the fix: FAIL. The test starts a single-`wait_for_input`-step
   run that blocks as `WaitingForInput` on step `ask`, records the durable
   callback `record_id`, then calls `resume_run`. It asserts (a) the run is still
   `WaitingForInput` on `ask`/`approval`, (b) a fresh `StepStarted { step_id:
@@ -102,27 +102,27 @@ real ACP agent or network access is required.
 Running the narrow command before any product-code change:
 
 ```
-cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback
+cargo test -p cowboy-workflow-engine resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback
 
 running 1 test
-test runtime::tests::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback ... FAILED
+test runtime::tests::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback ... FAILED
 
 failures:
 
----- runtime::tests::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback stdout ----
+---- runtime::tests::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback stdout ----
 
-thread 'runtime::tests::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback'
+thread 'runtime::tests::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback'
 panicked at crates/workflow/engine/src/runtime.rs:4107:9:
-resume must re-execute the waiting ask_user step, emitting StepStarted for it
+resume must re-execute the waiting wait_for_input step, emitting StepStarted for it
 
 failures:
-    runtime::tests::resume_reexecutes_waiting_ask_user_step_and_replaces_pending_callback
+    runtime::tests::resume_reexecutes_waiting_wait_for_input_step_and_replaces_pending_callback
 
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 119 filtered out; finished in 0.06s
 ```
 
 The panic confirms resume performed no execution on the waiting run: no
-`StepStarted` event for the retained `ask_user` step, so the step was never
+`StepStarted` event for the retained `wait_for_input` step, so the step was never
 re-prompted and the durable callback was never replaced.
 
 ## Fix constraints
@@ -143,13 +143,13 @@ re-prompted and the durable callback was never replaced.
 - Only `RunStatus::Completed` and `RunStatus::Cancelled` remain no-ops. State
   this exactly in code comments, tests, `README.md`, and `docs/architecture.md`
   (remove any wording that lists `WaitingForInput` as non-resumable).
-- Re-executing an `ask_user` step must safely replace the durable pending resume
+- Re-executing an `wait_for_input` step must safely replace the durable pending resume
   callback (a fresh `record_id`/callback), not duplicate or orphan it.
-- Preserve `answer_run` behavior exactly: answering a `WaitingForInput` run must
+- Preserve `provide_input_run` behavior exactly: answering a `WaitingForInput` run must
   still route through the (possibly replaced) pending callback and advance the
-  run. Do not change `answer_run`.
+  run. Do not change `provide_input_run`.
 - Update the existing test
-  `runtime::tests::resume_is_noop_for_waiting_run_and_prompt_stays_answerable`,
+  `runtime::tests::resume_is_noop_for_waiting_run_and_prompt_stays_inputable`,
   which encodes the pre-clarification no-op expectation and will contradict the
   new behavior after the fix; keep the two other no-op tests
   (`resume_is_noop_for_completed_run`, `resume_is_noop_for_cancelled_run`).

@@ -33,7 +33,7 @@ Production card-construction paths and their current time behavior:
 | # | Path | Location | Prefix today | Cards affected |
 |---|------|----------|--------------|----------------|
 | 0 | `event_card` / `workflow_title_prefix` | `crates/tui/app/src/app/events.rs:409-417` | current time (correct) | all workflow-event cards |
-| 1 | `spawn_card_report_task` action helpers | `crates/tui/app/src/app/commands.rs` (`spawn_start_run` and siblings) | literal `"00:00:00"` for Run variants; empty `[]` for Step/Resume/Answer/Resolve | Run, Step, Resume, Answer, Resolve submission cards |
+| 1 | `spawn_card_report_task` action helpers | `crates/tui/app/src/app/commands.rs` (`spawn_start_run` and siblings) | literal `"00:00:00"` for Run variants; empty `[]` for Step/Resume/ProvideInput/Resolve | Run, Step, Resume, ProvideInput, Resolve submission cards |
 | 2 | `AppState::push_card` | `crates/tui/app/src/app/state.rs:942-952` | `title_prefix: Vec::new()` (empty) | Usage, Notice, Error, Cancelled, Exit, Improve, Resolve-options, Help, Workflows, Prompt |
 | 3 | `spawn_runs_list_task` | `crates/tui/app/src/app/state.rs:1093-1109` | `title_prefix: Vec::new()` (empty) | `/runs` loading card |
 | 4 | `render_pending_prompt_lines` (direct `Card::new`) | `crates/tui/app/src/app/state.rs:110-139` | no `.title_prefix(..)` call | "Waiting for input" pending-prompt card |
@@ -73,7 +73,7 @@ line). Each step traces trigger → stored entry → rendered title.
    computed from `chrono::Local::now()`. Its siblings
    `spawn_start_run_stepwise`, `spawn_start_run_with_workflow`, and
    `spawn_start_run_with_workflow_stepwise` pass the same literal;
-   `spawn_step_run`, `spawn_resume_run`, `spawn_answer_task`, and the
+   `spawn_step_run`, `spawn_resume_run`, `spawn_input_task`, and the
    `resolve_run` `Some(status)` branch pass an empty `[]`.
 
 3. `AppState::spawn_card_report_task`
@@ -261,7 +261,7 @@ pending-prompt) omits the current time. The wall-clock values (`15:28`,
   1. Action helpers in `commands.rs` (`spawn_start_run`,
      `spawn_start_run_stepwise`, `spawn_start_run_with_workflow`,
      `spawn_start_run_with_workflow_stepwise`, `spawn_step_run`,
-     `spawn_resume_run`, `spawn_answer_task`, and the `resolve_run`
+     `spawn_resume_run`, `spawn_input_task`, and the `resolve_run`
      `Some(status)` branch) — replace the `"00:00:00"` literals and empty
      prefixes.
   2. `AppState::push_card` (`state.rs:942-952`) — stamp the current time.

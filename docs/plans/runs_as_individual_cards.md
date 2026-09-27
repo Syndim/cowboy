@@ -26,7 +26,7 @@ The desired behavior is: `/runs` still reports the total run count in the status
 
 3. Preserve structured run details:
    - Keep topic, workflow, current step, head, and expanded status fields exactly as structured text from `render_run_summary_lines`.
-   - Keep waiting-for-input details (`status.waiting_step`, `status.prompt_id`, `status.message`, `status.choices`) and failed reasons.
+   - Keep waiting-for-input details (`status.waiting_step`, `status.input_id`, `status.message`, `status.choices`) and failed reasons.
    - Continue avoiding Rust debug payload leaks such as `WaitingForInput {`, `Failed {`, and `resume_callback:`.
 
 4. Keep the diff scoped to TUI `/runs` rendering and its tests:

@@ -8,7 +8,7 @@ The TUI event loop handles Enter by awaiting command submission inline before re
 
 `WorkflowRuntime::list_runs()` does more than read run heads: it opens the store, iterates every run head, loads each full `WorkflowRun`, and, when `request_topic` is absent, reads and parses that run's persisted event JSON to backfill the topic. With many runs or slow storage, this blocks the same loop that must draw the UI and process keys.
 
-The existing long-running workflow commands (`/run`, `/step`, `/resume`, `/answer`, and resolving with a status) enqueue background tasks. `/runs` is the outlier: the regression test observes that submitting `/runs` leaves `background_task_count()` at `0`, proving it ran inline on the UI path.
+The existing long-running workflow commands (`/run`, `/step`, `/resume`, `/provide-input`, and resolving with a status) enqueue background tasks. `/runs` is the outlier: the regression test observes that submitting `/runs` leaves `background_task_count()` at `0`, proving it ran inline on the UI path.
 
 ## Reproduction steps
 

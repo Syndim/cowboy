@@ -25,7 +25,7 @@ Keep this as a workflow-file change, not an engine change. The workflow runtime 
   - Keep the existing initial-plan behavior for ordinary non-bug-fix work with no prior `Plan doc: ...`.
 - Add a reviewer gate for user result-confirmation feedback after implementation review.
   - Add `examples/workflows/steps/review_result_feedback.lua` to ask the reviewer whether the user's feedback is an implementation revision or a plan-level re-plan request.
-  - Route `confirm_result_answer` `changes_requested` through that reviewer step in feature and bug-fix workflows.
+  - Route `confirm_result_input` `changes_requested` through that reviewer step in feature and bug-fix workflows.
   - Route reviewer `changes_requested` output to `revise` and `replan_requested` output to `plan`, preserving `Work dir`, `Plan doc`, `RCA doc`, and `Repro test` values.
 
 - Do not change `revise.lua`, `implement.lua`, `test.lua`, or engine/runtime code unless tests reveal the workflow source cannot express this transition. The existing status routing and previous-step context mechanisms are sufficient.
@@ -37,7 +37,7 @@ Keep this as a workflow-file change, not an engine change. The workflow runtime 
   - Load `examples/workflows/workflows/bugfix.lua` and assert the `review` step routes `replan_requested` to `plan`, `changes_requested` to `revise`, and `approved` to `confirm_result`.
 - Add or extend a Lua runtime test that executes the example `review` step from the loaded source bundle and asserts the returned `StepAction::Agent` output status list includes `approved`, `changes_requested`, and `replan_requested`.
 - In the same runtime coverage, assert the generated review prompt contains guidance distinguishing implementation fixes from plan-level rejections and still mentions preserving `Plan doc`, `Work dir`, `RCA doc`, and `Repro test` values.
-- Add focused Lua workflow tests for the result-feedback reviewer gate: graph routing from `confirm_result_answer`, reviewer-step routes to `revise`/`plan`, and prompt/output contract for preserving user feedback and path fields.
+- Add focused Lua workflow tests for the result-feedback reviewer gate: graph routing from `confirm_result_input`, reviewer-step routes to `revise`/`plan`, and prompt/output contract for preserving user feedback and path fields.
 
 # How to verify
 

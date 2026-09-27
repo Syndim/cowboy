@@ -25,7 +25,7 @@ use crate::run_summary::render_run_summary_lines;
 pub(super) struct PendingPrompt {
     run_id: String,
     step: String,
-    prompt_id: String,
+    input_id: String,
     message: String,
     choices: Vec<Choice>,
     title_prefix: String,
@@ -40,8 +40,8 @@ impl PendingPrompt {
         &self.step
     }
 
-    pub(in crate::app) fn prompt_id(&self) -> &str {
-        &self.prompt_id
+    pub(in crate::app) fn input_id(&self) -> &str {
+        &self.input_id
     }
 
     pub(in crate::app) fn message(&self) -> &str {
@@ -228,7 +228,7 @@ fn is_submitted_background_task_card(title: &str, title_suffix: &[String]) -> bo
         "Restart" => suffix == "submitted restart",
         "Step" => suffix == "submitted step",
         "Resume" => suffix == "submitted resume",
-        "Answer" => suffix == "submitted answer",
+        "Provide input" => suffix == "submitted input",
         "Resolve" => suffix == "submitted resolve",
         "Export" => suffix == "exporting run",
         _ => false,
@@ -471,7 +471,7 @@ fn run_status_state_from_str(status: &str) -> Option<RunStatusState> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::app) enum ComposerSubmissionMode {
     Idle,
-    PendingAnswer,
+    PendingInput,
     AgentPrompt,
     ExecutionBlocked,
 }
@@ -607,7 +607,10 @@ impl AppState {
             RunStatusState::Failed => format!("cowboy resolve {run_id}"),
             RunStatusState::WaitingForInput => match &self.pending_prompt {
                 Some(prompt) if prompt.run_id() == run_id => {
-                    format!("cowboy answer {run_id} {} <answer>", prompt.prompt_id())
+                    format!(
+                        "cowboy provide-input {run_id} {} <input>",
+                        prompt.input_id()
+                    )
                 }
                 _ => format!("cowboy resume {run_id}"),
             },
@@ -659,7 +662,7 @@ impl AppState {
 
     pub(in crate::app) fn composer_submission_mode(&self) -> ComposerSubmissionMode {
         if self.pending_prompt.is_some() {
-            return ComposerSubmissionMode::PendingAnswer;
+            return ComposerSubmissionMode::PendingInput;
         }
         if !self.workflow_execution_running() {
             return ComposerSubmissionMode::Idle;
@@ -1049,10 +1052,10 @@ impl AppState {
         self.pending_prompt = None;
     }
 
-    pub(in crate::app) fn pending_prompt_answer_target(&self) -> Option<(String, String)> {
+    pub(in crate::app) fn pending_input_target(&self) -> Option<(String, String)> {
         self.pending_prompt
             .as_ref()
-            .map(|prompt| (prompt.run_id.clone(), prompt.prompt_id.clone()))
+            .map(|prompt| (prompt.run_id.clone(), prompt.input_id.clone()))
     }
 
     pub(in crate::app) fn terminal_restart_target(&self) -> Option<String> {
@@ -1455,7 +1458,7 @@ impl AppState {
             }
             WorkflowEventKind::WaitingForInput {
                 step,
-                prompt_id,
+                input_id,
                 message,
                 choices,
             } => {
@@ -1466,7 +1469,7 @@ impl AppState {
                 self.pending_prompt = Some(PendingPrompt {
                     run_id: event.run_id.clone(),
                     step: step.clone(),
-                    prompt_id: prompt_id.clone(),
+                    input_id: input_id.clone(),
                     message: message.clone(),
                     choices: choices.clone(),
                     title_prefix: event_wall_clock_prefix(event),
@@ -1729,7 +1732,7 @@ mod tests {
             "run-1",
             WorkflowEventKind::WaitingForInput {
                 step: "confirm".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![Choice {
                     key: "yes".to_string(),
@@ -1765,7 +1768,7 @@ mod tests {
             "run-1",
             WorkflowEventKind::WaitingForInput {
                 step: "confirm".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![Choice {
                     key: "yes".to_string(),
@@ -1886,7 +1889,7 @@ mod tests {
         let prompt = PendingPrompt {
             run_id: "run-1".to_string(),
             step: "confirm".to_string(),
-            prompt_id: "approval".to_string(),
+            input_id: "approval".to_string(),
             message: "first line\nsecond **literal** `plan`?".to_string(),
             choices: vec![Choice {
                 key: "approve".to_string(),
@@ -1964,7 +1967,7 @@ mod tests {
             ("Run", "submitted run --workflow slow"),
             ("Step", "submitted step"),
             ("Resume", "submitted resume"),
-            ("Answer", "submitted answer"),
+            ("Provide input", "submitted input"),
             ("Resolve", "submitted resolve"),
         ] {
             let entry = TranscriptEntry::Card {
@@ -2462,7 +2465,7 @@ mod tests {
             "run-1",
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: "approval".to_string(),
+                input_id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {
@@ -2479,7 +2482,7 @@ mod tests {
 
         assert_eq!(waiting_state.display_state(), "waiting");
         assert_eq!(
-            waiting_state.pending_prompt_answer_target(),
+            waiting_state.pending_input_target(),
             Some(("run-1".to_string(), "approval".to_string()))
         );
         assert!(waiting_state.composer_accepts_edits());
@@ -2934,12 +2937,12 @@ mod tests {
         );
     }
 
-    fn waiting_for_input_event(run_id: &str, prompt_id: &str) -> WorkflowEvent {
+    fn waiting_for_input_event(run_id: &str, input_id: &str) -> WorkflowEvent {
         WorkflowEvent::new(
             run_id,
             WorkflowEventKind::WaitingForInput {
                 step: "approve".to_string(),
-                prompt_id: prompt_id.to_string(),
+                input_id: input_id.to_string(),
                 message: "Approve?".to_string(),
                 choices: vec![
                     Choice {
@@ -2973,12 +2976,14 @@ mod tests {
     }
 
     #[test]
-    fn resume_hint_waiting_matching_prompt_uses_answer_command() {
+    fn resume_hint_waiting_matching_prompt_uses_input_command() {
         let mut state = test_state();
         state.apply_workflow_event(waiting_for_input_event("run-a", "approval"));
         assert_eq!(
             state.resume_hint().as_deref(),
-            Some("Run run-a is not complete. Resume with: cowboy answer run-a approval <answer>")
+            Some(
+                "Run run-a is not complete. Resume with: cowboy provide-input run-a approval <input>"
+            )
         );
     }
 

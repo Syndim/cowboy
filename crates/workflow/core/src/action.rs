@@ -18,8 +18,8 @@ pub enum StepAction {
     Command(CommandAction),
     /// Complete the step immediately with a status and optional data.
     Status(StatusAction),
-    /// Pause the run and ask the user for input.
-    AskUser(AskUserAction),
+    /// Pause the run and wait for external input.
+    WaitForInput(WaitForInputAction),
     /// Invoke another catalog workflow as a durable child run.
     Workflow(WorkflowAction),
     /// Fail the run immediately with a reason.
@@ -32,7 +32,7 @@ impl StepAction {
             Self::Agent(_) => "agent",
             Self::Command(_) => "command",
             Self::Status(_) => "status",
-            Self::AskUser(_) => "ask_user",
+            Self::WaitForInput(_) => "wait_for_input",
             Self::Workflow(_) => "workflow",
             Self::Fail(_) => "fail",
         }
@@ -173,29 +173,29 @@ pub struct StatusAction {
     pub body: String,
 }
 
-/// Request to pause and ask the user for input.
+/// Request to pause and wait for external input.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AskUserAction {
-    /// Stable prompt id shown in waiting state and answer validation.
+pub struct WaitForInputAction {
+    /// Stable input id shown in waiting state and input validation.
     pub id: String,
     /// Message shown to the user.
     pub message: String,
     /// Optional finite set of accepted choices.
     #[serde(default)]
     pub choices: Vec<Choice>,
-    /// Output status used when the user answers.
-    #[serde(default = "default_ask_user_status")]
+    /// Output status used when the user inputs.
+    #[serde(default = "default_wait_for_input_status")]
     pub status: Status,
-    /// Structured fields carried into the eventual ask-user step output.
+    /// Structured fields carried into the eventual wait-for-input step output.
     #[serde(default)]
     pub fields: Fields,
 }
 
-/// One accepted answer for an [`AskUserAction`], with a stable key matched
-/// against the user's answer and a human-readable description shown to them.
+/// One accepted input for an [`WaitForInputAction`], with a stable key matched
+/// against the user's input and a human-readable description shown to them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Choice {
-    /// Stable key matched against the user's answer text.
+    /// Stable key matched against the user's input text.
     pub key: String,
     /// Human-readable description of what this choice means.
     pub description: String,
@@ -208,8 +208,8 @@ impl Choice {
     }
 }
 
-fn default_ask_user_status() -> Status {
-    "answered".to_string()
+fn default_wait_for_input_status() -> Status {
+    "provided".to_string()
 }
 
 /// Request to invoke another workflow from the catalog.
@@ -373,15 +373,15 @@ mod tests {
             "command"
         );
         assert_eq!(
-            StepAction::AskUser(AskUserAction {
+            StepAction::WaitForInput(WaitForInputAction {
                 id: "approval".to_string(),
                 message: "Approve?".to_string(),
                 choices: Vec::new(),
-                status: "answered".to_string(),
+                status: "provided".to_string(),
                 fields: Fields::new(),
             })
             .action_name(),
-            "ask_user"
+            "wait_for_input"
         );
         assert_eq!(
             StepAction::Fail(FailAction {

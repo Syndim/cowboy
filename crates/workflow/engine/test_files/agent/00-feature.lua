@@ -145,30 +145,30 @@ end
 
 local unclear = step("unclear")
 unclear.run = function(ctx)
-  if ctx.prev and ctx.prev.action == "ask_user" then
+  if ctx.prev and ctx.prev.action == "wait_for_input" then
     local fields = ctx.prev.fields or {}
-    local answer = fields.answer
-    if answer and tostring(answer) ~= "" then
-      return action.status { status = "clarified", fields = { clarification = tostring(answer) }, body = "received additional context" }
+    local value = fields.input
+    if value and tostring(value) ~= "" then
+      return action.status { status = "clarified", fields = { clarification = tostring(value) }, body = "received additional context" }
     end
   end
 
-  local prompt_id = "clarification_" .. tostring(ctx.steps_executed or 0)
-  return action.ask_user {
-    id = prompt_id,
-    message = "The request is too unclear to plan. Please provide more context: user-visible behavior, entrypoint, expected inputs/outputs, and acceptance criteria.",
+  local input_id = "clarification_" .. tostring(ctx.steps_executed or 0)
+  return action.wait_for_input {
+    id = input_id,
+    message = "The request is too unclear to plan. Please provide more input: user-visible behavior, entrypoint, expected inputs/outputs, and acceptance criteria.",
     choices = {},
   }
 end
 
-local unclear_answer = step("unclear_answer")
-unclear_answer.run = function(ctx)
+local unclear_input = step("unclear_input")
+unclear_input.run = function(ctx)
   local fields = (ctx.prev and ctx.prev.fields) or {}
-  local answer = fields.answer
-  if answer and tostring(answer) ~= "" then
-    return action.status { status = "clarified", fields = { clarification = tostring(answer) }, body = "received additional context" }
+  local value = fields.input
+  if value and tostring(value) ~= "" then
+    return action.status { status = "clarified", fields = { clarification = tostring(value) }, body = "received additional context" }
   end
-  return action.fail { reason = "clarification answer was empty" }
+  return action.fail { reason = "clarification input was empty" }
 end
 
 local blocked = step("blocked")
@@ -178,8 +178,8 @@ end
 
 plan:on("ready", implement)
 plan:on("unclear", unclear)
-unclear:on("answered", unclear_answer)
-unclear_answer:on("clarified", plan)
+unclear:on("provided", unclear_input)
+unclear_input:on("clarified", plan)
 implement:on("implemented", review)
 implement:on("blocked", blocked)
 review:on("approved", done)

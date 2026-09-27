@@ -49,7 +49,7 @@ Use a clean persisted-store cutover. Keep the configuration key `workflow_store`
 - Port prompt-window tests unchanged at the behavior level: exact prompt content and millisecond timestamp preservation, monotonic sequences, total ordering between append and compare-and-seal, stale/sealed/terminal rejection, abort/clear behavior, and run deletion cleanup.
 - Update core and engine in-memory stores for the async typed interfaces, convert affected unit tests to `#[tokio::test]`, then retain runner tests for retry persistence, step completion, status persistence, and previous-step loading.
 - Update agent tests for session reuse, prompt delivery watermarks, turn persistence, prompt-window handoff, and cancellation cleanup through the narrower agent-store capabilities.
-- Update runtime tests for async construction of two `WorkflowRuntime` instances with independent SQLx pools sharing one SQLite store, different-run coexistence, same-run sidecar lock rejection, store-wait event emission, store-wait cancellation, list/load/start/resume/answer/resolve paths, and event persistence.
+- Update runtime tests for async construction of two `WorkflowRuntime` instances with independent SQLx pools sharing one SQLite store, different-run coexistence, same-run sidecar lock rejection, store-wait event emission, store-wait cancellation, list/load/start/resume/provide-input/resolve paths, and event persistence.
 - Update app/config, product CLI, diagnostic CLI, and TUI fixtures that currently name `workflow.redb`; retain rendering tests for the sanitized `WorkflowStoreWaiting` card.
 - Add an executable clean-cutover test that places non-SQLite bytes at the configured path, starts Cowboy, asserts the actionable error, and verifies the file digest is unchanged.
 - Make every required focused regression print one stable `EVIDENCE ...` line after its independent assertions pass. The marker summarizes the material observation but does not replace assertions.
@@ -328,7 +328,7 @@ Use a clean persisted-store cutover. Keep the configuration key `workflow_store`
     cowboy-workflow-engine	runtime::tests::cancelling_runtime_store_wait_interrupts_contended_operation	EVIDENCE runtime-wait-cancel cancelled=true bounded=true
     cowboy-workflow-engine	runtime::tests::cancellation_cleanup_retains_run_lock_until_persistence_finishes	EVIDENCE runtime-cancel lock_retained_until_persisted=true
     cowboy-workflow-engine	runtime::tests::list_runs_reads_persisted_head_summaries_without_full_runs	EVIDENCE runtime-list source=heads full_run_loads=0
-    cowboy-workflow-engine	runtime::tests::answer_run_persists_ask_user_completion_when_resumed_step_fails	EVIDENCE runtime-answer prompt_completion=persisted resumed_step=failed
+    cowboy-workflow-engine	runtime::tests::provide_input_run_persists_wait_for_input_completion_when_resumed_step_fails	EVIDENCE runtime-provide-input prompt_completion=persisted resumed_step=failed
     cowboy-workflow-engine	runtime::tests::resolve_run_restores_persisted_request_topic_and_exposes_fields_to_next_step	EVIDENCE runtime-resolve topic_restored=true fields_exposed=true
     cowboy-workflow-engine	runtime::tests::failed_runner_events_are_persisted_with_active_duration	EVIDENCE runtime-events persisted=true active_duration=true
     cowboy-workflow-engine	run_lock::tests::run_lock_rejects_same_run_in_process	EVIDENCE run-lock same_run=rejected

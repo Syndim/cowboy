@@ -13,7 +13,7 @@ return action.workflow {
 
 When the child completes, create a parent `StepRecord` with action `"workflow"` and copy the child terminal step's `StepOutput.status`, `fields`, `body`, and `raw` unchanged. This lets the parent route directly on the status returned by the child workflow and lets its next step consume the child result through `ctx.prev`. Record the target workflow id, exact request, and child run id in the parent step input/detail rather than injecting metadata into the child output.
 
-Map a child `RunStatus::Failed` to a completed parent workflow-action output with status `"failed"` and the child run id/reason in its diagnostic fields. Map a child cancellation to status `"cancelled"`. If the child waits for input, mirror its prompt as the parent's existing `RunStatus::WaitingForInput` with a durable workflow-child resume callback. Answering the parent prompt must answer and continue the child through the shared executor; if the child asks again, refresh the mirrored parent prompt, and if it becomes terminal, complete the parent workflow action and continue the parent automatically.
+Map a child `RunStatus::Failed` to a completed parent workflow-action output with status `"failed"` and the child run id/reason in its diagnostic fields. Map a child cancellation to status `"cancelled"`. If the child waits for input, mirror its prompt as the parent's existing `RunStatus::WaitingForInput` with a durable workflow-child resume callback. ProvideInputing the parent prompt must answer and continue the child through the shared executor; if the child asks again, refresh the mirrored parent prompt, and if it becomes terminal, complete the parent workflow action and continue the parent automatically.
 
 Make child creation idempotent across retries, resume, and process interruption without assuming that the parent `StepRecord` already exists. Before child creation, derive a stable workflow invocation UUID-v5 from the durable tuple `(parent run id, current step id, previous head hash or no-head marker)`. Use the fixed namespace `d31e45ed-1aac-578f-9314-765ee417df28`. Encode the UUID name as the ASCII domain tag `cowboy.workflow.invocation.v1\0`, followed by each UTF-8 string as an unsigned 64-bit big-endian byte length and its exact bytes; encode `previous_head` as one byte `0x00` for `None`, or `0x01` followed by the same length-prefixed UTF-8 representation for `Some`. Those values are already persisted before the action runs and change when the same step is reached again after another completed record. Use `run-<invocation-uuid>` as the child run id, persist parent run id, parent step id, parent previous head, and invocation id as child lineage, and reuse only a child whose stored workflow id, exact request, and lineage all match. Enable the existing `uuid` dependency's `v5` feature rather than adding a second identity implementation. Walk durable lineage before acquiring/executing the child to reject direct or indirect workflow-call cycles with a clear error, preventing recursive lock waits and unbounded workflow trees.
 
@@ -24,8 +24,8 @@ Make child creation idempotent across retries, resume, and process interruption 
 - In `crates/workflow/core/src/traits.rs`, make resume callback handling async so a durable callback can continue a child workflow before returning the parent's next `ActionResult`.
 - In `crates/workflow/lua/src/api.rs` and `crates/workflow/lua/src/convert.rs`, register `action.workflow`, require a nonblank catalog workflow id, require `request` to be a string while preserving it exactly, and report malformed tables through the existing action-field errors.
 - Add `crates/workflow/actions/src/workflow.rs` with a provider-neutral `WorkflowActionHandler` adapter. Extend `EngineActionDispatcher` to route `StepAction::Workflow` without making `cowboy-workflow-actions` depend on the engine or catalog crates.
-- Update `ResumeCallbackRegistry`, `AskUserActionRunner`, and `cowboy-workflow-engine::ResumeRouter` for async callback dispatch while preserving current ask-user behavior.
-- In `crates/workflow/engine/src/runtime.rs`, implement the workflow action handler and workflow-child resume callback by factoring the existing explicit-workflow start/resume/answer logic into one reusable execution path used by both public parent operations and nested children. Child runs must independently compile/snapshot their target source, resolve their own config set, acquire their own run lock, and use the same `run_existing_with_events`/`WorkflowRunner` path.
+- Update `ResumeCallbackRegistry`, `WaitForInputActionRunner`, and `cowboy-workflow-engine::ResumeRouter` for async callback dispatch while preserving current wait-for-input behavior.
+- In `crates/workflow/engine/src/runtime.rs`, implement the workflow action handler and workflow-child resume callback by factoring the existing explicit-workflow start/resume/provide-input logic into one reusable execution path used by both public parent operations and nested children. Child runs must independently compile/snapshot their target source, resolve their own config set, acquire their own run lock, and use the same `run_existing_with_events`/`WorkflowRunner` path.
 - Add stable workflow-invocation/child-run identity and validation helpers in the engine using the fixed UUID-v5 namespace and length-prefixed canonical byte encoding defined above. On first dispatch, create and persist the linked child; on retry or parent resume, load and continue the same child; on a terminal child, normalize it into the parent workflow-action record. Record `workflow`, exact `request`, `child_run_id`, and `invocation_id` under the parent workflow step's `StepInput.context`, with `StepDetail.backend = "workflow"` and `StepDetail.session_id = child_run_id`.
 - Enable the `v5` feature on the engine crate's existing `uuid` dependency.
 - Add lineage-cycle validation before child execution. Reject calls when the target catalog id already appears in the current run's ancestor chain, and include the attempted workflow chain in the error without including request contents.
@@ -39,15 +39,15 @@ Make child creation idempotent across retries, resume, and process interruption 
 - Add `state::tests::workflow_run_parent_lineage_defaults_and_round_trips` proving old serialized runs default child lineage to `None` and linked child runs round-trip with parent run/step/previous-head/invocation identities.
 - Add `runtime::tests::workflow_action_converts_and_preserves_request` and `runtime::tests::workflow_action_rejects_invalid_fields` in the Lua crate for a valid `action.workflow`, missing/blank/non-string `workflow`, missing/non-string `request`, and exact whitespace/newline preservation.
 - Add `tests::action_dispatcher_routes_workflow_variant` in the actions crate using a fake `WorkflowActionHandler` to prove the workflow variant is routed only to that handler and its completed/blocked results pass through unchanged.
-- Add `tests::async_ask_user_resume_callback_preserves_behavior` in the actions crate and `input::tests::async_resume_router_preserves_ask_user_behavior` in the engine crate before adding workflow-child callbacks.
+- Add `tests::async_wait_for_input_resume_callback_preserves_behavior` in the actions crate and `input::tests::async_resume_router_preserves_wait_for_input_behavior` in the engine crate before adding workflow-child callbacks.
 - Add `runtime::tests::workflow_action_child_uses_shared_executor_and_persists_lineage` proving the child uses the requested catalog id and exact initial request, runs through the same internal executor helper as a top-level run, resolves its own config set, and persists the defined lineage.
 - Add `runtime::tests::workflow_action_invocation_id_matches_fixed_uuid_v5_vector` proving the production identity helper matches a predetermined UUID-v5 namespace/name/result vector computed independently of production helpers.
 - Add `runtime::tests::workflow_action_propagates_terminal_child_output` proving a custom child terminal status and `fields`/`body`/`raw` are copied unchanged and route the parent.
 - Add `runtime::tests::workflow_action_maps_failed_and_cancelled_children` proving child failure and cancellation become routable `"failed"` and `"cancelled"` parent outputs with diagnostics.
-- Add `runtime::tests::workflow_action_parent_answers_repeated_child_prompts` and `runtime::tests::workflow_action_parent_prompt_survives_runtime_reconstruction` proving the parent mirrors/answers child prompts, handles a second prompt, and resumes after rebuilding `WorkflowRuntime`.
+- Add `runtime::tests::workflow_action_parent_inputs_repeated_child_prompts` and `runtime::tests::workflow_action_parent_prompt_survives_runtime_reconstruction` proving the parent supplies input to child prompts, handles a second prompt, and resumes after rebuilding `WorkflowRuntime`.
 - Add `runtime::tests::workflow_action_retry_and_resume_reuse_child_invocation` and `runtime::tests::workflow_action_rejects_mismatched_existing_child` proving UUID-v5 invocation reuse across retry/resume and explicit rejection of workflow/request/lineage mismatch.
 - Add `runtime::tests::workflow_action_rejects_direct_cycle_before_lock` and `runtime::tests::workflow_action_rejects_indirect_cycle_before_lock` proving `A -> A` and `A -> B -> A` fail before a conflicting ancestor lock is acquired.
-- Add `runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress` proving parent and child event files contain only their own run ids while the combined start/answer operation reports expose child lifecycle progress and final action completion.
+- Add `runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress` proving parent and child event files contain only their own run ids while the combined start/provide-input operation reports expose child lifecycle progress and final action completion.
 - Update exhaustive `StepAction` matches, workflow-run fixtures, action lists, and documentation examples across core, actions, Lua, engine, store contracts/test apps, and repository guidance.
 
 # How to verify
@@ -192,8 +192,8 @@ Make child creation idempotent across retries, resume, and process interruption 
    run_exact cowboy-workflow-lua runtime::tests::workflow_action_converts_and_preserves_request lua-convert
    run_exact cowboy-workflow-lua runtime::tests::workflow_action_rejects_invalid_fields lua-invalid
    run_exact cowboy-workflow-actions tests::action_dispatcher_routes_workflow_variant actions-dispatch
-   run_exact cowboy-workflow-actions tests::async_ask_user_resume_callback_preserves_behavior actions-async-resume
-   run_exact cowboy-workflow-engine input::tests::async_resume_router_preserves_ask_user_behavior engine-input
+   run_exact cowboy-workflow-actions tests::async_wait_for_input_resume_callback_preserves_behavior actions-async-resume
+   run_exact cowboy-workflow-engine input::tests::async_resume_router_preserves_wait_for_input_behavior engine-input
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_child_uses_shared_executor_and_persists_lineage engine-shared-executor
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_invocation_id_matches_fixed_uuid_v5_vector engine-uuid-vector
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_retry_and_resume_reuse_child_invocation engine-idempotent
@@ -202,7 +202,7 @@ Make child creation idempotent across retries, resume, and process interruption 
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_rejects_indirect_cycle_before_lock engine-indirect-cycle
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_propagates_terminal_child_output engine-terminal
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_maps_failed_and_cancelled_children engine-terminal-failure
-   run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_answers_repeated_child_prompts engine-prompts
+   run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_inputs_repeated_child_prompts engine-prompts
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_prompt_survives_runtime_reconstruction engine-prompt-restart
    run_exact cowboy-workflow-engine runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress engine-events
    ```
@@ -243,16 +243,16 @@ Make child creation idempotent across retries, resume, and process interruption 
 
   - Expected result: The exact test executes once and passes after asserting the fake workflow handler receives the original action/context exactly once, the fake agent handler receives no call, and completed and blocked workflow-handler results are returned unchanged.
   - Implementer observed result: The exact dispatcher test passed once, proving workflow actions route only to the workflow handler with unchanged action/context and that completed and blocked results pass through unchanged.
-- [x] TODO-04: Make durable resume callback dispatch asynchronous without changing ask-user semantics.
-  - Procedure: Update `ResumeCallbackHandler`, `ResumeCallbackRegistry`, `AskUserActionRunner`, and `ResumeRouter`; add the two named regression tests; define `run_exact` as shown in **How to verify**; run:
+- [x] TODO-04: Make durable resume callback dispatch asynchronous without changing wait-for-input semantics.
+  - Procedure: Update `ResumeCallbackHandler`, `ResumeCallbackRegistry`, `WaitForInputActionRunner`, and `ResumeRouter`; add the two named regression tests; define `run_exact` as shown in **How to verify**; run:
 
     ```bash
-    run_exact cowboy-workflow-actions tests::async_ask_user_resume_callback_preserves_behavior actions-async-resume
-    run_exact cowboy-workflow-engine input::tests::async_resume_router_preserves_ask_user_behavior engine-input
+    run_exact cowboy-workflow-actions tests::async_wait_for_input_resume_callback_preserves_behavior actions-async-resume
+    run_exact cowboy-workflow-engine input::tests::async_resume_router_preserves_wait_for_input_behavior engine-input
     ```
 
-  - Expected result: Both exact tests execute once and pass. They assert the original prompt id/message/choices/callback payload survive dispatch, valid answers still produce the same ask-user `StepRecord`, invalid answers still fail before callback execution, and a callback can await before returning its `ActionResult`.
-  - Implementer observed result: Both exact async-resume regression tests passed once. Prompt and callback data remained unchanged, invalid answers were rejected before callback execution, and awaited callbacks returned the original ask-user action result.
+  - Expected result: Both exact tests execute once and pass. They assert the original input id/message/choices/callback payload survive dispatch, valid inputs still produce the same wait-for-input `StepRecord`, invalid inputs still fail before callback execution, and a callback can await before returning its `ActionResult`.
+  - Implementer observed result: Both exact async-resume regression tests passed once. Prompt and callback data remained unchanged, invalid inputs were rejected before callback execution, and awaited callbacks returned the original wait-for-input action result.
 - [x] TODO-05: Reuse the engine's existing workflow execution path for top-level and child runs.
   - Procedure: Refactor `crates/workflow/engine/src/runtime.rs` so explicit top-level starts and the workflow action handler call one internal executor helper for catalog compile, config resolution, run creation/resume, lock acquisition, dispatcher construction, `WorkflowRunner`, cancellation, and event persistence. Add `runtime::tests::workflow_action_child_uses_shared_executor_and_persists_lineage`, but do not use a test-only entry counter as proof that the paths are shared; remove that probe if no other test requires it. Define `run_exact` and `record_command` as shown in **How to verify**, run the behavioral test, then execute an independent source-structure assertion that extracts Rust function bodies without invoking production helpers:
 
@@ -333,23 +333,23 @@ Make child creation idempotent across retries, resume, and process interruption 
   - Expected result: Both exact tests execute once and pass. The terminal-output test compares the complete child and parent `StepOutput` values for equality and verifies the parent takes the custom-status transition; the failure/cancellation test verifies statuses `"failed"`/`"cancelled"`, child id/reason diagnostics, `StepInput.context` metadata, and `StepDetail.backend/session_id`.
   - Implementer observed result: Both exact terminal-result tests passed once. Completed output was copied unchanged and routed by custom status, while failed/cancelled children produced the documented routable diagnostics and workflow step metadata.
 - [x] TODO-08: Support interactive child workflows through the parent's existing input flow.
-  - Procedure: Persist a workflow-child resume callback when the child waits, mirror the child prompt on the parent, and route `WorkflowRuntime::answer_run(parent_id, ...)` through the child executor. Add the two named tests, define `run_exact` as shown in **How to verify**, and run:
+  - Procedure: Persist a workflow-child resume callback when the child waits, mirror the child prompt on the parent, and route `WorkflowRuntime::provide_input_run(parent_id, ...)` through the child executor. Add the two named tests, define `run_exact` as shown in **How to verify**, and run:
 
     ```bash
-    run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_answers_repeated_child_prompts engine-prompts
+    run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_inputs_repeated_child_prompts engine-prompts
     run_exact cowboy-workflow-engine runtime::tests::workflow_action_parent_prompt_survives_runtime_reconstruction engine-prompt-restart
     ```
 
-  - Expected result: Both exact tests execute once and pass. The repeated-prompt test asserts the first and second child prompt ids/messages/choices appear on the parent in order, both answers use only the parent run id, the child id remains unchanged, and parent/child complete after the second answer. The reconstruction test drops and recreates `WorkflowRuntime` between prompt and answer, then asserts the persisted callback resumes the same child and advances the parent automatically.
+  - Expected result: Both exact tests execute once and pass. The repeated-prompt test asserts the first and second child input ids/messages/choices appear on the parent in order, both inputs use only the parent run id, the child id remains unchanged, and parent/child complete after the second answer. The reconstruction test drops and recreates `WorkflowRuntime` between prompt and answer, then asserts the persisted callback resumes the same child and advances the parent automatically.
   - Implementer observed result: Both exact interactive-child tests passed once. Repeated prompts were answered through the parent id with one stable child id, and a reconstructed runtime resumed the persisted child callback and completed the parent automatically.
 - [x] TODO-09: Isolate nested event collection and expose parent-visible child progress.
-  - Procedure: Filter both the receive loop and final drain in `run_existing_with_events` by the target run id; subscribe before async workflow-child callbacks so their parent progress is included in the current operation report; emit parent progress at child start/wait/resume/finish; add `runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress` with explicit nonempty event-set assertions for these four surfaces: `report_start.events` may contain only `parent_run_id`; `report_answer.events` may contain only `parent_run_id`; the persisted parent event file may contain only `parent_run_id`; and the persisted child event file may contain only `child_run_id`. Each parent surface must explicitly reject `child_run_id`, and the child file must explicitly reject `parent_run_id`. Define `run_exact` as shown in **How to verify**; and run:
+  - Procedure: Filter both the receive loop and final drain in `run_existing_with_events` by the target run id; subscribe before async workflow-child callbacks so their parent progress is included in the current operation report; emit parent progress at child start/wait/resume/finish; add `runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress` with explicit nonempty event-set assertions for these four surfaces: `report_start.events` may contain only `parent_run_id`; `report_input.events` may contain only `parent_run_id`; the persisted parent event file may contain only `parent_run_id`; and the persisted child event file may contain only `child_run_id`. Each parent surface must explicitly reject `child_run_id`, and the child file must explicitly reject `parent_run_id`. Define `run_exact` as shown in **How to verify**; and run:
 
     ```bash
     run_exact cowboy-workflow-engine runtime::tests::workflow_action_nested_events_are_isolated_and_parent_reports_progress engine-events
     ```
 
-  - Expected result: The exact test executes once and passes with these observed run-id sets: `ids(report_start.events) == {parent_run_id}`, `ids(report_answer.events) == {parent_run_id}`, `ids(parent_event_file) == {parent_run_id}`, and `ids(child_event_file) == {child_run_id}`. Concatenated parent operation reports contain the four exact lifecycle progress messages in order, the final parent report/file contains exactly one `StepCompleted { action: "workflow" }`, and the child file contains `RunCompleted`.
+  - Expected result: The exact test executes once and passes with these observed run-id sets: `ids(report_start.events) == {parent_run_id}`, `ids(report_input.events) == {parent_run_id}`, `ids(parent_event_file) == {parent_run_id}`, and `ids(child_event_file) == {child_run_id}`. Concatenated parent operation reports contain the four exact lifecycle progress messages in order, the final parent report/file contains exactly one `StepCompleted { action: "workflow" }`, and the child file contains `RunCompleted`.
   - Implementer observed result: The exact nested-event test passed once. Parent reports and persisted parent events contained only the parent id, child events contained only the child id, all four lifecycle messages appeared in order, and the parent emitted exactly one completed workflow action.
 - [x] TODO-10: Update all affected fixtures, exhaustive matches, documentation, and repository guidance.
   - Procedure: Define `record_command` as shown in **How to verify**. Build an explicit source inventory, generate and complete a one-row-per-match review ledger, run a zero-stale-enumeration guard, and compare workspace failures to the isolated baseline by test name rather than hard-coded counts:
@@ -360,7 +360,7 @@ Make child creation idempotent across retries, resume, and process interruption 
     record_command exhaustive-inventory bash -o pipefail -c '
       rg --sort path -n \
         -e "StepAction::" \
-        -e "action\\.(agent|command|status|ask_user|fail|workflow)" \
+        -e "action\\.(agent|command|status|wait_for_input|fail|workflow)" \
         -e "WorkflowRun \\{" \
         crates README.md AGENTS.md docs/architecture.md docs/module-map.md docs/workflow-authoring.md \
         | tee "$1"
@@ -441,7 +441,7 @@ Make child creation idempotent across retries, resume, and process interruption 
     record_command exhaustive-inventory-final bash -o pipefail -c '
       rg --sort path -n \
         -e "StepAction::" \
-        -e "action\\.(agent|command|status|ask_user|fail|workflow)" \
+        -e "action\\.(agent|command|status|wait_for_input|fail|workflow)" \
         -e "WorkflowRun \\{" \
         crates README.md AGENTS.md docs/architecture.md docs/module-map.md docs/workflow-authoring.md \
         | tee "$1"
@@ -453,9 +453,9 @@ Make child creation idempotent across retries, resume, and process interruption 
 
     record_command stale-enumeration-guard bash -o pipefail -c '
       if rg -n \
-        -e "\\[\"agent\", \"command\", \"status\", \"ask_user\", \"fail\"\\]" \
-        -e "\`agent\`, \`command\`, \`status\`, \`ask_user\`, \`fail\`" \
-        -e "agent, command, status, ask_user, and fail" \
+        -e "\\[\"agent\", \"command\", \"status\", \"wait_for_input\", \"fail\"\\]" \
+        -e "\`agent\`, \`command\`, \`status\`, \`wait_for_input\`, \`fail\`" \
+        -e "agent, command, status, wait_for_input, and fail" \
         crates README.md AGENTS.md docs/architecture.md docs/module-map.md docs/workflow-authoring.md \
         > "$1"; then
         cat "$1"
@@ -605,19 +605,19 @@ Make child creation idempotent across retries, resume, and process interruption 
        finish.run = function(ctx)
          return action.status {
            status = "child_ok",
-           fields = { answer = ctx.prev.fields.answer, marker = "child-output" },
+           fields = { input = ctx.prev.fields.input, marker = "child-output" },
            body = "child completed",
          }
        end
        local confirm = step("confirm")
        confirm.run = function(ctx)
-         return action.ask_user {
+         return action.wait_for_input {
            id = "child-confirm",
            message = "Continue child?",
            choices = { "yes" },
          }
        end
-       confirm:on("answered", finish)
+       confirm:on("provided", finish)
        return workflow("smoke-child", confirm)
        EOF
          cat > "$SMOKE_ROOT/workflows/parent.lua" <<EOF
@@ -626,7 +626,7 @@ Make child creation idempotent across retries, resume, and process interruption 
          return action.status {
            status = "success",
            fields = {
-             answer = ctx.prev.fields.answer,
+             input = ctx.prev.fields.input,
              child_status = ctx.prev.status,
              marker = ctx.prev.fields.marker,
            },
@@ -663,8 +663,8 @@ Make child creation idempotent across retries, resume, and process interruption 
        PARENT_RUN_ID="$(cat "$EVID/artifacts/parent-run-id.txt")"
        export PARENT_RUN_ID
 
-       record_command "$PREFIX-answer" target/debug/cowboy \
-         --config "$SMOKE_ROOT/config.toml" answer "$PARENT_RUN_ID" child-confirm yes
+       record_command "$PREFIX-provide-input" target/debug/cowboy \
+         --config "$SMOKE_ROOT/config.toml" provide-input "$PARENT_RUN_ID" child-confirm yes
        record_command "$PREFIX-runs" target/debug/cowboy \
          --config "$SMOKE_ROOT/config.toml" runs
        record_command "$PREFIX-child-id" bash -o pipefail -c '
@@ -682,16 +682,16 @@ Make child creation idempotent across retries, resume, and process interruption 
        ```bash
        record_command "$PREFIX-cli-assert" bash -o pipefail -c '
          START="$EVID_ROOT/raw/$PREFIX-start.log"
-         ANSWER="$EVID_ROOT/raw/$PREFIX-answer.log"
+         PROVIDE_INPUT="$EVID_ROOT/raw/$PREFIX-provide-input.log"
          RUNS="$EVID_ROOT/raw/$PREFIX-runs.log"
          {
            grep -F "status=WaitingForInput" "$START"
-           grep -F "prompt_id: \"child-confirm\"" "$START"
+           grep -F "input_id: \"child-confirm\"" "$START"
            grep -F "child workflow child started ($CHILD_RUN_ID)" "$START"
            grep -F "child workflow child waiting for input ($CHILD_RUN_ID)" "$START"
-           grep -F "run=$PARENT_RUN_ID workflow=parent status=Completed" "$ANSWER"
-           grep -F "child workflow child resumed ($CHILD_RUN_ID)" "$ANSWER"
-           grep -F "child workflow child finished ($CHILD_RUN_ID, status=child_ok)" "$ANSWER"
+           grep -F "run=$PARENT_RUN_ID workflow=parent status=Completed" "$PROVIDE_INPUT"
+           grep -F "child workflow child resumed ($CHILD_RUN_ID)" "$PROVIDE_INPUT"
+           grep -F "child workflow child finished ($CHILD_RUN_ID, status=child_ok)" "$PROVIDE_INPUT"
            test "$(grep -c "^run-" "$RUNS")" -eq 2
            test "$(grep -c "^  workflow: parent$" "$RUNS")" -eq 1
            test "$(grep -c "^  workflow: child$" "$RUNS")" -eq 1

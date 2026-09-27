@@ -16,7 +16,7 @@ Use the existing reviewed `scripts/run-exact-test.sh` artifact for focused proof
 
 Keep evidence generation and semantic validation independent. The deterministic restart fixture writes JSON evidence data only. Add a fixed, checked-in `scripts/validate-restart-workflow-evidence.py` validator whose implementation is reviewable independently of the fixture. The validator owns the evidence schemas and exits nonzero for missing/extra required artifacts, invalid JSON or field types, malformed restart/parent lineage, unequal workflow snapshots or config-set pointers, unequal inherited session identities/delivery metadata, replayed role/task sentinels, missing restart instructions or exact requests, dirty seed counters, unexpected source-run mutation, or inconsistent completed/failed statuses.
 
-The TUI owns only the interaction decision. Keep pending `ask_user` answers and active-agent prompt submission at their current higher priorities. When there is no execution task and the active run status is `Completed` or `Failed`, dispatch plain text to the runtime restart entry point using the active run id. Slash commands retain their existing behavior, and plain text after `Cancelled`, with no active run, or with an unknown durable status continues to start a normal new run.
+The TUI owns only the interaction decision. Keep pending `wait_for_input` answers and active-agent prompt submission at their current higher priorities. When there is no execution task and the active run status is `Completed` or `Failed`, dispatch plain text to the runtime restart entry point using the active run id. Slash commands retain their existing behavior, and plain text after `Cancelled`, with no active run, or with an unknown durable status continues to start a normal new run.
 
 # Changes
 
@@ -37,7 +37,7 @@ The TUI owns only the interaction decision. Keep pending `ask_user` answers and 
 - Update `crates/workflow/agent/src/prompt.rs` so an unseen restart sequence-zero input is introduced by the restart instruction and delivered exactly once. Keep ordinary initial/follow-up wording unchanged and continue deriving role/task inclusion from `RoleSession` delivery state.
 - Update `crates/workflow/agent/src/executor.rs` to derive ordered inputs with the `ExecutionContext` initial-input kind, preserve copied restart-session delivery metadata after successful load, and record the restart input/prompt block selection in existing `StepInput.context` diagnostics.
 - Update `crates/tui/app/src/app/state.rs` with a terminal restart target derived from the active run id, idle execution state, and durable `Completed`/`Failed` status.
-- Update `crates/tui/app/src/app/commands.rs` so plain idle input dispatches in this order: slash command, pending answer, terminal restart, normal new run. Add a restart-specific background card/status label while preserving exact draft/history behavior on successful dispatch and synchronous errors.
+- Update `crates/tui/app/src/app/commands.rs` so plain idle input dispatches in this order: slash command, pending input, terminal restart, normal new run. Add a restart-specific background card/status label while preserving exact draft/history behavior on successful dispatch and synchronous errors.
 - Update TUI composer copy in `crates/tui/app/src/app/controls/composer.rs` if needed so the idle terminal state communicates that Enter restarts the current workflow; do not alter active-agent, waiting-for-input, or cancelled-state affordances.
 - Reuse the existing reviewed `scripts/run-exact-test.sh` unchanged for all named focused tests. Document its exact-one discovery, one-pass/no-fail/no-ignore, marker, and command-error guarantees in the verification procedures.
 - Add `scripts/validate-restart-workflow-evidence.py` as a fixed repository validator and `scripts/tests/test_validate_restart_workflow_evidence.py` as its standard-library regression suite. Define strict schemas for the fixture config, source/restart run trees, session inheritance, and prompt evidence; reject unknown schema versions; compare source/restart data independently; print one success marker only after all semantic checks pass.
@@ -80,7 +80,7 @@ The TUI owns only the interaction decision. Keep pending `ask_user` answers and 
   - plain text after `Completed` calls restart for the active run and does not invoke workflow selection;
   - plain text after `Failed` follows the same restart path;
   - the resulting report switches `active_run_id` to the new run while retaining the old run in persistence;
-  - pending answers and active-agent prompt windows still take precedence;
+  - pending inputs and active-agent prompt windows still take precedence;
   - plain text after `Cancelled`, with no active run, or with unknown status still starts a normal run;
   - slash commands in terminal states remain slash commands;
   - successful restart submissions enter history once and clear the composer, while rejected restart submissions follow the existing error/history contract;
@@ -128,13 +128,13 @@ The TUI owns only the interaction decision. Keep pending `ask_user` answers and 
      'EVIDENCE tui-restart completed=true failed=true selector_bypassed=true'
    bash scripts/run-exact-test.sh cowboy \
      app::commands::tests::terminal_restart_preserves_submission_priority \
-     'EVIDENCE tui-restart priorities=slash,pending_answer,active_agent,restart,new_run'
+     'EVIDENCE tui-restart priorities=slash,pending_input,active_agent,restart,new_run'
    bash scripts/run-exact-test.sh cowboy \
      app::commands::tests::terminal_restart_updates_active_run \
      'EVIDENCE tui-restart source_retained=true active_run_switched=true'
    ```
 
-   Expected result: every gate proves exactly one fully qualified test exists, then reports `1 passed`, `0 failed`, and `0 ignored`, and observes its evidence marker. The tests prove completed/failed input takes the restart path, pending answers and active prompts still win, cancelled/unknown states retain normal start behavior, and the TUI follows the new run.
+   Expected result: every gate proves exactly one fully qualified test exists, then reports `1 passed`, `0 failed`, and `0 ignored`, and observes its evidence marker. The tests prove completed/failed input takes the restart path, pending inputs and active prompts still win, cancelled/unknown states retain normal start behavior, and the TUI follows the new run.
 
 4. Run affected regression and lint gates:
 
@@ -217,12 +217,12 @@ The TUI owns only the interaction decision. Keep pending `ask_user` answers and 
 - [x] TODO-04: Route completed and failed TUI plain-text submissions through the runtime restart path.
   - Procedure:
     1. Add an `AppState` terminal restart target for idle `Completed` and `Failed` active runs.
-    2. Insert restart dispatch after slash and pending-answer handling but before normal new-run dispatch.
+    2. Insert restart dispatch after slash and pending-input handling but before normal new-run dispatch.
     3. Add restart-specific task/card copy and preserve existing composer clearing, draft retention, and history rules.
-    4. Add state, command, input, and composer tests covering terminal, cancelled, unknown, pending-answer, active-agent, and slash-command cases.
+    4. Add state, command, input, and composer tests covering terminal, cancelled, unknown, pending-input, active-agent, and slash-command cases.
     5. Use the existing reviewed `scripts/run-exact-test.sh` unchanged. Make the three fully qualified `app::commands::tests::*` tests print the source-labeled markers from `How to verify`, then run them through the helper; require it to fail on command errors, zero or multiple exact matches, failed or ignored tests, a summary other than exactly one pass, or a missing marker.
   - Expected result: each gate proves one test was discovered and reports `1 passed`, `0 failed`, and `0 ignored`; completed/failed plain text restarts the visible workflow, all higher-priority input paths remain unchanged, excluded states still start normally, and the active TUI state follows the new run id.
-  - Implementer observed result: all three exact TUI tests were discovered once and each reported exactly `1 passed`, `0 failed`, and `0 ignored` with the required source-labeled marker. The tests observed completed and failed restart routing without selector use, priority order `slash,pending_answer,active_agent,restart,new_run`, source-run retention, active-run switching, excluded-state normal starts, and restart-specific composer copy.
+  - Implementer observed result: all three exact TUI tests were discovered once and each reported exactly `1 passed`, `0 failed`, and `0 ignored` with the required source-labeled marker. The tests observed completed and failed restart routing without selector use, priority order `slash,pending_input,active_agent,restart,new_run`, source-run retention, active-run switching, excluded-state normal starts, and restart-specific composer copy.
 
 - [x] TODO-05: Document and validate the terminal restart contract across runtime and TUI surfaces.
   - Procedure:

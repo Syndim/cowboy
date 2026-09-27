@@ -4,10 +4,10 @@ return function(id)
   local confirm = step(id or "confirm_plan")
   confirm.run = function(ctx)
     local fields = (ctx.prev and ctx.prev.fields) or {}
-    if ctx.prev and ctx.prev.action == "ask_user" then
-      local answer = fields.answer
-      if answer and tostring(answer) ~= "" then
-        local normalized = string.lower(tostring(answer))
+    if ctx.prev and ctx.prev.action == "wait_for_input" then
+      local value = fields.input
+      if value and tostring(value) ~= "" then
+        local normalized = string.lower(tostring(value))
         if normalized == "yes" or normalized == "y" or normalized == "approve" or normalized == "approved" then
           local reviewed_plan = fields.plan or context.previous_step_context(ctx, "Reviewed planning artifacts:")
           return action.status {
@@ -20,10 +20,10 @@ return function(id)
         return action.status {
           status = "changes_requested",
           fields = {
-            feedback = tostring(answer),
-            changes_needed = { tostring(answer) },
+            feedback = tostring(value),
+            changes_needed = { tostring(value) },
             change_context = "The user requested these plan changes during confirmation.",
-            user_feedback = context.append_user_feedback(fields, "Plan confirmation", answer),
+            user_feedback = context.append_user_feedback(fields, "Plan confirmation", value),
             goal = fields.goal,
             validation = fields.validation,
             work_dir = fields.work_dir,
@@ -38,10 +38,10 @@ return function(id)
     end
 
     local reviewed_plan = fields.plan or context.previous_step_context(ctx, "Reviewed planning artifacts:")
-    local prompt_id = "plan_confirmation_" .. tostring(ctx.steps_executed or 0)
+    local input_id = "plan_confirmation_" .. tostring(ctx.steps_executed or 0)
     local subject = fields.validation_doc and "planning artifacts" or "plan"
-    return action.ask_user {
-      id = prompt_id,
+    return action.wait_for_input {
+      id = input_id,
       message = "Review the approved " .. subject .. " below. Type 'yes' to approve, or describe the changes you want before implementation.\n" .. tostring(reviewed_plan),
       choices = {},
       fields = { plan = reviewed_plan, user_feedback = context.copy_user_feedback(fields), goal = fields.goal, validation = fields.validation, work_dir = fields.work_dir, plan_doc = fields.plan_doc, validation_doc = fields.validation_doc, rca_doc = fields.rca_doc, repro_test = fields.repro_test },

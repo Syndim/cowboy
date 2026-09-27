@@ -4,7 +4,7 @@ Change the TUI active-run input model from "composer disabled" to "composer edit
 
 Split that behavior into two explicit concepts: the composer accepts draft editing while a run is active, but plain `Enter` may submit only when there is no active background task or when the run is waiting for an input prompt. Update the composer header/title and status copy to say that draft typing is allowed and `Enter` is blocked until the active run blocks, finishes, or is cancelled.
 
-`WaitingForInput` must remain the prompt-answer exception: when `pending_prompt()` is present, typing and `Enter` should still answer that prompt through the existing `commands::dispatch_submitted_input` path.
+`WaitingForInput` must remain the prompt-input exception: when `pending_prompt()` is present, typing and `Enter` should still answer that prompt through the existing `commands::dispatch_submitted_input` path.
 
 # Changes
 
@@ -26,7 +26,7 @@ Split that behavior into two explicit concepts: the composer accepts draft editi
   - Suppress slash suggestions while submit is blocked if `Tab` completion remains inert.
 - In `crates/tui/src/app/controls/status.rs`, replace `input disabled while run active` with draft-only copy, for example `draft allowed ─ Enter waits for active run ─ Esc cancel`.
 - In render-level assertions under `crates/tui/src/app/tests.rs`, update expectations that currently require disabled copy so they instead require draft-only copy and editable input visibility.
-- Preserve prompt-answer behavior in `crates/tui/src/app/commands.rs`: `pending_prompt_answer_target()` should still route normal text to `spawn_answer_task`, and answer submission should temporarily close the submit gate again once the answer task starts running.
+- Preserve prompt-input behavior in `crates/tui/src/app/commands.rs`: `pending_prompt_input_target()` should still route normal text to `spawn_input_task`, and input submission should temporarily close the submit gate again once the input task starts running.
 
 # Tests to be added/updated
 
@@ -41,7 +41,7 @@ Split that behavior into two explicit concepts: the composer accepts draft editi
 - Update or replace `crates/tui/src/app/state.rs` coverage so the new edit/submit gates are tested independently:
   - idle state allows edits and submit;
   - active background task allows edits but blocks submit;
-  - `WorkflowEventKind::WaitingForInput` allows edits and submit for prompt answers;
+  - `WorkflowEventKind::WaitingForInput` allows edits and submit for prompt input;
   - completed, failed, drained, or cancelled background tasks allow submit again once no background task remains.
 - Update `crates/tui/src/app/controls/composer.rs` tests:
   - active-run title says draft typing is allowed and `Enter` is blocked/waits;
@@ -66,7 +66,7 @@ Split that behavior into two explicit concepts: the composer accepts draft editi
   - press plain `Enter` while the run is active and confirm no second run starts, the draft remains in the composer, and no history entry is written;
   - confirm the composer/status hint says draft typing is allowed but `Enter` is unavailable until the active run blocks or finishes;
   - press `Esc` during an active run and confirm cancellation still works;
-  - start or use a workflow that reaches `WaitingForInput`; confirm `Enter` still submits the prompt answer;
+  - start or use a workflow that reaches `WaitingForInput`; confirm `Enter` still submits the prompt input;
   - after the active run completes or is cancelled, press `Enter` with the saved draft and confirm it starts normally.
 
 Manual smoke evidence (2026-07-07 follow-up): ran `cargo run -p cowboy -- --config <temp-config>` through a real pseudo-terminal. Verified an active run accepted typing, bracketed paste, cursor left/right movement, Backspace deletion/replacement, and Ctrl-J newline input; the composer/status hint said draft typing was allowed and Enter waits; plain Enter did not submit while active and the draft remained; Esc cancelled the active task; the saved draft submitted after cancellation; a WaitingForInput workflow accepted an Enter-submitted answer and completed.
@@ -79,7 +79,7 @@ Paste follow-up evidence (2026-07-07): removed the `handle_paste` helper. Paste 
 - [x] Update active-run key handling so edits work but plain Enter cannot submit.
 - [x] Allow paste to edit the draft while a run is active.
 - [x] Keep active-run global controls unchanged.
-- [x] Preserve WaitingForInput answer submission as the submit-gate exception.
+- [x] Preserve WaitingForInput input submission as the submit-gate exception.
 - [x] Update composer title/header copy for draft-only active-run input.
 - [x] Remove or replace disabled-input composer notice and height reservation.
 - [x] Render the input cursor while active-run draft editing is allowed.

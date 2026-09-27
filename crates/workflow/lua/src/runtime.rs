@@ -169,19 +169,19 @@ mod tests {
     }
 
     #[test]
-    fn converts_ask_user_action() {
+    fn converts_wait_for_input_action() {
         let source = snapshot(
             r#"
             local step = step("approve")
             step.run = function(ctx)
-              return action.ask_user { id = "approval", message = "Approve?", choices = { yes = "Approve the release", no = "Reject the release" }, status = "accepted", fields = { plan = "ship" } }
+              return action.wait_for_input { id = "approval", message = "Approve?", choices = { yes = "Approve the release", no = "Reject the release" }, status = "accepted", fields = { plan = "ship" } }
             end
             return workflow("wf", step)
             "#,
         );
         let result = run_step(&source, "approve", serde_json::json!({})).unwrap();
-        let StepAction::AskUser(action) = result.action else {
-            panic!("expected ask_user action")
+        let StepAction::WaitForInput(action) = result.action else {
+            panic!("expected wait_for_input action")
         };
         assert_eq!(action.id, "approval");
         assert_eq!(
@@ -199,6 +199,41 @@ mod tests {
         );
         assert_eq!(action.status, "accepted");
         assert_eq!(action.fields["plan"], "ship");
+    }
+
+    #[test]
+    fn removed_ask_user_function_is_not_compatible() {
+        let source = snapshot(
+            r#"
+            local step = step("approve")
+            step.run = function(ctx)
+              return action.ask_user { id = "approval", message = "Approve?" }
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let err = run_step(&source, "approve", serde_json::json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains("attempt to call a nil value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn converter_rejects_removed_ask_user_action_kind() {
+        let source = snapshot(
+            r#"
+            local step = step("approve")
+            step.run = function(ctx)
+              local pending = action.wait_for_input { id = "approval", message = "Approve?" }
+              pending.action = "ask_user"
+              return pending
+            end
+            return workflow("wf", step)
+            "#,
+        );
+        let err = run_step(&source, "approve", serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, Error::UnknownAction(kind) if kind == "ask_user"));
     }
 
     #[test]
