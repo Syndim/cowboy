@@ -12,6 +12,11 @@ use super::transport::{Transport, TransportConfig};
 use async_trait::async_trait;
 
 const CONTINUE_PROMPT: &str = "Continue";
+const DENIED_TOOL_ERROR: &str = "ACP tool use is disabled for this agent";
+
+fn allow_tools_by_default() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -64,6 +69,10 @@ pub struct Client {
     session_descriptor: Option<AgentSessionDescriptor>,
     #[serde(default)]
     watchdog: AgentWatchdogOptions,
+    #[serde(default = "allow_tools_by_default")]
+    allow_tools: bool,
+    #[serde(default)]
+    tool_policy_violated: bool,
     #[cfg(test)]
     #[serde(skip)]
     replacement_factory: ReplacementTransportFactory,
@@ -118,6 +127,8 @@ impl Clone for Client {
             pushback: Vec::new(),
             session_descriptor: self.session_descriptor.clone(),
             watchdog: self.watchdog,
+            allow_tools: self.allow_tools,
+            tool_policy_violated: self.tool_policy_violated,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
             #[cfg(test)]
@@ -136,6 +147,8 @@ impl std::fmt::Debug for Client {
             .field("agent_info", &self.agent_info)
             .field("session_descriptor", &self.session_descriptor)
             .field("watchdog", &self.watchdog)
+            .field("allow_tools", &self.allow_tools)
+            .field("tool_policy_violated", &self.tool_policy_violated)
             .finish()
     }
 }
@@ -656,6 +669,8 @@ impl Client {
             pushback: Vec::new(),
             session_descriptor: None,
             watchdog,
+            allow_tools: true,
+            tool_policy_violated: false,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
             #[cfg(test)]
@@ -702,6 +717,12 @@ impl Client {
 
     pub fn watchdog_options(&self) -> AgentWatchdogOptions {
         self.watchdog
+    }
+
+    /// Allow ACP tool use for this client by default. When disabled, an observed
+    /// violation remains fatal across subsequent prompts, clones and reconnects.
+    pub fn set_allow_tools(&mut self, allow_tools: bool) {
+        self.allow_tools = allow_tools;
     }
 
     /// Create a new ACP session.
@@ -917,7 +938,7 @@ impl Client {
     /// Send a prompt and collect all session/update events until the turn ends.
     ///
     /// Collects streaming session/update notifications and forwards them to event_handler.
-    /// Automatically grants agent permission requests; executor and reviewer roles both have full permissions.
+    /// Permission requests are granted by default, but cancelled when tool use is denied.
     /// When the matching JSON-RPC response arrives, extracts and returns stopReason.
     ///
     /// Per the ACP spec, `end_turn` means the agent finished its response for
@@ -942,13 +963,24 @@ impl Client {
         mut cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         const MAX_CONTINUATIONS: u32 = 5;
         let mut content = prompt_content;
 
         for attempt in 0..=MAX_CONTINUATIONS {
             let outcome = self
                 .prompt_turn(session_id, content, &mut cancellation, event_handler)
-                .await?;
+                .await
+                .map_err(|err| {
+                    if self.tool_policy_violated {
+                        anyhow::anyhow!(DENIED_TOOL_ERROR)
+                    } else {
+                        err
+                    }
+                })?;
 
             // Done if the agent produced visible text, stopped for a reason
             // other than a normal end_turn, or completed after a permission
@@ -1196,20 +1228,28 @@ impl Client {
                 WatchdogTimeout,
             }
             let outcome = if external_cancellation_sent {
-                WaitOutcome::Message(self.recv_message().await)
+                WaitOutcome::Message(self.recv_message_raw().await)
             } else {
                 tokio::select! {
                     biased;
-                    message = self.recv_message() => WaitOutcome::Message(message),
+                    message = self.recv_message_raw() => WaitOutcome::Message(message),
                     () = cancellation.cancelled() => WaitOutcome::ExternalCancellation,
                     () = &mut response_deadline => WaitOutcome::WatchdogTimeout,
                 }
             };
 
+            if let WaitOutcome::Message(Ok(ref message)) = outcome {
+                self.reject_forbidden_message(message).await?;
+            }
+
             let msg = match outcome {
                 WaitOutcome::Message(message) => match message {
                     Ok(message) => message,
                     Err(err) => {
+                        if self.tool_policy_violated {
+                            anyhow::bail!(DENIED_TOOL_ERROR);
+                        }
+
                         if external_cancellation_sent {
                             return Err(err);
                         }
@@ -1307,11 +1347,11 @@ impl Client {
                             Timeout,
                         }
                         let outcome = if external_cancellation_sent {
-                            CancelGraceOutcome::Message(self.recv_message().await)
+                            CancelGraceOutcome::Message(self.recv_message_raw().await)
                         } else {
                             tokio::select! {
                                 biased;
-                                message = self.recv_message() => CancelGraceOutcome::Message(message),
+                                message = self.recv_message_raw() => CancelGraceOutcome::Message(message),
                                 () = cancellation.cancelled() => CancelGraceOutcome::ExternalCancellation,
                                 () = &mut cancel_deadline => CancelGraceOutcome::Timeout,
                             }
@@ -1331,9 +1371,16 @@ impl Client {
                                 continue 'monitor;
                             }
                         };
+                        if let Ok(ref message) = message {
+                            self.reject_forbidden_message(message).await?;
+                        }
                         let message = match message {
                             Ok(message) => message,
                             Err(err) => {
+                                if self.tool_policy_violated {
+                                    anyhow::bail!(DENIED_TOOL_ERROR);
+                                }
+
                                 if external_cancellation_sent {
                                     return Err(err);
                                 }
@@ -1486,8 +1533,11 @@ impl Client {
                 _ => {}
             }
         };
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
 
-        if matches!(stop_reason, StopReason::Cancelled) {
+        if matches!(stop_reason, StopReason::Cancelled) && self.allow_tools {
             tracing::debug!(
                 session_id,
                 id,
@@ -1505,12 +1555,18 @@ impl Client {
         // yet, wait generously: some backends (e.g. Oh My Pi) may acknowledge the
         // prompt before they start streaming, and first-token latency can be
         // several seconds, so a short window would silently drop the whole reply.
-        let drain_ms = if matches!(activity, PromptTurnActivity::Text) {
+        let drain_ms = if matches!(stop_reason, StopReason::Cancelled)
+            || matches!(activity, PromptTurnActivity::Text)
+        {
             500
         } else {
             15_000
         };
-        let saw_trailing_text = self.drain_trailing_events(event_handler, drain_ms).await;
+        let saw_trailing_text = self.drain_trailing_events(event_handler, drain_ms).await?;
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         activity.observe_trailing_text(saw_trailing_text);
 
         tracing::debug!(
@@ -1541,26 +1597,34 @@ impl Client {
         &mut self,
         event_handler: &mut (dyn FnMut(Event) + Send),
         initial_timeout_ms: u64,
-    ) -> bool {
+    ) -> anyhow::Result<bool> {
         use tokio::time::{Duration, timeout};
 
         let mut drain_timeout = Duration::from_millis(initial_timeout_ms);
         let mut saw_text = false;
 
-        let Some(transport) = self.transport.as_mut() else {
-            return saw_text;
-        };
+        if self.transport.is_none() {
+            return Ok(saw_text);
+        }
         let mut pushback_line = None;
 
-        while let Ok(Ok(Some(line))) = timeout(drain_timeout, transport.recv()).await {
+        loop {
+            let line = {
+                let transport = self.transport_mut()?;
+                match timeout(drain_timeout, transport.recv()).await {
+                    Ok(Ok(Some(line))) => line,
+                    _ => break,
+                }
+            };
             let line = line.trim().to_string();
             if line.is_empty() {
                 continue;
             }
-            tracing::debug!(payload = %line, "ACP <<< trailing");
             if let Ok(json) = serde_json::from_str::<Value>(&line)
                 && let Some(msg) = parse_acp_message(&json)
             {
+                self.reject_forbidden_message(&msg).await?;
+                tracing::debug!(payload = %line, "ACP <<< trailing");
                 match msg {
                     Message::SessionUpdate { update, .. } => {
                         if matches!(update, Event::MessageChunk { .. }) {
@@ -1584,7 +1648,7 @@ impl Client {
             self.pushback.push(line);
         }
 
-        saw_text
+        Ok(saw_text)
     }
 
     /// Check whether the agent supports session/load, based on agentCapabilities from initialize.
@@ -1731,11 +1795,52 @@ impl Client {
         Ok(())
     }
 
+    /// Reject forbidden tool activity before any caller can forward it or
+    /// accept a successful response. Permission requests receive an ACP
+    /// cancelled response, even during replay, cancellation grace and drain.
+    async fn reject_forbidden_message(&mut self, msg: &Message) -> anyhow::Result<()> {
+        if self.allow_tools {
+            return Ok(());
+        }
+
+        match msg {
+            Message::PermissionRequest { id, .. } => {
+                self.tool_policy_violated = true;
+                let response = JsonRpcResponse::new(*id, PermissionOutcome::cancelled());
+                let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+                let sent = async {
+                    let line = serde_json::to_string(&response)?;
+                    self.transport_mut()?.send(&line).await
+                };
+                if !matches!(tokio::time::timeout(timeout, sent,).await, Ok(Ok(()))) {
+                    tracing::warn!("ACP tool denial could not be sent; terminating transport");
+                    self.cleanup_replacement().await;
+                }
+
+                anyhow::bail!(DENIED_TOOL_ERROR);
+            }
+            Message::SessionUpdate {
+                update: Event::ToolCall { .. } | Event::ToolCallUpdate { .. },
+                ..
+            } => {
+                self.tool_policy_violated = true;
+                anyhow::bail!(DENIED_TOOL_ERROR);
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Receive and parse the next ACP message from the transport.
     ///
     /// Keeps reading until it gets one parseable ACP message.
     /// Skips empty lines and unrecognized message formats.
     async fn recv_message(&mut self) -> anyhow::Result<Message> {
+        let msg = self.recv_message_raw().await?;
+        self.reject_forbidden_message(&msg).await?;
+        Ok(msg)
+    }
+
+    async fn recv_message_raw(&mut self) -> anyhow::Result<Message> {
         loop {
             // Check pushback buffer first
             let line = if let Some(pushed) = self.pushback.pop() {
@@ -1754,15 +1859,23 @@ impl Client {
             }
 
             let json: Value = serde_json::from_str(&line).map_err(|e| {
-                anyhow::anyhow!("Failed to parse JSON from agent: {e}\nLine: {line}")
+                if !self.allow_tools {
+                    anyhow::anyhow!("Failed to parse ACP message: {e}")
+                } else {
+                    anyhow::anyhow!("Failed to parse JSON from agent: {e}\nLine: {line}")
+                }
             })?;
 
             if let Some(msg) = parse_acp_message(&json) {
-                tracing::debug!(payload = %line, "ACP <<< received");
-                log_acp_message("inbound", &msg);
+                if self.allow_tools {
+                    tracing::debug!(payload = %line, "ACP <<< received");
+                    log_acp_message("inbound", &msg);
+                }
                 return Ok(msg);
             }
-            tracing::warn!(payload = %line, "ACP <<< skipping unrecognized message");
+            if self.allow_tools {
+                tracing::warn!(payload = %line, "ACP <<< skipping unrecognized message");
+            }
         }
     }
 
@@ -1789,6 +1902,7 @@ impl Client {
             })?;
 
             if let Some(msg) = parse_acp_message(&json) {
+                self.reject_forbidden_message(&msg).await?;
                 tracing::debug!(payload = %line, "ACP <<< received");
                 log_acp_message("inbound_direct", &msg);
                 return Ok(msg);
@@ -3036,6 +3150,368 @@ mod tests {
         assert_eq!(perm_resp["id"], 100);
         assert_eq!(perm_resp["result"]["outcome"]["outcome"], "selected");
         assert_eq!(perm_resp["result"]["outcome"]["optionId"], "allow-once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allow_tools_false_never_completes_when_denial_send_is_blocked() {
+        for case in [
+            "external",
+            "watchdog_grace",
+            "trailing_response",
+            "send_error",
+            "terminate_pending",
+        ] {
+            let counters = Arc::new(ScriptedTransportCounters::default());
+            let mut incoming = vec![ScriptedReceive::Message(init_response(0))];
+            if case == "watchdog_grace" {
+                incoming.push(ScriptedReceive::Pending);
+            }
+            if case == "trailing_response" {
+                incoming.push(ScriptedReceive::Message(text_chunk_update(
+                    "sess_1", "answer",
+                )));
+                incoming.push(ScriptedReceive::Message(prompt_response(1, "end_turn")));
+            }
+            incoming.push(ScriptedReceive::Message(permission_request(
+                100,
+                "sess_1",
+                "private tool",
+            )));
+            if case != "trailing_response" {
+                incoming.push(ScriptedReceive::Message(prompt_response(1, "end_turn")));
+            }
+            let denial_send = if case == "watchdog_grace" { 3 } else { 2 };
+            let send_action = if case == "send_error" {
+                ScriptedOperation::Error("private send failure")
+            } else {
+                ScriptedOperation::Pending
+            };
+            let mut transport = ScriptedTransport::new(incoming, counters.clone())
+                .send_action(denial_send, send_action);
+            if case == "terminate_pending" {
+                transport = transport.force_action(ScriptedOperation::Pending);
+            }
+            let (mut client, _) = scripted_client(transport).await;
+            client.set_allow_tools(false);
+            let cancellation = if case == "external" {
+                PromptTurnCancellation::from_future(async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                })
+            } else {
+                PromptTurnCancellation::disabled()
+            };
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("answer")],
+                    cancellation,
+                    &mut |_| {},
+                )
+                .await;
+            assert_denied_prompt(result);
+            assert_eq!(
+                counters.force_terminated.load(Ordering::SeqCst),
+                1,
+                "{case}"
+            );
+            assert!(client.transport.is_none(), "{case}");
+        }
+    }
+
+    fn assert_denied_prompt(result: anyhow::Result<StopReason>) {
+        assert_eq!(result.unwrap_err().to_string(), DENIED_TOOL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn allow_tools_false_cancels_permission_and_poisoned_client_cannot_prompt_again() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        client.set_allow_tools(false);
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("write a file")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+
+        assert_eq!(
+            next_outgoing(&mut outgoing_rx).await["method"],
+            "session/prompt"
+        );
+        incoming_tx
+            .send(permission_request(100, "sess_1", "private-tool-title"))
+            .unwrap();
+        let response = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(response["id"], 100);
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+        assert!(response["result"]["outcome"].get("optionId").is_none());
+
+        let (mut client, result) = prompt.await.unwrap();
+        assert_denied_prompt(result);
+        assert_denied_prompt(
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("retry")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await,
+        );
+        assert!(
+            outgoing_rx.try_recv().is_err(),
+            "no retry may be dispatched"
+        );
+
+        let mut cloned = client.clone();
+        assert_denied_prompt(
+            cloned
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("retry")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await,
+        );
+        let persisted = serde_json::to_value(&client).unwrap();
+        let mut restored: Client = serde_json::from_value(persisted).unwrap();
+        restored.set_allow_tools(true);
+        assert_denied_prompt(
+            restored
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("retry")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_tools_false_rejects_unprompted_tool_events_without_forwarding_them() {
+        for forbidden in [
+            tool_call_started(
+                "sess_1",
+                "call_1",
+                "secret tool title",
+                "execute",
+                "pending",
+            ),
+            tool_call_progress("sess_1", "call_1", "completed"),
+        ] {
+            let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+            client.set_allow_tools(false);
+            incoming_tx.send(forbidden).unwrap();
+            incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+            let prompt = tokio::spawn(async move {
+                let mut events = Vec::new();
+                let result = client
+                    .prompt(
+                        "sess_1",
+                        vec![PromptContent::text("answer without tools")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |event| events.push(event),
+                    )
+                    .await;
+                (result, events)
+            });
+
+            assert_eq!(
+                next_outgoing(&mut outgoing_rx).await["method"],
+                "session/prompt"
+            );
+            let (result, events) = prompt.await.unwrap();
+            assert_denied_prompt(result);
+            assert!(events.is_empty(), "forbidden events must not be forwarded");
+        }
+    }
+
+    #[tokio::test]
+    async fn allow_tools_false_still_completes_tool_free_prompts() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        client.set_allow_tools(false);
+        let prompt = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("answer without tools")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |event| events.push(event),
+                )
+                .await;
+            (result, events)
+        });
+
+        assert_eq!(
+            next_outgoing(&mut outgoing_rx).await["method"],
+            "session/prompt"
+        );
+        incoming_tx
+            .send(text_chunk_update("sess_1", "safe answer"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        let (result, events) = prompt.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::MessageChunk { .. }));
+    }
+
+    #[tokio::test]
+    async fn allow_tools_false_rejects_tool_updates_trailing_successful_responses() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        client.set_allow_tools(false);
+        let prompt = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("answer")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |event| events.push(event),
+                )
+                .await;
+            (result, events)
+        });
+
+        assert_eq!(
+            next_outgoing(&mut outgoing_rx).await["method"],
+            "session/prompt"
+        );
+        incoming_tx
+            .send(text_chunk_update("sess_1", "ordinary text"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        incoming_tx
+            .send(tool_call_progress("sess_1", "secret-id", "completed"))
+            .unwrap();
+        let (result, events) = prompt.await.unwrap();
+        assert_denied_prompt(result);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Event::MessageChunk { .. }));
+    }
+
+    #[tokio::test]
+    async fn allow_tools_false_cancels_permission_after_prompt_response() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        client.set_allow_tools(false);
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("answer")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+
+        assert_eq!(
+            next_outgoing(&mut outgoing_rx).await["method"],
+            "session/prompt"
+        );
+        incoming_tx
+            .send(text_chunk_update("sess_1", "apparently complete"))
+            .unwrap();
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        incoming_tx
+            .send(permission_request(100, "sess_1", "secret tool"))
+            .unwrap();
+        let denial = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(denial["id"], 100);
+        assert_eq!(denial["result"]["outcome"]["outcome"], "cancelled");
+        assert_denied_prompt(prompt.await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allow_tools_false_catches_permission_and_tool_during_watchdog_grace() {
+        for permission in [false, true] {
+            let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+            client.set_allow_tools(false);
+            let prompt = tokio::spawn(async move {
+                let mut events = Vec::new();
+                let result = client
+                    .prompt(
+                        "sess_1",
+                        vec![PromptContent::text("answer")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |event| events.push(event),
+                    )
+                    .await;
+                (result, events)
+            });
+            assert_eq!(
+                next_outgoing(&mut outgoing_rx).await["method"],
+                "session/prompt"
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert_eq!(
+                next_outgoing(&mut outgoing_rx).await["method"],
+                "session/cancel"
+            );
+            if permission {
+                incoming_tx
+                    .send(permission_request(100, "sess_1", "secret tool"))
+                    .unwrap();
+                let denial = next_outgoing(&mut outgoing_rx).await;
+                assert_eq!(denial["id"], 100);
+                assert_eq!(denial["result"]["outcome"]["outcome"], "cancelled");
+            } else {
+                incoming_tx
+                    .send(tool_call_started(
+                        "sess_1",
+                        "call_1",
+                        "secret tool",
+                        "execute",
+                        "pending",
+                    ))
+                    .unwrap();
+            }
+            let (result, events) = prompt.await.unwrap();
+            assert_denied_prompt(result);
+            assert!(events.is_empty());
+            assert!(
+                outgoing_rx.try_recv().is_err(),
+                "no continuation after violation"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn allow_tools_false_catches_tool_use_on_automatic_continuation() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        client.set_allow_tools(false);
+        let prompt = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("answer")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        assert_eq!(
+            next_outgoing(&mut outgoing_rx).await["method"],
+            "session/prompt"
+        );
+        incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let continuation = next_outgoing(&mut outgoing_rx).await;
+        assert_eq!(continuation["method"], "session/prompt");
+        assert_eq!(continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT);
+        incoming_tx
+            .send(tool_call_progress("sess_1", "call_1", "completed"))
+            .unwrap();
+        incoming_tx.send(prompt_response(2, "end_turn")).unwrap();
+        assert_denied_prompt(prompt.await.unwrap());
     }
 
     #[tokio::test]

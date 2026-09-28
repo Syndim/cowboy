@@ -134,13 +134,14 @@ async fn generate_request_topic_result(
 ) -> Result<String> {
     let resolver = AgentResolver::new(config.agents.clone())?;
     let agent = resolver.resolve_default()?;
-    let client = connector
+    let mut client = connector
         .connect(
             transport_for(&config.allowed_env, agent),
             watchdog_options_for(agent),
         )
         .await
         .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+    client.set_allow_tools(agent.allow_tools);
     let generator = AgentRequestTopicGenerator::new(
         client,
         config.cwd.to_string_lossy().to_string(),
@@ -172,13 +173,14 @@ impl ClientFactory for AcpClientFactory {
             provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
             "resolving ACP client for role"
         );
-        let client = self
+        let mut client = self
             .connector
             .connect(
                 transport_for(&self.global_allowed_env, agent),
                 watchdog_options_for(agent),
             )
             .await?;
+        client.set_allow_tools(agent.allow_tools);
         Ok(ResolvedAgentClient {
             client: Box::new(client),
             model: agent.model.clone(),
@@ -216,10 +218,78 @@ pub(crate) fn watchdog_options_for(agent: &AgentRuntimeConfig) -> AgentWatchdogO
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use parking_lot::Mutex;
+
+    use cowboy_agent_acp::transport::Transport;
+    use cowboy_agent_client::{Event, PromptContent, PromptTurnCancellation, StopReason};
 
     use super::*;
     use crate::runtime::AgentWatchdogRuntimeConfig;
+
+    struct ScriptedAcpTransport {
+        incoming: VecDeque<String>,
+    }
+
+    #[async_trait]
+    impl Transport for ScriptedAcpTransport {
+        async fn send(&mut self, _message: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+            Ok(self.incoming.pop_front())
+        }
+
+        async fn close(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PolicyAcpConnector;
+
+    #[async_trait]
+    impl AcpConnector for PolicyAcpConnector {
+        async fn connect(
+            &self,
+            transport: TransportConfig,
+            watchdog: AgentWatchdogOptions,
+        ) -> anyhow::Result<AcpClient> {
+            let response = |id, result: serde_json::Value| {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+            };
+            let update = |update: serde_json::Value| {
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": {"sessionId": "session-1", "update": update}
+                })
+                .to_string()
+            };
+            let incoming = VecDeque::from([
+                response(
+                    0,
+                    serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
+                ),
+                response(1, serde_json::json!({"sessionId": "session-1"})),
+                update(serde_json::json!({
+                    "sessionUpdate": "tool_call", "toolCallId": "secret-tool-id",
+                    "title": "secret-tool-title", "kind": "execute", "status": "completed"
+                })),
+                update(serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "response"}
+                })),
+                response(2, serde_json::json!({"stopReason": "end_turn"})),
+            ]);
+            AcpClient::connect_with_transport_and_options(
+                Box::new(ScriptedAcpTransport { incoming }),
+                transport,
+                watchdog,
+            )
+            .await
+        }
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct RecordedAcpConnection {
@@ -273,6 +343,7 @@ mod tests {
             args: Vec::new(),
             model: None,
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds,
                 cancel_timeout_seconds,
@@ -304,6 +375,7 @@ mod tests {
             args: vec![],
             model: None,
             allowed_env: Vec::new(),
+            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds: 7,
                 cancel_timeout_seconds: 8,
@@ -319,6 +391,50 @@ mod tests {
                 recovery_operation_timeout_seconds: 9,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn factory_rejects_named_role_tool_activity_but_keeps_default_unrestricted() {
+        let mut config = config();
+        config.agents[1].allow_tools = false;
+        let dependencies = ProductionRuntimeDependencies::new(Arc::new(PolicyAcpConnector));
+        let factory = dependencies.agent_factory(&config).unwrap();
+
+        for (agent_name, allow_tools) in [("named", false), ("default", true)] {
+            let role = RoleDefinition {
+                id: "developer".to_string(),
+                instructions: "work".to_string(),
+                agent: Some(agent_name.to_string()),
+                properties: serde_json::Value::Null,
+            };
+            let mut resolved = factory.create_client(&role).await.unwrap();
+            assert_eq!(resolved.backend, agent_name);
+            let session = resolved.client.new_session(".", &[], None).await.unwrap();
+            let mut events = Vec::new();
+            let result = resolved
+                .client
+                .prompt(
+                    &session,
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(std::future::pending()),
+                    &mut |event| events.push(event),
+                )
+                .await;
+
+            if !allow_tools {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("tool"), "{error}");
+                assert!(!error.contains("secret-tool-title"), "{error}");
+                assert!(events.is_empty(), "tool events must not reach the role");
+            } else {
+                assert!(matches!(result.unwrap(), StopReason::EndTurn));
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, Event::ToolCall { .. }))
+                );
+            }
+        }
     }
 
     #[tokio::test]

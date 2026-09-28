@@ -258,6 +258,7 @@ args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 name = "reviewer"
 command = "omp"
 args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
+# allow_tools = false # Also disable tools in the backend's own configuration.
 
 [[agents]]
 name = "implementer"
@@ -293,6 +294,15 @@ improvement. Each `[[agents]].allowed_env` is additive for that selected agent:
 the child receives the union of the global names and that agent's names.
 Multiple roles selecting the same named agent intentionally share its policy;
 use separate agent entries when roles need different policies.
+
+Set `allow_tools = false` on an `[[agents]]` entry to reject that agent's ACP
+tool permission requests and tool-call events for every role using the entry.
+The default is `true`; this setting does not alter model selection. Configure
+the backend itself to run without tools as well (using its supported launch
+arguments or configuration). ACP tool-call notifications can arrive only after
+execution, so Cowboy's denial is a defense in depth, not a substitute for
+disabling backend tool execution. Give tool-free roles a dedicated named agent
+when other roles using the same backend still need tools.
 
 Omitting top-level `allowed_env` preserves the compatibility default shown
 above. Omitting an agent list adds nothing, while an explicit
