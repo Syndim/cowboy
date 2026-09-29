@@ -4646,6 +4646,50 @@ exit 0
         );
     }
 
+    #[tokio::test]
+    async fn decoded_command_json_survives_persisted_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(workflow_dir.join("json.lua"), r#"
+            local command = step("command")
+            command.run = function(ctx)
+              return action.command { program = "printf", args = { '{"items":[true,null,42],"absent":null,"nested":{"object":{},"array":[]}}' } }
+            end
+
+            local decode = step("decode")
+            decode.run = function(ctx)
+              local data = cowboy.json.decode(ctx.prev.fields.stdout)
+              return action.status { status = "success", fields = data }
+            end
+
+            local inspect = step("inspect")
+            inspect.run = function(ctx)
+              assert(ctx.prev.fields.items[2] == cowboy.json.null)
+              assert(ctx.prev.fields.absent == cowboy.json.null)
+              return action.status { status = "success", fields = { saved = ctx.prev.fields } }
+            end
+
+            command:on("success", decode)
+            decode:on("success", inspect)
+            return workflow("json", command)
+        "#).unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+        let report = runtime
+            .start_run_with_workflow("json", "check")
+            .await
+            .unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        let output = command_output_record(&runtime, &report)
+            .await
+            .output
+            .unwrap();
+        assert_eq!(
+            output.fields["saved"],
+            serde_json::json!({"items":[true,null,42],"absent":null,"nested":{"object":{},"array":[]}})
+        );
+    }
+
     async fn runtime_for_inline_workflow(dir: &tempfile::TempDir, source: &str) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();

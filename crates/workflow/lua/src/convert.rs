@@ -8,6 +8,7 @@ use cowboy_workflow_core::{
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
 
+use crate::api::json::{JSON_NULL, MAX_JSON_DEPTH};
 use crate::{Error, Result};
 
 pub(crate) fn workflow_from_value(
@@ -639,9 +640,14 @@ fn expect_table(value: Value, path: &str) -> Result<Table> {
     }
 }
 
+static JSON_OBJECT: u8 = 0;
+
 fn lua_to_json(value: Value) -> Result<serde_json::Value> {
     match value {
         Value::Nil => Ok(serde_json::Value::Null),
+        Value::LightUserData(v) if v.0 == (&JSON_NULL as *const u8).cast_mut().cast() => {
+            Ok(serde_json::Value::Null)
+        }
         Value::Boolean(v) => Ok(serde_json::Value::Bool(v)),
         Value::Integer(v) => Ok(serde_json::Value::Number(v.into())),
         Value::Number(v) => Number::from_f64(v)
@@ -654,6 +660,14 @@ fn lua_to_json(value: Value) -> Result<serde_json::Value> {
 }
 
 fn table_to_json(table: Table) -> Result<serde_json::Value> {
+    let decoded_object = table.metatable().is_some_and(|metatable| {
+        metatable
+            .raw_get::<bool>(Value::LightUserData(mlua::LightUserData(
+                (&JSON_OBJECT as *const u8).cast_mut().cast(),
+            )))
+            .unwrap_or(false)
+    });
+
     let mut array_items = BTreeMap::new();
     let mut object = Map::new();
     let mut is_array = true;
@@ -672,7 +686,7 @@ fn table_to_json(table: Table) -> Result<serde_json::Value> {
             }
         }
     }
-    if is_array {
+    if is_array && !decoded_object {
         let len = array_items.len();
         if array_items.keys().copied().eq(1..=len) {
             return Ok(serde_json::Value::Array(
@@ -681,6 +695,18 @@ fn table_to_json(table: Table) -> Result<serde_json::Value> {
         }
     }
     Ok(serde_json::Value::Object(object))
+}
+
+fn mark_json_object(lua: &Lua, table: &Table) -> Result<()> {
+    let marker = lua.create_table()?;
+    marker.raw_set(
+        Value::LightUserData(mlua::LightUserData(
+            (&JSON_OBJECT as *const u8).cast_mut().cast(),
+        )),
+        true,
+    )?;
+    table.set_metatable(Some(marker))?;
+    Ok(())
 }
 
 pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value> {
@@ -704,12 +730,61 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> Result<Value>
         }
         serde_json::Value::Object(values) => {
             let table = lua.create_table()?;
+            mark_json_object(lua, &table)?;
+
             for (key, value) in values {
                 table.set(key.as_str(), json_to_lua(lua, value)?)?;
             }
             Value::Table(table)
         }
     })
+}
+
+pub(crate) fn json_to_lua_preserving_null(
+    lua: &Lua,
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<Value> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(Error::UnsupportedValue(
+            "JSON nesting exceeds 64 levels".to_string(),
+        ));
+    }
+
+    match value {
+        serde_json::Value::Null => Ok(Value::LightUserData(mlua::LightUserData(
+            (&JSON_NULL as *const u8).cast_mut().cast(),
+        ))),
+        serde_json::Value::Number(number) if number.is_u64() && number.as_i64().is_none() => Err(
+            Error::UnsupportedValue("JSON integer exceeds Lua signed integer range".to_string()),
+        ),
+
+        serde_json::Value::Array(values) => {
+            let table = lua.create_table()?;
+            for (index, value) in values.iter().enumerate() {
+                table.set(
+                    index + 1,
+                    json_to_lua_preserving_null(lua, value, depth + 1)?,
+                )?;
+            }
+
+            Ok(Value::Table(table))
+        }
+        serde_json::Value::Object(values) => {
+            let table = lua.create_table()?;
+            mark_json_object(lua, &table)?;
+
+            for (key, value) in values {
+                table.set(
+                    key.as_str(),
+                    json_to_lua_preserving_null(lua, value, depth + 1)?,
+                )?;
+            }
+
+            Ok(Value::Table(table))
+        }
+        _ => json_to_lua(lua, value),
+    }
 }
 
 #[cfg(test)]

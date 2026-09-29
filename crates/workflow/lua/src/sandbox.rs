@@ -21,8 +21,8 @@ const SAFE_TABLE_FUNCS: &[&str] = &[
 /// only pure helpers that workflow definitions need, clear every global, and
 /// then reinstall the allowlisted values. This is safer than trying to keep a
 /// denylist (`os`, `io`, `package`, etc.) complete as Lua or `mlua` evolves.
-/// Cowboy-specific APIs (`role`, `step`, `workflow`, `action`, and scoped
-/// `require`) are installed later by `api.rs`.
+/// Cowboy-specific APIs (`role`, `step`, `workflow`, `action`, `cowboy`,
+/// and scoped `require`) are installed later by `api.rs`.
 pub fn create_sandbox() -> Result<Lua> {
     let lua = Lua::new();
     let globals = lua.globals();
@@ -43,6 +43,7 @@ pub fn create_sandbox() -> Result<Lua> {
     for (name, value) in safe_globals {
         globals.set(name, value)?;
     }
+
     globals.set("string", safe_string)?;
     globals.set("table", safe_table)?;
 
