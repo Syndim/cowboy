@@ -14,6 +14,40 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time;
+#[cfg(unix)]
+struct ProcessGroupGuard(Option<i32>);
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(group) = self.0.take() {
+            let _ = kill_command_group(group);
+        }
+    }
+}
+
+struct CaptureGuard<T>(JoinHandle<T>);
+
+impl<T> Drop for CaptureGuard<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(unix)]
+fn kill_command_group(group: i32) -> std::io::Result<()> {
+    // SAFETY: the spawned child is the leader of this dedicated process group.
+    if unsafe { libc::killpg(group, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
 
 const CAPTURE_LIMIT_BYTES: usize = 64 * 1024;
 
@@ -132,6 +166,8 @@ impl CommandActionRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         apply_command_environment(&mut command, &self.allowed_env);
+        #[cfg(unix)]
+        command.process_group(0);
 
         let mut child = match command.spawn() {
             Ok(child) => child,
@@ -142,31 +178,84 @@ impl CommandActionRunner {
             }
         };
 
+        #[cfg(unix)]
+        let group = child.id().map(|pid| pid as i32).ok_or_else(|| {
+            WorkflowError::InvalidAction("command process id unavailable".to_string())
+        })?;
+        #[cfg(unix)]
+        let mut group_guard = ProcessGroupGuard(Some(group));
         let stdout = child.stdout.take().ok_or_else(|| {
             WorkflowError::InvalidAction("command stdout pipe was not captured".to_string())
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
             WorkflowError::InvalidAction("command stderr pipe was not captured".to_string())
         })?;
-        let stdout_task = capture_stream(stdout, self.capture_limit_bytes);
-        let stderr_task = capture_stream(stderr, self.capture_limit_bytes);
+        let stdout_capture = std::sync::Arc::new(std::sync::Mutex::new(CapturedStream {
+            incomplete: true,
+            ..Default::default()
+        }));
+        let stderr_capture = std::sync::Arc::new(std::sync::Mutex::new(CapturedStream {
+            incomplete: true,
+            ..Default::default()
+        }));
+        let mut stdout_task = CaptureGuard(capture_stream(
+            stdout,
+            self.capture_limit_bytes,
+            stdout_capture.clone(),
+        ));
+        let mut stderr_task = CaptureGuard(capture_stream(
+            stderr,
+            self.capture_limit_bytes,
+            stderr_capture.clone(),
+        ));
 
-        let mut timed_out = false;
-        let exit_status = if let Some(timeout_ms) = action.timeout_ms {
-            match time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
-                Ok(status) => Some(status.map_err(command_io_error)?),
-                Err(_) => {
-                    timed_out = true;
-                    child.start_kill().map_err(command_io_error)?;
-                    Some(child.wait().await.map_err(command_io_error)?)
-                }
-            }
+        // The deadline includes parent exit and EOF on both inherited pipes.
+        let execution = async {
+            tokio::try_join!(
+                async { child.wait().await.map_err(command_io_error) },
+                join_capture(&mut stdout_task.0),
+                join_capture(&mut stderr_task.0)
+            )
+        };
+        let result = if let Some(timeout_ms) = action.timeout_ms {
+            time::timeout_at(
+                time::Instant::from_std(timer + Duration::from_millis(timeout_ms)),
+                execution,
+            )
+            .await
         } else {
-            Some(child.wait().await.map_err(command_io_error)?)
+            Ok(execution.await)
         };
 
-        let stdout = join_capture(stdout_task).await?;
-        let stderr = join_capture(stderr_task).await?;
+        let (exit_status, stdout, stderr, timed_out) = match result {
+            Ok(Ok((status, stdout, stderr))) => (Some(status), stdout, stderr, false),
+            failure => {
+                stdout_task.0.abort();
+                stderr_task.0.abort();
+                #[cfg(unix)]
+                kill_command_group(group).map_err(command_io_error)?;
+                #[cfg(not(unix))]
+                child.start_kill().map_err(command_io_error)?;
+
+                // Reap only the direct child; never wait on inherited pipe EOF here.
+                let _ = time::timeout(Duration::from_secs(1), child.wait()).await;
+                match failure {
+                    Err(_) => (
+                        None,
+                        stdout_capture.lock().unwrap().clone(),
+                        stderr_capture.lock().unwrap().clone(),
+                        true,
+                    ),
+                    Ok(Err(err)) => return Err(err),
+                    Ok(Ok(_)) => unreachable!(),
+                }
+            }
+        };
+        #[cfg(unix)]
+        {
+            group_guard.0 = None;
+        }
+
         Ok(ActionResult::completed(self.record(
             action,
             context,
@@ -255,8 +344,15 @@ impl CommandActionRunner {
 
 #[derive(Debug, Clone, Default)]
 struct CapturedStream {
-    text: String,
+    bytes: Vec<u8>,
     truncated: bool,
+    incomplete: bool,
+}
+
+impl CapturedStream {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -268,41 +364,39 @@ struct CommandOutcome {
     spawn_error: Option<String>,
 }
 
-fn capture_stream<R>(mut stream: R, limit: usize) -> JoinHandle<Result<CapturedStream>>
+fn capture_stream<R>(
+    mut stream: R,
+    limit: usize,
+    captured: std::sync::Arc<std::sync::Mutex<CapturedStream>>,
+) -> JoinHandle<Result<CapturedStream>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut captured = Vec::new();
-        let mut truncated = false;
         let mut buffer = [0_u8; 8192];
 
         loop {
             let read = stream.read(&mut buffer).await.map_err(command_io_error)?;
+            let mut state = captured.lock().unwrap();
             if read == 0 {
+                state.incomplete = false;
                 break;
             }
 
-            if captured.len() < limit {
-                let remaining = limit - captured.len();
-                let retained = read.min(remaining);
-                captured.extend_from_slice(&buffer[..retained]);
-                if retained < read {
-                    truncated = true;
-                }
+            if state.bytes.len() < limit {
+                let retained = read.min(limit - state.bytes.len());
+                state.bytes.extend_from_slice(&buffer[..retained]);
+                state.truncated |= retained < read;
             } else {
-                truncated = true;
+                state.truncated = true;
             }
         }
 
-        Ok(CapturedStream {
-            text: String::from_utf8_lossy(&captured).into_owned(),
-            truncated,
-        })
+        Ok(captured.lock().unwrap().clone())
     })
 }
 
-async fn join_capture(task: JoinHandle<Result<CapturedStream>>) -> Result<CapturedStream> {
+async fn join_capture(task: &mut JoinHandle<Result<CapturedStream>>) -> Result<CapturedStream> {
     task.await.map_err(|err| {
         WorkflowError::InvalidAction(format!("command output capture task failed: {err}"))
     })?
@@ -319,11 +413,13 @@ fn command_fields(action: &CommandAction, outcome: &CommandOutcome, success: boo
         "args": &action.args,
         "success": success,
         "exit_code": outcome.exit_code,
-        "stdout": &outcome.stdout.text,
-        "stderr": &outcome.stderr.text,
+        "stdout": outcome.stdout.text(),
+        "stderr": outcome.stderr.text(),
         "timed_out": outcome.timed_out,
         "stdout_truncated": outcome.stdout.truncated,
         "stderr_truncated": outcome.stderr.truncated,
+        "stdout_incomplete": outcome.stdout.incomplete,
+        "stderr_incomplete": outcome.stderr.incomplete,
     });
     let Value::Object(metadata) = metadata else {
         unreachable!("command metadata is always an object")
@@ -342,15 +438,15 @@ fn command_fields(action: &CommandAction, outcome: &CommandOutcome, success: boo
 
 fn command_body(success: bool, outcome: &CommandOutcome) -> String {
     if success {
-        return outcome.stdout.text.clone();
+        return outcome.stdout.text();
     }
 
-    if !outcome.stderr.text.is_empty() {
-        return outcome.stderr.text.clone();
+    if !outcome.stderr.bytes.is_empty() {
+        return outcome.stderr.text();
     }
 
-    if !outcome.stdout.text.is_empty() {
-        return outcome.stdout.text.clone();
+    if !outcome.stdout.bytes.is_empty() {
+        return outcome.stdout.text();
     }
 
     if let Some(spawn_error) = &outcome.spawn_error {
@@ -755,6 +851,126 @@ mod tests {
         assert_eq!(output.fields["success"], false);
         assert_eq!(output.fields["timed_out"], true);
     }
+    #[tokio::test]
+    async fn command_runner_default_timeout_status_is_failed() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "slow");
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
+        let mut command = action(program, helper_args());
+        command.status_map.clear();
+        command.timeout_ms = Some(50);
+
+        let output = command_output(runner.run(command, context()).await.unwrap());
+        assert_eq!(output.status, "failed");
+        assert_eq!(output.fields["success"], false);
+        assert_eq!(output.fields["timed_out"], true);
+        assert_eq!(output.fields["stdout_incomplete"], true);
+        assert_eq!(output.fields["stderr_incomplete"], true);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_runner_times_out_after_parent_exit_and_kills_descendant() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "inherited_pipe");
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
+
+        for iteration in 0..3 {
+            let marker = dir.path().join(format!("survived-{iteration}"));
+            let mut args = helper_args();
+            args.push(marker.to_string_lossy().into_owned());
+            let mut command = action(program.clone(), args);
+            command.timeout_ms = Some(200);
+            let output = command_output(
+                time::timeout(Duration::from_secs(2), runner.run(command, context()))
+                    .await
+                    .expect("runner must return within a bounded time")
+                    .unwrap(),
+            );
+
+            assert_eq!(output.status, "bad");
+            assert_eq!(output.fields["timed_out"], true);
+            assert_eq!(output.fields["success"], false);
+            time::sleep(Duration::from_millis(400)).await;
+            assert!(!marker.exists(), "descendant survived group termination");
+        }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_runner_abort_kills_descendant() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "abort_parent");
+        let marker = dir.path().join("survived");
+        let mut args = helper_args();
+        args.push(marker.to_string_lossy().into_owned());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
+        let task = tokio::spawn(async move { runner.run(action(program, args), context()).await });
+        let ready = marker.with_extension("ready");
+        time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap_err();
+        time::sleep(Duration::from_millis(450)).await;
+        assert!(!marker.exists(), "descendant survived cancellation");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_runner_retains_timeout_diagnostics() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "inherited_pipe");
+        let mut args = helper_args();
+        args.push(dir.path().join("survived").to_string_lossy().into_owned());
+        let runner = CommandActionRunner::new(dir.path(), Vec::new());
+        let mut command = action(program, args);
+        command.timeout_ms = Some(200);
+        command.status_map.insert("_".into(), "success".into());
+        let output = command_output(runner.run(command, context()).await.unwrap());
+        assert_eq!(output.status, "success");
+        assert_eq!(output.fields["success"], false);
+        assert_eq!(output.fields["timed_out"], true);
+        assert!(
+            output.fields["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("parent diagnostic")
+        );
+        assert_eq!(output.fields["stderr_incomplete"], true);
+        assert_eq!(output.fields["stdout_incomplete"], true);
+    }
+
+    #[tokio::test]
+    async fn command_runner_times_out_while_draining_oversized_output() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "continuous_output");
+        let runner = CommandActionRunner::with_capture_limit(dir.path(), Vec::new(), 8);
+        let mut command = action(program, helper_args());
+        command.timeout_ms = Some(100);
+
+        let output = command_output(
+            time::timeout(Duration::from_secs(2), runner.run(command, context()))
+                .await
+                .expect("continuous output must not extend deadline")
+                .unwrap(),
+        );
+
+        assert_eq!(output.status, "bad");
+        assert_eq!(output.fields["success"], false);
+        assert_eq!(output.fields["timed_out"], true);
+    }
 
     #[tokio::test]
     async fn command_runner_marks_truncated_streams() {
@@ -848,6 +1064,51 @@ mod tests {
                 println!("too late");
             }
 
+            #[cfg(unix)]
+            "inherited_pipe" => {
+                let marker = PathBuf::from(std::env::args().next_back().unwrap());
+                if std::env::var_os("COWBOY_DESCENDANT").is_some() {
+                    std::thread::sleep(Duration::from_millis(400));
+                    fs::write(marker, "survived").unwrap();
+                } else {
+                    // Deliberately leave the child unreaped to exercise parent-exit cleanup.
+                    #[allow(clippy::zombie_processes)]
+                    let child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(helper_args())
+                        .arg(marker)
+                        .env("COWBOY_DESCENDANT", "1")
+                        .spawn()
+                        .unwrap();
+                    // The descendant must already exist before the parent exits.
+                    assert!(child.id() > 0);
+                    eprintln!("parent diagnostic");
+                }
+            }
+            #[cfg(unix)]
+            "abort_parent" => {
+                let marker = PathBuf::from(std::env::args().next_back().unwrap());
+                if std::env::var_os("COWBOY_DESCENDANT").is_some() {
+                    fs::write(marker.with_extension("ready"), "ready").unwrap();
+                    std::thread::sleep(Duration::from_millis(400));
+                    fs::write(marker, "survived").unwrap();
+                } else {
+                    #[allow(clippy::zombie_processes)]
+                    let _child = std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(helper_args())
+                        .arg(marker)
+                        .env("COWBOY_DESCENDANT", "1")
+                        .spawn()
+                        .unwrap();
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+            "continuous_output" => {
+                use std::io::Write;
+
+                loop {
+                    std::io::stdout().write_all(&[b'x'; 8192]).unwrap();
+                }
+            }
             "large_stdout" => {
                 println!("abcdefghijklmnopqrstuvwxyz");
             }

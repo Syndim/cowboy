@@ -419,7 +419,7 @@ Fields:
 - `program` (required): non-empty executable name or path.
 - `args` (optional): array of string arguments; defaults to `{}`.
 - `status_map` (optional): table mapping an exit code (integer or numeric-string key) to the output status used for that code. The catch-all `"_"` key covers any exit code without an exact match, plus spawn errors and timeouts, which have no exit code. Defaults to `{ ["0"] = "success", ["_"] = "failed" }`. A `status_map` missing a `"_"` entry falls back to `"failed"` for unmatched codes.
-- `timeout_ms` (optional): positive integer wall-clock timeout. On timeout, Cowboy kills the child and completes the step with the `status_map`'s `"_"` status.
+- `timeout_ms` (optional): positive integer wall-clock deadline covering spawn, parent exit, and full stdout/stderr drain. If either pipe remains open past the deadline, `success = false` and `timed_out = true` even if the parent exited with code 0. Captured prefixes remain available, but incomplete streams are not complete command output. The status still follows `status_map`: a custom `"_" = "success"` can route a timeout to `success`, so downstream steps must check `ctx.prev.fields.success` and `ctx.prev.fields.timed_out` before trusting its output. On Unix Cowboy starts a separate process group and kills it on timeout, capture failure, or cancellation, including descendants that inherited pipes. On Windows Cowboy kills the direct child on timeout or cancellation but cannot guarantee descendant termination.
 
 The command runs from `RuntimeConfig.cwd`. Workflows cannot override cwd,
 environment, or stdin for this action; stdin is closed. Cowboy clears the child
@@ -467,10 +467,11 @@ The completed `StepOutput.fields` contains:
 - `exit_code` (`null` for spawn errors or signal-only exits)
 - `stdout`, `stderr`
 - `timed_out`
-- `stdout_truncated`, `stderr_truncated`
+- `stdout_truncated`, `stderr_truncated` (capture limit exceeded)
+- `stdout_incomplete`, `stderr_incomplete` (EOF not observed; for example, timeout)
 - `spawn_error` when the process could not be started
 
-Captured stdout and stderr are bounded. The truncation flags tell following steps whether a captured stream was cut. `StepOutput.body` is stdout on success; on failure it is stderr when present, otherwise stdout, otherwise the spawn error or timeout text.
+Captured stdout and stderr are bounded. The truncation flags report capture-limit overflow; the incomplete flags report a stream stopped before EOF. `StepOutput.body` is stdout on success; on failure it is stderr when present, otherwise stdout, otherwise the spawn error or timeout text.
 
 Command `program`, `args`, captured stdout, and captured stderr are persisted in the step output so later workflow steps can read them through `ctx.prev.fields`. `program` is persisted too and may expose an absolute or private path; prefer bare executable names or non-sensitive paths when persisted run records may be shared. Do not put secrets, tokens, personal data, private local paths, or proprietary content in command metadata or command output.
 
