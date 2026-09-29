@@ -5,7 +5,7 @@ use mlua::{Function, Table, Value};
 use parking_lot::Mutex;
 
 use crate::api::ImportMode;
-use crate::convert::{action_from_value, json_to_lua};
+use crate::convert::{action_from_value, json_to_lua, json_to_lua_preserving_null};
 use crate::imports::normalize_relative_path;
 use crate::loader::setup_lua;
 use crate::{Error, Result};
@@ -35,7 +35,13 @@ pub fn run_step(
     let steps: Table = lua.globals().get("__cowboy_steps")?;
     let step: Table = steps.get(step_id)?;
     let run: Function = step.get("run")?;
-    let ctx = json_to_lua(&lua, &ctx)?;
+    let lua_ctx = json_to_lua(&lua, &ctx)?;
+    if let (Value::Table(ctx_table), Some(fields)) = (&lua_ctx, ctx.pointer("/prev/fields")) {
+        let prev: Table = ctx_table.get("prev")?;
+        prev.set("fields", json_to_lua_preserving_null(&lua, fields, 0)?)?;
+    }
+
+    let ctx = lua_ctx;
     let value = run.call::<Value>(ctx)?;
     Ok(RunStepResult {
         action: action_from_value(value)?,

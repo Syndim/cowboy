@@ -481,6 +481,56 @@ run_tests:on("success", summarize)
 run_tests:on("failed", diagnose)
 ```
 
+### `cowboy.json.decode(text)`
+
+The public `cowboy` Lua module groups workflow utilities under submodules. Decode
+JSON command output with `cowboy.json.decode(ctx.prev.fields.stdout)`; the result
+contains Lua strings, booleans, numbers, arrays (1-based tables), and objects
+(string-keyed tables). JSON `null` is the distinct `cowboy.json.null` sentinel,
+including inside arrays and objects. Passing that sentinel in `action.status`
+fields persists JSON `null`; Lua `nil` removes a table entry. Only decode
+untruncated successful output. Invalid JSON, trailing content, inputs over 64
+KiB, or nesting over 64 levels raise a Lua error. This API does not expose
+`json` as a global or add filesystem/process access to the Lua sandbox.
+
+Decoded empty objects remain objects (`{}`), distinct from empty arrays (`[]`),
+including when nested in status fields and passed to subsequent steps. JSON
+`null` in `ctx.prev.fields` remains `cowboy.json.null` across persisted steps;
+ordinary request/context nulls retain their Lua `nil` behavior. Ordinary
+workflow-authored empty Lua tables retain their existing array interpretation.
+JSON integers outside Lua's signed 64-bit range are rejected instead of rounded;
+floating-point numbers with magnitude above 2^53 are rejected.
+
+```lua
+local fetch = step("fetch")
+fetch.run = function(ctx)
+  return action.command { program = "gh", args = { "api", "repos/OWNER/REPO/issues/123" } }
+end
+
+local decode = step("decode")
+decode.run = function(ctx)
+  local output = ctx.prev.fields
+  if output.stdout_truncated then
+    return action.fail { reason = "JSON output truncated" }
+  end
+
+  local issue = cowboy.json.decode(output.stdout)
+  return action.status {
+    status = "success",
+    fields = { number = issue.number, title = issue.title, milestone = issue.milestone }
+  }
+end
+
+local consume = step("consume")
+consume.run = function(ctx)
+  return action.status { status = "success", fields = { issue = ctx.prev.fields } }
+end
+
+fetch:on("success", decode)
+decode:on("success", consume)
+return workflow("issue-example", fetch)
+```
+
 ### `action.status { status, fields, body }`
 
 Completes the step immediately without calling an agent.

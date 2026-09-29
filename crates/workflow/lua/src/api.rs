@@ -1,3 +1,5 @@
+pub(crate) mod json;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,6 +24,10 @@ pub enum ImportMode {
 
 pub fn install_workflow_api(lua: &Lua) -> Result<()> {
     let globals = lua.globals();
+    let cowboy = lua.create_table()?;
+    json::install(lua, &cowboy)?;
+    globals.set("cowboy", cowboy)?;
+
     let registry_roles = lua.create_table()?;
     let registry_steps = lua.create_table()?;
     globals.set("__cowboy_roles", registry_roles.clone())?;
