@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Run required SQLite tests
+        run: bash scripts/run-required-sqlite-tests.sh
