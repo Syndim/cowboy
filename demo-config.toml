@@ -52,6 +52,9 @@ args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 name = "reviewer"
 command = "omp"
 args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
+# Optional: access = "deny_all" blocks ACP tool activity; also disable backend tools.
+# To retain read-only tools while denying permission escalation, configure the
+# backend's mode and use access = { mode = "deny_escalation", acp_mode = "read-only" }.
 
 [[agents]]
 name = "implementer"

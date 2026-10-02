@@ -16,6 +16,7 @@ mod runtime_dependencies;
 mod system;
 pub mod workflow;
 
+pub use cowboy_agent_acp::AgentAccess;
 pub use cowboy_workflow_actions::{
     AgentActionHandler, AgentActionRunner, CommandActionRunner, EngineActionDispatcher,
     FailActionRunner, PendingWaitForInput, ResumeCallbackRegistry, StatusActionRunner,

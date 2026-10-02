@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use cowboy_agent_acp::AgentAccess;
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
 use cowboy_agent_client::PromptTurnCancellation;
@@ -103,10 +104,6 @@ pub struct RuntimeConfig {
     pub config_sets: BTreeMap<String, RunnerLimitsConfig>,
 }
 
-fn allow_tools_by_default() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRuntimeConfig {
@@ -116,9 +113,9 @@ pub struct AgentRuntimeConfig {
     pub args: Vec<String>,
     pub model: Option<ModelInfo>,
     #[serde(default)]
+    pub access: AgentAccess,
+    #[serde(default)]
     pub allowed_env: Vec<String>,
-    #[serde(default = "allow_tools_by_default")]
-    pub allow_tools: bool,
     #[serde(default)]
     pub watchdog: AgentWatchdogRuntimeConfig,
 }
@@ -173,8 +170,8 @@ impl AgentRuntimeConfig {
             command: command.into(),
             args,
             model,
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -1758,15 +1755,15 @@ impl WorkflowRuntime {
             SelectorMode::Agent => {
                 let resolver = AgentResolver::new(self.config.agents.clone())?;
                 let agent = resolver.resolve_default()?;
-                let mut client = self
+                let client = self
                     .acp_connector
                     .connect(
                         transport_for(&self.config.allowed_env, agent),
                         watchdog_options_for(agent),
+                        agent.access.clone(),
                     )
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-                client.set_allow_tools(agent.allow_tools);
                 let selector = crate::AgentWorkflowSelector::new(
                     client,
                     self.config.cwd.to_string_lossy().to_string(),
@@ -2117,15 +2114,15 @@ impl WorkflowRuntime {
         let run = self.load_run(run_id).await?;
         let resolver = AgentResolver::new(self.config.agents.clone())?;
         let agent = resolver.resolve_default()?;
-        let mut client = self
+        let client = self
             .acp_connector
             .connect(
                 transport_for(&self.config.allowed_env, agent),
                 watchdog_options_for(agent),
+                agent.access.clone(),
             )
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        client.set_allow_tools(agent.allow_tools);
         let summarizer = crate::AgentWorkflowSummarizer::new(
             client,
             self.config.cwd.to_string_lossy().to_string(),
@@ -2664,6 +2661,7 @@ mod tests {
         clear_env: bool,
         allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
     }
 
     #[derive(Clone, Default)]
@@ -2688,6 +2686,7 @@ mod tests {
             &self,
             transport: TransportConfig,
             watchdog: AgentWatchdogOptions,
+            access: AgentAccess,
         ) -> anyhow::Result<AcpClient> {
             let TransportConfig::Stdio(transport) = transport else {
                 panic!("workflow runtime agents must use stdio")
@@ -2697,6 +2696,7 @@ mod tests {
                 clear_env: transport.clear_env,
                 allowed_env: transport.allowed_env,
                 watchdog,
+                access,
             });
             Err(anyhow::anyhow!("recording runtime connector"))
         }
@@ -2718,6 +2718,7 @@ mod tests {
             &self,
             _transport: TransportConfig,
             _watchdog: AgentWatchdogOptions,
+            _access: AgentAccess,
         ) -> anyhow::Result<AcpClient> {
             Err(anyhow::anyhow!("hanging connector"))
         }
@@ -2734,8 +2735,8 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -3094,8 +3095,8 @@ mod tests {
                 command: "default-runtime-agent".to_string(),
                 args: Vec::new(),
                 model: None,
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig {
                     response_timeout_seconds: 31,
                     cancel_timeout_seconds: 32,
@@ -3129,6 +3130,7 @@ mod tests {
                 cancel_timeout_seconds: 32,
                 recovery_operation_timeout_seconds: 33,
             },
+            access: AgentAccess::Default,
         }
     }
 
@@ -3183,6 +3185,9 @@ mod tests {
         let mut config = production_connector_test_config(&dir);
         config.allowed_env = vec!["GLOBAL".to_string(), "SHARED".to_string()];
         config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string(), "SHARED".to_string()];
+        config.agents[0].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
         let runtime = runtime_with_recording_connector(config, connector.clone()).await;
         let catalog = runtime.catalog().unwrap();
 
@@ -3211,6 +3216,12 @@ mod tests {
             assert_eq!(
                 connection.allowed_env,
                 ["GLOBAL", "SHARED", "DEFAULT_AGENT"]
+            );
+            assert_eq!(
+                connection.access,
+                AgentAccess::DenyEscalation {
+                    acp_mode: "read-only".to_string(),
+                }
             );
         }
     }
@@ -3929,8 +3940,8 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     handoff_gate.to_string_lossy().to_string(),
                 ],
                 model: Some(ModelInfo::default()),
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 // Generous watchdog timeouts: this test drives a real
                 // subprocess (fork/exec + several JSON-RPC round trips)
                 // whose scheduling can be slow under heavy parallel-test CPU
@@ -4060,8 +4071,8 @@ done
                 command: agent_script.to_string_lossy().to_string(),
                 args: Vec::new(),
                 model: None,
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
         )
@@ -6073,8 +6084,8 @@ exit 0
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -6363,8 +6374,8 @@ exit 0
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -9009,8 +9020,8 @@ Recovery implementation review"#
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(
@@ -9934,8 +9945,8 @@ return workflow("{label}", plan)
                 command: "agent".to_string(),
                 args: Vec::new(),
                 model: Some(ModelInfo::default()),
+                access: AgentAccess::default(),
                 allowed_env: Vec::new(),
-                allow_tools: true,
                 watchdog: AgentWatchdogRuntimeConfig::default(),
             }],
             config_sets: BTreeMap::from([(

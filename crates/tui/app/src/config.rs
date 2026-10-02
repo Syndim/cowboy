@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_engine::{
-    AgentRuntimeConfig, AgentWatchdogRuntimeConfig, RunnerLimitsConfig, RuntimeConfig,
+    AgentAccess, AgentRuntimeConfig, AgentWatchdogRuntimeConfig, RunnerLimitsConfig, RuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,9 +102,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub model: Option<ModelConfig>,
     #[serde(default)]
+    pub access: AgentAccess,
+    #[serde(default)]
     pub allowed_env: Vec<String>,
-    #[serde(default = "default_allow_tools")]
-    pub allow_tools: bool,
     #[serde(default)]
     pub watchdog: AgentWatchdogConfig,
 }
@@ -129,10 +129,6 @@ impl Default for AgentWatchdogConfig {
 
 fn default_agent_command() -> String {
     "copilot".to_string()
-}
-
-fn default_allow_tools() -> bool {
-    true
 }
 
 fn default_agent_args() -> Vec<String> {
@@ -162,8 +158,8 @@ impl Default for AgentConfig {
             command: default_agent_command(),
             args: default_agent_args(),
             model: None,
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogConfig::default(),
         }
     }
@@ -288,6 +284,11 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
         if !names.insert(agent.name.as_str()) {
             anyhow::bail!("agent names must be unique: {:?}", agent.name);
         }
+        if let AgentAccess::DenyEscalation { acp_mode } = &agent.access
+            && acp_mode.trim().is_empty()
+        {
+            anyhow::bail!("agent {:?} access acp_mode must not be blank", agent.name);
+        }
         validate_allowed_env(
             &format!("agent {:?} allowed_env", agent.name),
             &agent.allowed_env,
@@ -374,7 +375,7 @@ impl AppConfig {
                             provider: model.provider,
                         }),
                     );
-                    runtime.allow_tools = agent.allow_tools;
+                    runtime.access = agent.access.clone();
                     runtime.watchdog = AgentWatchdogRuntimeConfig {
                         response_timeout_seconds: agent.watchdog.response_timeout_seconds,
                         cancel_timeout_seconds: agent.watchdog.cancel_timeout_seconds,
@@ -456,7 +457,7 @@ provider = "configured-provider"
     }
 
     #[test]
-    fn named_agent_tool_policy_parses_and_reaches_runtime_without_changing_model() {
+    fn named_agent_access_parses_and_reaches_runtime_independently_of_model() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
@@ -466,29 +467,108 @@ name = "default"
 
 [[agents]]
 name = "reviewer"
-allow_tools = false
+access = { mode = "deny_escalation", acp_mode = "read-only" }
 [agents.model]
 id = "review-model"
 provider = "configured-provider"
 
 [[agents]]
 name = "implementer"
-allow_tools = true
+access = "deny_all"
 "#,
         )
         .unwrap();
 
         let config = load_config(&path).unwrap();
-        assert!(config.agents[0].allow_tools);
-        assert!(!config.agents[1].allow_tools);
-        assert!(config.agents[2].allow_tools);
-        assert_eq!(config.agents[1].model.as_ref().unwrap().id, "review-model");
-
         let runtime = config.runtime_config(dir.path().to_path_buf());
-        assert!(runtime.agents[0].allow_tools);
-        assert!(!runtime.agents[1].allow_tools);
-        assert!(runtime.agents[2].allow_tools);
+        let expected = [
+            AgentAccess::Default,
+            AgentAccess::DenyEscalation {
+                acp_mode: "read-only".to_string(),
+            },
+            AgentAccess::DenyAll,
+        ];
+        for (index, access) in expected.into_iter().enumerate() {
+            assert_eq!(config.agents[index].access, access);
+            assert_eq!(runtime.agents[index].access, access);
+        }
         assert_eq!(runtime.agents[1].model.as_ref().unwrap().id, "review-model");
+    }
+
+    #[test]
+    fn omitted_access_and_explicit_default_have_the_same_runtime_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "[[agents]]\nname = \"default\"\n[[agents]]\nname = \"second\"\naccess = \"default\"\n",
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        for agent in &config.agents {
+            assert_eq!(agent.access, AgentAccess::Default);
+        }
+        for agent in &runtime.agents {
+            assert_eq!(agent.access, AgentAccess::Default);
+        }
+    }
+
+    #[test]
+    fn blank_access_acp_mode_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for mode in ["", "  "] {
+            fs::write(
+                &path,
+                format!(
+                    "[[agents]]\nname = \"reviewer\"\naccess = {{ mode = \"deny_escalation\", acp_mode = {mode:?} }}\n"
+                ),
+            )
+            .unwrap();
+            let error = load_config(&path).unwrap_err();
+            assert!(format!("{error:#}").contains("acp_mode"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn obsolete_agent_policy_keys_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for old_key in [
+            "allow_tools = false",
+            "permission_requests = \"deny\"",
+            "required_acp_mode = \"read-only\"",
+        ] {
+            fs::write(
+                &path,
+                format!("[[agents]]\nname = \"default\"\n{old_key}\n"),
+            )
+            .unwrap();
+            let error = load_config(&path).unwrap_err();
+            assert!(format!("{error:#}").contains("unknown field"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn malformed_agent_access_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in [
+            "\"deny\"",
+            "{ mode = \"deny_escalation\" }",
+            "{ mode = \"deny_escalation\", acp_mode = 42 }",
+            "{ mode = \"deny_escalation\", acp_mode = \"read-only\", extra = true }",
+            "{ mode = \"unknown\", acp_mode = \"read-only\" }",
+        ] {
+            fs::write(
+                &path,
+                format!("[[agents]]\nname = \"default\"\naccess = {value}\n"),
+            )
+            .unwrap();
+            assert!(load_config(&path).is_err(), "accepted access = {value}");
+        }
     }
 
     #[test]
