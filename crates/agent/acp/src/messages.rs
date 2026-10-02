@@ -45,16 +45,43 @@ impl<P: Serialize> JsonRpcNotification<P> {
     }
 }
 
+/// Agent-originated JSON-RPC request ID. Responses must preserve its JSON type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Number(u64),
+    String(String),
+}
+
+impl std::fmt::Display for JsonRpcId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Number(id) => std::fmt::Display::fmt(id, formatter),
+            Self::String(id) => std::fmt::Display::fmt(id, formatter),
+        }
+    }
+}
+
+impl JsonRpcId {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Number(number) => number.as_u64().map(Self::Number),
+            Value::String(id) => Some(Self::String(id.clone())),
+            _ => None,
+        }
+    }
+}
+
 /// JSON-RPC 2.0 Response (outgoing — for replying to Agent requests)
 #[derive(Debug, Clone, Serialize)]
-pub struct JsonRpcResponse<R: Serialize> {
+pub struct JsonRpcResponse<'a, R: Serialize> {
     pub jsonrpc: &'static str,
-    pub id: u64,
+    pub id: &'a JsonRpcId,
     pub result: R,
 }
 
-impl<R: Serialize> JsonRpcResponse<R> {
-    pub fn new(id: u64, result: R) -> Self {
+impl<'a, R: Serialize> JsonRpcResponse<'a, R> {
+    pub fn new(id: &'a JsonRpcId, result: R) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
@@ -222,6 +249,8 @@ pub struct InitializeResult {
 pub struct SessionNewResult {
     pub session_id: String,
     #[serde(default)]
+    pub mode_state: Option<SessionModeState>,
+    #[serde(default)]
     pub config_options: Vec<SessionConfigOption>,
 }
 
@@ -230,7 +259,16 @@ pub struct SessionNewResult {
 #[serde(rename_all = "camelCase")]
 pub struct SessionLoadResult {
     #[serde(default)]
+    pub mode_state: Option<SessionModeState>,
+    #[serde(default)]
     pub config_options: Vec<SessionConfigOption>,
+}
+
+/// The ACP agent's reported current session mode.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionModeState {
+    pub current_mode_id: String,
 }
 
 /// A session-level configuration option exposed by the ACP agent.
@@ -283,7 +321,7 @@ pub enum Message {
     SessionUpdate { session_id: String, update: Event },
     /// session/request_permission (Agent → Client request)
     PermissionRequest {
-        id: u64,
+        id: JsonRpcId,
         session_id: String,
         tool_call: Value,
         options: Vec<Value>,
@@ -356,38 +394,48 @@ fn parse_session_update_payload(value: &Value) -> Option<Event> {
 // Message parsing
 // ============================================================
 
+/// A permission request without a replyable string or unsigned integer ID.
+pub(crate) fn has_invalid_permission_request_id(msg: &Value) -> bool {
+    msg.get("method").and_then(Value::as_str) == Some("session/request_permission")
+        && !msg
+            .get("id")
+            .is_some_and(|value| matches!(value, Value::String(_)) || value.as_u64().is_some())
+}
+
 /// Parse raw JSON-RPC line into typed Message
 pub fn parse_acp_message(msg: &Value) -> Option<Message> {
-    // JSON-RPC Response (has "id" + ("result" or "error"), no "method")
-    if let Some(id) = msg.get("id").and_then(|v| v.as_u64()) {
-        if msg.get("method").is_none() {
-            return Some(Message::Response {
-                id,
-                result: msg.get("result").cloned(),
-                error: msg.get("error").cloned(),
-            });
-        }
+    // JSON-RPC Response (has a numeric "id" and no "method")
+    if let Some(id) = msg.get("id").and_then(Value::as_u64)
+        && msg.get("method").is_none()
+    {
+        return Some(Message::Response {
+            id,
+            result: msg.get("result").cloned(),
+            error: msg.get("error").cloned(),
+        });
+    }
 
-        // JSON-RPC Request from Agent (has "id" + "method")
-        if let Some(method) = msg.get("method").and_then(|v| v.as_str())
-            && method == "session/request_permission"
-        {
-            let params = msg.get("params").cloned().unwrap_or(Value::Null);
-            return Some(Message::PermissionRequest {
-                id,
-                session_id: params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                tool_call: params.get("toolCall").cloned().unwrap_or(Value::Null),
-                options: params
-                    .get("options")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default(),
-            });
-        }
+    // JSON-RPC Request from Agent (has a string or unsigned integer "id")
+    if msg.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+        let id = JsonRpcId::from_value(msg.get("id")?)?;
+        let params = msg.get("params");
+        return Some(Message::PermissionRequest {
+            id,
+            session_id: params
+                .and_then(|params| params.get("sessionId"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            tool_call: params
+                .and_then(|params| params.get("toolCall"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            options: params
+                .and_then(|params| params.get("options"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        });
     }
 
     // JSON-RPC Notification (has "method", no "id")
@@ -423,6 +471,30 @@ mod tests {
         let result: SessionLoadResult = serde_json::from_value(serde_json::json!({})).unwrap();
 
         assert!(result.config_options.is_empty());
+        assert!(result.mode_state.is_none());
+    }
+
+    #[test]
+    fn session_results_parse_mode_state_without_losing_config_options() {
+        let response = serde_json::json!({
+            "sessionId": "session-1",
+            "modeState": {"currentModeId": "read-only"},
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "example-model",
+                "options": [{"value": "example-model"}]
+            }]
+        });
+        let new: SessionNewResult = serde_json::from_value(response.clone()).unwrap();
+        assert_eq!(new.session_id, "session-1");
+        assert_eq!(new.mode_state.unwrap().current_mode_id, "read-only");
+        assert_eq!(new.config_options[0].id, "model");
+        let loaded: SessionLoadResult = serde_json::from_value(response).unwrap();
+        assert_eq!(loaded.mode_state.unwrap().current_mode_id, "read-only");
+        assert_eq!(
+            loaded.config_options[0].current_value,
+            serde_json::json!("example-model")
+        );
     }
 
     #[test]
@@ -479,12 +551,58 @@ mod tests {
                 options,
                 ..
             } => {
-                assert_eq!(id, 5);
+                assert_eq!(id, JsonRpcId::Number(5));
                 assert_eq!(session_id, "sess_1");
                 assert!(options.is_empty());
             }
             _ => panic!("Expected PermissionRequest"),
         }
+    }
+
+    #[test]
+    fn string_permission_request_id_and_missing_options_remain_replyable() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "grant-123",
+            "method": "session/request_permission",
+            "params": { "sessionId": "sess_1" }
+        });
+
+        assert!(!has_invalid_permission_request_id(&message));
+        let Message::PermissionRequest { id, options, .. } = parse_acp_message(&message).unwrap()
+        else {
+            panic!("Expected PermissionRequest");
+        };
+        assert_eq!(id, JsonRpcId::String("grant-123".into()));
+        assert!(options.is_empty());
+        assert_eq!(
+            serde_json::to_value(JsonRpcResponse::new(&id, PermissionOutcome::cancelled()))
+                .unwrap()["id"],
+            "grant-123"
+        );
+    }
+
+    #[test]
+    fn malformed_permission_request_ids_are_unreplyable() {
+        for id in [
+            Value::Null,
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!({ "nested": 1 }),
+            serde_json::json!([1]),
+            serde_json::json!(true),
+        ] {
+            let message = serde_json::json!({
+                "id": id,
+                "method": "session/request_permission"
+            });
+            assert!(has_invalid_permission_request_id(&message), "{message}");
+            assert!(parse_acp_message(&message).is_none(), "{message}");
+        }
+
+        let missing = serde_json::json!({ "method": "session/request_permission" });
+        assert!(has_invalid_permission_request_id(&missing));
+        assert!(parse_acp_message(&missing).is_none());
     }
 
     #[test]

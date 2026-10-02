@@ -14,8 +14,90 @@ use async_trait::async_trait;
 const CONTINUE_PROMPT: &str = "Continue";
 const DENIED_TOOL_ERROR: &str = "ACP tool use is disabled for this agent";
 
-fn allow_tools_by_default() -> bool {
-    true
+/// Agent tool and permission boundary. The backend must enforce its own sandbox.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AccessValue", into = "AccessValue")]
+pub enum AgentAccess {
+    #[default]
+    Default,
+    DenyAll,
+    DenyEscalation {
+        acp_mode: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum AccessValue {
+    Name(AccessName),
+    Restricted(RestrictedAccess),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccessName {
+    Default,
+    DenyAll,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestrictedAccess {
+    mode: RestrictedMode,
+    acp_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RestrictedMode {
+    DenyEscalation,
+}
+
+impl TryFrom<AccessValue> for AgentAccess {
+    type Error = &'static str;
+
+    fn try_from(value: AccessValue) -> Result<Self, Self::Error> {
+        match value {
+            AccessValue::Name(AccessName::Default) => Ok(Self::Default),
+            AccessValue::Name(AccessName::DenyAll) => Ok(Self::DenyAll),
+            AccessValue::Restricted(RestrictedAccess { acp_mode, .. })
+                if !acp_mode.trim().is_empty() =>
+            {
+                Ok(Self::DenyEscalation { acp_mode })
+            }
+            _ => Err("deny_escalation acp_mode must not be blank"),
+        }
+    }
+}
+
+impl From<AgentAccess> for AccessValue {
+    fn from(access: AgentAccess) -> Self {
+        match access {
+            AgentAccess::Default => Self::Name(AccessName::Default),
+            AgentAccess::DenyAll => Self::Name(AccessName::DenyAll),
+            AgentAccess::DenyEscalation { acp_mode } => Self::Restricted(RestrictedAccess {
+                mode: RestrictedMode::DenyEscalation,
+                acp_mode,
+            }),
+        }
+    }
+}
+
+impl AgentAccess {
+    fn allows_tools(&self) -> bool {
+        !matches!(self, Self::DenyAll)
+    }
+
+    fn denies_permissions(&self) -> bool {
+        !matches!(self, Self::Default)
+    }
+
+    fn required_mode(&self) -> Option<&str> {
+        match self {
+            Self::DenyEscalation { acp_mode } => Some(acp_mode),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +123,7 @@ impl Default for AgentWatchdogOptions {
 /// The orchestrator acts as the ACP client; each agent subprocess is an ACP server.
 /// Communication uses JSON-RPC 2.0, with the Transport trait abstracting the underlying I/O.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Client {
     /// Underlying transport (stdio, Zellij, etc.)
     #[serde(skip)]
@@ -55,6 +138,9 @@ pub struct Client {
     pub agent_info: Option<AgentInfo>,
     /// Current ACP session ID (set by new_session / load_session)
     session_id: Option<String>,
+    /// Session being loaded; not verified for prompting until load succeeds.
+    #[serde(skip)]
+    pending_session_id: Option<String>,
     /// Parameters needed to re-register the current session after a watchdog
     /// replaces the ACP server process.
     #[serde(skip)]
@@ -69,8 +155,8 @@ pub struct Client {
     session_descriptor: Option<AgentSessionDescriptor>,
     #[serde(default)]
     watchdog: AgentWatchdogOptions,
-    #[serde(default = "allow_tools_by_default")]
-    allow_tools: bool,
+    #[serde(default)]
+    access: AgentAccess,
     #[serde(default)]
     tool_policy_violated: bool,
     #[cfg(test)]
@@ -123,11 +209,12 @@ impl Clone for Client {
             agent_capabilities: self.agent_capabilities.clone(),
             agent_info: self.agent_info.clone(),
             session_id: self.session_id.clone(),
+            pending_session_id: None,
             session_load_context: self.session_load_context.clone(),
             pushback: Vec::new(),
             session_descriptor: self.session_descriptor.clone(),
             watchdog: self.watchdog,
-            allow_tools: self.allow_tools,
+            access: self.access.clone(),
             tool_policy_violated: self.tool_policy_violated,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
@@ -147,7 +234,7 @@ impl std::fmt::Debug for Client {
             .field("agent_info", &self.agent_info)
             .field("session_descriptor", &self.session_descriptor)
             .field("watchdog", &self.watchdog)
-            .field("allow_tools", &self.allow_tools)
+            .field("access", &self.access)
             .field("tool_policy_violated", &self.tool_policy_violated)
             .finish()
     }
@@ -391,7 +478,7 @@ fn log_acp_message(direction: &'static str, msg: &Message) {
             tracing::debug!(
                 direction,
                 kind = "permission_request",
-                id,
+                %id,
                 session_id,
                 tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
                 tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
@@ -448,6 +535,10 @@ impl ReplacementTransportFactoryOutcome {
 impl Client {
     /// Get a mutable reference to the existing transport (no reconnect).
     fn transport_mut(&mut self) -> anyhow::Result<&mut Box<dyn Transport>> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         self.transport
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("client transport not connected"))
@@ -455,6 +546,10 @@ impl Client {
 
     /// Get a mutable reference to the transport, reconnecting if needed.
     async fn ensure_transport(&mut self) -> anyhow::Result<&mut Box<dyn Transport>> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         if self.transport.is_none() {
             tracing::info!(
                 transport = transport_kind(&self.transport_config),
@@ -508,6 +603,10 @@ impl Client {
         &mut self,
         session_id: &str,
     ) -> anyhow::Result<Box<dyn Transport>> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         #[cfg(test)]
         if let Some(outcome) = self.replacement_factory.next() {
             return outcome.into_transport().await;
@@ -516,6 +615,10 @@ impl Client {
     }
 
     async fn create_reconnect_transport(&mut self) -> anyhow::Result<Box<dyn Transport>> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
         #[cfg(test)]
         if let Some(outcome) = self.reconnect_factory.next() {
             return outcome.into_transport().await;
@@ -636,8 +739,23 @@ impl Client {
         transport_config: TransportConfig,
         watchdog: AgentWatchdogOptions,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_options_and_access(transport_config, watchdog, AgentAccess::Default)
+            .await
+    }
+
+    pub async fn connect_with_options_and_access(
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+    ) -> anyhow::Result<Self> {
         let transport = Self::create_transport(&transport_config, None).await?;
-        Self::connect_with_transport_and_options(transport, transport_config, watchdog).await
+        Self::connect_with_transport_and_options_and_access(
+            transport,
+            transport_config,
+            watchdog,
+            access,
+        )
+        .await
     }
 
     /// Connect using a pre-built transport (for tests or custom transports).
@@ -658,6 +776,21 @@ impl Client {
         transport_config: TransportConfig,
         watchdog: AgentWatchdogOptions,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_transport_and_options_and_access(
+            transport,
+            transport_config,
+            watchdog,
+            AgentAccess::Default,
+        )
+        .await
+    }
+
+    pub async fn connect_with_transport_and_options_and_access(
+        transport: Box<dyn Transport>,
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+    ) -> anyhow::Result<Self> {
         let mut client = Self {
             transport: Some(transport),
             transport_config,
@@ -665,11 +798,12 @@ impl Client {
             agent_capabilities: None,
             agent_info: None,
             session_id: None,
+            pending_session_id: None,
             session_load_context: None,
             pushback: Vec::new(),
             session_descriptor: None,
             watchdog,
-            allow_tools: true,
+            access,
             tool_policy_violated: false,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
@@ -719,10 +853,48 @@ impl Client {
         self.watchdog
     }
 
-    /// Allow ACP tool use for this client by default. When disabled, an observed
-    /// violation remains fatal across subsequent prompts, clones and reconnects.
-    pub fn set_allow_tools(&mut self, allow_tools: bool) {
-        self.allow_tools = allow_tools;
+    /// Changing access revokes any previously verified ACP session.
+    pub fn set_access(&mut self, access: AgentAccess) {
+        if self.access != access {
+            self.session_id = None;
+            self.pending_session_id = None;
+            self.session_descriptor = None;
+            self.session_load_context = None;
+        }
+
+        self.access = access;
+    }
+
+    fn validate_required_acp_mode(
+        &self,
+        mode_state: Option<&SessionModeState>,
+        config_options: &[SessionConfigOption],
+    ) -> anyhow::Result<()> {
+        let Some(required) = self.access.required_mode() else {
+            return Ok(());
+        };
+        if required.trim().is_empty() {
+            anyhow::bail!("ACP required mode must not be blank");
+        }
+
+        let reported_state = mode_state.map(|state| state.current_mode_id.as_str());
+        let mut reported_config = false;
+        for option in config_options.iter().filter(|option| option.id == "mode") {
+            reported_config = true;
+            if option.current_value.as_str() != Some(required) {
+                anyhow::bail!("ACP reported session mode differs from required mode");
+            }
+        }
+
+        if reported_state.is_none() && !reported_config {
+            anyhow::bail!("ACP agent did not report required session mode");
+        }
+
+        if reported_state.is_some_and(|mode| mode != required) {
+            anyhow::bail!("ACP reported session mode differs from required mode");
+        }
+
+        Ok(())
     }
 
     /// Create a new ACP session.
@@ -736,6 +908,11 @@ impl Client {
         mcp_servers: &[Value],
         model: Option<&ModelInfo>,
     ) -> anyhow::Result<String> {
+        if self.access.required_mode().is_some() {
+            self.session_id = None;
+            self.pending_session_id = None;
+        }
+
         tracing::debug!(
             cwd,
             mcp_server_count = mcp_servers.len(),
@@ -755,15 +932,44 @@ impl Client {
         };
 
         let result = self.send_request("session/new", params).await?;
-        let session: SessionNewResult = serde_json::from_value(result)?;
+        let session: SessionNewResult = match serde_json::from_value(result) {
+            Ok(session) => session,
+            Err(error) if self.access.required_mode().is_some() => {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) =
+            self.validate_required_acp_mode(session.mode_state.as_ref(), &session.config_options)
+        {
+            self.tool_policy_violated = true;
+            self.cleanup_replacement().await;
+            return Err(error);
+        }
+        if self.access.required_mode().is_some() {
+            self.pending_session_id = Some(session.session_id.clone());
+        }
+
         let mut descriptor_options = session.config_options.clone();
         if let Some(model) = model
             && let Some(applied_options) = self
                 .apply_model_config_option(&session.session_id, &session.config_options, model)
                 .await?
         {
+            // A returned configOptions snapshot supersedes session/new. Do not
+            // treat the earlier modeState or mode option as fresh evidence.
+            if let Err(error) = self.validate_required_acp_mode(None, &applied_options) {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                return Err(error);
+            }
+
             descriptor_options = applied_options;
         }
+        self.pending_session_id = None;
+
         self.session_descriptor = Self::descriptor_from_config_options(&descriptor_options);
         self.session_id = Some(session.session_id.clone());
         self.session_load_context = Some(SessionLoadContext {
@@ -966,6 +1172,17 @@ impl Client {
         if self.tool_policy_violated {
             anyhow::bail!(DENIED_TOOL_ERROR);
         }
+        if self.access.required_mode().is_some() {
+            if self.session_id.as_deref() != Some(session_id) {
+                anyhow::bail!("ACP prompt session has not passed required mode verification");
+            }
+
+            if self.transport.is_none() {
+                anyhow::bail!(
+                    "ACP required mode must be reverified by session/load before reconnecting"
+                );
+            }
+        }
 
         const MAX_CONTINUATIONS: u32 = 5;
         let mut content = prompt_content;
@@ -1046,6 +1263,12 @@ impl Client {
         session_id: &str,
     ) -> anyhow::Result<()> {
         let Some(context) = self.session_load_context.clone() else {
+            if self.access.required_mode().is_some() {
+                anyhow::bail!(
+                    "ACP replacement cannot verify required mode without session/load context"
+                );
+            }
+
             tracing::warn!(
                 session_id,
                 "Agent watchdog has no session/load context; continuing legacy recovery"
@@ -1218,9 +1441,10 @@ impl Client {
         let mut external_cancellation_sent = false;
         let mut deferred_updates_after_external_cancellation = 0usize;
         let mut replacement_continuation_active = false;
+        let mut response_deadline_at = tokio::time::Instant::now()
+            + Duration::from_secs(self.watchdog.response_timeout_seconds);
         let stop_reason = 'monitor: loop {
-            let response_deadline =
-                tokio::time::sleep(Duration::from_secs(self.watchdog.response_timeout_seconds));
+            let response_deadline = tokio::time::sleep_until(response_deadline_at);
             tokio::pin!(response_deadline);
             enum WaitOutcome {
                 Message(anyhow::Result<Message>),
@@ -1229,6 +1453,13 @@ impl Client {
             }
             let outcome = if external_cancellation_sent {
                 WaitOutcome::Message(self.recv_message_raw().await)
+            } else if self.access.denies_permissions() {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => WaitOutcome::ExternalCancellation,
+                    () = &mut response_deadline => WaitOutcome::WatchdogTimeout,
+                    message = self.recv_message_raw() => WaitOutcome::Message(message),
+                }
             } else {
                 tokio::select! {
                     biased;
@@ -1239,8 +1470,15 @@ impl Client {
             };
 
             if let WaitOutcome::Message(Ok(ref message)) = outcome {
+                self.reject_foreign_session_message(message, session_id)
+                    .await?;
+                if self.deny_permission_request(message).await? {
+                    continue 'monitor;
+                }
                 self.reject_forbidden_message(message).await?;
             }
+            response_deadline_at = tokio::time::Instant::now()
+                + Duration::from_secs(self.watchdog.response_timeout_seconds);
 
             let msg = match outcome {
                 WaitOutcome::Message(message) => match message {
@@ -1348,6 +1586,13 @@ impl Client {
                         }
                         let outcome = if external_cancellation_sent {
                             CancelGraceOutcome::Message(self.recv_message_raw().await)
+                        } else if self.access.denies_permissions() {
+                            tokio::select! {
+                                biased;
+                                () = cancellation.cancelled() => CancelGraceOutcome::ExternalCancellation,
+                                () = &mut cancel_deadline => CancelGraceOutcome::Timeout,
+                                message = self.recv_message_raw() => CancelGraceOutcome::Message(message),
+                            }
                         } else {
                             tokio::select! {
                                 biased;
@@ -1368,11 +1613,18 @@ impl Client {
                                 }
                                 id = self.hard_recover_and_continue(session_id).await?;
                                 replacement_continuation_active = true;
+                                response_deadline_at = tokio::time::Instant::now()
+                                    + Duration::from_secs(self.watchdog.response_timeout_seconds);
                                 continue 'monitor;
                             }
                         };
                         if let Ok(ref message) = message {
+                            self.reject_foreign_session_message(message, session_id)
+                                .await?;
                             self.reject_forbidden_message(message).await?;
+                            if self.deny_permission_request(message).await? {
+                                continue;
+                            }
                         }
                         let message = match message {
                             Ok(message) => message,
@@ -1386,6 +1638,8 @@ impl Client {
                                 }
                                 id = self.hard_recover_and_continue(session_id).await?;
                                 replacement_continuation_active = true;
+                                response_deadline_at = tokio::time::Instant::now()
+                                    + Duration::from_secs(self.watchdog.response_timeout_seconds);
                                 continue 'monitor;
                             }
                         };
@@ -1403,11 +1657,11 @@ impl Client {
                             } => {
                                 tracing::debug!(
                                     session_id = %permission_session_id,
-                                    request_id = req_id,
+                                    request_id = %req_id,
                                     tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
                                     "ACP permission request cancelled during watchdog grace"
                                 );
-                                self.send_rpc_response(req_id, PermissionOutcome::cancelled())
+                                self.send_rpc_response(&req_id, PermissionOutcome::cancelled())
                                     .await?;
                             }
                             Message::Response {
@@ -1421,6 +1675,10 @@ impl Client {
                                     }
                                     id = self.hard_recover_and_continue(session_id).await?;
                                     replacement_continuation_active = true;
+                                    response_deadline_at = tokio::time::Instant::now()
+                                        + Duration::from_secs(
+                                            self.watchdog.response_timeout_seconds,
+                                        );
                                     continue 'monitor;
                                 }
                                 let result: SessionPromptResult =
@@ -1452,6 +1710,8 @@ impl Client {
                                     "Agent watchdog cancellation completed; continuing session"
                                 );
                                 id = self.dispatch_watchdog_continuation(session_id).await?;
+                                response_deadline_at = tokio::time::Instant::now()
+                                    + Duration::from_secs(self.watchdog.response_timeout_seconds);
                                 continue 'monitor;
                             }
                             _ => {}
@@ -1499,14 +1759,14 @@ impl Client {
                     };
                     tracing::debug!(
                         session_id = %permission_session_id,
-                        request_id = req_id,
+                        request_id = %req_id,
                         tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
                         tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
                         options = options.len(),
                         outcome = ?outcome,
                         "ACP permission request answered"
                     );
-                    self.send_rpc_response(req_id, outcome).await?;
+                    self.send_rpc_response(&req_id, outcome).await?;
                 }
                 Message::Response {
                     id: resp_id,
@@ -1537,7 +1797,10 @@ impl Client {
             anyhow::bail!(DENIED_TOOL_ERROR);
         }
 
-        if matches!(stop_reason, StopReason::Cancelled) && self.allow_tools {
+        if matches!(stop_reason, StopReason::Cancelled)
+            && self.access.allows_tools()
+            && !self.access.denies_permissions()
+        {
             tracing::debug!(
                 session_id,
                 id,
@@ -1562,7 +1825,9 @@ impl Client {
         } else {
             15_000
         };
-        let saw_trailing_text = self.drain_trailing_events(event_handler, drain_ms).await?;
+        let saw_trailing_text = self
+            .drain_trailing_events(session_id, event_handler, drain_ms)
+            .await?;
         if self.tool_policy_violated {
             anyhow::bail!(DENIED_TOOL_ERROR);
         }
@@ -1595,12 +1860,15 @@ impl Client {
     /// the next prompt call.
     async fn drain_trailing_events(
         &mut self,
+        active_session_id: &str,
         event_handler: &mut (dyn FnMut(Event) + Send),
         initial_timeout_ms: u64,
     ) -> anyhow::Result<bool> {
         use tokio::time::{Duration, timeout};
 
         let mut drain_timeout = Duration::from_millis(initial_timeout_ms);
+        let restricted_deadline = (self.access.denies_permissions())
+            .then(|| tokio::time::Instant::now() + Duration::from_millis(initial_timeout_ms));
         let mut saw_text = false;
 
         if self.transport.is_none() {
@@ -1609,21 +1877,54 @@ impl Client {
         let mut pushback_line = None;
 
         loop {
+            if restricted_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                break;
+            }
+
             let line = {
                 let transport = self.transport_mut()?;
-                match timeout(drain_timeout, transport.recv()).await {
+                let remaining = restricted_deadline
+                    .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()))
+                    .unwrap_or(drain_timeout);
+                match timeout(drain_timeout.min(remaining), transport.recv()).await {
                     Ok(Ok(Some(line))) => line,
-                    _ => break,
+                    Ok(Err(error)) => {
+                        if self.access.denies_permissions() || !self.access.allows_tools() {
+                            self.tool_policy_violated = true;
+                            self.cleanup_replacement().await;
+                            return Err(error);
+                        }
+                        break;
+                    }
+                    // EOF after a completed response is normal for some backends.
+                    Ok(Ok(None)) | Err(_) => break,
                 }
             };
             let line = line.trim().to_string();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(json) = serde_json::from_str::<Value>(&line)
-                && let Some(msg) = parse_acp_message(&json)
-            {
+            let json = match serde_json::from_str::<Value>(&line) {
+                Ok(json) => json,
+                Err(error) if self.access.denies_permissions() || !self.access.allows_tools() => {
+                    self.tool_policy_violated = true;
+                    self.cleanup_replacement().await;
+                    anyhow::bail!("invalid ACP trailing message: {error}");
+                }
+                Err(_) => continue,
+            };
+            self.validate_incoming_mode_update(&json).await?;
+            self.reject_invalid_permission_request_id(&json).await?;
+
+            if let Some(msg) = parse_acp_message(&json) {
+                self.reject_foreign_session_message(&msg, active_session_id)
+                    .await?;
+
                 self.reject_forbidden_message(&msg).await?;
+                if self.deny_permission_request(&msg).await? {
+                    drain_timeout = Duration::from_millis(200);
+                    continue;
+                }
                 tracing::debug!(payload = %line, "ACP <<< trailing");
                 match msg {
                     Message::SessionUpdate { update, .. } => {
@@ -1670,9 +1971,21 @@ impl Client {
         cwd: &str,
         mcp_servers: &[Value],
     ) -> anyhow::Result<Vec<Event>> {
+        if self.tool_policy_violated {
+            anyhow::bail!(DENIED_TOOL_ERROR);
+        }
+
+        if self.access.required_mode().is_some() {
+            self.session_id = None;
+            self.pending_session_id = None;
+        }
+
         if !self.supports_load_session() {
             tracing::warn!(session_id, "ACP session/load unsupported by agent");
             anyhow::bail!("Agent does not support loadSession capability");
+        }
+        if self.access.required_mode().is_some() {
+            self.pending_session_id = Some(session_id.to_string());
         }
 
         tracing::debug!(
@@ -1686,11 +1999,35 @@ impl Client {
             cwd: cwd.to_string(),
             mcp_servers: mcp_servers.to_vec(),
         };
-        let id = self.send_request_no_wait("session/load", params).await?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let id = match tokio::time::timeout_at(
+            deadline,
+            self.send_request_no_wait("session/load", params),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                anyhow::bail!("ACP session/load timed out; transport terminated");
+            }
+        };
 
         let mut history = Vec::new();
         loop {
-            let msg = self.recv_message().await?;
+            let msg =
+                match tokio::time::timeout_at(deadline, self.recv_message_for_session(session_id))
+                    .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        self.tool_policy_violated = true;
+                        self.cleanup_replacement().await;
+                        anyhow::bail!("ACP session/load timed out; transport terminated");
+                    }
+                };
             match msg {
                 Message::SessionUpdate { update, .. } => {
                     tracing::trace!(
@@ -1710,12 +2047,31 @@ impl Client {
                         anyhow::bail!("session/load error: {err}");
                     }
                     let result = match result {
-                        Some(Value::Null) | None => SessionLoadResult::default(),
-                        Some(result) => serde_json::from_value(result)?,
+                        Some(Value::Null) | None => Ok(SessionLoadResult::default()),
+                        Some(result) => serde_json::from_value(result),
                     };
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(error) if self.access.required_mode().is_some() => {
+                            self.tool_policy_violated = true;
+                            self.cleanup_replacement().await;
+                            return Err(error.into());
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    if let Err(error) = self.validate_required_acp_mode(
+                        result.mode_state.as_ref(),
+                        &result.config_options,
+                    ) {
+                        self.tool_policy_violated = true;
+                        self.cleanup_replacement().await;
+                        return Err(error);
+                    }
+
                     self.session_descriptor =
                         Self::descriptor_from_config_options(&result.config_options);
                     self.session_id = Some(session_id.to_string());
+                    self.pending_session_id = None;
                     self.session_load_context = Some(SessionLoadContext {
                         cwd: cwd.to_string(),
                         mcp_servers: mcp_servers.to_vec(),
@@ -1738,10 +2094,28 @@ impl Client {
         method: &'static str,
         params: P,
     ) -> anyhow::Result<Value> {
-        let id = self.send_request_no_wait(method, params).await?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let id = match tokio::time::timeout_at(deadline, self.send_request_no_wait(method, params))
+            .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                anyhow::bail!("ACP {method} timed out; transport terminated");
+            }
+        };
 
         loop {
-            let msg = self.recv_message().await?;
+            let msg = match tokio::time::timeout_at(deadline, self.recv_message()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    self.tool_policy_violated = true;
+                    self.cleanup_replacement().await;
+                    anyhow::bail!("ACP {method} timed out; transport terminated");
+                }
+            };
             match msg {
                 Message::Response {
                     id: resp_id,
@@ -1787,11 +2161,96 @@ impl Client {
     }
 
     /// Send a JSON-RPC response to an agent request, such as a permission request.
-    async fn send_rpc_response<R: Serialize>(&mut self, id: u64, result: R) -> anyhow::Result<()> {
+    async fn send_rpc_response<R: Serialize>(
+        &mut self,
+        id: &JsonRpcId,
+        result: R,
+    ) -> anyhow::Result<()> {
         let response = JsonRpcResponse::new(id, result);
         let line = serde_json::to_string(&response)?;
-        tracing::debug!(id, payload = %line, "ACP >>> response");
+        tracing::debug!(%id, payload = %line, "ACP >>> response");
         self.ensure_transport().await?.send(&line).await?;
+        Ok(())
+    }
+
+    /// A restricted agent may keep working after a cancelled permission request.
+    /// Never reconnect to send the denial: an uncertain send stops this transport.
+    async fn deny_permission_request(&mut self, msg: &Message) -> anyhow::Result<bool> {
+        let Message::PermissionRequest { id, .. } = msg else {
+            return Ok(false);
+        };
+
+        if !matches!(self.access, AgentAccess::DenyEscalation { .. }) {
+            return Ok(false);
+        }
+
+        let response = JsonRpcResponse::new(id, PermissionOutcome::cancelled());
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        let sent = async {
+            let line = serde_json::to_string(&response)?;
+            self.transport_mut()?.send(&line).await
+        };
+        if !matches!(tokio::time::timeout(timeout, sent).await, Ok(Ok(()))) {
+            self.tool_policy_violated = true;
+            self.cleanup_replacement().await;
+            anyhow::bail!("ACP permission denial could not be sent; transport terminated");
+        }
+
+        Ok(true)
+    }
+
+    async fn reject_foreign_session_message(
+        &mut self,
+        msg: &Message,
+        active_session_id: &str,
+    ) -> anyhow::Result<()> {
+        if matches!(self.access, AgentAccess::Default) {
+            return Ok(());
+        }
+
+        let observed = match msg {
+            Message::PermissionRequest { session_id, .. }
+            | Message::SessionUpdate { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        };
+        if observed.is_some_and(|id| id != active_session_id) {
+            self.tool_policy_violated = true;
+            self.cleanup_replacement().await;
+            anyhow::bail!("ACP restricted session mismatch; transport terminated");
+        }
+
+        if let (
+            Some(required),
+            Message::SessionUpdate {
+                update: Event::Unknown { raw, .. },
+                ..
+            },
+        ) = (self.access.required_mode(), msg)
+        {
+            let reported = raw
+                .get("currentModeId")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    raw.get("modeState")
+                        .and_then(|value| value.get("currentModeId"))
+                        .and_then(Value::as_str)
+                });
+            let changed_options = raw.get("configOptions").and_then(Value::as_array);
+            if reported.is_some_and(|mode| mode != required)
+                || changed_options
+                    .into_iter()
+                    .flatten()
+                    .filter(|option| option.get("id").and_then(Value::as_str) == Some("mode"))
+                    .any(|option| {
+                        option.get("currentValue").and_then(Value::as_str) != Some(required)
+                    })
+            {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                anyhow::bail!("ACP reported session mode differs from required mode");
+            }
+        }
+
         Ok(())
     }
 
@@ -1799,18 +2258,22 @@ impl Client {
     /// accept a successful response. Permission requests receive an ACP
     /// cancelled response, even during replay, cancellation grace and drain.
     async fn reject_forbidden_message(&mut self, msg: &Message) -> anyhow::Result<()> {
-        if self.allow_tools {
+        if self.access.allows_tools() {
             return Ok(());
         }
 
         match msg {
             Message::PermissionRequest { id, .. } => {
                 self.tool_policy_violated = true;
-                let response = JsonRpcResponse::new(*id, PermissionOutcome::cancelled());
+                let response = JsonRpcResponse::new(id, PermissionOutcome::cancelled());
                 let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
                 let sent = async {
                     let line = serde_json::to_string(&response)?;
-                    self.transport_mut()?.send(&line).await
+                    self.transport
+                        .as_mut()
+                        .ok_or_else(|| anyhow::anyhow!("Agent connection closed unexpectedly"))?
+                        .send(&line)
+                        .await
                 };
                 if !matches!(tokio::time::timeout(timeout, sent,).await, Ok(Ok(()))) {
                     tracing::warn!("ACP tool denial could not be sent; terminating transport");
@@ -1824,10 +2287,99 @@ impl Client {
                 ..
             } => {
                 self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
                 anyhow::bail!(DENIED_TOOL_ERROR);
             }
             _ => Ok(()),
         }
+    }
+
+    async fn reject_invalid_permission_request_id(&mut self, json: &Value) -> anyhow::Result<()> {
+        if (!self.access.allows_tools() || self.access.denies_permissions())
+            && has_invalid_permission_request_id(json)
+        {
+            self.tool_policy_violated = true;
+            self.cleanup_replacement().await;
+            anyhow::bail!("ACP permission request has an invalid id; transport terminated");
+        }
+
+        Ok(())
+    }
+
+    async fn validate_incoming_mode_update(&mut self, json: &Value) -> anyhow::Result<()> {
+        let Some(required) = self.access.required_mode() else {
+            return Ok(());
+        };
+        if json.get("method").and_then(Value::as_str) != Some("session/update") {
+            return Ok(());
+        }
+
+        let params = json.get("params");
+        let update = params.and_then(|params| params.get("update"));
+        let kind = update
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str);
+        let mode = update.and_then(|update| update.get("currentModeId"));
+        let state = update.and_then(|update| update.get("modeState"));
+        let state_mode = state.and_then(|state| state.get("currentModeId"));
+        let options = update.and_then(|update| update.get("configOptions"));
+        let mode_options = options
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|option| option.get("id").and_then(Value::as_str) == Some("mode"))
+            .collect::<Vec<_>>();
+        let is_mode_update = matches!(
+            kind,
+            Some("current_mode_update" | "mode_update" | "config_option_update")
+        ) || mode.is_some()
+            || state.is_some()
+            || !mode_options.is_empty();
+        let expected = self
+            .pending_session_id
+            .as_deref()
+            .or(self.session_id.as_deref());
+        let observed = params
+            .and_then(|params| params.get("sessionId"))
+            .and_then(Value::as_str);
+        let invalid = kind.is_none()
+            || options.is_some_and(|value| !value.is_array())
+            || (is_mode_update
+                && (expected.is_none()
+                    || observed != expected
+                    || mode.is_some_and(|value| value.as_str() != Some(required))
+                    || state
+                        .is_some_and(|_| state_mode.and_then(Value::as_str) != Some(required))
+                    || mode_options.iter().any(|option| {
+                        option.get("currentValue").and_then(Value::as_str) != Some(required)
+                    })
+                    || (mode.is_none() && state.is_none() && mode_options.is_empty())));
+        if invalid {
+            self.tool_policy_violated = true;
+            self.cleanup_replacement().await;
+            anyhow::bail!(
+                "ACP mode update could not confirm required session mode; transport terminated"
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn parse_incoming_json(&mut self, line: &str) -> anyhow::Result<Value> {
+        let json = match serde_json::from_str(line) {
+            Ok(json) => json,
+            Err(err) if !self.access.allows_tools() || self.access.denies_permissions() => {
+                self.tool_policy_violated = true;
+                self.cleanup_replacement().await;
+                anyhow::bail!(
+                    "Malformed ACP JSON under restricted policy: {err}; transport terminated"
+                );
+            }
+            Err(err) => anyhow::bail!("Failed to parse JSON from agent: {err}\nLine: {line}"),
+        };
+        self.reject_invalid_permission_request_id(&json).await?;
+        self.validate_incoming_mode_update(&json).await?;
+        Ok(json)
     }
 
     /// Receive and parse the next ACP message from the transport.
@@ -1835,9 +2387,25 @@ impl Client {
     /// Keeps reading until it gets one parseable ACP message.
     /// Skips empty lines and unrecognized message formats.
     async fn recv_message(&mut self) -> anyhow::Result<Message> {
-        let msg = self.recv_message_raw().await?;
-        self.reject_forbidden_message(&msg).await?;
-        Ok(msg)
+        loop {
+            let msg = self.recv_message_raw().await?;
+            self.reject_forbidden_message(&msg).await?;
+            if !self.deny_permission_request(&msg).await? {
+                return Ok(msg);
+            }
+        }
+    }
+
+    async fn recv_message_for_session(&mut self, session_id: &str) -> anyhow::Result<Message> {
+        loop {
+            let msg = self.recv_message_raw().await?;
+            self.reject_foreign_session_message(&msg, session_id)
+                .await?;
+            self.reject_forbidden_message(&msg).await?;
+            if !self.deny_permission_request(&msg).await? {
+                return Ok(msg);
+            }
+        }
     }
 
     async fn recv_message_raw(&mut self) -> anyhow::Result<Message> {
@@ -1858,22 +2426,16 @@ impl Client {
                 continue;
             }
 
-            let json: Value = serde_json::from_str(&line).map_err(|e| {
-                if !self.allow_tools {
-                    anyhow::anyhow!("Failed to parse ACP message: {e}")
-                } else {
-                    anyhow::anyhow!("Failed to parse JSON from agent: {e}\nLine: {line}")
-                }
-            })?;
+            let json = self.parse_incoming_json(&line).await?;
 
             if let Some(msg) = parse_acp_message(&json) {
-                if self.allow_tools {
+                if self.access.allows_tools() {
                     tracing::debug!(payload = %line, "ACP <<< received");
                     log_acp_message("inbound", &msg);
                 }
                 return Ok(msg);
             }
-            if self.allow_tools {
+            if self.access.allows_tools() {
                 tracing::warn!(payload = %line, "ACP <<< skipping unrecognized message");
             }
         }
@@ -1897,12 +2459,13 @@ impl Client {
                 continue;
             }
 
-            let json: Value = serde_json::from_str(&line).map_err(|e| {
-                anyhow::anyhow!("Failed to parse JSON from agent: {e}\nLine: {line}")
-            })?;
+            let json = self.parse_incoming_json(&line).await?;
 
             if let Some(msg) = parse_acp_message(&json) {
                 self.reject_forbidden_message(&msg).await?;
+                if self.deny_permission_request(&msg).await? {
+                    continue;
+                }
                 tracing::debug!(payload = %line, "ACP <<< received");
                 log_acp_message("inbound_direct", &msg);
                 return Ok(msg);
@@ -2123,6 +2686,7 @@ mod tests {
 
     enum ScriptedReceive {
         Message(String),
+        Error(&'static str),
         Eof,
         Pending,
     }
@@ -2190,6 +2754,7 @@ mod tests {
                 .unwrap_or(ScriptedReceive::Pending)
             {
                 ScriptedReceive::Message(message) => Ok(Some(message)),
+                ScriptedReceive::Error(error) => anyhow::bail!("{error}"),
                 ScriptedReceive::Eof => Ok(None),
                 ScriptedReceive::Pending => std::future::pending().await,
             }
@@ -2340,6 +2905,57 @@ mod tests {
         .await
         .unwrap();
         (client, counters)
+    }
+
+    #[test]
+    fn access_round_trips_and_rejects_invalid_combinations() {
+        for (value, access) in [
+            (serde_json::json!("default"), AgentAccess::Default),
+            (serde_json::json!("deny_all"), AgentAccess::DenyAll),
+            (
+                serde_json::json!({"mode":"deny_escalation","acp_mode":"read-only"}),
+                AgentAccess::DenyEscalation {
+                    acp_mode: "read-only".into(),
+                },
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<AgentAccess>(value.clone()).unwrap(),
+                access
+            );
+            assert_eq!(serde_json::to_value(access).unwrap(), value);
+        }
+
+        for value in [
+            serde_json::json!("deny_escalation"),
+            serde_json::json!({"mode":"deny_escalation"}),
+            serde_json::json!({"mode":"deny_escalation","acp_mode":" "}),
+            serde_json::json!({"mode":"deny_all","acp_mode":"read-only"}),
+            serde_json::json!({"mode":"deny_escalation","acp_mode":"read-only","extra":true}),
+        ] {
+            assert!(serde_json::from_value::<AgentAccess>(value).is_err());
+        }
+
+        let mut old_client = serde_json::to_value(Client {
+            transport: None,
+            transport_config: dummy_transport_config(),
+            next_id: 0,
+            agent_capabilities: None,
+            agent_info: None,
+            session_id: None,
+            session_load_context: None,
+            pushback: Vec::new(),
+            session_descriptor: None,
+            pending_session_id: None,
+            watchdog: AgentWatchdogOptions::default(),
+            access: AgentAccess::Default,
+            tool_policy_violated: false,
+            replacement_factory: ReplacementTransportFactory::default(),
+            reconnect_factory: ReplacementTransportFactory::default(),
+        })
+        .unwrap();
+        old_client["allow_tools"] = serde_json::json!(false);
+        assert!(serde_json::from_value::<Client>(old_client).is_err());
     }
 
     #[tokio::test]
@@ -2632,6 +3248,387 @@ mod tests {
         assert_eq!(sent.len(), 2);
         let request: Value = serde_json::from_str(&sent[1]).unwrap();
         assert!(request["params"].get("_meta").is_none());
+    }
+
+    #[tokio::test]
+    async fn required_mode_checks_new_session_before_prompt() {
+        for (reported, accepted) in [
+            (
+                serde_json::json!({"modeState":{"currentModeId":"read-only"}}),
+                true,
+            ),
+            (
+                serde_json::json!({"configOptions":[{"id":"mode","currentValue":"read-only"}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"modeState":{"currentModeId":"read-only"},"configOptions":[{"id":"mode","currentValue":"agent"}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"modeState":{"currentModeId":"agent"}}),
+                false,
+            ),
+            (serde_json::json!({}), false),
+        ] {
+            let init = init_response(0);
+            let mut result = reported;
+            result["sessionId"] = serde_json::json!("sess_1");
+            let session = rpc_response(1, result);
+            let transport = MockTransport::new(vec![&init, &session]);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let response = client.new_session("/tmp", &[], None).await;
+            assert_eq!(response.is_ok(), accepted);
+            if !accepted {
+                assert!(!client.is_connected());
+                assert!(client.tool_policy_violated);
+                assert!(
+                    client
+                        .prompt(
+                            "sess_1",
+                            vec![PromptContent::text("work")],
+                            PromptTurnCancellation::disabled(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(client.clone().access.required_mode(), Some("read-only"));
+            let restored: Client =
+                serde_json::from_value(serde_json::to_value(&client).unwrap()).unwrap();
+            assert_eq!(restored.access.required_mode(), Some("read-only"));
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_required_mode_revokes_prior_session_proof() {
+        let init = init_response(0);
+        let unrestricted = rpc_response(1, serde_json::json!({"sessionId":"sess_A"}));
+        let verified = rpc_response(
+            2,
+            serde_json::json!({"sessionId":"sess_B","modeState":{"currentModeId":"read-only"}}),
+        );
+        let transport = MockTransport::new(vec![&init, &unrestricted, &verified]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.new_session("/tmp", &[], None).await.unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        assert_eq!(client.session_id(), None);
+        assert!(
+            client
+                .prompt(
+                    "sess_A",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(outgoing.lock().len(), 2);
+        client.new_session("/tmp", &[], None).await.unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        assert_eq!(
+            client.session_id(),
+            Some("sess_B"),
+            "same requirement preserves proof"
+        );
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "other".into(),
+        });
+        assert_eq!(client.session_id(), None);
+        assert!(
+            client
+                .clone()
+                .prompt(
+                    "sess_B",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(outgoing.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn required_mode_prompt_requires_verified_id_and_live_transport() {
+        let init = init_response(0);
+        let session = rpc_response(
+            1,
+            serde_json::json!({"sessionId":"sess_A","modeState":{"currentModeId":"read-only"}}),
+        );
+        let transport = MockTransport::new(vec![&init, &session]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        assert_eq!(
+            client.new_session("/tmp", &[], None).await.unwrap(),
+            "sess_A"
+        );
+        assert!(
+            client
+                .prompt(
+                    "sess_B",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not passed")
+        );
+        assert_eq!(
+            outgoing.lock().len(),
+            2,
+            "mismatched session must not send prompt"
+        );
+        let mut cloned = client.clone();
+        assert!(
+            cloned
+                .prompt(
+                    "sess_A",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("reverified")
+        );
+        assert!(!cloned.is_connected());
+        let mut restored: Client =
+            serde_json::from_value(serde_json::to_value(&client).unwrap()).unwrap();
+        assert!(
+            restored
+                .prompt(
+                    "sess_A",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert!(!restored.is_connected());
+    }
+
+    #[tokio::test]
+    async fn required_mode_rechecks_model_option_response() {
+        let init = init_response(0);
+        let session = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId":"sess_A",
+                "modeState":{"currentModeId":"read-only"},
+                "configOptions":[{"id":"model","category":"model","currentValue":"old","options":[{"value":"new"}]},
+                                 {"id":"mode","currentValue":"read-only"}]
+            }),
+        );
+        let changed = rpc_response(
+            2,
+            serde_json::json!({"configOptions":[
+                {"id":"model","currentValue":"new"}, {"id":"mode","currentValue":"agent"}
+            ]}),
+        );
+        let transport = MockTransport::new(vec![&init, &session, &changed]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        let model = ModelInfo {
+            id: "new".into(),
+            provider: None,
+        };
+        assert!(
+            client
+                .new_session("/tmp", &[], Some(&model))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("required mode")
+        );
+        assert!(client.tool_policy_violated);
+        assert!(!client.is_connected());
+        assert_eq!(
+            outgoing.lock().len(),
+            3,
+            "no prompt may follow model mode drift"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_mode_notification_during_model_selection_fails_closed() {
+        let init = init_response(0);
+        let session = rpc_response(
+            1,
+            serde_json::json!({
+                "sessionId": "sess_A", "configOptions": [
+                    {"id":"model","category":"model","currentValue":"old","options":[{"value":"new"}]},
+                    {"id":"mode","currentValue":"read-only"}
+                ]
+            }),
+        );
+        let malformed = session_update(
+            "sess_A",
+            serde_json::json!({"sessionUpdate":"current_mode_update"}),
+        );
+        let model_only = rpc_response(
+            2,
+            serde_json::json!({"configOptions":[{"id":"model","currentValue":"new"}]}),
+        );
+        let transport = MockTransport::new(vec![&init, &session, &malformed, &model_only]);
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        let model = ModelInfo {
+            id: "new".into(),
+            provider: None,
+        };
+        assert!(client.new_session("/tmp", &[], Some(&model)).await.is_err());
+        assert!(client.tool_policy_violated);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn model_selection_requires_mode_in_returned_full_snapshot() {
+        for (mode, accepted) in [(None, false), (Some("read-only"), true)] {
+            let init = init_response(0);
+            let session = rpc_response(
+                1,
+                serde_json::json!({
+                    "sessionId": "sess_A",
+                    "modeState": {"currentModeId": "read-only"},
+                    "configOptions": [
+                        {"id":"model","category":"model","currentValue":"old","options":[{"value":"new"}]},
+                        {"id":"mode","currentValue":"read-only"}
+                    ]
+                }),
+            );
+            let mut options = vec![serde_json::json!({"id":"model","currentValue":"new"})];
+            if let Some(mode) = mode {
+                options.push(serde_json::json!({"id":"mode","currentValue":mode}));
+            }
+            let changed = rpc_response(2, serde_json::json!({"configOptions":options}));
+            let transport = MockTransport::new(vec![&init, &session, &changed]);
+            let outgoing = transport.outgoing();
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let model = ModelInfo {
+                id: "new".into(),
+                provider: None,
+            };
+            let result = client.new_session("/tmp", &[], Some(&model)).await;
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert!(client.tool_policy_violated);
+                assert!(!client.is_connected());
+                assert!(
+                    client
+                        .prompt(
+                            "sess_A",
+                            vec![PromptContent::text("work")],
+                            PromptTurnCancellation::disabled(),
+                            &mut |_| {}
+                        )
+                        .await
+                        .is_err()
+                );
+            }
+            assert_eq!(outgoing.lock().len(), 3, "no prompt after missing mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn model_selection_rejects_mode_change_before_model_only_response() {
+        for reported_mode in ["agent", "read-only"] {
+            let init = init_response(0);
+            let session = rpc_response(
+                1,
+                serde_json::json!({
+                    "sessionId": "sess_A",
+                    "configOptions": [
+                        {"id": "model", "category": "model", "currentValue": "old", "options": [{"value": "new"}]},
+                        {"id": "mode", "currentValue": "read-only"}
+                    ]
+                }),
+            );
+            let notification = session_update(
+                "sess_A",
+                serde_json::json!({
+                    "sessionUpdate": "current_mode_update", "currentModeId": reported_mode
+                }),
+            );
+            let changed = rpc_response(
+                2,
+                serde_json::json!({
+                    "configOptions": [{"id": "model", "currentValue": "new"}]
+                }),
+            );
+            let transport = MockTransport::new(vec![&init, &session, &notification, &changed]);
+            let outgoing = transport.outgoing();
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let model = ModelInfo {
+                id: "new".into(),
+                provider: None,
+            };
+            let result = client.new_session("/tmp", &[], Some(&model)).await;
+            if reported_mode == "agent" {
+                assert!(result.is_err());
+                assert!(client.tool_policy_violated);
+                assert!(!client.is_connected());
+            } else {
+                assert!(result.is_err(), "model-only snapshot omits required mode");
+                assert!(client.tool_policy_violated);
+                assert!(!client.is_connected());
+            }
+            assert_eq!(
+                outgoing.lock().len(),
+                3,
+                "no prompt may be sent during setup"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3152,8 +4149,442 @@ mod tests {
         assert_eq!(perm_resp["result"]["outcome"]["optionId"], "allow-once");
     }
 
+    #[tokio::test]
+    async fn string_permission_request_id_is_preserved_when_granted() {
+        let init = init_response(0);
+        let permission = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "permission/grant",
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess_1",
+                "options": [{ "kind": "allow_once", "optionId": "allow-once" }]
+            }
+        })
+        .to_string();
+        let response = prompt_response(1, "end_turn");
+        let transport = MockTransport::new(vec![&init, &permission, &response]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+
+        assert!(matches!(
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap(),
+            StopReason::EndTurn
+        ));
+        let sent = outgoing.lock();
+        let permission_response: Value = serde_json::from_str(&sent[2]).unwrap();
+        assert_eq!(permission_response["id"], "permission/grant");
+        assert_eq!(
+            permission_response["result"]["outcome"]["optionId"],
+            "allow-once"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_receive_cancels_string_permission_id_without_options() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        incoming
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission/setup",
+                    "method": "session/request_permission",
+                    "params": { "sessionId": "sess_1" }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        incoming.send(rpc_response(42, Value::Null)).unwrap();
+
+        assert!(matches!(
+            client.recv_message_direct().await.unwrap(),
+            Message::Response { id: 42, .. }
+        ));
+        let denied = next_outgoing(&mut outgoing).await;
+        assert_eq!(denied["id"], "permission/setup");
+        assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled");
+        assert!(!client.tool_policy_violated);
+    }
+
+    #[tokio::test]
+    async fn invalid_permission_ids_poison_and_terminate_restricted_transports() {
+        for deny_permissions in [true, false] {
+            for direct in [true, false] {
+                for id in [
+                    None,
+                    Some(Value::Null),
+                    Some(serde_json::json!(-1)),
+                    Some(serde_json::json!(1.5)),
+                    Some(serde_json::json!({ "unexpected": "id" })),
+                ] {
+                    let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+                    if deny_permissions {
+                        client.set_access(AgentAccess::DenyEscalation {
+                            acp_mode: "read-only".into(),
+                        });
+                    } else {
+                        client.set_access(AgentAccess::DenyAll);
+                    }
+                    let mut request = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/request_permission",
+                        "params": { "sessionId": "sess_1" }
+                    });
+                    if let Some(id) = &id {
+                        request["id"] = id.clone();
+                    }
+                    incoming.send(request.to_string()).unwrap();
+
+                    let received = if direct {
+                        client.recv_message_direct().await
+                    } else {
+                        client.recv_message_raw().await
+                    };
+                    assert!(
+                        received.unwrap_err().to_string().contains("invalid id"),
+                        "direct={direct}, deny_permissions={deny_permissions}, id={id:?}"
+                    );
+                    assert!(client.tool_policy_violated);
+                    assert!(client.transport.is_none());
+                    assert!(outgoing.try_recv().is_err());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_json_terminates_restricted_receive_paths() {
+        for direct in [true, false] {
+            let (mut client, incoming, _) = controlled_watchdog_client().await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            incoming
+                .send("{\"method\":\"session/request_permission\",\"id\":".into())
+                .unwrap();
+
+            let received = if direct {
+                client.recv_message_direct().await
+            } else {
+                client.recv_message_raw().await
+            };
+            assert!(
+                received
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Malformed ACP JSON")
+            );
+            assert!(client.tool_policy_violated);
+            assert!(client.transport.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_permission_does_not_block_tools_or_poison_session() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |event| events.push(event),
+                )
+                .await;
+            (client, result, events)
+        });
+
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/prompt"
+        );
+        incoming
+            .send(tool_call_started(
+                "sess_1", "call_1", "ordinary", "execute", "pending",
+            ))
+            .unwrap();
+        incoming
+            .send(permission_request(101, "sess_1", "escalation"))
+            .unwrap();
+        let denied = next_outgoing(&mut outgoing).await;
+        assert_eq!(denied["id"], 101);
+        assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled");
+        incoming
+            .send(tool_call_progress("sess_1", "call_1", "completed"))
+            .unwrap();
+        incoming.send(text_chunk_update("sess_1", "done")).unwrap();
+        incoming.send(prompt_response(1, "end_turn")).unwrap();
+        let (client, result, events) = task.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ToolCall { .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::ToolCallUpdate { .. }))
+        );
+        assert!(!client.tool_policy_violated);
+        assert_eq!(client.clone().access.required_mode(), Some("read-only"));
+        let restored: Client =
+            serde_json::from_value(serde_json::to_value(&client).unwrap()).unwrap();
+        assert_eq!(restored.access.required_mode(), Some("read-only"));
+    }
+
+    #[tokio::test]
+    async fn denied_permission_with_missing_options_still_cancels() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+
+        let _prompt = next_outgoing(&mut outgoing).await;
+        incoming.send(serde_json::json!({"jsonrpc":"2.0","id":102,"method":"session/request_permission","params":{"sessionId":"sess_1","options":"invalid"}}).to_string()).unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["result"]["outcome"]["outcome"],
+            "cancelled"
+        );
+        incoming
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming.send(prompt_response(1, "end_turn")).unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    #[tokio::test]
+    async fn restricted_receive_cancels_string_permission_id_without_options() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        incoming
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission/prompt",
+                    "method": "session/request_permission",
+                    "params": { "sessionId": "sess_1" }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        incoming.send(rpc_response(42, Value::Null)).unwrap();
+
+        assert!(matches!(
+            client.recv_message().await.unwrap(),
+            Message::Response { id: 42, .. }
+        ));
+        let denied = next_outgoing(&mut outgoing).await;
+        assert_eq!(denied["id"], "permission/prompt");
+        assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled");
+        assert!(!client.tool_policy_violated);
+    }
+
+    #[tokio::test]
+    async fn default_allow_skips_unreplyable_permission_requests() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        incoming
+            .send(
+                serde_json::json!({ "method": "session/request_permission", "id": null })
+                    .to_string(),
+            )
+            .unwrap();
+        incoming.send(rpc_response(42, Value::Null)).unwrap();
+
+        assert!(matches!(
+            client.recv_message().await.unwrap(),
+            Message::Response { id: 42, .. }
+        ));
+        assert!(!client.tool_policy_violated);
+        assert!(client.transport.is_some());
+        assert!(outgoing.try_recv().is_err());
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn allow_tools_false_never_completes_when_denial_send_is_blocked() {
+    async fn denied_requests_cannot_extend_session_setup_deadlines() {
+        for load in [false, true] {
+            let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let task = tokio::spawn(async move {
+                let result = if load {
+                    client.load_session("sess_1", "/tmp", &[]).await.map(|_| ())
+                } else {
+                    client.new_session("/tmp", &[], None).await.map(|_| ())
+                };
+                (client, result)
+            });
+            let request = next_outgoing(&mut outgoing).await;
+            assert_eq!(
+                request["method"],
+                if load { "session/load" } else { "session/new" }
+            );
+            for id in 300..305 {
+                tokio::time::advance(Duration::from_millis(500)).await;
+                incoming
+                    .send(permission_request(id, "sess_1", "escalation"))
+                    .unwrap();
+                assert_eq!(
+                    next_outgoing(&mut outgoing).await["result"]["outcome"]["outcome"],
+                    "cancelled"
+                );
+            }
+            tokio::time::advance(Duration::from_millis(600)).await;
+            let (client, result) = task.await.unwrap();
+            assert!(result.unwrap_err().to_string().contains("timed out"));
+            assert!(!client.is_connected());
+            assert!(client.tool_policy_violated);
+        }
+    }
+
+    #[tokio::test]
+    async fn restricted_permission_is_denied_during_session_setup() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        let task = tokio::spawn(async move { client.new_session("/tmp", &[], None).await });
+        let request = next_outgoing(&mut outgoing).await;
+        assert_eq!(request["method"], "session/new");
+        incoming
+            .send(permission_request(103, "sess_1", "setup escalation"))
+            .unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["result"]["outcome"]["outcome"],
+            "cancelled"
+        );
+        incoming.send(serde_json::json!({"jsonrpc":"2.0","id":request["id"],"result":{"sessionId":"sess_1","configOptions":[{"id":"mode","currentValue":"read-only"}]}}).to_string()).unwrap();
+        assert_eq!(task.await.unwrap().unwrap(), "sess_1");
+    }
+
+    #[tokio::test]
+    async fn restricted_permission_is_denied_during_trailing_drain() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _prompt = next_outgoing(&mut outgoing).await;
+        incoming
+            .send(text_chunk_update("sess_1", "answer"))
+            .unwrap();
+        incoming.send(prompt_response(1, "end_turn")).unwrap();
+        incoming
+            .send(permission_request(104, "sess_1", "trailing escalation"))
+            .unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["result"]["outcome"]["outcome"],
+            "cancelled"
+        );
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restricted_denial_send_failure_terminates_and_poisoned_client_cannot_reconnect() {
+        for action in [
+            ScriptedOperation::Pending,
+            ScriptedOperation::Error("send failed"),
+        ] {
+            let counters = Arc::new(ScriptedTransportCounters::default());
+            let transport = ScriptedTransport::new(
+                vec![
+                    ScriptedReceive::Message(init_response(0)),
+                    ScriptedReceive::Message(permission_request(100, "sess_1", "escalation")),
+                ],
+                counters.clone(),
+            )
+            .send_action(2, action)
+            .force_action(ScriptedOperation::Error("termination failed"));
+            let (mut client, _) = scripted_client(transport).await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            client.session_id = Some("sess_1".into());
+            let error = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("denial") || error.to_string().contains("tool"));
+            assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+            assert!(client.transport.is_none());
+            assert!(client.tool_policy_violated);
+            assert_denied_prompt(
+                client
+                    .prompt(
+                        "sess_1",
+                        vec![PromptContent::text("again")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |_| {},
+                    )
+                    .await,
+            );
+            assert_denied_prompt(
+                client
+                    .new_session("/tmp", &[], None)
+                    .await
+                    .map(|_| StopReason::EndTurn),
+            );
+            assert_denied_prompt(
+                client
+                    .load_session("sess_1", "/tmp", &[])
+                    .await
+                    .map(|_| StopReason::EndTurn),
+            );
+            assert_denied_prompt(client.ensure_transport().await.map(|_| StopReason::EndTurn));
+            assert_eq!(counters.sends.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deny_all_never_completes_when_denial_send_is_blocked() {
         for case in [
             "external",
             "watchdog_grace",
@@ -3192,7 +4623,7 @@ mod tests {
                 transport = transport.force_action(ScriptedOperation::Pending);
             }
             let (mut client, _) = scripted_client(transport).await;
-            client.set_allow_tools(false);
+            client.set_access(AgentAccess::DenyAll);
             let cancellation = if case == "external" {
                 PromptTurnCancellation::from_future(async {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -3223,9 +4654,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_tools_false_cancels_permission_and_poisoned_client_cannot_prompt_again() {
+    async fn deny_all_cancels_permission_and_poisoned_client_cannot_prompt_again() {
         let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-        client.set_allow_tools(false);
+        client.set_access(AgentAccess::DenyAll);
         let prompt = tokio::spawn(async move {
             let result = client
                 .prompt(
@@ -3243,10 +4674,18 @@ mod tests {
             "session/prompt"
         );
         incoming_tx
-            .send(permission_request(100, "sess_1", "private-tool-title"))
+            .send(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": "permission/forbidden",
+                    "method": "session/request_permission",
+                    "params": { "sessionId": "sess_1", "toolCall": { "title": "private-tool-title" } }
+                })
+                .to_string(),
+            )
             .unwrap();
         let response = next_outgoing(&mut outgoing_rx).await;
-        assert_eq!(response["id"], 100);
+        assert_eq!(response["id"], "permission/forbidden");
         assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
         assert!(response["result"]["outcome"].get("optionId").is_none());
 
@@ -3280,7 +4719,7 @@ mod tests {
         );
         let persisted = serde_json::to_value(&client).unwrap();
         let mut restored: Client = serde_json::from_value(persisted).unwrap();
-        restored.set_allow_tools(true);
+        restored.set_access(AgentAccess::Default);
         assert_denied_prompt(
             restored
                 .prompt(
@@ -3294,7 +4733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_tools_false_rejects_unprompted_tool_events_without_forwarding_them() {
+    async fn deny_all_rejects_unprompted_tool_events_without_forwarding_them() {
         for forbidden in [
             tool_call_started(
                 "sess_1",
@@ -3306,7 +4745,7 @@ mod tests {
             tool_call_progress("sess_1", "call_1", "completed"),
         ] {
             let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-            client.set_allow_tools(false);
+            client.set_access(AgentAccess::DenyAll);
             incoming_tx.send(forbidden).unwrap();
             incoming_tx.send(prompt_response(1, "end_turn")).unwrap();
             let prompt = tokio::spawn(async move {
@@ -3333,9 +4772,175 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_tools_false_still_completes_tool_free_prompts() {
+    async fn foreign_or_missing_session_activity_cannot_keep_restricted_prompt_alive() {
+        for message in [
+            tool_call_started("foreign", "call_1", "fake", "execute", "pending"),
+            tool_call_started("", "call_1", "fake", "execute", "pending"),
+            text_chunk_update("foreign", "leak"),
+            text_chunk_update("", "leak"),
+            permission_request(501, "foreign", "escalation"),
+            permission_request(502, "", "escalation"),
+        ] {
+            let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            client.session_id = Some("sess_1".into());
+            let task = tokio::spawn(async move {
+                let result = client
+                    .prompt(
+                        "sess_1",
+                        vec![PromptContent::text("work")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |_| {},
+                    )
+                    .await;
+                (client, result)
+            });
+            let _prompt = next_outgoing(&mut outgoing).await;
+            incoming.send(message).unwrap();
+            let (client, result) = task.await.unwrap();
+            assert_denied_prompt(result);
+            assert!(client.tool_policy_violated);
+            assert!(!client.is_connected());
+            assert!(
+                outgoing.try_recv().is_err(),
+                "foreign request cannot receive a grant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_mode_change_aborts_required_session_before_forwarding() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            let mut events = Vec::new();
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |event| events.push(event),
+                )
+                .await;
+            (client, result, events)
+        });
+        let _prompt = next_outgoing(&mut outgoing).await;
+        incoming
+            .send(session_update(
+                "sess_1",
+                serde_json::json!({"sessionUpdate":"current_mode_update","currentModeId":"agent"}),
+            ))
+            .unwrap();
+        let (client, result, events) = task.await.unwrap();
+        assert_denied_prompt(result);
+        assert!(events.is_empty());
+        assert!(client.tool_policy_violated);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn model_updates_do_not_invalidate_required_mode_but_full_snapshots_do() {
+        for (update, accepted) in [
+            (
+                serde_json::json!({"sessionUpdate":"current_model_update","currentModelId":"new"}),
+                true,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":"new"}]}),
+                false,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"model","currentValue":"new"},{"id":"mode","currentValue":"read-only"}]}),
+                true,
+            ),
+            (
+                serde_json::json!({"sessionUpdate":"config_option_update","configOptions":[{"id":"mode","currentValue":"agent"}]}),
+                false,
+            ),
+        ] {
+            let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            client.session_id = Some("sess_1".into());
+            let task = tokio::spawn(async move {
+                let result = client
+                    .prompt(
+                        "sess_1",
+                        vec![PromptContent::text("work")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |_| {},
+                    )
+                    .await;
+                (client, result)
+            });
+            let _prompt = next_outgoing(&mut outgoing).await;
+            incoming.send(session_update("sess_1", update)).unwrap();
+            if accepted {
+                incoming.send(text_chunk_update("sess_1", "ok")).unwrap();
+                incoming.send(prompt_response(1, "end_turn")).unwrap();
+            }
+            let (client, result) = task.await.unwrap();
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(client.tool_policy_violated, !accepted);
+            assert_eq!(client.is_connected(), accepted);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forbidden_tool_event_terminates_even_when_force_termination_fails() {
+        for event in [
+            tool_call_started("sess_1", "call_1", "forbidden", "execute", "pending"),
+            tool_call_progress("sess_1", "call_1", "completed"),
+        ] {
+            for force in [
+                ScriptedOperation::Error("cannot terminate"),
+                ScriptedOperation::Pending,
+            ] {
+                let counters = Arc::new(ScriptedTransportCounters::default());
+                let transport = ScriptedTransport::new(
+                    vec![
+                        ScriptedReceive::Message(init_response(0)),
+                        ScriptedReceive::Message(event.clone()),
+                    ],
+                    counters.clone(),
+                )
+                .force_action(force);
+                let (mut client, _) = scripted_client(transport).await;
+                client.set_access(AgentAccess::DenyAll);
+                assert_denied_prompt(
+                    client
+                        .prompt(
+                            "sess_1",
+                            vec![PromptContent::text("work")],
+                            PromptTurnCancellation::disabled(),
+                            &mut |_| {},
+                        )
+                        .await,
+                );
+                assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+                assert!(client.transport.is_none());
+                assert!(client.tool_policy_violated);
+                assert_denied_prompt(
+                    client
+                        .new_session("/tmp", &[], None)
+                        .await
+                        .map(|_| StopReason::EndTurn),
+                );
+                assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_all_still_completes_tool_free_prompts() {
         let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-        client.set_allow_tools(false);
+        client.set_access(AgentAccess::DenyAll);
         let prompt = tokio::spawn(async move {
             let mut events = Vec::new();
             let result = client
@@ -3364,9 +4969,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_tools_false_rejects_tool_updates_trailing_successful_responses() {
+    async fn deny_all_rejects_tool_updates_trailing_successful_responses() {
         let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-        client.set_allow_tools(false);
+        client.set_access(AgentAccess::DenyAll);
         let prompt = tokio::spawn(async move {
             let mut events = Vec::new();
             let result = client
@@ -3398,9 +5003,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_tools_false_cancels_permission_after_prompt_response() {
+    async fn deny_all_cancels_permission_after_prompt_response() {
         let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-        client.set_allow_tools(false);
+        client.set_access(AgentAccess::DenyAll);
         let prompt = tokio::spawn(async move {
             client
                 .prompt(
@@ -3429,11 +5034,202 @@ mod tests {
         assert_denied_prompt(prompt.await.unwrap());
     }
 
+    #[tokio::test]
+    async fn restricted_trailing_transport_error_terminates_instead_of_succeeding() {
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let transport = ScriptedTransport::new(
+            vec![
+                ScriptedReceive::Message(init_response(0)),
+                ScriptedReceive::Message(text_chunk_update("sess_1", "answer")),
+                ScriptedReceive::Message(prompt_response(1, "end_turn")),
+                ScriptedReceive::Error("stream failed"),
+            ],
+            counters.clone(),
+        );
+        let (mut client, _) = scripted_client(transport).await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let error = client
+            .prompt(
+                "sess_1",
+                vec![PromptContent::text("work")],
+                PromptTurnCancellation::disabled(),
+                &mut |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("tool"));
+        assert!(client.tool_policy_violated);
+        assert!(!client.is_connected());
+        assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test(start_paused = true)]
-    async fn allow_tools_false_catches_permission_and_tool_during_watchdog_grace() {
+    async fn restricted_cancelled_turn_denies_trailing_request() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _prompt = next_outgoing(&mut outgoing).await;
+        incoming.send(prompt_response(1, "cancelled")).unwrap();
+        incoming
+            .send(permission_request(107, "sess_1", "late escalation"))
+            .unwrap();
+        let denied = next_outgoing(&mut outgoing).await;
+        assert_eq!(denied["id"], 107);
+        assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled");
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            StopReason::Cancelled
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn denied_requests_do_not_defer_watchdog_cancellation() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _prompt = next_outgoing(&mut outgoing).await;
+        for id in 110..115 {
+            tokio::time::advance(Duration::from_millis(190)).await;
+            incoming
+                .send(permission_request(id, "sess_1", "escalation"))
+                .unwrap();
+            assert_eq!(next_outgoing(&mut outgoing).await["id"], id);
+        }
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/cancel"
+        );
+        incoming.send(prompt_response(1, "cancelled")).unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/prompt"
+        );
+        incoming
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming.send(prompt_response(2, "end_turn")).unwrap();
+        assert!(matches!(task.await.unwrap().unwrap(), StopReason::EndTurn));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn external_cancellation_wins_ready_denial_flood() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::from_future(async move {
+                        let _ = cancel_rx.await;
+                    }),
+                    &mut |_| {},
+                )
+                .await
+        });
+        let _prompt = next_outgoing(&mut outgoing).await;
+        cancel_tx.send(()).unwrap();
+        for id in 200..300 {
+            incoming
+                .send(permission_request(id, "sess_1", "escalation"))
+                .unwrap();
+        }
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/cancel"
+        );
+        incoming.send(prompt_response(1, "cancelled")).unwrap();
+        assert!(matches!(
+            task.await.unwrap().unwrap(),
+            StopReason::Cancelled
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restricted_permission_during_watchdog_grace_is_cancelled_without_poisoning() {
+        let (mut client, incoming, mut outgoing) = controlled_watchdog_client().await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        let task = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/prompt"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/cancel"
+        );
+        incoming
+            .send(permission_request(106, "sess_1", "grace escalation"))
+            .unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["result"]["outcome"]["outcome"],
+            "cancelled"
+        );
+        incoming.send(prompt_response(1, "cancelled")).unwrap();
+        assert_eq!(
+            next_outgoing(&mut outgoing).await["method"],
+            "session/prompt"
+        );
+        incoming
+            .send(text_chunk_update("sess_1", "recovered"))
+            .unwrap();
+        incoming.send(prompt_response(2, "end_turn")).unwrap();
+        let (client, result) = task.await.unwrap();
+        assert!(matches!(result.unwrap(), StopReason::EndTurn));
+        assert!(!client.tool_policy_violated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deny_all_catches_permission_and_tool_during_watchdog_grace() {
         for permission in [false, true] {
             let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-            client.set_allow_tools(false);
+            client.set_access(AgentAccess::DenyAll);
             let prompt = tokio::spawn(async move {
                 let mut events = Vec::new();
                 let result = client
@@ -3484,9 +5280,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn allow_tools_false_catches_tool_use_on_automatic_continuation() {
+    async fn deny_all_catches_tool_use_on_automatic_continuation() {
         let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
-        client.set_allow_tools(false);
+        client.set_access(AgentAccess::DenyAll);
         let prompt = tokio::spawn(async move {
             client
                 .prompt(
@@ -3993,6 +5789,217 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(matches!(&history[0], Event::UserMessageChunk { .. }));
         assert!(matches!(&history[1], Event::MessageChunk { .. }));
+    }
+
+    #[tokio::test]
+    async fn restricted_permission_during_session_replay_preserves_history() {
+        let init = init_response(0);
+        let replay = text_chunk_update("sess_old", "history");
+        let escalation = permission_request(105, "sess_old", "replay escalation");
+        let loaded = rpc_response(
+            1,
+            serde_json::json!({"configOptions":[{"id":"mode","currentValue":"read-only"}]}),
+        );
+        let transport = MockTransport::new(vec![&init, &replay, &escalation, &loaded]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        let history = client
+            .load_session("sess_old", "/project", &[])
+            .await
+            .unwrap();
+        assert!(matches!(history.as_slice(), [Event::MessageChunk { .. }]));
+        let sent = outgoing.lock();
+        let denied: Value = serde_json::from_str(&sent[2]).unwrap();
+        assert_eq!(denied["id"], 105);
+        assert_eq!(denied["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn required_mode_rejects_drift_during_session_replay() {
+        let init = init_response(0);
+        let drift = session_update(
+            "sess_B",
+            serde_json::json!({"sessionUpdate":"current_mode_update","currentModeId":"agent"}),
+        );
+        let loaded = rpc_response(
+            1,
+            serde_json::json!({"configOptions":[{"id":"mode","currentValue":"read-only"}]}),
+        );
+        let transport = MockTransport::new(vec![&init, &drift, &loaded]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        assert!(client.load_session("sess_B", "/tmp", &[]).await.is_err());
+        assert!(client.tool_policy_violated);
+        assert!(!client.is_connected());
+        assert_eq!(
+            outgoing.lock().len(),
+            2,
+            "no prompt after replay mode drift"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_load_revokes_previously_verified_session() {
+        for timeout in [false, true] {
+            let counters = Arc::new(ScriptedTransportCounters::default());
+            let mut incoming = vec![
+                ScriptedReceive::Message(init_response(0)),
+                ScriptedReceive::Message(rpc_response(
+                    1,
+                    serde_json::json!({
+                        "sessionId": "sess_A", "configOptions": [{"id": "mode", "currentValue": "read-only"}]
+                    }),
+                )),
+            ];
+            if !timeout {
+                incoming.push(ScriptedReceive::Message(rpc_response(
+                    2,
+                    serde_json::json!("malformed"),
+                )));
+            }
+            let (mut client, _) =
+                scripted_client(ScriptedTransport::new(incoming, counters.clone())).await;
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            client.new_session("/tmp", &[], None).await.unwrap();
+            assert!(client.load_session("sess_B", "/tmp", &[]).await.is_err());
+            assert_ne!(client.session_id.as_deref(), Some("sess_A"));
+            let sends = counters.sends.load(Ordering::SeqCst);
+            assert!(
+                client
+                    .prompt(
+                        "sess_A",
+                        vec![PromptContent::text("work")],
+                        PromptTurnCancellation::disabled(),
+                        &mut |_| {}
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                counters.sends.load(Ordering::SeqCst),
+                sends,
+                "stale session cannot prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_mode_state_terminates_new_or_loaded_session() {
+        for load in [false, true] {
+            let init = init_response(0);
+            let mut messages = vec![init];
+            if load {
+                messages.push(rpc_response(1, serde_json::json!({"sessionId":"sess_A","configOptions":[{"id":"mode","currentValue":"read-only"}]})));
+                messages.push(rpc_response(
+                    2,
+                    serde_json::json!({"modeState":{"currentModeId":7}}),
+                ));
+            } else {
+                messages.push(rpc_response(
+                    1,
+                    serde_json::json!({"sessionId":"sess_A","modeState":{"currentModeId":7}}),
+                ));
+            }
+            let refs = messages.iter().map(String::as_str).collect::<Vec<_>>();
+            let transport = MockTransport::new(refs);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let result = if load {
+                client.new_session("/tmp", &[], None).await.unwrap();
+                client.load_session("sess_B", "/tmp", &[]).await.map(|_| ())
+            } else {
+                client.new_session("/tmp", &[], None).await.map(|_| ())
+            };
+            assert!(result.is_err());
+            assert!(client.tool_policy_violated);
+            assert!(!client.is_connected());
+            assert_eq!(client.session_id(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_load_revokes_prior_verified_session() {
+        let init = rpc_response(
+            0,
+            serde_json::json!({"protocolVersion":1,"agentCapabilities":{"loadSession":false}}),
+        );
+        let session = rpc_response(
+            1,
+            serde_json::json!({"sessionId":"sess_A","modeState":{"currentModeId":"read-only"}}),
+        );
+        let transport = MockTransport::new(vec![&init, &session]);
+        let outgoing = transport.outgoing();
+        let mut client =
+            Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                .await
+                .unwrap();
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.new_session("/tmp", &[], None).await.unwrap();
+        assert!(client.load_session("sess_B", "/tmp", &[]).await.is_err());
+        assert_eq!(client.session_id(), None);
+        assert!(
+            client
+                .prompt(
+                    "sess_A",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {}
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(outgoing.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn required_mode_checks_loaded_session_before_use() {
+        for (mode, accepted) in [
+            (Some("read-only"), true),
+            (Some("agent"), false),
+            (None, false),
+        ] {
+            let init = init_response(0);
+            let result = mode.map_or_else(
+                || serde_json::json!({}),
+                |value| serde_json::json!({"configOptions":[{"id":"mode","currentValue":value}]}),
+            );
+            let loaded = rpc_response(1, result);
+            let transport = MockTransport::new(vec![&init, &loaded]);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.set_access(AgentAccess::DenyEscalation {
+                acp_mode: "read-only".into(),
+            });
+            let result = client.load_session("sess_1", "/tmp", &[]).await;
+            assert_eq!(result.is_ok(), accepted);
+            if !accepted {
+                assert!(!client.is_connected());
+                assert!(client.tool_policy_violated);
+            }
+        }
     }
 
     #[tokio::test]
@@ -4882,6 +6889,48 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         counters: Arc<ScriptedTransportCounters>,
     ) -> ScriptedTransport {
         ScriptedTransport::new(incoming, counters)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_replacement_revalidates_required_mode_before_continuation() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        client.set_access(AgentAccess::DenyEscalation {
+            acp_mode: "read-only".into(),
+        });
+        client.session_id = Some("sess_1".into());
+        client.session_load_context = Some(SessionLoadContext {
+            cwd: "/tmp".into(),
+            mcp_servers: Vec::new(),
+        });
+        let counters = Arc::new(ScriptedTransportCounters::default());
+        let replacement = replacement_with(
+            vec![
+                ScriptedReceive::Message(init_response(1)),
+                ScriptedReceive::Message(rpc_response(
+                    2,
+                    serde_json::json!({"configOptions":[{"id":"mode","currentValue":"agent"}]}),
+                )),
+            ],
+            counters.clone(),
+        );
+        client.push_replacement_transport(Box::new(replacement));
+        let error = client
+            .hard_recover_and_continue("sess_1")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replacement session/load failed"),
+            "{error}"
+        );
+        assert_eq!(
+            counters.sends.load(Ordering::SeqCst),
+            2,
+            "no continuation may be sent"
+        );
+        assert!(!client.is_connected());
+        assert!(client.tool_policy_violated);
     }
 
     #[tokio::test(start_paused = true)]

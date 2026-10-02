@@ -258,7 +258,7 @@ args = ["--model=github-copilot/claude-opus-4.8", "--thinking=xhigh", "acp"]
 name = "reviewer"
 command = "omp"
 args = ["--model=github-copilot/gpt-5.6-sol", "--thinking=high", "acp"]
-# allow_tools = false # Also disable tools in the backend's own configuration.
+access = "deny_all" # Configure the backend without tools as well.
 
 [[agents]]
 name = "implementer"
@@ -295,14 +295,46 @@ the child receives the union of the global names and that agent's names.
 Multiple roles selecting the same named agent intentionally share its policy;
 use separate agent entries when roles need different policies.
 
-Set `allow_tools = false` on an `[[agents]]` entry to reject that agent's ACP
-tool permission requests and tool-call events for every role using the entry.
-The default is `true`; this setting does not alter model selection. Configure
-the backend itself to run without tools as well (using its supported launch
-arguments or configuration). ACP tool-call notifications can arrive only after
-execution, so Cowboy's denial is a defense in depth, not a substitute for
-disabling backend tool execution. Give tool-free roles a dedicated named agent
-when other roles using the same backend still need tools.
+Set one `access` value per `[[agents]]` entry. Omitting it (or setting
+`access = "default"`) leaves ACP tools and permission requests available. With
+`access = "deny_all"`, Cowboy cancels ACP permission requests, rejects ACP tool
+events, and aborts the operation when the backend attempts to use a tool. The
+backend may already have executed a tool before its ACP notification arrives:
+configure the backend itself to disable tools too. For a named role needing a
+different access policy, configure a dedicated named agent rather than sharing
+one entry across roles.
+
+For permission denial while retaining backend-reported read-only tool activity,
+use `access = { mode = "deny_escalation", acp_mode = "read-only" }`, substituting a
+mode ID supported and configured in the backend. Cowboy cancels ACP permission
+requests and requires that the backend report the configured mode for each
+`session/new` and `session/load` before prompting, including watchdog replacement;
+it never selects or switches to the mode itself. Unlike `deny_all`, this policy
+does not reject tool-call notifications. A disconnected client must reload and
+reverify its session before another prompt. Cowboy checks reported mode changes
+during setup, model selection, replay, and turns; a mismatched or malformed
+mode report terminates the connection. A full `config_option_update` snapshot
+must retain the mode option, and a model-selection response containing full
+`configOptions` must report the required mode anew. Model-only updates do not
+imply a mode change. Changing the policy or failing a session load revokes the
+previous verification.
+
+Cowboy accepts `modeState.currentModeId` or the `mode` config option's
+`currentValue`, rejecting missing, conflicting, or mismatched reports. These
+are **backend self-reports**, not enforcement: an unreported mode change is
+undetectable, and no report proves OS sandboxing, filesystem isolation, or
+network restrictions. Independently enforce the backend sandbox and approval
+policy. For Codex ACP, the default `agent` mode has auto-review; choose an
+appropriate backend preset such as `read-only` and verify its actual workspace
+and network restrictions. If using Codex's `INITIAL_AGENT_MODE`, include
+`"INITIAL_AGENT_MODE"` in that agent's `allowed_env` and set it when launching
+Cowboy: backend environments are cleared by default. Forwarding a variable
+does not replace ACP mode verification or backend sandbox enforcement. Cowboy
+answers permission requests during turns and for a bounded trailing window,
+but cannot answer indefinitely after it stops reading.
+
+An agent can still emit fake same-session tool progress to defer the watchdog's
+in-flight-tool deadline. The backend must enforce tool and sandbox boundaries.
 
 Omitting top-level `allowed_env` preserves the compatibility default shown
 above. Omitting an agent list adds nothing, while an explicit

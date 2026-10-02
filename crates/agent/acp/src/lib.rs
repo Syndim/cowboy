@@ -11,5 +11,5 @@ pub mod transport;
 
 pub use agent_processes::terminate_all_agent_processes;
 pub use backend::BackendPreset;
-pub use client::{AgentWatchdogOptions, Client};
+pub use client::{AgentAccess, AgentWatchdogOptions, Client};
 pub use transport::TransportConfig;

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cowboy_agent_acp::AgentAccess;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient};
 use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
@@ -17,6 +18,7 @@ pub(crate) trait AcpConnector: Send + Sync {
         &self,
         transport: TransportConfig,
         watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
     ) -> anyhow::Result<AcpClient>;
 
     /// Terminate every live agent process tree, bounded by `timeout`, and
@@ -36,8 +38,9 @@ impl AcpConnector for ProductionAcpConnector {
         &self,
         transport: TransportConfig,
         watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
     ) -> anyhow::Result<AcpClient> {
-        AcpClient::connect_with_options(transport, watchdog).await
+        AcpClient::connect_with_options_and_access(transport, watchdog, access).await
     }
 
     async fn terminate_all_agents(&self, timeout: Duration) -> usize {
@@ -134,14 +137,14 @@ async fn generate_request_topic_result(
 ) -> Result<String> {
     let resolver = AgentResolver::new(config.agents.clone())?;
     let agent = resolver.resolve_default()?;
-    let mut client = connector
+    let client = connector
         .connect(
             transport_for(&config.allowed_env, agent),
             watchdog_options_for(agent),
+            agent.access.clone(),
         )
         .await
         .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-    client.set_allow_tools(agent.allow_tools);
     let generator = AgentRequestTopicGenerator::new(
         client,
         config.cwd.to_string_lossy().to_string(),
@@ -173,14 +176,14 @@ impl ClientFactory for AcpClientFactory {
             provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
             "resolving ACP client for role"
         );
-        let mut client = self
+        let client = self
             .connector
             .connect(
                 transport_for(&self.global_allowed_env, agent),
                 watchdog_options_for(agent),
+                agent.access.clone(),
             )
             .await?;
-        client.set_allow_tools(agent.allow_tools);
         Ok(ResolvedAgentClient {
             client: Box::new(client),
             model: agent.model.clone(),
@@ -230,11 +233,15 @@ mod tests {
 
     struct ScriptedAcpTransport {
         incoming: VecDeque<String>,
+        outgoing: Option<Arc<Mutex<Vec<serde_json::Value>>>>,
     }
 
     #[async_trait]
     impl Transport for ScriptedAcpTransport {
-        async fn send(&mut self, _message: &str) -> anyhow::Result<()> {
+        async fn send(&mut self, message: &str) -> anyhow::Result<()> {
+            if let Some(outgoing) = &self.outgoing {
+                outgoing.lock().push(serde_json::from_str(message)?);
+            }
             Ok(())
         }
 
@@ -255,6 +262,7 @@ mod tests {
             &self,
             transport: TransportConfig,
             watchdog: AgentWatchdogOptions,
+            access: AgentAccess,
         ) -> anyhow::Result<AcpClient> {
             let response = |id, result: serde_json::Value| {
                 serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
@@ -282,10 +290,83 @@ mod tests {
                 })),
                 response(2, serde_json::json!({"stopReason": "end_turn"})),
             ]);
-            AcpClient::connect_with_transport_and_options(
-                Box::new(ScriptedAcpTransport { incoming }),
+            AcpClient::connect_with_transport_and_options_and_access(
+                Box::new(ScriptedAcpTransport {
+                    incoming,
+                    outgoing: None,
+                }),
                 transport,
                 watchdog,
+                access,
+            )
+            .await
+        }
+    }
+
+    #[derive(Default)]
+    struct PermissionAcpConnector {
+        outgoing: Arc<Mutex<Vec<serde_json::Value>>>,
+        request_during_initialize: bool,
+    }
+
+    #[async_trait]
+    impl AcpConnector for PermissionAcpConnector {
+        async fn connect(
+            &self,
+            transport: TransportConfig,
+            watchdog: AgentWatchdogOptions,
+            access: AgentAccess,
+        ) -> anyhow::Result<AcpClient> {
+            let response = |id, result: serde_json::Value| {
+                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+            };
+            let mut incoming = VecDeque::from([
+                response(
+                    0,
+                    serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
+                ),
+                response(1, serde_json::json!({"sessionId": "session-1", "modeState": {"currentModeId": "read-only"}})),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": 100, "method": "session/request_permission",
+                    "params": {
+                        "sessionId": "session-1", "toolCall": {"name": "write_file"},
+                        "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "jsonrpc": "2.0", "method": "session/update",
+                    "params": {
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "{\"topic\":\"Example task\"}"}
+                        }
+                    }
+                })
+                .to_string(),
+                response(2, serde_json::json!({"stopReason": "end_turn"})),
+            ]);
+            if self.request_during_initialize {
+                incoming.push_front(
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 101, "method": "session/request_permission",
+                        "params": {
+                            "sessionId": "session-1", "toolCall": {"name": "setup_tool"},
+                            "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}]
+                        }
+                    })
+                    .to_string(),
+                );
+            }
+            AcpClient::connect_with_transport_and_options_and_access(
+                Box::new(ScriptedAcpTransport {
+                    incoming,
+                    outgoing: Some(self.outgoing.clone()),
+                }),
+                transport,
+                watchdog,
+                access,
             )
             .await
         }
@@ -297,6 +378,7 @@ mod tests {
         clear_env: bool,
         allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
     }
 
     #[derive(Clone, Default)]
@@ -316,6 +398,7 @@ mod tests {
             &self,
             transport: TransportConfig,
             watchdog: AgentWatchdogOptions,
+            access: AgentAccess,
         ) -> anyhow::Result<AcpClient> {
             let TransportConfig::Stdio(transport) = transport else {
                 unreachable!("engine agents use stdio transport")
@@ -325,6 +408,7 @@ mod tests {
                 clear_env: transport.clear_env,
                 allowed_env: transport.allowed_env,
                 watchdog,
+                access,
             });
             Err(anyhow::anyhow!("recording connector"))
         }
@@ -342,8 +426,8 @@ mod tests {
             command: command.to_string(),
             args: Vec::new(),
             model: None,
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds,
                 cancel_timeout_seconds,
@@ -374,8 +458,8 @@ mod tests {
             command: "agent".to_string(),
             args: vec![],
             model: None,
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig {
                 response_timeout_seconds: 7,
                 cancel_timeout_seconds: 8,
@@ -396,11 +480,11 @@ mod tests {
     #[tokio::test]
     async fn factory_rejects_named_role_tool_activity_but_keeps_default_unrestricted() {
         let mut config = config();
-        config.agents[1].allow_tools = false;
+        config.agents[1].access = AgentAccess::DenyAll;
         let dependencies = ProductionRuntimeDependencies::new(Arc::new(PolicyAcpConnector));
         let factory = dependencies.agent_factory(&config).unwrap();
 
-        for (agent_name, allow_tools) in [("named", false), ("default", true)] {
+        for (agent_name, tools_allowed) in [("named", false), ("default", true)] {
             let role = RoleDefinition {
                 id: "developer".to_string(),
                 instructions: "work".to_string(),
@@ -421,7 +505,7 @@ mod tests {
                 )
                 .await;
 
-            if !allow_tools {
+            if !tools_allowed {
                 let error = result.unwrap_err().to_string();
                 assert!(error.contains("tool"), "{error}");
                 assert!(!error.contains("secret-tool-title"), "{error}");
@@ -438,10 +522,136 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_role_denies_escalation_but_default_agent_allows_requests() {
+        let mut config = config();
+        config.agents[1].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
+        let connector = Arc::new(PermissionAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
+        let factory = dependencies.agent_factory(&config).unwrap();
+
+        for (agent_name, expected_outcome) in [("named", "cancelled"), ("default", "selected")] {
+            let role = RoleDefinition {
+                id: "developer".to_string(),
+                instructions: "work".to_string(),
+                agent: Some(agent_name.to_string()),
+                properties: serde_json::Value::Null,
+            };
+            let mut resolved = factory.create_client(&role).await.unwrap();
+            let session = resolved.client.new_session(".", &[], None).await.unwrap();
+            let stop = resolved
+                .client
+                .prompt(
+                    &session,
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await
+                .unwrap();
+            assert!(matches!(stop, StopReason::EndTurn));
+
+            let mut outgoing = connector.outgoing.lock();
+            let response = outgoing
+                .iter()
+                .find(|message| message["id"] == 100)
+                .unwrap();
+            assert_eq!(response["result"]["outcome"]["outcome"], expected_outcome);
+            if agent_name == "default" {
+                assert_eq!(response["result"]["outcome"]["optionId"], "allow-once");
+            }
+            outgoing.clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_topic_uses_default_agent_access() {
+        let mut config = config();
+        config.agents[0].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
+        let connector = Arc::new(PermissionAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
+
+        let topic = dependencies
+            .generate_request_topic(&config, SelectorMode::Agent, "Describe this work")
+            .await;
+
+        assert_eq!(topic.as_deref(), Some("Example task"));
+        let outgoing = connector.outgoing.lock();
+        let response = outgoing
+            .iter()
+            .find(|message| message["id"] == 100)
+            .unwrap();
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn restricted_role_denies_permission_during_initialize_before_session_creation() {
+        let mut config = config();
+        config.agents[1].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
+        let connector = Arc::new(PermissionAcpConnector {
+            request_during_initialize: true,
+            ..Default::default()
+        });
+        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
+        let factory = dependencies.agent_factory(&config).unwrap();
+        let role = RoleDefinition {
+            id: "developer".to_string(),
+            instructions: "work".to_string(),
+            agent: Some("named".to_string()),
+            properties: serde_json::Value::Null,
+        };
+
+        let mut resolved = factory.create_client(&role).await.unwrap();
+        {
+            let outgoing = connector.outgoing.lock();
+            assert_eq!(outgoing[0]["method"], "initialize");
+            assert_eq!(outgoing[1]["id"], 101);
+            assert_eq!(outgoing[1]["result"]["outcome"]["outcome"], "cancelled");
+        }
+
+        resolved.client.new_session(".", &[], None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deny_all_cancels_permission_and_aborts_during_initialize() {
+        let mut config = config();
+        config.agents[0].access = AgentAccess::DenyAll;
+        let connector = Arc::new(PermissionAcpConnector {
+            request_during_initialize: true,
+            ..Default::default()
+        });
+        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
+
+        let topic = dependencies
+            .generate_request_topic(&config, SelectorMode::Agent, "Describe this work")
+            .await;
+
+        assert_eq!(topic, None);
+        let outgoing = connector.outgoing.lock();
+        assert_eq!(
+            outgoing.len(),
+            2,
+            "no session may start after a forbidden setup request"
+        );
+        assert_eq!(outgoing[0]["method"], "initialize");
+        assert_eq!(outgoing[1]["id"], 101);
+        assert_eq!(outgoing[1]["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    #[tokio::test]
     async fn role_agent_client_construction_uses_explicit_named_watchdog() {
         let recording = Arc::new(RecordingAcpConnector::default());
         let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-        let factory = dependencies.agent_factory(&config()).unwrap();
+        let mut config = config();
+        config.agents[1].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
+        let factory = dependencies.agent_factory(&config).unwrap();
         let role = RoleDefinition {
             id: "developer".to_string(),
             instructions: "implement".to_string(),
@@ -465,6 +675,9 @@ mod tests {
                     response_timeout_seconds: 21,
                     cancel_timeout_seconds: 22,
                     recovery_operation_timeout_seconds: 23,
+                },
+                access: AgentAccess::DenyEscalation {
+                    acp_mode: "read-only".to_string(),
                 },
             }]
         );
@@ -491,6 +704,7 @@ mod tests {
                     cancel_timeout_seconds: 12,
                     recovery_operation_timeout_seconds: 13,
                 },
+                access: AgentAccess::Default,
             }]
         );
     }
@@ -533,6 +747,9 @@ mod tests {
             agent("implementer", "implementer-command", 21, 22, 23),
         ];
         config.agents[0].allowed_env = vec!["PLANNER".to_string()];
+        config.agents[0].access = AgentAccess::DenyEscalation {
+            acp_mode: "read-only".to_string(),
+        };
         config.agents[1].allowed_env = vec!["IMPLEMENTER".to_string()];
         let factory = dependencies.agent_factory(&config).unwrap();
 
@@ -548,7 +765,14 @@ mod tests {
 
         let connections = recording.connections();
         assert_eq!(connections[0].allowed_env, ["GLOBAL", "PLANNER"]);
+        assert_eq!(
+            connections[0].access,
+            AgentAccess::DenyEscalation {
+                acp_mode: "read-only".to_string(),
+            }
+        );
         assert_eq!(connections[1].allowed_env, ["GLOBAL", "IMPLEMENTER"]);
+        assert_eq!(connections[1].access, AgentAccess::Default);
         assert!(!connections[1].allowed_env.contains(&"PLANNER".to_string()));
     }
 
@@ -559,6 +783,9 @@ mod tests {
         let mut config = config();
         config.allowed_env = vec!["GLOBAL".to_string()];
         config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string()];
+        config.agents[0].access = AgentAccess::DenyEscalation {
+            acp_mode: "review".to_string(),
+        };
         let factory = dependencies.agent_factory(&config).unwrap();
         let role = RoleDefinition {
             id: "implicit".to_string(),
@@ -578,6 +805,12 @@ mod tests {
         assert_eq!(recording.connections().len(), 2);
         for connection in recording.connections() {
             assert_eq!(connection.allowed_env, ["GLOBAL", "DEFAULT_AGENT"]);
+            assert_eq!(
+                connection.access,
+                AgentAccess::DenyEscalation {
+                    acp_mode: "review".to_string(),
+                }
+            );
         }
     }
 }

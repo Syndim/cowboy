@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+use cowboy_agent_acp::AgentAccess;
 use cowboy_workflow_core::{Result, RoleDefinition, WorkflowError};
 
 use crate::runtime::AgentRuntimeConfig;
@@ -34,6 +36,15 @@ impl AgentResolver {
                     "agent name must not be empty".to_string(),
                 ));
             }
+            if let cowboy_agent_acp::AgentAccess::DenyEscalation { acp_mode } = &agent.access
+                && acp_mode.trim().is_empty()
+            {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "agent {:?} access acp_mode must not be blank",
+                    agent.name
+                )));
+            }
+
             if by_name.insert(agent.name.clone(), agent).is_some() {
                 return Err(WorkflowError::InvalidAction(
                     "agent names must be unique".to_string(),
@@ -101,8 +112,8 @@ mod tests {
             command: format!("{name}-cmd"),
             args: Vec::new(),
             model: Some(ModelInfo::default()),
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         }
     }
@@ -126,18 +137,19 @@ mod tests {
     }
 
     #[test]
-    fn explicit_agent_name_preserves_its_tool_policy_without_affecting_default() {
+    fn explicit_agent_name_preserves_selected_access() {
         let mut restricted = agent("reviewer");
-        restricted.allow_tools = false;
+        restricted.access = AgentAccess::DenyAll;
         let resolver = AgentResolver::new(vec![agent("default"), restricted]).unwrap();
 
-        assert!(
-            !resolver
-                .resolve(&role(Some("reviewer")))
-                .unwrap()
-                .allow_tools
+        assert_eq!(
+            resolver.resolve(&role(Some("reviewer"))).unwrap().access,
+            AgentAccess::DenyAll
         );
-        assert!(resolver.resolve(&role(None)).unwrap().allow_tools);
+        assert_eq!(
+            resolver.resolve(&role(None)).unwrap().access,
+            AgentAccess::Default
+        );
     }
 
     #[test]
@@ -151,8 +163,8 @@ mod tests {
                 "acp".to_string(),
             ],
             model: Some(ModelInfo::default()),
+            access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            allow_tools: true,
             watchdog: AgentWatchdogRuntimeConfig::default(),
         };
         let resolver =
@@ -220,6 +232,21 @@ mod tests {
         let err = AgentResolver::new(vec![agent("   ")]).unwrap_err();
 
         assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn blank_access_acp_mode_fails_for_runtime_agents() {
+        for mode in ["", " \t "] {
+            let mut configured = agent("reviewer");
+            configured.access = AgentAccess::DenyEscalation {
+                acp_mode: mode.to_string(),
+            };
+            let err = AgentResolver::new(vec![configured]).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("access acp_mode must not be blank")
+            );
+        }
     }
 
     #[test]
