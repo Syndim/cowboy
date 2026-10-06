@@ -75,6 +75,10 @@ pub enum CliCommand {
     #[command(alias = "start")]
     Tui,
 
+    /// Inspect native owned-writer shutdown evidence without private process data.
+    #[command(about = "inspect native writer shutdown evidence")]
+    Ownership(RunIdArgs),
+
     #[command(flatten)]
     Shared(SharedCommand),
 }

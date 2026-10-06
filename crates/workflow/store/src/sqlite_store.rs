@@ -130,7 +130,7 @@ impl SqliteWorkflowStore {
         self.pool.close().await;
     }
 
-    async fn retry_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
+    pub(crate) async fn retry_write<T, F, Fut>(&self, mut operation: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -172,12 +172,67 @@ impl SqliteWorkflowStore {
         .await
     }
 
+    /// Advance only the generation the caller observed. A cached SQLite reader
+    /// must not overwrite a newer wait or committed agent result.
+    pub async fn compare_and_save_run(&self, expected_data: &[u8], updated: &Run) -> Result<bool> {
+        self.compare_and_save_run_with_parent(expected_data, updated, None)
+            .await
+    }
+
+    /// Fence a child and its still-matching parent proxy in one transaction.
+    /// Preserve an intervening parent clock update, but never overwrite a
+    /// changed wait generation, step cursor, or head.
+    pub async fn compare_and_save_run_with_parent(
+        &self,
+        expected_data: &[u8],
+        updated: &Run,
+        parent: Option<(&[u8], &Run)>,
+    ) -> Result<bool> {
+        let updated_data = serde_json::to_vec(updated)?;
+        let parent_data = parent.map(|(_, run)| serde_json::to_vec(run)).transpose()?;
+        self.retry_write(|| async {
+            let mut tx = self.pool.begin().await?;
+            if !compare_run_in_tx(&mut tx, expected_data, updated, &updated_data).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+
+            if let (Some((expected_parent, parent)), Some(data)) = (parent, parent_data.as_deref())
+                && !compare_run_in_tx(&mut tx, expected_parent, parent, data).await?
+            {
+                let original: Run = serde_json::from_slice(expected_parent)?;
+                if let Some(mut current) = load_run_in_tx(&mut tx, &parent.id).await?
+                    && current.status == original.status
+                    && current.step.next == original.step.next
+                    && current.step.head == original.step.head
+                {
+                    // Another operation may have persisted only the active
+                    // clock. Preserve its fields while fencing the same wait.
+                    current.agent_recovery_denied = true;
+                    current.status = parent.status.clone();
+                    current.updated_at = Utc::now();
+                    upsert_run_and_head(&mut tx, &current).await?;
+                }
+            }
+
+            tx.commit().await?;
+            Ok(true)
+        })
+        .await
+    }
+
     pub async fn create_restart(&self, seed: &RestartSeed) -> Result<RestartCreationOutcome> {
         self.retry_write(|| async {
             let mut tx = self.pool.begin().await?;
             let source = load_run_in_tx(&mut tx, &seed.source_run_id)
                 .await?
                 .ok_or_else(|| Error::RunNotFound(seed.source_run_id.clone()))?;
+            if source.agent_recovery_denied {
+                return Err(Error::InvalidRestartSeed(
+                    "unsafe agent failure cannot be restarted".to_string(),
+                ));
+            }
+
             if !matches!(
                 source.status,
                 RunStatus::Completed | RunStatus::Failed { .. }
@@ -641,6 +696,8 @@ impl SqliteWorkflowStore {
                 "run_turns",
                 "run_user_prompts",
                 "agent_prompt_windows",
+                "native_writer_attempts",
+                "native_writer_runs",
             ] {
                 let query = format!("DELETE FROM {table} WHERE run_id = ?");
                 sqlx::query(&query).bind(run_id).execute(&mut *tx).await?;
@@ -665,6 +722,27 @@ impl SqliteWorkflowStore {
     }
 }
 
+async fn compare_run_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    expected_data: &[u8],
+    updated: &Run,
+    updated_data: &[u8],
+) -> Result<bool> {
+    let changed = sqlx::query("UPDATE runs SET data = ? WHERE run_id = ? AND data = ?")
+        .bind(updated_data)
+        .bind(&updated.id)
+        .bind(expected_data)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    if changed == 0 {
+        return Ok(false);
+    }
+
+    upsert_run_head(tx, updated).await?;
+    Ok(true)
+}
+
 async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
     sqlx::query(
         "INSERT INTO runs(run_id, data) VALUES(?, ?) \
@@ -674,6 +752,10 @@ async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Res
     .bind(serde_json::to_vec(run)?)
     .execute(&mut **tx)
     .await?;
+    upsert_run_head(tx, run).await
+}
+
+async fn upsert_run_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
     let head = RunHead::from_run(run);
     sqlx::query(
         "INSERT INTO run_heads(run_id, data) VALUES(?, ?) \
@@ -1058,6 +1140,7 @@ mod tests {
             run_id: target.id.clone(),
             role_id: "developer".to_string(),
             backend: cowboy_workflow_core::PROVIDED_SESSION_BACKEND.to_string(),
+            backend_identity: None,
             session_id: "session-1".to_string(),
             updated_at: target.created_at,
             role_instructions_sent: true,
@@ -1065,6 +1148,7 @@ mod tests {
             delivered_task_contracts: [("task".to_string(), "fingerprint".to_string())]
                 .into_iter()
                 .collect(),
+            delivered_actions: Default::default(),
         };
         RestartSeed {
             source_run_id: source.id.clone(),
@@ -1149,6 +1233,126 @@ mod tests {
             store.save_run(&reusable).await.unwrap();
             assert_eq!(store.load_run(&reusable.id).await.unwrap(), reusable);
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_child_and_idle_parent_fence_commit_or_rollback_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("data.db"))
+            .await
+            .unwrap();
+        let mut child = run("run-child");
+        child.agent_input_checkpoint = Some(Box::new(RunStatus::WaitingForInput {
+            step: "implement".to_string(),
+            input_id: "agent-interrupted".to_string(),
+            message: "Verify partial work".to_string(),
+            choices: Vec::new(),
+            resume_callback: cowboy_workflow_core::ResumeCallback::new(
+                "agent_human_input",
+                serde_json::Value::Null,
+            )
+            .unwrap(),
+        }));
+        let mut parent = run("run-parent");
+        parent.status = RunStatus::WaitingForInput {
+            step: "call".to_string(),
+            input_id: "agent-old".to_string(),
+            message: "Child requested input".to_string(),
+            choices: Vec::new(),
+            resume_callback: cowboy_workflow_core::ResumeCallback::new(
+                "workflow_child",
+                serde_json::Value::Null,
+            )
+            .unwrap(),
+        };
+        store.save_run(&child).await.unwrap();
+        store.save_run(&parent).await.unwrap();
+        let before_child = child.clone();
+        let before_parent = parent.clone();
+        let child_expected = serde_json::to_vec(&child).unwrap();
+        let parent_expected = serde_json::to_vec(&parent).unwrap();
+        child.agent_recovery_denied = true;
+        child.status = RunStatus::Failed {
+            reason: "unsafe".into(),
+        };
+        parent.agent_recovery_denied = true;
+        parent.status = RunStatus::Failed {
+            reason: "unsafe child".into(),
+        };
+
+        sqlx::query("CREATE TRIGGER fail_parent_fence BEFORE UPDATE ON run_heads WHEN NEW.run_id = 'run-parent' BEGIN SELECT RAISE(ABORT, 'injected parent head failure'); END")
+            .execute(store.pool()).await.unwrap();
+        assert!(
+            store
+                .compare_and_save_run_with_parent(
+                    &child_expected,
+                    &child,
+                    Some((&parent_expected, &parent)),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.load_run(&before_child.id).await.unwrap(),
+            before_child
+        );
+        assert_eq!(
+            store.load_run(&before_parent.id).await.unwrap(),
+            before_parent
+        );
+        assert_eq!(
+            store.load_run_head(&before_child.id).await.unwrap(),
+            RunHead::from_run(&before_child)
+        );
+        assert_eq!(
+            store.load_run_head(&before_parent.id).await.unwrap(),
+            RunHead::from_run(&before_parent)
+        );
+        sqlx::query("DROP TRIGGER fail_parent_fence")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut clock_parent = before_parent.clone();
+        clock_parent.active_duration_ms = 375;
+        store.save_run(&clock_parent).await.unwrap();
+
+        assert!(
+            store
+                .compare_and_save_run_with_parent(
+                    &child_expected,
+                    &child,
+                    Some((&parent_expected, &parent)),
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(store.load_run(&child.id).await.unwrap(), child);
+        let fenced_parent = store.load_run(&parent.id).await.unwrap();
+        assert_eq!(
+            fenced_parent.status, parent.status,
+            "stale parent reader left an unsafe idle wait"
+        );
+        assert!(fenced_parent.agent_recovery_denied);
+        assert_eq!(fenced_parent.active_duration_ms, 375);
+        assert_eq!(
+            store.load_run_head(&child.id).await.unwrap(),
+            RunHead::from_run(&child)
+        );
+        assert_eq!(
+            store.load_run_head(&parent.id).await.unwrap(),
+            RunHead::from_run(&fenced_parent)
+        );
+        assert!(
+            !store
+                .compare_and_save_run_with_parent(
+                    &child_expected,
+                    &child,
+                    Some((&parent_expected, &parent)),
+                )
+                .await
+                .unwrap(),
+            "stale child generation must not update either run"
+        );
     }
 
     #[test]

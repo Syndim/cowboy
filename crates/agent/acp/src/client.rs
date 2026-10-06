@@ -159,6 +159,19 @@ pub struct Client {
     access: AgentAccess,
     #[serde(default)]
     tool_policy_violated: bool,
+    #[serde(skip)]
+    policy_rejected: bool,
+    #[serde(skip, default = "cleanup_verified_default")]
+    cleanup_verified: bool,
+    /// Workflow-agent policy; selectors and legacy clients keep it disabled.
+    #[serde(skip)]
+    agent_human_input: bool,
+    #[serde(skip)]
+    native_owner: Option<String>,
+    #[serde(skip)]
+    native_scope: Option<String>,
+    #[serde(skip)]
+    native_verified: Option<cowboy_agent_client::VerifiedProcessScope>,
     #[cfg(test)]
     #[serde(skip)]
     replacement_factory: ReplacementTransportFactory,
@@ -216,6 +229,14 @@ impl Clone for Client {
             watchdog: self.watchdog,
             access: self.access.clone(),
             tool_policy_violated: self.tool_policy_violated,
+            policy_rejected: self.policy_rejected,
+            cleanup_verified: self.cleanup_verified,
+            agent_human_input: self.agent_human_input,
+            // No transport or receipt is cloned, but the owner still forbids
+            // an unregistered reconnect from this detached handle.
+            native_owner: self.native_owner.clone(),
+            native_scope: None,
+            native_verified: None,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
             #[cfg(test)]
@@ -532,6 +553,35 @@ impl ReplacementTransportFactoryOutcome {
     }
 }
 
+/// Initialization failed, but its original owned process scope was reaped and inspected empty.
+#[derive(Debug)]
+pub struct VerifiedConnectFailure {
+    source: anyhow::Error,
+    shutdown: cowboy_agent_client::VerifiedClientShutdown,
+}
+
+impl VerifiedConnectFailure {
+    pub fn shutdown(&self) -> &cowboy_agent_client::VerifiedClientShutdown {
+        &self.shutdown
+    }
+}
+
+impl std::fmt::Display for VerifiedConnectFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.source)
+    }
+}
+
+impl std::error::Error for VerifiedConnectFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn cleanup_verified_default() -> bool {
+    true
+}
+
 impl Client {
     /// Get a mutable reference to the existing transport (no reconnect).
     fn transport_mut(&mut self) -> anyhow::Result<&mut Box<dyn Transport>> {
@@ -574,6 +624,7 @@ impl Client {
     async fn create_transport(
         config: &TransportConfig,
         resume_session_id: Option<&str>,
+        owned_scope: Option<&str>,
     ) -> anyhow::Result<Box<dyn Transport>> {
         #[cfg(test)]
         record_transport_creation(config, resume_session_id);
@@ -583,7 +634,11 @@ impl Client {
                 let resume_arg =
                     resume_session_id.map(|session_id| format!("--resume={session_id}"));
                 let additional_args = resume_arg.as_deref().into_iter().collect::<Vec<_>>();
-                let transport = StdioTransport::connect(cfg, &additional_args).await?;
+                let transport = if let Some(scope) = owned_scope {
+                    StdioTransport::connect_owned(cfg, &additional_args, scope.to_string()).await?
+                } else {
+                    StdioTransport::connect(cfg, &additional_args).await?
+                };
                 Ok(Box::new(transport) as Box<dyn Transport>)
             }
 
@@ -607,11 +662,15 @@ impl Client {
             anyhow::bail!(DENIED_TOOL_ERROR);
         }
 
+        if self.native_owner.is_some() {
+            anyhow::bail!("owned ACP replacement requires a new durable writer generation");
+        }
+
         #[cfg(test)]
         if let Some(outcome) = self.replacement_factory.next() {
             return outcome.into_transport().await;
         }
-        Self::create_transport(&self.transport_config, Some(session_id)).await
+        Self::create_transport(&self.transport_config, Some(session_id), None).await
     }
 
     async fn create_reconnect_transport(&mut self) -> anyhow::Result<Box<dyn Transport>> {
@@ -619,11 +678,15 @@ impl Client {
             anyhow::bail!(DENIED_TOOL_ERROR);
         }
 
+        if self.native_owner.is_some() {
+            anyhow::bail!("owned ACP reconnect requires a new durable writer generation");
+        }
+
         #[cfg(test)]
         if let Some(outcome) = self.reconnect_factory.next() {
             return outcome.into_transport().await;
         }
-        Self::create_transport(&self.transport_config, self.session_id.as_deref()).await
+        Self::create_transport(&self.transport_config, self.session_id.as_deref(), None).await
     }
 
     /// Run the ACP initialize handshake on the current transport.
@@ -706,7 +769,14 @@ impl Client {
         let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
         let primary_error = initialization_error.to_string();
 
-        let cleanup_error = match tokio::time::timeout(timeout, transport.force_terminate()).await {
+        let termination = async {
+            if self.agent_human_input {
+                transport.force_terminate_verified().await
+            } else {
+                transport.force_terminate().await
+            }
+        };
+        let cleanup_error = match tokio::time::timeout(timeout, termination).await {
             Ok(Ok(())) => None,
             Ok(Err(error)) => {
                 tracing::error!(
@@ -722,10 +792,23 @@ impl Client {
                 Some("transport force termination timed out".to_string())
             }
         };
+        if cleanup_error.is_none() && self.native_owner.is_some() {
+            self.native_verified = transport.verified_shutdown_scope();
+        }
+
         drop(transport);
+        if cleanup_error.is_some() {
+            self.cleanup_verified = false;
+        }
 
         match cleanup_error {
-            Some(cleanup_error) => anyhow::anyhow!("{primary_error}; {cleanup_error}"),
+            Some(cleanup_error) => cowboy_agent_client::AgentSafetyError::CleanupUnverified(
+                format!("{primary_error}; {cleanup_error}"),
+            )
+            .into(),
+            None if self.policy_rejected => {
+                cowboy_agent_client::AgentSafetyError::PolicyRejected(primary_error).into()
+            }
             None => initialization_error,
         }
     }
@@ -748,14 +831,63 @@ impl Client {
         watchdog: AgentWatchdogOptions,
         access: AgentAccess,
     ) -> anyhow::Result<Self> {
-        let transport = Self::create_transport(&transport_config, None).await?;
-        Self::connect_with_transport_and_options_and_access(
+        Self::connect_with_options_access_and_human_input(transport_config, watchdog, access, false)
+            .await
+    }
+
+    pub async fn connect_with_options_access_and_human_input(
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        agent_human_input: bool,
+    ) -> anyhow::Result<Self> {
+        let transport = Self::create_transport(&transport_config, None, None).await?;
+        Self::connect_with_transport_options_access_and_human_input(
             transport,
             transport_config,
             watchdog,
             access,
+            agent_human_input,
         )
         .await
+    }
+
+    /// The caller must durably register this random owner token before ACP is spawned.
+    pub async fn connect_owned(
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        owner_token: String,
+    ) -> anyhow::Result<Self> {
+        let transport = Self::create_transport(&transport_config, None, Some(&owner_token)).await?;
+        let mut client = Self::uninitialized(
+            transport,
+            transport_config,
+            watchdog,
+            access,
+            true,
+            Some(owner_token.clone()),
+        );
+        if let Err(source) = client.initialize_bounded("ACP initialize").await {
+            if client.cleanup_verified
+                && let Some(scope) = client.native_verified.take()
+                && scope.scope_id == owner_token
+            {
+                return Err(VerifiedConnectFailure {
+                    source,
+                    shutdown: cowboy_agent_client::VerifiedClientShutdown {
+                        owner_token,
+                        session_id: None,
+                        scopes: vec![scope],
+                    },
+                }
+                .into());
+            }
+
+            return Err(source);
+        }
+
+        Ok(client)
     }
 
     /// Connect using a pre-built transport (for tests or custom transports).
@@ -791,7 +923,45 @@ impl Client {
         watchdog: AgentWatchdogOptions,
         access: AgentAccess,
     ) -> anyhow::Result<Self> {
-        let mut client = Self {
+        Self::connect_with_transport_options_access_and_human_input(
+            transport,
+            transport_config,
+            watchdog,
+            access,
+            false,
+        )
+        .await
+    }
+
+    pub async fn connect_with_transport_options_access_and_human_input(
+        transport: Box<dyn Transport>,
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        agent_human_input: bool,
+    ) -> anyhow::Result<Self> {
+        let mut client = Self::uninitialized(
+            transport,
+            transport_config,
+            watchdog,
+            access,
+            agent_human_input,
+            None,
+        );
+        client.initialize_bounded("ACP initialize").await?;
+        Ok(client)
+    }
+
+    fn uninitialized(
+        transport: Box<dyn Transport>,
+        transport_config: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        agent_human_input: bool,
+        native_owner: Option<String>,
+    ) -> Self {
+        let native_scope = transport.scope_id().map(str::to_string);
+        Self {
             transport: Some(transport),
             transport_config,
             next_id: 0,
@@ -805,14 +975,22 @@ impl Client {
             watchdog,
             access,
             tool_policy_violated: false,
+            policy_rejected: false,
+            cleanup_verified: true,
+            agent_human_input,
+            native_owner,
+            native_scope,
+            native_verified: None,
             #[cfg(test)]
             replacement_factory: ReplacementTransportFactory::default(),
             #[cfg(test)]
             reconnect_factory: ReplacementTransportFactory::default(),
-        };
+        }
+    }
 
-        client.initialize_bounded("ACP initialize").await?;
-        Ok(client)
+    /// Set the workflow policy only before starting a backend session.
+    pub fn set_agent_human_input(&mut self, enabled: bool) {
+        self.agent_human_input = enabled;
     }
 
     #[cfg(test)]
@@ -936,6 +1114,7 @@ impl Client {
             Ok(session) => session,
             Err(error) if self.access.required_mode().is_some() => {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 self.cleanup_replacement().await;
                 return Err(error.into());
             }
@@ -945,6 +1124,7 @@ impl Client {
             self.validate_required_acp_mode(session.mode_state.as_ref(), &session.config_options)
         {
             self.tool_policy_violated = true;
+            self.policy_rejected = true;
             self.cleanup_replacement().await;
             return Err(error);
         }
@@ -962,6 +1142,7 @@ impl Client {
             // treat the earlier modeState or mode option as fresh evidence.
             if let Err(error) = self.validate_required_acp_mode(None, &applied_options) {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 self.cleanup_replacement().await;
                 return Err(error);
             }
@@ -1208,6 +1389,10 @@ impl Client {
                 return Ok(outcome.stop_reason);
             }
 
+            if self.agent_human_input {
+                anyhow::bail!("agent turn ended without a workflow result");
+            }
+
             if !Self::commit_automatic_continuation(&mut cancellation).await {
                 tracing::debug!(
                     session_id,
@@ -1291,7 +1476,16 @@ impl Client {
             return;
         };
         let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
-        let _ = tokio::time::timeout(timeout, transport.force_terminate()).await;
+        let termination = async {
+            if self.agent_human_input {
+                transport.force_terminate_verified().await
+            } else {
+                transport.force_terminate().await
+            }
+        };
+        if !matches!(tokio::time::timeout(timeout, termination).await, Ok(Ok(()))) {
+            self.cleanup_verified = false;
+        }
     }
 
     async fn invalidate_session_after_failed_recovery(&mut self, session_id: &str, reason: &str) {
@@ -1331,6 +1525,7 @@ impl Client {
                     "Agent watchdog force termination failed"
                 );
                 let reason = format!("agent watchdog force termination failed: {err}");
+                self.cleanup_verified = false;
                 drop(old_transport);
                 self.invalidate_session_after_failed_recovery(session_id, &reason)
                     .await;
@@ -1343,6 +1538,7 @@ impl Client {
                     "Agent watchdog force termination timed out"
                 );
                 let reason = "agent watchdog force termination timed out".to_string();
+                self.cleanup_verified = false;
                 drop(old_transport);
                 self.invalidate_session_after_failed_recovery(session_id, &reason)
                     .await;
@@ -1359,12 +1555,19 @@ impl Client {
         {
             Ok(Ok(replacement)) => replacement,
             Ok(Err(err)) => {
+                if err
+                    .chain()
+                    .any(|cause| cause.is::<cowboy_agent_client::AgentSafetyError>())
+                {
+                    self.cleanup_verified = false;
+                }
                 let reason = format!("agent watchdog replacement transport creation failed: {err}");
                 self.invalidate_session_after_failed_recovery(session_id, &reason)
                     .await;
                 return Err(anyhow::anyhow!(reason));
             }
             Err(_) => {
+                self.cleanup_verified = false;
                 let reason = "agent watchdog replacement transport creation timed out".to_string();
                 self.invalidate_session_after_failed_recovery(session_id, &reason)
                     .await;
@@ -1488,6 +1691,10 @@ impl Client {
                             anyhow::bail!(DENIED_TOOL_ERROR);
                         }
 
+                        if self.agent_human_input {
+                            return Err(err);
+                        }
+
                         if external_cancellation_sent {
                             return Err(err);
                         }
@@ -1521,6 +1728,17 @@ impl Client {
                 }
                 WaitOutcome::WatchdogTimeout => {
                     replacement_continuation_active = false;
+                    if self.agent_human_input {
+                        // A bounded cancellation is advisory; the action runner
+                        // must still verify scoped process-tree termination.
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(self.watchdog.cancel_timeout_seconds),
+                            self.send_prompt_turn_cancellation(session_id),
+                        )
+                        .await;
+                        anyhow::bail!("agent response timed out");
+                    }
+
                     if last_activity.tool_call_in_flight() {
                         // A tool call is still running, so the conversation is
                         // alive and the agent is waiting on it. Cancelling here
@@ -1891,6 +2109,7 @@ impl Client {
                     Ok(Err(error)) => {
                         if self.access.denies_permissions() || !self.access.allows_tools() {
                             self.tool_policy_violated = true;
+                            self.policy_rejected = true;
                             self.cleanup_replacement().await;
                             return Err(error);
                         }
@@ -1908,6 +2127,7 @@ impl Client {
                 Ok(json) => json,
                 Err(error) if self.access.denies_permissions() || !self.access.allows_tools() => {
                     self.tool_policy_violated = true;
+                    self.policy_rejected = true;
                     self.cleanup_replacement().await;
                     anyhow::bail!("invalid ACP trailing message: {error}");
                 }
@@ -2054,6 +2274,7 @@ impl Client {
                         Ok(result) => result,
                         Err(error) if self.access.required_mode().is_some() => {
                             self.tool_policy_violated = true;
+                            self.policy_rejected = true;
                             self.cleanup_replacement().await;
                             return Err(error.into());
                         }
@@ -2064,6 +2285,7 @@ impl Client {
                         &result.config_options,
                     ) {
                         self.tool_policy_violated = true;
+                        self.policy_rejected = true;
                         self.cleanup_replacement().await;
                         return Err(error);
                     }
@@ -2192,6 +2414,7 @@ impl Client {
         };
         if !matches!(tokio::time::timeout(timeout, sent).await, Ok(Ok(()))) {
             self.tool_policy_violated = true;
+            self.policy_rejected = true;
             self.cleanup_replacement().await;
             anyhow::bail!("ACP permission denial could not be sent; transport terminated");
         }
@@ -2215,6 +2438,7 @@ impl Client {
         };
         if observed.is_some_and(|id| id != active_session_id) {
             self.tool_policy_violated = true;
+            self.policy_rejected = true;
             self.cleanup_replacement().await;
             anyhow::bail!("ACP restricted session mismatch; transport terminated");
         }
@@ -2246,6 +2470,7 @@ impl Client {
                     })
             {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 self.cleanup_replacement().await;
                 anyhow::bail!("ACP reported session mode differs from required mode");
             }
@@ -2265,6 +2490,7 @@ impl Client {
         match msg {
             Message::PermissionRequest { id, .. } => {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 let response = JsonRpcResponse::new(id, PermissionOutcome::cancelled());
                 let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
                 let sent = async {
@@ -2287,6 +2513,7 @@ impl Client {
                 ..
             } => {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 self.cleanup_replacement().await;
                 anyhow::bail!(DENIED_TOOL_ERROR);
             }
@@ -2299,6 +2526,7 @@ impl Client {
             && has_invalid_permission_request_id(json)
         {
             self.tool_policy_violated = true;
+            self.policy_rejected = true;
             self.cleanup_replacement().await;
             anyhow::bail!("ACP permission request has an invalid id; transport terminated");
         }
@@ -2356,6 +2584,7 @@ impl Client {
                     || (mode.is_none() && state.is_none() && mode_options.is_empty())));
         if invalid {
             self.tool_policy_violated = true;
+            self.policy_rejected = true;
             self.cleanup_replacement().await;
             anyhow::bail!(
                 "ACP mode update could not confirm required session mode; transport terminated"
@@ -2370,6 +2599,7 @@ impl Client {
             Ok(json) => json,
             Err(err) if !self.access.allows_tools() || self.access.denies_permissions() => {
                 self.tool_policy_violated = true;
+                self.policy_rejected = true;
                 self.cleanup_replacement().await;
                 anyhow::bail!(
                     "Malformed ACP JSON under restricted policy: {err}; transport terminated"
@@ -2474,6 +2704,51 @@ impl Client {
         }
     }
 
+    async fn terminate_for_human_input(&mut self) -> anyhow::Result<()> {
+        if !self.cleanup_verified {
+            anyhow::bail!("prior ACP process cleanup was not verified");
+        }
+
+        let Some(mut transport) = self.transport.take() else {
+            return Ok(());
+        };
+        let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
+        match tokio::time::timeout(timeout, transport.force_terminate_verified()).await {
+            Ok(Ok(())) => {
+                self.native_verified = transport.verified_shutdown_scope();
+                Ok(())
+            }
+            _ => {
+                self.cleanup_verified = false;
+                anyhow::bail!("ACP process cleanup was not verified")
+            }
+        }
+    }
+
+    pub async fn close_verified(
+        &mut self,
+        owner_token: &str,
+    ) -> anyhow::Result<cowboy_agent_client::VerifiedClientShutdown> {
+        if self.native_owner.as_deref() != Some(owner_token)
+            || self.native_scope.as_deref() != Some(owner_token)
+            || !self.cleanup_verified
+        {
+            anyhow::bail!("ACP owned process identity or prior cleanup is unverified");
+        }
+
+        self.terminate_for_human_input().await?;
+        let scope = self
+            .native_verified
+            .as_ref()
+            .filter(|scope| scope.scope_id == owner_token)
+            .ok_or_else(|| anyhow::anyhow!("ACP owned process scope has no verified exit"))?;
+        Ok(cowboy_agent_client::VerifiedClientShutdown {
+            owner_token: owner_token.to_string(),
+            session_id: self.session_id.clone(),
+            scopes: vec![scope.clone()],
+        })
+    }
+
     /// Close the connection.
     pub async fn close(&mut self) -> anyhow::Result<()> {
         tracing::debug!(
@@ -2482,6 +2757,10 @@ impl Client {
             connected = self.transport.is_some(),
             "Closing ACP client"
         );
+        if self.native_owner.is_some() && self.transport.is_some() {
+            self.cleanup_verified = false;
+        }
+
         if let Some(ref mut t) = self.transport {
             t.close().await?;
         }
@@ -2546,6 +2825,21 @@ impl cowboy_agent_client::Client for Client {
             event_handler,
         )
         .await
+    }
+
+    fn human_input_failure_allowed(&self) -> bool {
+        !self.policy_rejected && self.cleanup_verified
+    }
+
+    async fn terminate_for_human_input(&mut self) -> anyhow::Result<()> {
+        Client::terminate_for_human_input(self).await
+    }
+
+    async fn close_verified(
+        &mut self,
+        owner_token: &str,
+    ) -> anyhow::Result<cowboy_agent_client::VerifiedClientShutdown> {
+        Client::close_verified(self, owner_token).await
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
@@ -2620,9 +2914,9 @@ mod tests {
         reset_transport_creation_records();
         let config = sanitized_missing_transport_config();
 
-        assert!(Client::create_transport(&config, None).await.is_err());
+        assert!(Client::create_transport(&config, None, None).await.is_err());
         assert!(
-            Client::create_transport(&config, Some("session-lazy"))
+            Client::create_transport(&config, Some("session-lazy"), None)
                 .await
                 .is_err()
         );
@@ -2653,7 +2947,7 @@ mod tests {
         let config = sanitized_missing_transport_config();
 
         assert!(
-            Client::create_transport(&config, Some("session-hard"))
+            Client::create_transport(&config, Some("session-hard"), None)
                 .await
                 .is_err()
         );
@@ -2950,6 +3244,12 @@ mod tests {
             watchdog: AgentWatchdogOptions::default(),
             access: AgentAccess::Default,
             tool_policy_violated: false,
+            policy_rejected: false,
+            cleanup_verified: true,
+            agent_human_input: false,
+            native_owner: None,
+            native_scope: None,
+            native_verified: None,
             replacement_factory: ReplacementTransportFactory::default(),
             reconnect_factory: ReplacementTransportFactory::default(),
         })

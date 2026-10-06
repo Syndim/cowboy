@@ -6,9 +6,12 @@
 //! interfaces rather than carrying workflow runtime logic itself.
 
 mod active_clock;
+mod agent_input;
 mod agent_resolver;
 pub mod events;
 pub mod input;
+mod native_ownership;
+mod preflight;
 mod run_lock;
 pub mod runner;
 pub mod runtime;
@@ -22,7 +25,8 @@ pub use cowboy_workflow_actions::{
     FailActionRunner, PendingWaitForInput, ResumeCallbackRegistry, StatusActionRunner,
     WaitForInputActionRunner, WorkflowActionHandler,
 };
-pub use cowboy_workflow_core::Choice;
+pub use cowboy_workflow_core::{Choice, RunStatus};
+pub use cowboy_workflow_store::NativeShutdownEvidence;
 pub use events::{EventBus, WorkflowEvent, WorkflowEventKind};
 pub use input::ResumeRouter;
 pub use runner::{LuaStepActionProvider, ResolvedRuntimePolicy, WorkflowRunner};

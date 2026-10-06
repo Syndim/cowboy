@@ -6,6 +6,8 @@
 //! [`ProcessTreeScope`] is configured on the [`Command`] before spawn, attached
 //! to the spawned child, and terminates the whole tree on demand or on drop.
 
+use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::process::{Child, Command};
@@ -13,7 +15,9 @@ use tokio::process::{Child, Command};
 /// A platform handle on the process tree rooted at one spawned child.
 pub(crate) struct ProcessTreeScope {
     inner: platform::Scope,
-    terminated: AtomicBool,
+    terminated: Mutex<bool>,
+    #[cfg(test)]
+    fail_termination: AtomicBool,
 }
 
 impl ProcessTreeScope {
@@ -21,7 +25,9 @@ impl ProcessTreeScope {
     pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {
             inner: platform::Scope::new()?,
-            terminated: AtomicBool::new(false),
+            terminated: Mutex::new(false),
+            #[cfg(test)]
+            fail_termination: AtomicBool::new(false),
         })
     }
 
@@ -36,13 +42,53 @@ impl ProcessTreeScope {
         self.inner.attach(child)
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_termination_failure(&self, fail: bool) {
+        self.fail_termination.store(fail, Ordering::SeqCst);
+    }
+
     /// Terminate the whole tree. Idempotent: repeated calls succeed.
     pub(crate) fn terminate(&self) -> anyhow::Result<()> {
-        if self.terminated.swap(true, Ordering::SeqCst) {
+        let mut terminated = self
+            .terminated
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent process tree termination state is poisoned"))?;
+        if *terminated {
             return Ok(());
         }
 
-        self.inner.terminate()
+        #[cfg(test)]
+        if self.fail_termination.load(Ordering::SeqCst) {
+            anyhow::bail!("injected process-group termination error");
+        }
+
+        self.inner.terminate()?;
+        *terminated = true;
+        Ok(())
+    }
+
+    /// Inspect the original kernel-owned group/job after its direct child was
+    /// reaped. Do not infer descendant exit merely from SIGKILL delivery.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn verify_absent_after_reap(&self) -> anyhow::Result<()> {
+        self.inner.confirm_absent()
+    }
+
+    /// Confirm a failed group signal addressed no remaining owned processes.
+    /// Call only after reaping the original leader; never infer this from EOF.
+    #[cfg(unix)]
+    pub(crate) fn confirm_absent_after_reap(&self) -> anyhow::Result<()> {
+        let mut terminated = self
+            .terminated
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent process tree termination state is poisoned"))?;
+        if *terminated {
+            return Ok(());
+        }
+
+        self.verify_absent_after_reap()?;
+        *terminated = true;
+        Ok(())
     }
 }
 
@@ -60,8 +106,9 @@ mod platform {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
     };
 
     /// A Windows Job Object owning the agent's process tree. Job handles are
@@ -143,6 +190,31 @@ mod platform {
 
             Ok(())
         }
+        pub(super) fn confirm_absent(&self) -> anyhow::Result<()> {
+            let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: The job handle remains owned by this scope. `accounting`
+            // is a correctly sized output buffer for the requested class.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.job,
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut accounting).cast(),
+                    std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                anyhow::bail!(
+                    "cannot inspect owned agent job: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            if accounting.ActiveProcesses != 0 {
+                anyhow::bail!("owned agent job still has live processes");
+            }
+
+            Ok(())
+        }
     }
 
     impl Drop for Scope {
@@ -204,6 +276,21 @@ mod platform {
             }
 
             Ok(())
+        }
+
+        pub(super) fn confirm_absent(&self) -> anyhow::Result<()> {
+            let pgid = self.pgid.load(Ordering::SeqCst);
+            if pgid <= 0 {
+                anyhow::bail!("agent process group identity was not established");
+            }
+
+            // SAFETY: signal 0 only tests the existence of the original group.
+            let result = unsafe { libc::killpg(pgid, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+
+            anyhow::bail!("agent process group still exists after reaping its leader")
         }
     }
 }

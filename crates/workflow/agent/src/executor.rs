@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cowboy_agent_client::{
     AgentSessionDescriptor, Client, Event, ModelInfo, PromptContent, PromptTurnCancellation,
-    StopReason,
+    StopReason, VerifiedClientShutdown,
 };
 use cowboy_workflow_core::{
     AbortAgentPromptWindowOutcome, AgentAction, AgentPromptWindow, AgentSessionStore,
@@ -21,7 +21,8 @@ use tokio::sync::{Mutex, watch};
 
 use crate::frontmatter::parse_frontmatter_output;
 use crate::prompt::{
-    PromptBlockSelection, build_correction_prompt, build_prompt_blocks, task_contract_fingerprint,
+    PromptBlockSelection, action_delivery_fingerprint, build_correction_prompt,
+    build_prompt_blocks, task_contract_fingerprint,
 };
 use crate::{Error, Result};
 
@@ -208,6 +209,10 @@ pub struct AgentExecutionConfig {
     pub mcp_servers: Vec<serde_json::Value>,
     /// Optional progress sink for streaming UI-visible agent/tool updates.
     pub progress: Option<ProgressSink>,
+    /// Whether incomplete agent execution may request human context.
+    pub agent_human_input: bool,
+    /// Runtime-owned durable ledger; absent for legacy/test app executions.
+    pub native_writer: Option<Arc<dyn NativeWriterTracker>>,
     #[cfg(any(test, feature = "test-support"))]
     /// Optional observer used by deterministic handoff-boundary tests.
     pub handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
@@ -219,7 +224,8 @@ impl fmt::Debug for AgentExecutionConfig {
         debug
             .field("cwd", &self.cwd)
             .field("mcp_servers", &self.mcp_servers)
-            .field("progress", &self.progress.as_ref().map(|_| "<sink>"));
+            .field("progress", &self.progress.as_ref().map(|_| "<sink>"))
+            .field("native_writer", &self.native_writer.is_some());
         #[cfg(any(test, feature = "test-support"))]
         debug.field(
             "handoff_observer",
@@ -235,6 +241,8 @@ impl Default for AgentExecutionConfig {
             cwd: ".".to_string(),
             mcp_servers: Vec::new(),
             progress: None,
+            agent_human_input: false,
+            native_writer: None,
             #[cfg(any(test, feature = "test-support"))]
             handoff_observer: None,
         }
@@ -255,12 +263,34 @@ pub struct ResolvedAgentClient {
     pub client: Box<dyn Client>,
     pub model: Option<ModelInfo>,
     pub backend: String,
+    pub backend_identity: Option<String>,
+}
+
+/// The runtime persists an attempt before the client factory may create a writer.
+#[async_trait]
+pub trait NativeWriterTracker: Send + Sync {
+    async fn begin(
+        &self,
+        context: &ExecutionContext,
+        action: &AgentAction,
+        owner_token: &str,
+        backend_identity: &str,
+    ) -> cowboy_workflow_core::Result<String>;
+
+    async fn seal(
+        &self,
+        run_id: &str,
+        backend_identity: &str,
+        proof: VerifiedClientShutdown,
+    ) -> cowboy_workflow_core::Result<()>;
 }
 
 struct ActiveClient {
     client: Box<dyn Client>,
     model: Option<ModelInfo>,
     backend: String,
+    backend_identity: Option<String>,
+    native_owner: Option<String>,
 }
 
 /// Outcome of acquiring a backend session for a dispatch.
@@ -278,6 +308,33 @@ struct AcquiredSession {
 pub trait ClientFactory: Send + Sync {
     /// Resolve and create a fresh backend client for `role`.
     async fn create_client(&self, role: &RoleDefinition) -> Result<ResolvedAgentClient>;
+    /// Opt-in is scoped to the executing workflow run, never a global ACP flag.
+    async fn create_client_with_policy(
+        &self,
+        role: &RoleDefinition,
+        _agent_human_input: bool,
+    ) -> Result<ResolvedAgentClient> {
+        self.create_client(role).await
+    }
+
+    /// Resolves the configured backend *without* spawning a writer.
+    fn native_backend_identity(&self, _role: &RoleDefinition) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Connect with a process owner already registered in the durable ledger.
+    async fn create_owned_client(
+        &self,
+        _role: &RoleDefinition,
+        _owner_token: &str,
+    ) -> Result<ResolvedAgentClient> {
+        Err(Error::HumanInputUnsafe)
+    }
+
+    /// True only when failed client creation cannot leave a backend writer.
+    fn connect_failure_cleanup_verified(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -293,6 +350,18 @@ pub struct AgentExecutor<F, S> {
     config: AgentExecutionConfig,
     clients: Arc<Mutex<HashMap<RoleSessionKey, ActiveClient>>>,
     prompt_turn_controls: PromptTurnControlRegistry,
+}
+
+impl<F: Clone, S> Clone for AgentExecutor<F, S> {
+    fn clone(&self) -> Self {
+        Self {
+            factory: self.factory.clone(),
+            store: self.store.clone(),
+            config: self.config.clone(),
+            clients: self.clients.clone(),
+            prompt_turn_controls: self.prompt_turn_controls.clone(),
+        }
+    }
 }
 
 pub trait AgentStore: AgentSessionStore + TurnStore + PromptWindowStore {}
@@ -439,9 +508,79 @@ where
             agent = ?role.agent,
             "agent step: starting"
         );
+        let native_owner = if let Some(tracker) = &self.config.native_writer {
+            let backend_identity = self
+                .factory
+                .native_backend_identity(role)?
+                .ok_or(Error::HumanInputUnsafe)?;
+            let clients = self.clients.lock().await;
+            let owner = match clients.get(&key) {
+                Some(active) if active.backend_identity.as_deref() == Some(&backend_identity) => {
+                    active.native_owner.clone().ok_or(Error::HumanInputUnsafe)?
+                }
+                Some(_) => return Err(Error::HumanInputUnsafe),
+                None => uuid::Uuid::new_v4().to_string(),
+            };
+            drop(clients);
+            let action_fingerprint = tracker
+                .begin(&context, &action, &owner, &backend_identity)
+                .await
+                .map_err(|_| Error::HumanInputUnsafe)?;
+            Some((owner, backend_identity, action_fingerprint))
+        } else {
+            None
+        };
+
         if !self.clients.lock().await.contains_key(&key) {
             tracing::debug!(run_id = %key.run_id, role = %key.role_id, agent = ?role.agent, "agent client missing; creating");
-            let resolved = self.factory.create_client(role).await?;
+            let connection = if let Some((owner, _, _)) = &native_owner {
+                self.factory.create_owned_client(role, owner).await
+            } else {
+                self.factory
+                    .create_client_with_policy(role, self.config.agent_human_input)
+                    .await
+            };
+            if let (Some((owner, backend_identity, _)), Some(tracker), Err(Error::Client(error))) =
+                (&native_owner, &self.config.native_writer, &connection)
+            {
+                let proof = if let Some(verified) =
+                    error.downcast_ref::<cowboy_agent_acp::VerifiedConnectFailure>()
+                {
+                    Some(verified.shutdown().clone())
+                } else {
+                    error
+                        .downcast_ref::<cowboy_agent_acp::NeverSpawned>()
+                        .filter(|failure| failure.owner_token() == owner)
+                        .map(|_| VerifiedClientShutdown {
+                            owner_token: owner.clone(),
+                            session_id: None,
+                            scopes: vec![cowboy_agent_client::VerifiedProcessScope {
+                                scope_id: owner.clone(),
+                                method: "spawn_failed_no_child",
+                            }],
+                        })
+                };
+                if let Some(proof) = proof {
+                    tracker
+                        .seal(&context.run_id, backend_identity, proof)
+                        .await
+                        .map_err(|_| Error::HumanInputUnsafe)?;
+                }
+            }
+
+            let resolved = connection.map_err(|error| {
+                self.human_input_error(
+                    error,
+                    cowboy_workflow_core::AgentFailureCategory::Connection,
+                    self.factory.connect_failure_cleanup_verified(),
+                )
+            })?;
+            if let Some((_, expected, _)) = &native_owner
+                && resolved.backend_identity.as_ref() != Some(expected)
+            {
+                return Err(Error::HumanInputUnsafe);
+            }
+
             self.clients
                 .lock()
                 .await
@@ -450,6 +589,8 @@ where
                     client: resolved.client,
                     model: resolved.model,
                     backend: resolved.backend,
+                    backend_identity: resolved.backend_identity,
+                    native_owner: native_owner.as_ref().map(|(owner, _, _)| owner.clone()),
                 });
         }
 
@@ -469,7 +610,14 @@ where
             && crate::prompt::requires_fresh_session(context.retry_reason.as_deref());
         let acquired = self
             .ensure_session(active, &key, force_fresh_session)
-            .await?;
+            .await
+            .map_err(|error| {
+                self.human_input_error(
+                    error,
+                    cowboy_workflow_core::AgentFailureCategory::Session,
+                    active.client.human_input_failure_allowed(),
+                )
+            })?;
         let session_id = acquired.session_id;
         // Resolve the per-session prompt-delivery watermark. A brand-new backend
         // session ignores any stale stored row and resends everything; a reused
@@ -482,17 +630,22 @@ where
                 .await
                 .map_err(Error::from)?
         };
-        let (role_instructions_sent, last_sent_input_sequence, mut delivered_task_contracts) =
-            prior_session
-                .as_ref()
-                .map(|session| {
-                    (
-                        session.role_instructions_sent,
-                        session.last_sent_input_sequence,
-                        session.delivered_task_contracts.clone(),
-                    )
-                })
-                .unwrap_or((false, None, Default::default()));
+        let (
+            role_instructions_sent,
+            last_sent_input_sequence,
+            mut delivered_task_contracts,
+            mut delivered_actions,
+        ) = prior_session
+            .as_ref()
+            .map(|session| {
+                (
+                    session.role_instructions_sent,
+                    session.last_sent_input_sequence,
+                    session.delivered_task_contracts.clone(),
+                    session.delivered_actions.clone(),
+                )
+            })
+            .unwrap_or((false, None, Default::default(), Default::default()));
         // Preserve the persisted backend for a reused session; fall back to the
         // active backend for a fresh session with no prior row.
         let session_backend = prior_session
@@ -519,11 +672,29 @@ where
             .is_some_and(|(task, fingerprint)| {
                 delivered_task_contracts.get(&task.key) == Some(fingerprint)
             });
-        let include_task = action.task.is_none() || !task_already_delivered;
-        let include_turn = action.task.is_none()
-            || context.attempt == 1
-            || acquired.fresh
-            || !task_already_delivered;
+        let action_fingerprint = self
+            .config
+            .agent_human_input
+            .then(|| action_delivery_fingerprint(&action));
+        let current_action_delivered = action_fingerprint.as_ref().is_some_and(|fingerprint| {
+            delivered_actions.get(&context.step_record_id) == Some(fingerprint)
+        });
+        let include_task = if context.agent_human_input.is_some() && !acquired.fresh {
+            match &action.task {
+                Some(_) => !task_already_delivered,
+                None => !current_action_delivered,
+            }
+        } else {
+            action.task.is_none() || !task_already_delivered
+        };
+        let include_turn = if context.agent_human_input.is_some() && !acquired.fresh {
+            !current_action_delivered
+        } else {
+            action.task.is_none()
+                || context.attempt == 1
+                || acquired.fresh
+                || !task_already_delivered
+        };
         let assembly = build_prompt_blocks(
             role,
             &action,
@@ -536,7 +707,9 @@ where
             },
         );
         let mut included_blocks = assembly.included_blocks;
-        let prompt = if context.attempt > 1 {
+        let mut prompt = if context.agent_human_input.is_some() && context.retry_reason.is_none() {
+            assembly.prompt
+        } else if context.attempt > 1 {
             included_blocks.push("retry");
             if assembly.prompt.is_empty() {
                 crate::prompt::build_retry_nudge(
@@ -558,6 +731,18 @@ where
         } else {
             assembly.prompt
         };
+        if let Some(input) = &context.agent_human_input {
+            if !include_task && let Some(output) = &action.output {
+                prompt.push_str("\n\n");
+                prompt.push_str(&crate::prompt::build_output_instruction(output));
+                included_blocks.push("deliverable");
+            }
+
+            prompt.push_str("\n\n## Human context for the incomplete step\n\n");
+            prompt.push_str("Verify existing work before acting. Do not repeat completed side effects. Continue only the original step with these operator instructions:\n\n");
+            prompt.push_str(input);
+            included_blocks.push("human_input");
+        }
         let descriptor = active
             .client
             .session_descriptor()
@@ -656,7 +841,11 @@ where
             Ok(turn) => turn,
             Err(error) => {
                 window_guard.abort().await;
-                return Err(error);
+                return Err(self.human_input_error(
+                    error,
+                    cowboy_workflow_core::AgentFailureCategory::Prompt,
+                    active.client.human_input_failure_allowed(),
+                ));
             }
         };
         tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
@@ -747,7 +936,11 @@ where
                         Ok(turn) => turn,
                         Err(error) => {
                             window_guard.abort().await;
-                            return Err(error);
+                            return Err(self.human_input_error(
+                                error,
+                                cowboy_workflow_core::AgentFailureCategory::Prompt,
+                                active.client.human_input_failure_allowed(),
+                            ));
                         }
                     };
                     visible = replacement;
@@ -781,16 +974,21 @@ where
         if let (Some(task), Some(fingerprint)) = (&action.task, task_fingerprint.as_ref()) {
             delivered_task_contracts.insert(task.key.clone(), fingerprint.clone());
         }
+        if let Some(fingerprint) = action_fingerprint {
+            delivered_actions.insert(context.step_record_id.clone(), fingerprint);
+        }
         self.store
             .save_role_session(RoleSession {
                 run_id: key.run_id.clone(),
                 role_id: key.role_id.clone(),
                 backend: session_backend,
+                backend_identity: active.backend_identity.clone(),
                 session_id: session_id.clone(),
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(advanced_sequence),
                 delivered_task_contracts,
+                delivered_actions,
             })
             .await
             .map_err(Error::from)?;
@@ -801,14 +999,66 @@ where
                 other => other,
             })
             .inspect_err(|_err| {
-                tracing::error!(
-                    run_id = %context.run_id,
-                    step = %context.step_id,
-                    reply = %visible,
-                    "agent step: failed to parse frontmatter output"
-                );
+                if self.config.agent_human_input {
+                    tracing::error!(
+                        run_id = %context.run_id,
+                        step = %context.step_id,
+                        "agent step: failed to parse frontmatter output"
+                    );
+                } else {
+                    tracing::error!(
+                        run_id = %context.run_id,
+                        step = %context.step_id,
+                        reply = %visible,
+                        "agent step: failed to parse frontmatter output"
+                    );
+                }
+            })
+            .map_err(|error| {
+                self.human_input_error(
+                    error,
+                    cowboy_workflow_core::AgentFailureCategory::InvalidResult,
+                    true,
+                )
             })?;
-        validate_output_spec(action.output.as_ref(), &parsed.output)?;
+        if self.config.agent_human_input
+            && parsed.output.status == "blocked"
+            && action.output.as_ref().is_none_or(|spec| {
+                spec.statuses.is_empty() || spec.statuses.iter().any(|status| status == "blocked")
+            })
+        {
+            return Err(Error::HumanInput {
+                category: cowboy_workflow_core::AgentFailureCategory::DeclaredBlocked,
+            });
+        }
+
+        validate_output_spec(action.output.as_ref(), &parsed.output).map_err(|error| {
+            self.human_input_error(
+                error,
+                cowboy_workflow_core::AgentFailureCategory::InvalidResult,
+                true,
+            )
+        })?;
+        let mut input_context = serde_json::json!({
+            "role": action.role,
+            "initial_input_kind": context.initial_input_kind,
+            "user_inputs": user_inputs,
+            "prompt_blocks": included_blocks,
+            "task_key": action.task.as_ref().map(|task| task.key.as_str()),
+            "task_contract_fingerprint": task_fingerprint,
+            "correction_turns": correction_turns,
+            "final_applied_sequence": applied_sequence,
+        });
+        if let Some((_, _, fingerprint)) = &native_owner {
+            input_context
+                .as_object_mut()
+                .expect("agent context object")
+                .insert(
+                    "native_action_fingerprint".to_string(),
+                    fingerprint.clone().into(),
+                );
+        }
+
         let completed_at = Utc::now();
         let record = StepRecord {
             id: context.step_record_id,
@@ -817,16 +1067,7 @@ where
             action: "agent".to_string(),
             input: StepInput {
                 prompt: Some(prompt),
-                context: serde_json::json!({
-                    "role": action.role,
-                    "initial_input_kind": context.initial_input_kind,
-                    "user_inputs": user_inputs,
-                    "prompt_blocks": included_blocks,
-                    "task_key": action.task.as_ref().map(|task| task.key.as_str()),
-                    "task_contract_fingerprint": task_fingerprint,
-                    "correction_turns": correction_turns,
-                    "final_applied_sequence": applied_sequence,
-                }),
+                context: input_context,
             },
             output: Some(parsed.output),
             detail: StepDetail {
@@ -840,6 +1081,119 @@ where
             completed_at: Some(completed_at),
         };
         Ok(AgentExecution { record, turns })
+    }
+
+    pub fn human_input_enabled(&self) -> bool {
+        self.config.agent_human_input
+    }
+
+    /// Verify every client from this executor invocation before an idle candidate
+    /// can be returned. Failure leaves the durable generation unsealed.
+    pub async fn close_owned_writers(&self, run_id: &str) -> cowboy_workflow_core::Result<()> {
+        let Some(tracker) = &self.config.native_writer else {
+            return Ok(());
+        };
+        let mut clients = self.clients.lock().await;
+        let mut failed = false;
+        for (key, active) in clients.iter_mut().filter(|(key, _)| key.run_id == run_id) {
+            let Some(owner) = active.native_owner.as_deref() else {
+                failed = true;
+                continue;
+            };
+            let Some(backend_identity) = active.backend_identity.as_deref() else {
+                failed = true;
+                continue;
+            };
+            let proof = tokio::time::timeout(
+                std::time::Duration::from_secs(40),
+                active.client.close_verified(owner),
+            )
+            .await;
+            match proof {
+                Ok(Ok(proof)) if proof.owner_token == owner => {
+                    if tracker
+                        .seal(&key.run_id, backend_identity, proof)
+                        .await
+                        .is_err()
+                    {
+                        failed = true;
+                    }
+                }
+                _ => failed = true,
+            }
+        }
+
+        if failed {
+            Err(WorkflowError::AgentUnsafe)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn human_input_error(
+        &self,
+        error: Error,
+        category: cowboy_workflow_core::AgentFailureCategory,
+        allowed: bool,
+    ) -> Error {
+        if !self.config.agent_human_input {
+            return error;
+        }
+
+        let tagged_unsafe = matches!(&error, Error::Client(source) if source.chain().any(|cause| cause.is::<cowboy_agent_client::AgentSafetyError>()));
+        if tagged_unsafe || !allowed {
+            return Error::HumanInputUnsafe;
+        }
+
+        if error.recoverable() {
+            Error::HumanInput { category }
+        } else if matches!(error, Error::Workflow(WorkflowError::InvalidAction(_))) {
+            Error::HumanInputUnsafe
+        } else {
+            error
+        }
+    }
+
+    /// Stop the exact active role client before releasing the run lock.
+    /// The native role session row is retained for load on continuation.
+    pub async fn terminate_for_human_input(&self, run_id: &str, role_id: &str) -> Result<()> {
+        let key = RoleSessionKey {
+            run_id: run_id.to_string(),
+            role_id: role_id.to_string(),
+        };
+        if self.config.native_writer.is_some() {
+            let mut clients = self.clients.lock().await;
+            let Some(active) = clients.get_mut(&key) else {
+                return Ok(());
+            };
+            return tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                active.client.terminate_for_human_input(),
+            )
+            .await
+            .map_err(|_| Error::HumanInputUnsafe)?
+            .map_err(|_| Error::HumanInputUnsafe);
+        }
+
+        let Some(mut active) = self.clients.lock().await.remove(&key) else {
+            return Ok(());
+        };
+        let termination = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            active.client.terminate_for_human_input(),
+        )
+        .await;
+        match termination {
+            Ok(Ok(())) => Ok(()),
+            other => {
+                tracing::error!(run_id, role_id, result = ?other, "agent cleanup could not be verified");
+                Err(WorkflowError::InvalidAction(
+                    "agent process ownership could not be verified; refusing human wait"
+                        .to_string(),
+                )
+                .into())
+            }
+        }
     }
 
     async fn ensure_session(
@@ -864,6 +1218,20 @@ where
                 .await
                 .map_err(Error::from)?
             {
+                if self.config.agent_human_input {
+                    let mismatched_name = saved.backend != PROVIDED_SESSION_BACKEND
+                        && saved.backend != active.backend;
+                    let mismatched_identity = match &saved.backend_identity {
+                        Some(saved_identity) => {
+                            active.backend_identity.as_ref() != Some(saved_identity)
+                        }
+                        None => active.backend_identity.is_some(),
+                    };
+                    if mismatched_name || mismatched_identity {
+                        return Err(WorkflowError::AgentUnsafe.into());
+                    }
+                }
+
                 if client.supports_load_session() {
                     tracing::debug!(
                         run_id = %key.run_id,
@@ -893,6 +1261,11 @@ where
                             });
                         }
                         Err(err) => {
+                            if self.config.agent_human_input {
+                                // An RPC/transport error is not permission to
+                                // replace even an externally supplied session.
+                                return Err(Error::Client(err));
+                            }
                             if saved.backend == PROVIDED_SESSION_BACKEND {
                                 return Err(WorkflowError::InvalidAction(format!(
                                     "failed to load supplied session {:?} for role {:?}: {err}",
@@ -910,6 +1283,10 @@ where
                             );
                         }
                     }
+                } else if self.config.agent_human_input {
+                    return Err(Error::Client(anyhow::anyhow!(
+                        "saved agent session cannot be loaded by this backend"
+                    )));
                 } else if saved.backend == PROVIDED_SESSION_BACKEND {
                     return Err(WorkflowError::InvalidAction(format!(
                         "agent backend cannot load supplied session {:?} for role {:?}",
@@ -949,11 +1326,13 @@ where
                 run_id: key.run_id.clone(),
                 role_id: key.role_id.clone(),
                 backend: active.backend.clone(),
+                backend_identity: active.backend_identity.clone(),
                 session_id: session_id.clone(),
                 updated_at: Utc::now(),
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
                 delivered_task_contracts: Default::default(),
+                delivered_actions: Default::default(),
             })
             .await
             .map_err(Error::from)?;
@@ -1569,6 +1948,7 @@ mod tests {
                 client,
                 model: self.model.clone(),
                 backend: "fake-agent".to_string(),
+                backend_identity: None,
             })
         }
     }
@@ -1681,6 +2061,7 @@ mod tests {
                     provider: Some("fake-provider".to_string()),
                 }),
                 backend: "fake-agent".to_string(),
+                backend_identity: None,
             })
         }
     }
@@ -1983,6 +2364,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         }
     }
 
@@ -2004,6 +2386,7 @@ mod tests {
             role: Some(role("developer")),
             attempt: 1,
             retry_reason: None,
+            agent_human_input: None,
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: "Original request".to_string(),
@@ -2021,6 +2404,7 @@ mod tests {
             role: Some(role(role_id)),
             attempt: 1,
             retry_reason: None,
+            agent_human_input: None,
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: "Original request".to_string(),
@@ -2774,11 +3158,13 @@ resending the same instruction as attempt two"
                 run_id: "run".into(),
                 role_id: "developer".into(),
                 backend: "agent".into(),
+                backend_identity: None,
                 session_id: "persisted-session".into(),
                 updated_at: Utc::now(),
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
                 delivered_task_contracts: Default::default(),
+                delivered_actions: Default::default(),
             })
             .await
             .unwrap();
@@ -3465,6 +3851,7 @@ still applies, got non-recoverable: {error:?}"
                     true,
                 )]),
             }),
+            pre_input: None,
         }
     }
 
@@ -3494,6 +3881,7 @@ still applies, got non-recoverable: {error:?}"
                 run_id: "restart-run".into(),
                 role_id: "developer".into(),
                 backend: PROVIDED_SESSION_BACKEND.into(),
+                backend_identity: None,
                 session_id: "source-session".into(),
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
@@ -3501,6 +3889,7 @@ still applies, got non-recoverable: {error:?}"
                 delivered_task_contracts: [("implementation".to_string(), fingerprint)]
                     .into_iter()
                     .collect(),
+                delivered_actions: Default::default(),
             })
             .await
             .unwrap();
@@ -3749,6 +4138,8 @@ still applies, got non-recoverable: {error:?}"
             client: Box::new(FakeClient::new(vec![event()])),
             model: None,
             backend: "fake-agent".to_string(),
+            backend_identity: None,
+            native_owner: None,
         };
 
         let acquired = executor
@@ -3769,11 +4160,13 @@ still applies, got non-recoverable: {error:?}"
                 run_id: "run".into(),
                 role_id: "developer".into(),
                 backend: stored.backend.clone(),
+                backend_identity: None,
                 session_id: stored.session_id.clone(),
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(3),
                 delivered_task_contracts: Default::default(),
+                delivered_actions: Default::default(),
             })
             .await
             .unwrap();
@@ -3877,11 +4270,13 @@ still applies, got non-recoverable: {error:?}"
                 run_id: "run".into(),
                 role_id: "developer".into(),
                 backend: "seeded-backend".into(),
+                backend_identity: None,
                 session_id: "seeded-session".into(),
                 updated_at: seeded_at,
                 role_instructions_sent: false,
                 last_sent_input_sequence: None,
                 delivered_task_contracts: Default::default(),
+                delivered_actions: Default::default(),
             })
             .await
             .unwrap();
@@ -3913,11 +4308,13 @@ still applies, got non-recoverable: {error:?}"
             run_id: "run".into(),
             role_id: "developer".into(),
             backend: "fake-agent".into(),
+            backend_identity: None,
             session_id: "session-x".into(),
             updated_at: Utc::now(),
             role_instructions_sent: true,
             last_sent_input_sequence: Some(2),
             delivered_task_contracts: Default::default(),
+            delivered_actions: Default::default(),
         };
         store.save_role_session(session.clone()).await.unwrap();
         let loaded = clone
@@ -3983,11 +4380,13 @@ still applies, got non-recoverable: {error:?}"
                 run_id: "run".into(),
                 role_id: "developer".into(),
                 backend: "fake-agent".into(),
+                backend_identity: None,
                 session_id: "old-session".into(),
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(1),
                 delivered_task_contracts: Default::default(),
+                delivered_actions: Default::default(),
             })
             .await
             .unwrap();

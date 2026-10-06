@@ -2,6 +2,43 @@ use crate::{RoleId, Status, StepId, WorkflowId};
 
 pub type Result<T, E = WorkflowError> = std::result::Result<T, E>;
 
+/// Safe, stable categories for incomplete agent actions. Never embed backend text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFailureCategory {
+    DeclaredBlocked,
+    Connection,
+    Session,
+    Prompt,
+    InvalidResult,
+    Interrupted,
+}
+
+impl AgentFailureCategory {
+    pub fn question(self) -> &'static str {
+        match self {
+            Self::DeclaredBlocked => {
+                "The agent declared it cannot finish this step. What missing context, instructions, or operator decision would let it continue safely?"
+            }
+            Self::Connection => {
+                "The agent could not start or initialize. What setup or operator decision is required before attempting this step again?"
+            }
+            Self::Session => {
+                "The agent could not establish its session. What session context or operator decision is needed before continuing?"
+            }
+            Self::Prompt => {
+                "The agent prompt failed or timed out. Check any work already performed: what instructions allow this incomplete step to continue without repeating side effects?"
+            }
+            Self::InvalidResult => {
+                "The agent did not produce a valid workflow result. What additional instructions are needed to finish the incomplete step?"
+            }
+            Self::Interrupted => {
+                "The previous continuation was interrupted. Verify its side effects before providing instructions to continue this incomplete step."
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum WorkflowError {
     #[error("workflow id must not be empty")]
@@ -38,6 +75,12 @@ pub enum WorkflowError {
     InvalidAction(String),
     #[error("recoverable action failure: {0}")]
     RecoverableAction(String),
+    #[error("agent action incomplete ({category:?})")]
+    AgentFailure { category: AgentFailureCategory },
+    #[error("agent security or process ownership rejected human recovery")]
+    AgentUnsafe,
+    #[error("agent result was not durably committed; manual reconciliation required")]
+    AgentCommitFailed,
 }
 
 impl WorkflowError {

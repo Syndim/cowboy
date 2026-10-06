@@ -768,6 +768,8 @@ mod tests {
             parent: None,
             restart_source_run_id: None,
             status,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             step: StepState {
                 next: current_step.to_string(),
                 head: head.map(ToString::to_string),

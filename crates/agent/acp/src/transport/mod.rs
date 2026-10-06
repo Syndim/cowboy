@@ -17,6 +17,21 @@ pub trait Transport: Send + Sync {
     async fn force_terminate(&mut self) -> anyhow::Result<()> {
         self.close().await
     }
+
+    /// Opted-in human waits require proof the owned process tree stopped.
+    async fn force_terminate_verified(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("ACP transport has no verified process-tree termination")
+    }
+
+    /// Available only after this exact owned transport passed native shutdown.
+    fn verified_shutdown_scope(&self) -> Option<cowboy_agent_client::VerifiedProcessScope> {
+        None
+    }
+
+    /// Random process identity minted at construction, never a recyclable PID.
+    fn scope_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Stdio transport config

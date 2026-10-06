@@ -28,3 +28,5 @@ fi
 while IFS=$'\t' read -r package test_name marker; do
   "$script_dir/run-exact-test.sh" "$package" "$test_name" "$marker"
 done <"$manifest"
+
+"$script_dir/check-required-sqlite-manifest.sh"

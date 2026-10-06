@@ -23,6 +23,25 @@ pub fn run_step(
     step_id: &str,
     ctx: serde_json::Value,
 ) -> Result<RunStepResult> {
+    run_step_function(bundle, step_id, "run", ctx)
+}
+
+/// Evaluate the guard's verifier in the same trusted source snapshot. This
+/// function never performs a workflow transition or commits a step record.
+pub fn verify_pre_input(
+    bundle: &WorkflowSourceSnapshot,
+    step_id: &str,
+    ctx: serde_json::Value,
+) -> Result<RunStepResult> {
+    run_step_function(bundle, step_id, "verify", ctx)
+}
+
+fn run_step_function(
+    bundle: &WorkflowSourceSnapshot,
+    step_id: &str,
+    method: &str,
+    ctx: serde_json::Value,
+) -> Result<RunStepResult> {
     let lua = setup_lua(ImportMode::Snapshot {
         sources: Arc::new(Mutex::new(bundle.files.clone())),
     })?;
@@ -34,7 +53,7 @@ pub fn run_step(
     lua.load(source).set_name(&entry).eval::<Value>()?;
     let steps: Table = lua.globals().get("__cowboy_steps")?;
     let step: Table = steps.get(step_id)?;
-    let run: Function = step.get("run")?;
+    let run: Function = step.get(method)?;
     let lua_ctx = json_to_lua(&lua, &ctx)?;
     if let (Value::Table(ctx_table), Some(fields)) = (&lua_ctx, ctx.pointer("/prev/fields")) {
         let prev: Table = ctx_table.get("prev")?;
@@ -434,6 +453,24 @@ mod tests {
                 "{name}: expected error containing {expected:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn non_function_verify_remains_a_step_property() {
+        let source = snapshot(
+            r#"
+            local implement = step("implement", { verify = "trusted by workflow" })
+            implement.run = function(ctx)
+              return action.status { status = "success" }
+            end
+            return workflow("wf", implement)
+            "#,
+        );
+        let definition = crate::compile_snapshot(&source).unwrap();
+        assert_eq!(
+            definition.steps["implement"].properties["verify"],
+            "trusted by workflow"
+        );
     }
 
     #[test]

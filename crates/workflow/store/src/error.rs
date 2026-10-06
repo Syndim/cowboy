@@ -32,6 +32,8 @@ pub enum Error {
     InvalidPromptState(String),
     #[error("invalid restart seed: {0}")]
     InvalidRestartSeed(String),
+    #[error("invalid native writer ownership: {0}")]
+    InvalidNativeWriter(&'static str),
     #[cfg(test)]
     #[error("injected transaction failure")]
     InjectedFailure,

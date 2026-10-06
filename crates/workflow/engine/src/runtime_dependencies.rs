@@ -21,6 +21,32 @@ pub(crate) trait AcpConnector: Send + Sync {
         access: AgentAccess,
     ) -> anyhow::Result<AcpClient>;
 
+    async fn connect_for_run(
+        &self,
+        transport: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        agent_human_input: bool,
+    ) -> anyhow::Result<AcpClient> {
+        let mut client = self.connect(transport, watchdog, access).await?;
+        client.set_agent_human_input(agent_human_input);
+        Ok(client)
+    }
+
+    fn supports_native_owned_shutdown(&self) -> bool {
+        false
+    }
+
+    async fn connect_owned(
+        &self,
+        _transport: TransportConfig,
+        _watchdog: AgentWatchdogOptions,
+        _access: AgentAccess,
+        _owner_token: &str,
+    ) -> anyhow::Result<AcpClient> {
+        anyhow::bail!("connector cannot attest owned ACP shutdown")
+    }
+
     /// Terminate every live agent process tree, bounded by `timeout`, and
     /// report how many were terminated. Connectors that never spawn real agent
     /// processes keep the default no-op.
@@ -41,6 +67,36 @@ impl AcpConnector for ProductionAcpConnector {
         access: AgentAccess,
     ) -> anyhow::Result<AcpClient> {
         AcpClient::connect_with_options_and_access(transport, watchdog, access).await
+    }
+
+    async fn connect_for_run(
+        &self,
+        transport: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        agent_human_input: bool,
+    ) -> anyhow::Result<AcpClient> {
+        AcpClient::connect_with_options_access_and_human_input(
+            transport,
+            watchdog,
+            access,
+            agent_human_input,
+        )
+        .await
+    }
+
+    fn supports_native_owned_shutdown(&self) -> bool {
+        true
+    }
+
+    async fn connect_owned(
+        &self,
+        transport: TransportConfig,
+        watchdog: AgentWatchdogOptions,
+        access: AgentAccess,
+        owner_token: &str,
+    ) -> anyhow::Result<AcpClient> {
+        AcpClient::connect_owned(transport, watchdog, access, owner_token.to_string()).await
     }
 
     async fn terminate_all_agents(&self, timeout: Duration) -> usize {
@@ -65,6 +121,32 @@ impl ClientFactory for SharedClientFactory {
     ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
         self.0.create_client(role).await
     }
+    async fn create_client_with_policy(
+        &self,
+        role: &RoleDefinition,
+        enabled: bool,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        self.0.create_client_with_policy(role, enabled).await
+    }
+
+    fn native_backend_identity(
+        &self,
+        role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<Option<String>> {
+        self.0.native_backend_identity(role)
+    }
+
+    async fn create_owned_client(
+        &self,
+        role: &RoleDefinition,
+        owner_token: &str,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        self.0.create_owned_client(role, owner_token).await
+    }
+
+    fn connect_failure_cleanup_verified(&self) -> bool {
+        self.0.connect_failure_cleanup_verified()
+    }
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -78,6 +160,9 @@ pub(crate) trait RuntimeDependencies: Send + Sync {
         selector: SelectorMode,
         request: &str,
     ) -> Option<String>;
+    fn supports_native_owned_shutdown(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) struct ProductionRuntimeDependencies {
@@ -107,7 +192,11 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
             resolver: AgentResolver::new(config.agents.clone())?,
             connector: self.connector.clone(),
             global_allowed_env: config.allowed_env.clone(),
+            cwd: config.cwd.clone(),
         }))
+    }
+    fn supports_native_owned_shutdown(&self) -> bool {
+        self.connector.supports_native_owned_shutdown()
     }
 
     async fn generate_request_topic(
@@ -158,6 +247,30 @@ struct AcpClientFactory {
     resolver: AgentResolver,
     connector: Arc<dyn AcpConnector>,
     global_allowed_env: Vec<String>,
+    cwd: std::path::PathBuf,
+}
+
+pub(crate) fn backend_identity(
+    agent: &AgentRuntimeConfig,
+    global_allowed_env: &[String],
+    cwd: &std::path::Path,
+) -> Result<String> {
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x4a01_778d_e123_493d_b9ad_038f_fe3c_1223);
+    let cwd = cwd.canonicalize().map_err(|_| {
+        WorkflowError::InvalidAction("cannot identify backend working directory".to_string())
+    })?;
+    let bytes = serde_json::to_vec(&(
+        &agent.name,
+        &agent.command,
+        &agent.args,
+        &agent.model,
+        &agent.access,
+        &agent.allowed_env,
+        global_allowed_env,
+        &cwd,
+    ))
+    .expect("configured backend identity serializes");
+    Ok(uuid::Uuid::new_v5(&NAMESPACE, &bytes).to_string())
 }
 
 #[async_trait]
@@ -166,7 +279,24 @@ impl ClientFactory for AcpClientFactory {
         &self,
         role: &RoleDefinition,
     ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        self.create_client_with_policy(role, false).await
+    }
+
+    async fn create_client_with_policy(
+        &self,
+        role: &RoleDefinition,
+        enabled: bool,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
         let agent = self.resolver.resolve(role)?;
+        let identity = if enabled {
+            Some(backend_identity(
+                agent,
+                &self.global_allowed_env,
+                &self.cwd,
+            )?)
+        } else {
+            None
+        };
         tracing::debug!(
             role = %role.id,
             agent = %agent.name,
@@ -178,17 +308,59 @@ impl ClientFactory for AcpClientFactory {
         );
         let client = self
             .connector
-            .connect(
+            .connect_for_run(
                 transport_for(&self.global_allowed_env, agent),
                 watchdog_options_for(agent),
                 agent.access.clone(),
+                enabled,
             )
             .await?;
         Ok(ResolvedAgentClient {
             client: Box::new(client),
             model: agent.model.clone(),
             backend: agent.name.clone(),
+            backend_identity: identity,
         })
+    }
+
+    fn native_backend_identity(
+        &self,
+        role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<Option<String>> {
+        let agent = self.resolver.resolve(role)?;
+        Ok(Some(backend_identity(
+            agent,
+            &self.global_allowed_env,
+            &self.cwd,
+        )?))
+    }
+
+    async fn create_owned_client(
+        &self,
+        role: &RoleDefinition,
+        owner_token: &str,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        let agent = self.resolver.resolve(role)?;
+        let identity = backend_identity(agent, &self.global_allowed_env, &self.cwd)?;
+        let client = self
+            .connector
+            .connect_owned(
+                transport_for(&self.global_allowed_env, agent),
+                watchdog_options_for(agent),
+                agent.access.clone(),
+                owner_token,
+            )
+            .await?;
+        Ok(ResolvedAgentClient {
+            client: Box::new(client),
+            model: agent.model.clone(),
+            backend: agent.name.clone(),
+            backend_identity: Some(identity),
+        })
+    }
+
+    fn connect_failure_cleanup_verified(&self) -> bool {
+        true
     }
 }
 

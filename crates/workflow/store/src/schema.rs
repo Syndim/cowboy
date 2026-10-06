@@ -6,7 +6,7 @@ use sqlx::{Connection, Executor, Row, SqliteConnection, SqlitePool};
 
 use crate::{Error, Result, is_retryable_sqlite_code};
 
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF: Duration = Duration::from_millis(25);
 
@@ -18,6 +18,8 @@ pub(crate) const TABLES: &[&str] = &[
     "run_turns",
     "run_user_prompts",
     "agent_prompt_windows",
+    "native_writer_runs",
+    "native_writer_attempts",
 ];
 
 const DDL: &[&str] = &[
@@ -29,6 +31,12 @@ const DDL: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS run_turns_object_hash ON run_turns(object_hash)",
     "CREATE TABLE IF NOT EXISTS run_user_prompts (run_id TEXT NOT NULL, sequence INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(run_id, sequence))",
     "CREATE TABLE IF NOT EXISTS agent_prompt_windows (run_id TEXT PRIMARY KEY NOT NULL, window_id TEXT NOT NULL, data BLOB NOT NULL)",
+];
+
+const NATIVE_WRITER_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS native_writer_runs (run_id TEXT PRIMARY KEY NOT NULL, workflow_hash TEXT NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS native_writer_attempts (generation TEXT PRIMARY KEY NOT NULL, run_id TEXT NOT NULL, data BLOB NOT NULL, receipt BLOB)",
+    "CREATE INDEX IF NOT EXISTS native_writer_attempts_run ON native_writer_attempts(run_id)",
 ];
 
 pub(crate) async fn connect(path: &Path) -> Result<SqlitePool> {
@@ -144,8 +152,18 @@ async fn initialize_in_transaction(connection: &mut SqliteConnection) -> Result<
         for statement in DDL {
             connection.execute(*statement).await?;
         }
+
         connection.execute("PRAGMA user_version = 1").await?;
     }
+
+    if version < 2 {
+        for statement in NATIVE_WRITER_DDL {
+            connection.execute(*statement).await?;
+        }
+
+        connection.execute("PRAGMA user_version = 2").await?;
+    }
+
     validate_tables(connection).await
 }
 
@@ -251,13 +269,13 @@ mod tests {
                 .await
                 .unwrap()
                 .get(0);
-            assert_eq!(version, 1);
+            assert_eq!(version, 2);
             assert_eq!(foreign_keys, 1);
             assert_eq!(mode.to_ascii_lowercase(), "wal");
             assert_eq!(store.pool().options().get_max_connections(), 4);
         }
         println!(
-            "EVIDENCE schema-init header=SQLite_format_3 user_version=1 wal=true foreign_keys=true max_connections=4"
+            "EVIDENCE schema-init header=SQLite_format_3 user_version=2 wal=true foreign_keys=true max_connections=4"
         );
     }
 
@@ -276,16 +294,16 @@ mod tests {
                 .fetch_one(store.pool())
                 .await
                 .unwrap(),
-            1
+            2
         );
         let table_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('runs','run_heads','objects','role_sessions','run_turns','run_user_prompts','agent_prompt_windows')",
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('runs','run_heads','objects','role_sessions','run_turns','run_user_prompts','agent_prompt_windows','native_writer_runs','native_writer_attempts')",
         )
         .fetch_one(store.pool())
         .await
         .unwrap();
-        assert_eq!(table_count, 7);
-        println!("EVIDENCE schema-reopen user_version=1 tables=7");
+        assert_eq!(table_count, 9);
+        println!("EVIDENCE schema-reopen user_version=2 tables=9");
     }
 
     #[tokio::test]
@@ -293,7 +311,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("future.db");
         let store = crate::SqliteWorkflowStore::connect(&path).await.unwrap();
-        sqlx::query("PRAGMA user_version = 2")
+        sqlx::query("PRAGMA user_version = 3")
             .execute(store.pool())
             .await
             .unwrap();
@@ -302,7 +320,7 @@ mod tests {
         let error = crate::SqliteWorkflowStore::connect(&path)
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::FutureSchema { found: 2, .. }));
+        assert!(matches!(error, Error::FutureSchema { found: 3, .. }));
         assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
         println!("EVIDENCE schema-future rejected=true bytes_unchanged=true");
     }
@@ -340,13 +358,64 @@ mod tests {
         let b = b.unwrap();
         for store in [&a, &b] {
             let count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('runs','run_heads','objects','role_sessions','run_turns','run_user_prompts','agent_prompt_windows')",
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('runs','run_heads','objects','role_sessions','run_turns','run_user_prompts','agent_prompt_windows','native_writer_runs','native_writer_attempts')",
             )
             .fetch_one(store.pool())
             .await
             .unwrap();
-            assert_eq!(count, 7);
+            assert_eq!(count, 9);
         }
-        println!("EVIDENCE schema-concurrent connects=2 user_version=1 tables=7");
+        println!("EVIDENCE schema-concurrent connects=2 user_version=2 tables=9");
+    }
+
+    #[tokio::test]
+    async fn upgrades_existing_v1_store_without_reclassifying_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let store = crate::SqliteWorkflowStore::connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO runs(run_id, data) VALUES('old', x'7b7d')")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE native_writer_attempts")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE native_writer_runs")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.close().await;
+
+        let migrated = crate::SqliteWorkflowStore::connect(&path).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA user_version")
+                .fetch_one(migrated.pool())
+                .await
+                .unwrap(),
+            2
+        );
+        let raw: Vec<u8> = sqlx::query_scalar("SELECT data FROM runs WHERE run_id='old'")
+            .fetch_one(migrated.pool())
+            .await
+            .unwrap();
+        assert_eq!(raw, b"{}");
+        let enrolled: i64 = sqlx::query_scalar("SELECT count(*) FROM native_writer_runs")
+            .fetch_one(migrated.pool())
+            .await
+            .unwrap();
+        assert_eq!(enrolled, 0);
+        let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM native_writer_attempts")
+            .fetch_one(migrated.pool())
+            .await
+            .unwrap();
+        assert_eq!(attempts, 0);
+        println!(
+            "EVIDENCE schema-upgrade from=1 to=2 legacy_run_preserved=true native_enrollment=empty"
+        );
     }
 }

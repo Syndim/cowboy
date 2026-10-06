@@ -176,6 +176,8 @@ mod tests {
             parent: None,
             restart_source_run_id: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
                 next: "start".to_string(),

@@ -88,11 +88,22 @@ fn steps_from_registry(lua: &Lua) -> Result<BTreeMap<String, StepDefinition>> {
         if !matches!(run_value, Value::Function(_)) {
             return Err(Error::MissingRunFunction(id));
         }
+
         let transitions = transitions_from_step(&step)?;
-        let properties = table_properties_to_json(
-            &step,
-            &["__cowboy_kind", "id", "role", "transitions", "run"],
-        )?;
+        let reserved: &[&str] = if matches!(step.get::<Value>("verify")?, Value::Function(_)) {
+            &[
+                "__cowboy_kind",
+                "id",
+                "role",
+                "transitions",
+                "run",
+                "verify",
+            ]
+        } else {
+            &["__cowboy_kind", "id", "role", "transitions", "run"]
+        };
+
+        let properties = table_properties_to_json(&step, reserved)?;
         steps.insert(
             key,
             StepDefinition {
@@ -133,6 +144,19 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
                 task: agent_task_contract(table.get::<Value>("task")?, &prompt)?,
                 prompt,
                 output: output_spec(table.get::<Value>("output")?)?,
+                pre_input: optional_string(&table, "pre_input")?
+                    .map(|id| {
+                        if id.trim().is_empty() {
+                            Err(Error::InvalidActionField {
+                                action: "agent".to_string(),
+                                field: "pre_input".to_string(),
+                                reason: "must name a non-empty preflight step".to_string(),
+                            })
+                        } else {
+                            Ok(id)
+                        }
+                    })
+                    .transpose()?,
             }))
         }
         "command" => Ok(StepAction::Command(CommandAction {

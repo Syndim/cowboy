@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +88,82 @@ where
     .await
 }
 
+/// Input for exactly one continuation of an incomplete agent action.
+pub struct AgentContinuation {
+    pub action: crate::AgentAction,
+    pub human_input: Arc<str>,
+}
+
+/// Dispatch the original incomplete agent action without reevaluating Lua or
+/// charging another step visit. A caller must validate the current durable wait
+/// and record explicit human input before calling this function.
+pub async fn continue_agent_step<S, D>(
+    store: &S,
+    dispatcher: &D,
+    definition: &WorkflowDefinition,
+    run: &mut Run,
+    continuation: AgentContinuation,
+    attempt: u64,
+    retry_reason: Option<String>,
+) -> Result<RunStatus>
+where
+    S: WorkflowStateStore + WorkflowObjectStore + UserPromptStore + ?Sized,
+    D: ActionDispatcher,
+{
+    let AgentContinuation {
+        action,
+        human_input,
+    } = continuation;
+
+    let role = definition
+        .roles
+        .get(&action.role)
+        .ok_or_else(|| WorkflowError::UnknownRole {
+            step: run.step.next.clone(),
+            role: action.role.clone(),
+        })?
+        .clone();
+    let context = crate::ExecutionContext {
+        run_id: run.id.clone(),
+        step_id: run.step.next.clone(),
+        step_record_id: next_record_id(run),
+        prev: run.step.head.clone(),
+        role: Some(role),
+        attempt,
+        retry_reason,
+        agent_human_input: Some(human_input),
+        initial_input_kind: run.initial_input_kind(),
+        step_visit: run.step.visits.get(&run.step.next).copied().unwrap_or(0),
+        original_request: run.original_request.clone(),
+        run_created_at: run.created_at,
+        user_prompts: store.load_user_prompts(&run.id).await?,
+    };
+
+    match dispatcher
+        .dispatch(StepAction::Agent(action), context)
+        .await?
+    {
+        crate::ActionResult::Completed(record) => {
+            let mut committed = run.clone();
+            committed.agent_input_checkpoint = None;
+            let status = apply_step_record(store, definition, &mut committed, *record)
+                .await
+                .map_err(|_| WorkflowError::AgentCommitFailed)?;
+            *run = committed;
+            Ok(status)
+        }
+        crate::ActionResult::Blocked(status) => {
+            let mut committed = run.clone();
+            committed.agent_input_checkpoint = None;
+            let status = apply_run_status(store, &mut committed, status)
+                .await
+                .map_err(|_| WorkflowError::AgentCommitFailed)?;
+            *run = committed;
+            Ok(status)
+        }
+    }
+}
+
 async fn dispatch_current_step<S, D, P>(
     store: &S,
     dispatcher: &D,
@@ -136,6 +214,7 @@ where
         role,
         attempt,
         retry_reason,
+        agent_human_input: None,
         initial_input_kind: run.initial_input_kind(),
         step_visit: run.step.visits.get(&step.id).copied().unwrap_or(0),
         original_request: run.original_request.clone(),
@@ -247,6 +326,7 @@ pub fn next_step<'a>(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use chrono::Utc;
@@ -444,6 +524,7 @@ mod tests {
         sessions: Mutex<HashMap<(String, String), crate::RoleSession>>,
         objects: Mutex<HashMap<String, Vec<u8>>>,
         prompts: Mutex<HashMap<String, Vec<crate::FollowUpPrompt>>>,
+        fail_commit_once: AtomicBool,
     }
 
     #[async_trait]
@@ -481,6 +562,12 @@ mod tests {
             run: &Run,
             record: &StepRecord,
         ) -> Result<crate::ObjectHash> {
+            if self.fail_commit_once.swap(false, Ordering::SeqCst) {
+                return Err(WorkflowError::InvalidAction(
+                    "injected precommit rollback".to_string(),
+                ));
+            }
+
             let bytes = serde_json::to_vec(record).unwrap();
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
             self.objects.lock().insert(hash.clone(), bytes);
@@ -707,6 +794,8 @@ mod tests {
             original_request: "do it".to_string(),
             request_topic: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             step: StepState {
                 next: "start".to_string(),
                 head: None,
@@ -997,6 +1086,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn continuation_commit_rollback_preserves_original_cursor_head_and_checkpoint() {
+        let store = MemoryStore::default();
+        let executor = NoopDispatcher::default();
+        let mut definition = definition();
+        definition
+            .steps
+            .get_mut("agent")
+            .unwrap()
+            .transitions
+            .insert("success", "next");
+        let mut run = run();
+        run.step.next = "agent".to_string();
+        run.step.executed = 1;
+        run.step.visits.insert("agent".to_string(), 1);
+        run.agent_input_checkpoint = Some(Box::new(RunStatus::WaitingForInput {
+            step: "agent".to_string(),
+            input_id: "agent-interrupted".to_string(),
+            message: "Inspect previous work".to_string(),
+            choices: Vec::new(),
+            resume_callback: ResumeCallback::new("agent_human_input", Value::Null).unwrap(),
+        }));
+        store.save_run(&run).await.unwrap();
+        let before = run.clone();
+        let head_before = store.load_run_head(&run.id).await.unwrap();
+        store.fail_commit_once.store(true, Ordering::SeqCst);
+        let error = continue_agent_step(
+            &store,
+            &executor,
+            &definition,
+            &mut run,
+            AgentContinuation {
+                action: AgentAction {
+                    role: "developer".into(),
+                    prompt: "original task".into(),
+                    task: None,
+                    output: None,
+                    pre_input: None,
+                },
+                human_input: Arc::from("Check partial work before continuing"),
+            },
+            1,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, WorkflowError::AgentCommitFailed);
+        assert_eq!(run, before, "in-memory cursor must not jump to next step");
+        assert_eq!(store.load_run(&run.id).await.unwrap(), before);
+        assert_eq!(store.load_run_head(&run.id).await.unwrap(), head_before);
+        assert!(
+            store.objects.lock().is_empty(),
+            "rolled back completion must not create a record"
+        );
+        assert_eq!(executor.dispatched.lock().as_slice(), ["agent"]);
+    }
+
+    #[tokio::test]
     async fn agent_action_uses_executor_result() {
         let store = MemoryStore::default();
         let executor = NoopDispatcher::default();
@@ -1005,6 +1151,7 @@ mod tests {
             prompt: "do it".to_string(),
             task: None,
             output: None,
+            pre_input: None,
         })]);
         let mut run = run();
         run.step.next = "agent".to_string();
@@ -1054,6 +1201,7 @@ mod tests {
                 prompt: "do it".to_string(),
                 task: None,
                 output: None,
+                pre_input: None,
             }),
         ];
 

@@ -1,9 +1,10 @@
 cowboy-workflow-core	traits::tests::workflow_store_capabilities_are_object_safe	EVIDENCE workflow-store-traits object_safe=7 async=true
-cowboy-workflow-store	schema::tests::initializes_new_and_empty_files	EVIDENCE schema-init header=SQLite_format_3 user_version=1 wal=true foreign_keys=true max_connections=4
-cowboy-workflow-store	schema::tests::reopens_supported_schema_version	EVIDENCE schema-reopen user_version=1 tables=7
+cowboy-workflow-store	schema::tests::initializes_new_and_empty_files	EVIDENCE schema-init header=SQLite_format_3 user_version=2 wal=true foreign_keys=true max_connections=4
+cowboy-workflow-store	schema::tests::reopens_supported_schema_version	EVIDENCE schema-reopen user_version=2 tables=9
 cowboy-workflow-store	schema::tests::rejects_future_schema_version_without_modifying_file	EVIDENCE schema-future rejected=true bytes_unchanged=true
 cowboy-workflow-store	schema::tests::rejects_non_sqlite_file_without_modifying_file	EVIDENCE schema-non-sqlite rejected=true bytes_unchanged=true
-cowboy-workflow-store	schema::tests::concurrent_first_connects_initialize_one_schema	EVIDENCE schema-concurrent connects=2 user_version=1 tables=7
+cowboy-workflow-store	schema::tests::concurrent_first_connects_initialize_one_schema	EVIDENCE schema-concurrent connects=2 user_version=2 tables=9
+cowboy-workflow-store	schema::tests::upgrades_existing_v1_store_without_reclassifying_runs	EVIDENCE schema-upgrade from=1 to=2 legacy_run_preserved=true native_enrollment=empty
 cowboy-workflow-store	contract::tests::run_head_round_trip_and_deterministic_listing	EVIDENCE contract-run-head round_trip=true deterministic=true
 cowboy-workflow-store	contract::tests::source_step_hashes_and_reopen_durability	EVIDENCE contract-objects source_hash=true step_hash=true reopen=true
 cowboy-workflow-store	contract::tests::role_session_and_turn_ordering	EVIDENCE contract-agent session_crud=true turn_order=true

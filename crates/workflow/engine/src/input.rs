@@ -24,6 +24,14 @@ pub struct ValidatedInput {
     input: String,
 }
 
+struct WaitView<'a> {
+    step: &'a str,
+    input_id: &'a str,
+    message: &'a str,
+    choices: &'a [Choice],
+    callback: &'a ResumeCallback,
+}
+
 impl ResumeRouter {
     pub fn new(registry: ResumeCallbackRegistry) -> Self {
         Self { registry }
@@ -40,6 +48,32 @@ impl ResumeRouter {
         input: impl Into<String>,
     ) -> cowboy_workflow_core::Result<ValidatedInput> {
         let input = input.into();
+        let waiting = Self::wait_view(run, input_id, &input)?;
+        Ok(ValidatedInput {
+            resume_callback: waiting.callback.clone(),
+            step: waiting.step.to_string(),
+            input_id: waiting.input_id.to_string(),
+            message: waiting.message.to_string(),
+            choices: waiting.choices.to_vec(),
+            input,
+        })
+    }
+
+    /// Validate the native waiting contract without copying callback payloads
+    /// or human text. Agent continuation performs its own generation check too.
+    pub fn validate_wait(
+        run: &Run,
+        input_id: &str,
+        input: &str,
+    ) -> cowboy_workflow_core::Result<()> {
+        Self::wait_view(run, input_id, input).map(|_| ())
+    }
+
+    fn wait_view<'a>(
+        run: &'a Run,
+        input_id: &str,
+        input: &str,
+    ) -> cowboy_workflow_core::Result<WaitView<'a>> {
         let RunStatus::WaitingForInput {
             step,
             input_id: waiting_input_id,
@@ -66,13 +100,12 @@ impl ResumeRouter {
             )));
         }
 
-        Ok(ValidatedInput {
-            resume_callback: resume_callback.clone(),
-            step: step.clone(),
-            input_id: waiting_input_id.clone(),
-            message: message.clone(),
-            choices: choices.clone(),
-            input,
+        Ok(WaitView {
+            step,
+            input_id: waiting_input_id,
+            message,
+            choices,
+            callback: resume_callback,
         })
     }
 
@@ -167,6 +200,8 @@ mod tests {
                 )
                 .unwrap(),
             },
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
                 next: "approve".to_string(),

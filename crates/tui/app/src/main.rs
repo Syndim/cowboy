@@ -42,6 +42,13 @@ async fn run_main() -> Result<()> {
 
     match cli.command.unwrap_or(CliCommand::Tui) {
         CliCommand::Tui => cowboy::run_tui(config).await,
+        CliCommand::Ownership(args) => {
+            let runtime =
+                cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd)).await?;
+            let evidence = runtime.native_shutdown_evidence(&args.run_id).await?;
+            println!("{}", serde_json::to_string(&evidence)?);
+            Ok(())
+        }
         CliCommand::Shared(command) => run_shared_command(command, config, cwd).await,
     }
 }
@@ -184,9 +191,23 @@ fn print_resolution_options(options: &cowboy_workflow_engine::ResolutionOptions)
 }
 
 fn print_report(report: &cowboy_workflow_engine::RunReport) {
+    let status = match &report.run.status {
+        cowboy_workflow_engine::RunStatus::WaitingForInput {
+            step,
+            input_id,
+            message,
+            resume_callback,
+            ..
+        } if resume_callback.kind() == "agent_human_input" => {
+            format!(
+                "WaitingForInput {{ step: {step:?}, input_id: {input_id:?}, message: {message:?} }}"
+            )
+        }
+        status => format!("{status:?}"),
+    };
     println!(
-        "run={} workflow={} status={:?} step={}",
-        report.run.id, report.run.workflow.name, report.run.status, report.run.step.next
+        "run={} workflow={} status={} step={}",
+        report.run.id, report.run.workflow.name, status, report.run.step.next
     );
     for event in &report.events {
         println!("event={:?}", event.kind);

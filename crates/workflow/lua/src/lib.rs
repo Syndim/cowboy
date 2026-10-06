@@ -15,4 +15,4 @@ mod sandbox;
 pub use error::{Error, Result};
 pub use imports::SourceResolver;
 pub use loader::{Loader, compile_snapshot, load};
-pub use runtime::{RunStepResult, run_step};
+pub use runtime::{RunStepResult, run_step, verify_pre_input};

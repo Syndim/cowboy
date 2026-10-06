@@ -2,6 +2,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("agent action incomplete ({category:?})")]
+    HumanInput {
+        category: cowboy_workflow_core::AgentFailureCategory,
+    },
+    #[error("agent policy or process ownership rejection; human recovery is not permitted")]
+    HumanInputUnsafe,
     #[error("agent client error: {0}")]
     Client(#[from] anyhow::Error),
     #[error("yaml parse error: {0}")]
@@ -61,7 +67,12 @@ impl Error {
             | Error::MissingOutputFields(_)
             | Error::InvalidOutputFieldType { .. }
             | Error::MissingOutput => true,
-            Error::MissingClient(_) | Error::Json(_) => false,
+            Error::HumanInput { category } => !matches!(
+                category,
+                cowboy_workflow_core::AgentFailureCategory::DeclaredBlocked
+                    | cowboy_workflow_core::AgentFailureCategory::Interrupted
+            ),
+            Error::MissingClient(_) | Error::Json(_) | Error::HumanInputUnsafe => false,
             Error::Workflow(err) => err.recoverable(),
         }
     }
@@ -69,6 +80,19 @@ impl Error {
 
 impl From<Error> for cowboy_workflow_core::WorkflowError {
     fn from(value: Error) -> Self {
+        if let Error::HumanInput { category } = value {
+            return cowboy_workflow_core::WorkflowError::AgentFailure { category };
+        }
+        if matches!(value, Error::HumanInputUnsafe) {
+            return cowboy_workflow_core::WorkflowError::AgentUnsafe;
+        }
+        if matches!(
+            &value,
+            Error::Workflow(cowboy_workflow_core::WorkflowError::AgentUnsafe)
+        ) {
+            return cowboy_workflow_core::WorkflowError::AgentUnsafe;
+        }
+
         if value.recoverable() {
             cowboy_workflow_core::WorkflowError::RecoverableAction(value.to_string())
         } else {

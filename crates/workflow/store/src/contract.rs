@@ -27,6 +27,8 @@ pub(crate) mod tests {
             parent: None,
             restart_source_run_id: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             retries_used: 2,
             step: StepState {
                 next: "start".into(),
@@ -144,11 +146,13 @@ pub(crate) mod tests {
             run_id: "run-1".into(),
             role_id: "developer".into(),
             backend: "acp".into(),
+            backend_identity: None,
             session_id: "session-1".into(),
             updated_at: Utc::now(),
             role_instructions_sent: true,
             last_sent_input_sequence: Some(3),
             delivered_task_contracts: Default::default(),
+            delivered_actions: Default::default(),
         };
         store.save_role_session(session.clone()).await.unwrap();
         assert_eq!(

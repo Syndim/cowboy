@@ -31,6 +31,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt: config.prompt.clone(),
         task: None,
         output: None,
+        pre_input: None,
     };
     let context = execution_context(&config, &run_state, user_prompts);
     let factory = AcpFactory {
@@ -81,6 +82,7 @@ fn execution_context(
         }),
         attempt: 1,
         retry_reason: None,
+        agent_human_input: None,
         initial_input_kind: run.initial_input_kind(),
         step_visit: run.step.visits.get(&config.step_id).copied().unwrap_or(1),
         original_request: run.original_request.clone(),
@@ -111,6 +113,8 @@ async fn ensure_standalone_run(
                 parent: None,
                 restart_source_run_id: None,
                 status: RunStatus::Running,
+                agent_input_checkpoint: None,
+                agent_recovery_denied: false,
                 step: StepState {
                     next: config.step_id.clone(),
                     head: None,
@@ -208,6 +212,7 @@ impl ClientFactory for AcpFactory {
             client: Box::new(AcpClient::connect(self.transport.clone()).await?),
             model: None,
             backend: "acp".to_string(),
+            backend_identity: None,
         })
     }
 }

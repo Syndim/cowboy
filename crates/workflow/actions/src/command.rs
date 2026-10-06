@@ -508,6 +508,7 @@ mod tests {
             role: None,
             attempt: 1,
             retry_reason: None,
+            agent_human_input: None,
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: "request".to_string(),

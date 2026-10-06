@@ -128,6 +128,7 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         max_visits_per_step: 20,
         max_retries_per_run: 200,
         max_retries_per_step: 2,
+        agent_human_input: false,
     };
     let selector = env_or("COWBOY_ENGINE_SELECTOR", "agent");
     eprintln!(

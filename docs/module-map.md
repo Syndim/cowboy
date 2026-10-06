@@ -91,10 +91,13 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list runs; live config-set policy; current-generation input CAS, terminal unsafe reconciliation of interrupted top-level and child agents, session-bound continuation, events and bounded shutdown. |
+| `agent_input.rs` | Durable `agent_human_input` callback: safe failure category, original action/role, run/step/visit/head/generation binding and bounded answer validation. |
+| `native_ownership.rs` | Adapter from frozen agent dispatch and native ACP shutdown receipt into the SQLite owner-generation ledger. |
+| `preflight.rs` | Optional snapshot-bound read/verify hook before consuming an opted-in agent wait. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates supplied input for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
-| `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, persists `Failed` on give-up, and exposes canonical `ctx.prev.output` plus compatibility aliases through `LuaStepActionProvider`. |
+| `runner.rs` | `WorkflowRunner<S, D, P>` over `execute_step`: disabled retry budgets, enabled first-failure agent waits without automatic retry, original-action capture, same-step continuation and event projection. |
 | `workflow.rs` | Selector/summarizer adapters: deterministic selector, agent-backed selector, agent-backed summarizer. |
 | `lib.rs` | Public runtime interface exported to UI/CLI and future frontends. |
 
@@ -108,12 +111,12 @@ Important seams:
 
 Runner-policy contract: TOML uses `[config_sets.<name>]` with
 `max_steps_per_run`, `max_visits_per_step`, `max_retries_per_run`, and
-`max_retries_per_step`, independently defaulting to `100`, `20`, `200`, and
-`2`. `default` always exists; retry limits may be zero; step/visit limits may
-not. Lua selects a nonblank name through `workflow(..., { config_set = ... })`.
-Only the resolved set **name** is durable; effective limits are resolved live
-from current config on every lifecycle path, while cumulative retry counters
-remain durable. Old top-level runner-limit keys are rejected.
+`max_retries_per_step`, defaulting independently to `100`, `20`, `200`, and
+`2`. `agent_human_input` independently defaults to `false` and changes only
+opted-in agent steps. Named sets do not inherit the default set's boolean;
+only the selected set **name** is durable and deleted sets fall back to live
+`default`, then built-in policy. Retry counters remain durable. Old top-level
+runner-limit keys remain rejected.
 
 ## Crate: `cowboy-workflow-catalog`
 
@@ -136,10 +139,10 @@ Owns workflow domain data and pure execution rules.
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
 | `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `wait_for_input`, `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
-| `state.rs` | Durable `Run`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
+| `state.rs` | Durable `Run` agent continuation checkpoint and unsafe-recovery fence, config-set pointer, retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` backend identity plus independent role/static-task/current-action delivery evidence. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
-| `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, `next_step` routing, and step/visit budget enforcement. |
+| `engine.rs` | `RunnerLimits`, `execute_step`, continuation of the saved agent action with transactional completion, `next_step` routing and step/visit budget enforcement. |
 | `error.rs` | `WorkflowError` and `Result`. |
 
 Core must remain independent of TUI, Lua, storage backends, and agent protocols.
@@ -167,8 +170,9 @@ returned; writes use transactions and busy/locked retry with cancellation.
 
 | Module | Responsibility |
 | --- | --- |
-| `sqlite_store.rs` | `SqliteWorkflowStore`; typed transactional state, object, session, turn, prompt, and prompt-window operations. |
-| `schema.rs` | SQLite schema version 1 bootstrap, validation, WAL, and SQLx pool policy. |
+| `sqlite_store.rs` | `SqliteWorkflowStore`; transactional run/head, object, session, turn, prompt and prompt-window operations; compare-and-save run generation for stale human-input rejection. |
+| `schema.rs` | SQLite schema version 2 bootstrap, transactional v1 upgrade, validation, WAL, and SQLx pool policy. |
+| `native_ownership.rs` | Versioned private writer/attempt ledger, session and immutable action linkage, and read-only redacted shutdown projection. |
 | `contract.rs` | Reusable public-interface behavioral tests. |
 | `hash.rs` | Canonical JSON object envelope and BLAKE3 object hashes. |
 | `error.rs` | Store-specific errors mapped into core errors by the trait implementation. |
@@ -180,7 +184,7 @@ Owns execution of `StepAction::Agent`.
 
 | Module | Responsibility |
 | --- | --- |
-| `executor.rs` | `AgentExecutor`, `ClientFactory`, per-`(run_id, role_id)` client/session reuse, equal-key-and-fingerprint delivery checks, durable role/task/input state, fresh-session fallback, prompt-block metadata, and turn capture. Runtime tests persist client-boundary captures and matching `StepRecord`/session metadata for reuse, retry, load, and recreation paths. |
+| `executor.rs` | `AgentExecutor`, per-run-policy `ClientFactory`, native per-role/session reuse, backend identity/load guards, prompt-seal current-action fingerprints for raw task/new turn, and verified client cleanup. |
 | `prompt.rs` | Composes role, task, recovery, turn, user-input, deliverable, and retry blocks; fingerprints static task instructions plus the output specification while excluding recovery and turn deltas. |
 | `frontmatter.rs` | Parses YAML frontmatter + Markdown body into normalized `StepOutput`. |
 | `error.rs` | Agent execution errors. |
@@ -192,7 +196,7 @@ Provider-neutral seam between Cowboy and agent backends.
 
 | Module | Responsibility |
 | --- | --- |
-| `traits.rs` | `Client` trait: session create/load, prompt, events, close. |
+| `traits.rs` | `Client` trait: session create/load, prompt, close, and explicit verified termination/policy failure gates for human-input recovery. |
 | `types.rs` | `ModelInfo`, `AgentInfo`, `PromptContent`, `Event`, `StopReason`. |
 
 ## Crate: `cowboy-agent-acp`
@@ -201,11 +205,11 @@ ACP backend implementation.
 
 | Module | Responsibility |
 | --- | --- |
-| `client.rs` | ACP client implementing `cowboy-agent-client::Client`, including inactivity reset, `session/cancel`, same-session `"Continue"`, and bounded restart/resume recovery. |
+| `client.rs` | ACP client implementing the provider-neutral `Client`, with unchanged disabled watchdog/`Continue` behavior and per-run enabled bounded failures without automatic continuation/replacement. |
 | `messages.rs` | ACP JSON-RPC message types and parser. |
 | `process_tree.rs` | `ProcessTreeScope`: platform ownership of an agent's whole process tree (Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; Unix `process_group(0)` + `killpg`), configured before spawn, attached after spawn, terminated idempotently and on drop. |
 | `agent_processes.rs` | Process-wide registry of live agent process trees, exposed as `terminate_all_agent_processes(timeout)` for bounded shutdown. |
-| `transport/` | stdio and Zellij line transports, including recorded-PID force termination before replacement startup with `--resume=<session-id>`. `StdioTransport` owns a `ProcessTreeScope` and terminates the whole tree on `force_terminate`/`close`/drop, so the agent's stdio pipes are actually released. |
+| `transport/` | stdio and Zellij ACP transports. Stdio preserves legacy direct-child kill after failed group termination; opted-in human waits require separate verified scoped group termination and direct-child reap/absence proof before releasing a run. |
 | `bin/acp-chat.rs` | Test app for chatting with an ACP agent. |
 | `bin/watchdog-fixture.rs` | Deterministic soft/hard watchdog smoke fixture and authenticated cleanup verifier. |
 

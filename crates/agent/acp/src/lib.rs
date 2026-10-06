@@ -11,5 +11,6 @@ pub mod transport;
 
 pub use agent_processes::terminate_all_agent_processes;
 pub use backend::BackendPreset;
-pub use client::{AgentAccess, AgentWatchdogOptions, Client};
+pub use client::{AgentAccess, AgentWatchdogOptions, Client, VerifiedConnectFailure};
 pub use transport::TransportConfig;
+pub use transport::stdio::NeverSpawned;

@@ -21,10 +21,27 @@ where
         action: AgentAction,
         context: ExecutionContext,
     ) -> Result<StepRecord> {
-        self.execute_agent(action, context)
-            .await
-            .map(|execution| execution.record)
-            .map_err(WorkflowError::from)
+        let identity = self
+            .human_input_enabled()
+            .then(|| (context.run_id.clone(), action.role.clone()));
+        match self.execute_agent(action, context).await {
+            Ok(execution) => Ok(execution.record),
+            Err(error) => {
+                if matches!(
+                    error,
+                    cowboy_workflow_agent::Error::HumanInput { .. }
+                        | cowboy_workflow_agent::Error::HumanInputUnsafe
+                        | cowboy_workflow_agent::Error::Workflow(WorkflowError::AgentUnsafe)
+                ) {
+                    let (run_id, role_id) = identity.expect("human input was enabled");
+                    self.terminate_for_human_input(&run_id, &role_id)
+                        .await
+                        .map_err(|_| WorkflowError::AgentUnsafe)?;
+                }
+
+                Err(WorkflowError::from(error))
+            }
+        }
     }
 }
 

@@ -7,6 +7,41 @@ use serde_json::Value;
 
 use crate::{AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, StopReason};
 
+/// A transport failure that must never become a human approval/context wait.
+/// The message is retained only for the legacy disabled error path.
+#[derive(Debug)]
+pub enum AgentSafetyError {
+    PolicyRejected(String),
+    CleanupUnverified(String),
+}
+
+impl std::fmt::Display for AgentSafetyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PolicyRejected(message) | Self::CleanupUnverified(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl std::error::Error for AgentSafetyError {}
+
+/// Process-scope evidence minted by a backend after native owned-process cleanup.
+/// The caller must still bind it to its durable owner/generation before use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedProcessScope {
+    pub scope_id: String,
+    pub method: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClientShutdown {
+    pub owner_token: String,
+    pub session_id: Option<String>,
+    pub scopes: Vec<VerifiedProcessScope>,
+}
+
 /// Awaitable signal that cancels only the currently active prompt turn.
 ///
 /// Backend adapters intentionally receive no workflow ids, prompt-window ids,
@@ -116,6 +151,27 @@ pub trait Client: Send + Sync + std::fmt::Debug {
         cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason>;
+
+    /// Whether the last backend failure is safe to present as a request for
+    /// context. Policy/provenance rejections must return false.
+    fn human_input_failure_allowed(&self) -> bool {
+        false
+    }
+
+    /// Stop and verify ownership of the backend before publishing a human wait.
+    /// Other providers must opt in with an equivalent process ownership proof.
+    async fn terminate_for_human_input(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("backend has no verified termination boundary")
+    }
+
+    /// Stop every process this client has owned and inspect each original
+    /// process group/job after direct-child reap. Unsupported backends fail closed.
+    async fn close_verified(
+        &mut self,
+        _owner_token: &str,
+    ) -> anyhow::Result<VerifiedClientShutdown> {
+        anyhow::bail!("backend has no verified client shutdown boundary")
+    }
 
     /// Close the client and release transport resources.
     async fn close(&mut self) -> anyhow::Result<()>;

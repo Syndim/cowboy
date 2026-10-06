@@ -21,6 +21,7 @@ cowboy-workflow-lua.workspace = true
 cowboy-log.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+blake3 = "1"
 chrono = { workspace = true, features = ["serde"] }
 fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -137,14 +137,20 @@ falls back to `default` limits with a warning (or the built-in defaults when
 `default` is also absent). This is a breaking persisted-shape change with no
 migration; pre-existing runs may be discarded by resetting the store.
 
-`WorkflowRunner` reserves each recoverable retry by incrementing the run-wide
-and per-step-id counters and saving the run before emitting `StepRetrying` or
-dispatching. Both budgets are cumulative; repeated visits share the per-step
-remainder. Initial attempts and non-recoverable failures consume no retry
-budget, and retries consume no step/visit budget. Event attempts stay local to
-the current visit, with one fixed `max_attempts` derived from the smaller
-remaining retry budget. Run-budget exhaustion takes precedence when both
-ceilings are exhausted.
+`agent_human_input` is an independent per-set boolean with built-in default
+`false`. An explicit `true` enables the native incomplete-agent wait; a named
+set's missing value does not inherit `default`'s value. Existing runs persist
+only the selected name; a deleted set falls back to current `default` policy,
+then the built-in `false`. No historical failed run is reclassified.
+
+For disabled/missing agent human-input policy, `WorkflowRunner` reserves each
+recoverable retry by incrementing durable run-wide and per-step counters
+before dispatching. Both budgets are cumulative; repeated visits share the
+per-step remainder. Initial attempts and non-recoverable failures consume no
+retry budget, and retries consume no step/visit budget. Event attempts remain
+local to a visit, with fixed `max_attempts`; run-budget exhaustion takes
+precedence when both ceilings are exhausted. Enabled typed agent failures
+bypass this retry loop and ask for human input on their first occurrence.
 
 ### Agent execution
 
@@ -267,6 +273,69 @@ Providing input does not increment step budgets. The supplied value is a hint ra
 
 No Lua coroutine or host-call replay cache is persisted.
 
+### Agent human-input recovery
+
+Opt-in `action.agent` failures bypass automatic workflow retry. An allowed
+`blocked` output parks immediately, even if completion-only fields are absent.
+The first safe ACP initialization/session/prompt failure or invalid result
+parks before another coding action, with a category-specific question. The
+per-run policy is passed to the ACP connector before initialization: enabled
+prompts do not send automatic `Continue` or watchdog replacement prompts, and
+in-flight tool inactivity is bounded. Disabled/missing policy retains the old
+ACP watchdog and workflow retry behavior. The runner persists
+`WaitingForInput` on the original step **without** a completed agent
+`StepRecord`; safe categories are separate from provider text. The callback
+binds the original action, run, role, step visit, prior head, and unique wait
+generation. Wait fields contain no raw ACP stderr or backend session id.
+Verified scoped ACP process-tree termination is required before publishing a
+wait; an unverified cleanup or policy/provenance rejection fails closed.
+
+For an incomplete or unsafe agent step, the returned report and persisted
+workflow event log remove that step's raw prompt, response, thought, tool,
+plan and backend-session progress entries. Earlier completed-step events and
+the safe wait or terminal failure event remain.
+
+`provide-input` takes the same-run guard, validates the current input id,
+callback binding, nonempty 4096-byte limit, and config policy, then atomically
+compares the observed SQLite run to the stored run before starting an agent
+turn. It saves `Running` plus an `agent_input_checkpoint` carrying a **new**
+interrupted identity before dispatch. An interruption leaves the checkpoint
+durable but cannot prove old ACP children were stopped after a hard `SIGKILL`.
+Under the run guard both top-level and child-run entrypoints atomically fence
+the run as terminal unsafe, rather than restoring an actionable wait or
+replaying side effects. A fresh human answer cannot clear the fence. A
+successful action commits its real record, run and head in one transaction;
+the in-memory cursor and checkpoint are changed only after commit. If the
+commit rolls back, the original step/head/checkpoint remain, and a later
+reconciliation fails closed. If event-log persistence fails after the commit,
+the completed record remains authoritative and cannot be replayed. A further
+declared inability parks again with another unique id, without spending a
+second step visit. The compare-and-save prevents a stale SQLite reader from
+consuming an obsolete wait. Existing parent workflow callbacks proxy only the
+current child generation; child checkpoint reconciliation never redispatches
+the agent. A marked unsafe failure rejects resume, step, restart and manual
+resolution.
+
+Normal `action.wait_for_input` callbacks still complete a wait step and expose
+`ctx.prev.fields.input`; native agent answers instead supplement the original
+agent prompt in its existing role/session and never create a wait-step record.
+
+Saved role sessions carry an opaque fingerprint of the configured ACP agent,
+access policy and runtime working directory. Enabled recovery verifies it
+before sending the original session ID to any backend. An ordinary native or
+supplied-session load failure parks with the same ID; a backend with no load
+capability cannot silently create a replacement. Only an absent saved session
+may create a first session. Native `RoleSession` separately records delivered
+role instructions, stable task-contract fingerprints, and full current-action
+fingerprints by step-record id. The latter includes raw `action.prompt` or
+structured `task.turn` and advances only after the prompt window seals. On
+human continuation a reused session omits current raw task/turn only when
+that exact action was confirmed delivered; role or prior same-key task
+delivery alone is insufficient. Unknown delivery resends the frozen task/turn
+with explicit verify-existing-work instructions, not a fresh workflow visit.
+Legacy rows default the new action map to empty and disabled-mode prompt
+selection is unchanged.
+
 ### Nested workflow calls
 
 `StepAction::Workflow` lets a step invoke another catalog workflow (by the id
@@ -304,8 +373,9 @@ genuinely new branch uses the current catalog.
 ### Event logs
 
 Run bodies live in the configured SQLite `WorkflowStore` (`workflow_store`,
-default `data.db`). The store bootstraps schema version 1, uses WAL and a
-bounded SQLx pool, and retries only SQLite busy/locked writes with cancellable
+default `data.db`). The store bootstraps schema version 2 (transactionally
+upgrading SQLite v1), uses WAL and a bounded SQLx pool, and retries only
+SQLite busy/locked writes with cancellable
 async backoff. The first retry emits one sanitized `WorkflowStoreWaiting`
 event for CLI/TUI progress without exposing SQL or database paths. Per-run
 sidecar locks remain under `<workflow_store>.locks`, which is `data.db.locks`
@@ -331,6 +401,38 @@ registers it in a process-wide registry of live agent trees. `force_terminate`,
 required for termination to release the agent's stdio pipes: descendants
 inherit the stdout write handle, so killing only the direct child leaves the
 transport's pending read without EOF and blocks process exit forever.
+
+For a newly enrolled run with `agent_human_input = true`, the workflow runtime
+registers each exact agent dispatch in a private SQLite ledger **before** the
+ACP factory can spawn a subprocess. The versioned pending row binds the run and
+workflow hash, frozen action fingerprint, step/record/head, role, configured
+backend identity, visit/attempt and random owner/generation tokens. The owner
+token is also the original stdio process scope identity, not a PID. Existing
+disabled and historical runs are never enrolled retroactively. A failed OS
+spawn can certify *no child was created*; otherwise only
+`StdioTransport::force_terminate_verified` can certify shutdown after direct
+child reap and kernel inspection of the original group/Job. The client closes
+every acquired role at the normal completed, blocked or stepwise boundary; a
+single cleanup failure leaves its generation unsealed and fences an otherwise
+actionable run as unsafe. Drop and process-wide teardown alone do not create
+a persisted proof. An interrupted process—including Cowboy self-`SIGKILL`—
+cannot attest an old writer and never restores an actionable checkpoint.
+
+`WorkflowRuntime::native_shutdown_evidence` and CLI-only
+`cowboy ownership <run-id>` read a consistent SQLite snapshot: current
+run/head and immutable committed action records, private generation and
+native-exit receipts, nested children, ancestors and restart sources. The
+redacted projection exposes `state: verified | unknown`, current `status`,
+`head`, `attempt_count` and distinct verified `process_count`, never the
+process/session/owner token or agent prompt. An input wait can be quiescent
+without being complete; a completed status without native receipts is not
+proof. No library or CLI method releases a checkout. The caller must compare
+its own current physical reservation and preserved artifacts before any
+atomic release. Source selection by an untracked ACP agent is not enrolled;
+an explicitly named workflow can be. An enrolled run skips the optional
+presentation-only topic agent so it cannot create an untracked writer.
+Process-group escape and externally modified SQLite contents remain outside
+the OS/local-store trust boundary.
 
 The registry is exposed as
 `cowboy_agent_acp::terminate_all_agent_processes(timeout)` and reached through
@@ -362,6 +464,7 @@ cowboy improve <run-id>                 # summarize and apply workflow-file impr
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
 cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
+cowboy ownership <run-id>              # inspect redacted native writer shutdown evidence
 cowboy export <run-id>                  # write a searchable HTML transcript
 ```
 
@@ -385,15 +488,12 @@ remain strings while valid JSON literals preserve structured types, for example
 `--field summary "manual resolution" --field retry false --field files '["src/a.rs"]'`.
 
 Recoverable step failures consume the live-resolved cumulative run-wide and
-per-step-id retry budgets described above. Exhaustion persists `Failed` while
-keeping the current step available. More generally, `cowboy resume`/`cowboy
-step` re-execute the retained current step for every non-terminal run status —
-`Running`, `Failed`, and `WaitingForInput`: for a `Failed` step this grants one
-fresh initial attempt that can succeed or deterministically re-fail on an
-exhausted budget, and for a `WaitingForInput` run it re-prompts the retained
-`wait_for_input` step and safely replaces the durable pending resume callback. Only
-`Completed` and `Cancelled` runs are non-resumable no-ops. `cowboy resolve`
-forces a manual status on a failed run.
+per-step-id retry budgets. Exhaustion normally persists `Failed` while keeping
+the current step available. `cowboy resume` and `cowboy step` re-execute the
+retained step of ordinary `Running`, `Failed`, and `WaitingForInput` runs; the
+latter re-prompts its `action.wait_for_input` callback. An opt-in agent wait is
+the exception: both commands leave it unchanged until `provide-input` supplies
+its current input id. Only `Completed` and `Cancelled` are non-resumable no-ops.
 
 ## TUI
 

@@ -57,6 +57,8 @@ pub struct ConfigSetConfig {
     pub max_visits_per_step: u32,
     pub max_retries_per_run: u32,
     pub max_retries_per_step: u32,
+    /// Park incomplete agent actions for scoped human input; off by default.
+    pub agent_human_input: bool,
 }
 
 impl Default for ConfigSetConfig {
@@ -66,6 +68,7 @@ impl Default for ConfigSetConfig {
             max_visits_per_step: 20,
             max_retries_per_run: 200,
             max_retries_per_step: 2,
+            agent_human_input: false,
         }
     }
 }
@@ -349,6 +352,7 @@ impl AppConfig {
                         max_visits_per_step: config_set.max_visits_per_step,
                         max_retries_per_run: config_set.max_retries_per_run,
                         max_retries_per_step: config_set.max_retries_per_step,
+                        agent_human_input: config_set.agent_human_input,
                     },
                 )
             })
@@ -711,6 +715,7 @@ access = "deny_all"
                 max_visits_per_step: 20,
                 max_retries_per_run: 200,
                 max_retries_per_step: 2,
+                agent_human_input: false,
             }
         );
         assert_eq!(config.agents.len(), 1);
@@ -857,6 +862,7 @@ max_retries_per_step = 4
                         max_visits_per_step: 8,
                         max_retries_per_run: 7,
                         max_retries_per_step: 6,
+                        agent_human_input: false,
                     },
                 ),
             ]),

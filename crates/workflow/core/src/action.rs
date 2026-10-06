@@ -52,6 +52,10 @@ pub struct AgentAction {
     /// Optional expected output shape used to instruct/validate the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputSpec>,
+    /// Trusted step ID whose snapshot-bound command and verifier guard a
+    /// human answer before this incomplete agent action is dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_input: Option<String>,
 }
 
 /// Stable task definition and recovery state for one agent responsibility.
@@ -357,6 +361,7 @@ mod tests {
                 prompt: "do it".to_string(),
                 task: None,
                 output: None,
+                pre_input: None,
             })
             .action_name(),
             "agent"
@@ -407,6 +412,7 @@ mod tests {
                 statuses: vec!["implemented".to_string()],
                 fields: BTreeMap::new(),
             }),
+            pre_input: None,
         });
 
         let json = serde_json::to_value(&action).unwrap();

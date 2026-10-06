@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::{
     AbortAgentPromptWindowOutcome, AgentPromptWindow, AppendUserPromptOutcome, Choice,
     CompareAndSealPromptWindowOutcome, FollowUpPrompt, ObjectHash, OpenAgentPromptWindowOutcome,
@@ -45,6 +47,8 @@ pub struct ExecutionContext {
     pub attempt: u64,
     /// Reason the previous attempt failed, when this is a corrective retry.
     pub retry_reason: Option<String>,
+    /// Validated, scoped human instructions for an incomplete agent action only.
+    pub agent_human_input: Option<Arc<str>>,
     /// Origin of the synthesized sequence-zero user input.
     pub initial_input_kind: UserInputKind,
     /// 1-based visit ordinal for this step id, stable across recoverable retries.

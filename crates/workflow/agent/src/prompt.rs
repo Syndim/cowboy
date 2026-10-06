@@ -60,6 +60,13 @@ pub(crate) fn task_contract_fingerprint(
     blake3::hash(&bytes).to_hex().to_string()
 }
 
+/// Evidence for the frozen action of one step visit, including its raw prompt
+/// and current turn. Static task fingerprints deliberately exclude the turn.
+pub(crate) fn action_delivery_fingerprint(action: &AgentAction) -> String {
+    let bytes = serde_json::to_vec(action).expect("agent action serializes");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 pub fn build_prompt_blocks(
     role: &RoleDefinition,
     action: &AgentAction,
@@ -88,10 +95,11 @@ pub fn build_prompt_blocks(
             parts.push(format!("## Current Turn\n\n{}", task.turn.trim()));
             included_blocks.push("turn");
         }
-    } else {
+    } else if selection.include_task {
         parts.push(format!("## Task\n\n{}", action.prompt.trim()));
         included_blocks.push("legacy_task");
     }
+
     if !user_inputs.is_empty() {
         let header = if selection.include_role {
             "All entries below are cumulative user direction. Apply them in sequence."
@@ -126,7 +134,7 @@ pub fn build_prompt_blocks(
         parts.push(format!("## User Inputs\n\n{body}"));
         included_blocks.push("user_inputs");
     }
-    if (action.task.is_none() || selection.include_task)
+    if selection.include_task
         && let Some(output) = &action.output
     {
         parts.push(build_output_instruction(output));
@@ -255,7 +263,7 @@ on its own before the Markdown body.",
     nudge
 }
 
-fn build_output_instruction(output: &OutputSpec) -> String {
+pub(crate) fn build_output_instruction(output: &OutputSpec) -> String {
     let statuses = if output.statuses.is_empty() {
         "Any status required by the workflow.".to_string()
     } else {
@@ -351,6 +359,7 @@ mod tests {
                 ],
                 fields: summary_field(true),
             }),
+            pre_input: None,
         };
         let prompt = build_agent_prompt(&role, &action, &[], true);
         assert!(prompt.contains("Implement changes"));
@@ -417,6 +426,7 @@ mod tests {
                 statuses: vec!["implemented".into(), "blocked".into()],
                 fields: summary_field(false),
             }),
+            pre_input: None,
         };
 
         let prompt = build_agent_prompt(&role, &action, &[], true);
@@ -442,6 +452,7 @@ mod tests {
             prompt: "Create the implementation plan without repeating user inputs.".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let timestamp = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
             .unwrap()
@@ -480,6 +491,7 @@ mod tests {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
             }),
+            pre_input: None,
         };
         let nudge = build_retry_nudge(&action, 2, Some("missing YAML frontmatter"));
         assert!(nudge.contains("Retry"));
@@ -499,6 +511,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let reason =
             "agent response has an opening `---` but is missing the closing `---` delimiter";
@@ -517,6 +530,7 @@ mod tests {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
             }),
+            pre_input: None,
         };
         // Full wrapped runner-style reason threaded through context.retry_reason.
         let reason = "recoverable action failure: agent reply did not contain a workflow result";
@@ -562,6 +576,7 @@ mod tests {
                 statuses: vec!["success".into(), "blocked".into()],
                 fields: summary_field(false),
             }),
+            pre_input: None,
         };
         let reason = "recoverable action failure: agent reply did not contain a workflow result";
         let nudge = build_retry_nudge(&action, 17, Some(reason));
@@ -588,6 +603,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let reason = "missing YAML frontmatter";
         let nudge = build_retry_nudge(&action, 17, Some(reason));
@@ -606,6 +622,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let nudge = build_retry_nudge(&action, 2, None);
         assert!(nudge.contains("Do not redo the work"));
@@ -641,6 +658,7 @@ mod tests {
                 turn: "current turn".into(),
             }),
             output: None,
+            pre_input: None,
         };
         let raw = "  restart\nrequest with trailing space  ";
         let assembly = build_prompt_blocks(
@@ -682,6 +700,7 @@ mod tests {
                 statuses: vec!["success".into()],
                 fields: summary_field(true),
             }),
+            pre_input: None,
         };
         let prompt = build_agent_prompt(&role, &action, &[], false);
         assert!(!prompt.contains("## Role"));
@@ -704,6 +723,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let empty = build_agent_prompt(&role, &action, &[], false);
         assert!(!empty.contains("## User Inputs"));
@@ -730,6 +750,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         let inputs = vec![user_input(0, UserInputKind::Initial, "initial request")];
         let prompt = build_agent_prompt(&role, &action, &inputs, true);
@@ -750,6 +771,7 @@ mod tests {
             prompt: "Do work".into(),
             task: None,
             output: None,
+            pre_input: None,
         };
         for include_role in [true, false] {
             let prompt = build_agent_prompt(&role, &action, &[], include_role);
@@ -780,6 +802,7 @@ mod tests {
                 statuses: vec!["success".into()],
                 fields: summary_field(true),
             }),
+            pre_input: None,
         };
 
         let fresh = build_prompt_blocks(

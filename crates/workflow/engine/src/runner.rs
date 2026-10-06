@@ -1,14 +1,17 @@
 use chrono::Utc;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use cowboy_workflow_core::{
-    ActionDispatcher, FollowUpPrompt, Result, Run, RunStatus, RunnerLimits, StepAction,
-    StepActionProvider, StepDefinition, StepRecord, UserPromptStore, WorkflowDefinition,
-    WorkflowError, WorkflowObjectStore, WorkflowSourceSnapshot, WorkflowStateStore,
-    apply_run_status, execute_step, ordered_user_inputs, retry_current_step,
+    ActionDispatcher, AgentAction, AgentContinuation, FollowUpPrompt, Result, Run, RunStatus,
+    RunnerLimits, StepAction, StepActionProvider, StepDefinition, StepRecord, UserPromptStore,
+    WorkflowDefinition, WorkflowError, WorkflowObjectStore, WorkflowSourceSnapshot,
+    WorkflowStateStore, apply_run_status, continue_agent_step, execute_step, ordered_user_inputs,
+    retry_current_step,
 };
 use serde_json::{Value, json};
 
+use crate::agent_input::PendingAgentInput;
 use crate::{
     active_clock::ActiveRunClock,
     events::{EventBus, WorkflowEvent, WorkflowEventKind},
@@ -23,6 +26,43 @@ use crate::{
 pub struct ResolvedRuntimePolicy {
     pub name: String,
     pub limits: RunnerLimits,
+    pub agent_human_input: bool,
+}
+
+/// Keeps the first agent action of a visit intact across corrective retries.
+/// Non-agent actions retain the original provider's evaluation behavior.
+struct VisitActionProvider<'a, P> {
+    provider: &'a P,
+    original_agent: Mutex<Option<AgentAction>>,
+    freeze_agent: bool,
+}
+
+impl<P: StepActionProvider> StepActionProvider for VisitActionProvider<'_, P> {
+    fn step_action(
+        &self,
+        definition: &WorkflowDefinition,
+        run: &Run,
+        step: &StepDefinition,
+        prev: Option<&StepRecord>,
+        user_prompts: &[FollowUpPrompt],
+    ) -> Result<StepAction> {
+        if self.freeze_agent
+            && let Some(action) = self.original_agent.lock().unwrap().as_ref()
+        {
+            return Ok(StepAction::Agent(action.clone()));
+        }
+
+        let action = self
+            .provider
+            .step_action(definition, run, step, prev, user_prompts)?;
+        if self.freeze_agent
+            && let StepAction::Agent(agent) = &action
+        {
+            *self.original_agent.lock().unwrap() = Some(agent.clone());
+        }
+
+        Ok(action)
+    }
 }
 
 /// Runs one workflow until it completes, fails, waits for input, or hits a budget.
@@ -145,6 +185,93 @@ where
         Ok(run)
     }
 
+    /// Continue only the saved agent action after a validated human answer.
+    /// The caller has already durably rotated the wait identity, so a crash or
+    /// cancellation cannot cause `resume` to replay this prompt automatically.
+    pub async fn continue_agent(
+        &self,
+        definition: &WorkflowDefinition,
+        mut run: Run,
+        action: AgentAction,
+        human_input: Arc<str>,
+    ) -> Result<Run> {
+        let step_id = run.step.next.clone();
+        let previous_head = run.step.head.clone();
+        self.events.emit(self.run_started_event(&run));
+        self.events.emit(self.workflow_event_for_run(
+            &run,
+            WorkflowEventKind::StepStarted {
+                step_id: step_id.clone(),
+            },
+        ));
+        let status = match continue_agent_step(
+            &self.store,
+            &self.executor,
+            definition,
+            &mut run,
+            AgentContinuation {
+                action: action.clone(),
+                human_input: human_input.clone(),
+            },
+            1,
+            None,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(err @ WorkflowError::AgentCommitFailed) => return Err(err),
+            Err(WorkflowError::AgentFailure { category }) if self.policy.agent_human_input => {
+                let wait = PendingAgentInput::wait(&run, action, category);
+                run.agent_input_checkpoint = None;
+                apply_run_status(&self.store, &mut run, wait).await?
+            }
+            Err(err) => match self
+                .retry_step(
+                    definition,
+                    &mut run,
+                    &step_id,
+                    if self.policy.agent_human_input && err.recoverable() {
+                        WorkflowError::AgentUnsafe
+                    } else {
+                        err
+                    },
+                    &self.provider,
+                    Some((&action, &human_input)),
+                )
+                .await
+            {
+                Ok(status) => status,
+                Err(err) => {
+                    run.agent_input_checkpoint = None;
+                    if matches!(err, WorkflowError::AgentUnsafe) {
+                        run.agent_recovery_denied = true;
+                    }
+
+                    let reason = err.to_string();
+                    let _ = apply_run_status(
+                        &self.store,
+                        &mut run,
+                        RunStatus::Failed {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await;
+                    self.events.emit(
+                        self.workflow_event_for_run(&run, WorkflowEventKind::RunFailed { reason }),
+                    );
+                    return Err(err);
+                }
+            },
+        };
+        self.emit_step_result(&run, &previous_head, &status).await?;
+        while matches!(run.status, RunStatus::Running) {
+            self.execute_one(definition, &mut run).await?;
+        }
+
+        self.close_active_window(&mut run).await?;
+        Ok(run)
+    }
+
     async fn close_active_window(&self, run: &mut Run) -> Result<()> {
         if let Some(clock) = &self.active_clock {
             clock.close(&self.store, run).await?;
@@ -168,12 +295,17 @@ where
                 step_id: step_id.clone(),
             },
         ));
+        let provider = VisitActionProvider {
+            provider: &self.provider,
+            original_agent: Mutex::new(None),
+            freeze_agent: self.policy.agent_human_input,
+        };
 
         let limits = self.policy.limits;
         let status = match execute_step(
             &self.store,
             &self.executor,
-            &self.provider,
+            &provider,
             definition,
             run,
             &limits,
@@ -181,9 +313,44 @@ where
         .await
         {
             Ok(status) => status,
-            Err(err) => match self.retry_step(definition, run, &step_id, err).await {
+            Err(WorkflowError::AgentFailure { category }) if self.policy.agent_human_input => {
+                let action = provider
+                    .original_agent
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .ok_or_else(|| {
+                        WorkflowError::InvalidAction(
+                            "agent failure has no original action".to_string(),
+                        )
+                    })?;
+                let wait = PendingAgentInput::wait(run, action, category);
+                apply_run_status(&self.store, run, wait).await?
+            }
+            Err(err) => match self
+                .retry_step(
+                    definition,
+                    run,
+                    &step_id,
+                    if self.policy.agent_human_input
+                        && err.recoverable()
+                        && provider.original_agent.lock().unwrap().is_some()
+                    {
+                        WorkflowError::AgentUnsafe
+                    } else {
+                        err
+                    },
+                    &provider,
+                    None,
+                )
+                .await
+            {
                 Ok(status) => status,
                 Err(err) => {
+                    if matches!(err, WorkflowError::AgentUnsafe) {
+                        run.agent_recovery_denied = true;
+                    }
+
                     let reason = err.to_string();
                     let _ = apply_run_status(
                         &self.store,
@@ -200,17 +367,26 @@ where
                 }
             },
         };
+        self.emit_step_result(run, &previous_head, &status).await?;
+        Ok(status)
+    }
 
-        if run.step.head != previous_head
+    async fn emit_step_result(
+        &self,
+        run: &Run,
+        previous_head: &Option<String>,
+        status: &RunStatus,
+    ) -> Result<()> {
+        if run.step.head != *previous_head
             && let Some(head) = &run.step.head
         {
             let record = self.store.load_step_record(head).await?;
             self.events.emit(self.step_completed_event(run, &record));
         }
-        self.events
-            .emit(self.workflow_event_for_run(run, WorkflowEventKind::from(&status)));
 
-        Ok(status)
+        self.events
+            .emit(self.workflow_event_for_run(run, WorkflowEventKind::from(status)));
+        Ok(())
     }
 
     /// Retry a recoverable failure within the run-wide and per-step cumulative
@@ -221,6 +397,8 @@ where
         run: &mut Run,
         step_id: &str,
         first_error: WorkflowError,
+        provider: &impl StepActionProvider,
+        continuation: Option<(&AgentAction, &Arc<str>)>,
     ) -> Result<RunStatus> {
         if !first_error.recoverable() {
             return Err(first_error);
@@ -257,17 +435,36 @@ where
                     reason: last_error.to_string(),
                 },
             ));
-            match retry_current_step(
-                &self.store,
-                &self.executor,
-                &self.provider,
-                definition,
-                run,
-                attempt,
-                Some(last_error.to_string()),
-            )
-            .await
-            {
+            let result = match continuation {
+                Some((action, human_input)) => {
+                    continue_agent_step(
+                        &self.store,
+                        &self.executor,
+                        definition,
+                        run,
+                        AgentContinuation {
+                            action: action.clone(),
+                            human_input: human_input.clone(),
+                        },
+                        attempt,
+                        Some(last_error.to_string()),
+                    )
+                    .await
+                }
+                None => {
+                    retry_current_step(
+                        &self.store,
+                        &self.executor,
+                        provider,
+                        definition,
+                        run,
+                        attempt,
+                        Some(last_error.to_string()),
+                    )
+                    .await
+                }
+            };
+            match result {
                 Ok(status) => return Ok(status),
                 Err(err) if !err.recoverable() => return Err(err),
                 Err(err) => last_error = err,
@@ -285,6 +482,16 @@ where
         step_id: &str,
         last_error: &WorkflowError,
     ) -> Option<WorkflowError> {
+        if let WorkflowError::AgentFailure { category } = last_error
+            && (run.retries_used >= self.policy.limits.max_retries_per_run
+                || run.step.retries_used.get(step_id).copied().unwrap_or(0)
+                    >= self.policy.limits.max_retries_per_step)
+        {
+            return Some(WorkflowError::AgentFailure {
+                category: *category,
+            });
+        }
+
         let limits = self.policy.limits;
         if run.retries_used >= limits.max_retries_per_run {
             return Some(WorkflowError::InvalidAction(format!(
@@ -737,6 +944,8 @@ mod tests {
             parent: None,
             restart_source_run_id: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
                 next: "start".to_string(),
@@ -771,6 +980,7 @@ mod tests {
                     prompt: "do it".to_string(),
                     task: None,
                     output: None,
+                    pre_input: None,
                 }),
             ]),
             bus,
@@ -846,6 +1056,7 @@ mod tests {
                     prompt: "do it".to_string(),
                     task: None,
                     output: None,
+                    pre_input: None,
                 }),
             ]),
             bus.clone(),
@@ -1115,6 +1326,7 @@ mod tests {
         ResolvedRuntimePolicy {
             name: "default".to_string(),
             limits: RunnerLimits::default(),
+            agent_human_input: false,
         }
     }
 
@@ -1127,6 +1339,7 @@ mod tests {
                 max_retries_per_run,
                 max_retries_per_step,
             },
+            agent_human_input: false,
         }
     }
 
@@ -1136,6 +1349,7 @@ mod tests {
             prompt: "do it".to_string(),
             task: None,
             output: None,
+            pre_input: None,
         })
     }
 
@@ -1474,6 +1688,7 @@ mod tests {
         let policy = ResolvedRuntimePolicy {
             name: "default".to_string(),
             limits,
+            agent_human_input: false,
         };
         persisted.retries_used = retries_used;
         persisted
@@ -1572,6 +1787,7 @@ mod tests {
                     max_retries_per_run: 200,
                     max_retries_per_step: 1,
                 },
+                agent_human_input: false,
             },
         );
 

@@ -6,6 +6,16 @@ rust-version.workspace = true
 license.workspace = true
 description = "Workflow-first terminal UI for Cowboy"
 
+
+[[bin]]
+name = "fake-human-input-acp"
+path = "tests/fixtures/fake_acp.rs"
+test = false
+[[bin]]
+name = "fake-preflight-authority"
+path = "tests/fixtures/fake_preflight_authority.rs"
+test = false
+
 [dependencies]
 base64.workspace = true
 cowboy-agent-client.workspace = true
@@ -33,5 +43,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+cowboy-agent-acp.workspace = true
 cowboy-workflow-core.workspace = true
 cowboy-workflow-store.workspace = true
+sqlx.workspace = true

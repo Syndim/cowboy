@@ -38,6 +38,10 @@ impl Default for ConfigSetRef {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Durable state of a workflow run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
@@ -62,6 +66,14 @@ pub struct Run {
     pub restart_source_run_id: Option<RunId>,
     /// Current lifecycle status for the run.
     pub status: RunStatus,
+    /// One already-authorized agent continuation. If execution is interrupted
+    /// before committing a result, `resume` restores this fresh human wait
+    /// instead of automatically rerunning an unknown set of side effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_input_checkpoint: Option<Box<RunStatus>>,
+    /// Security or unverified cleanup cannot be resolved into agent success.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub agent_recovery_denied: bool,
     /// Next-step cursor and cumulative step accounting.
     pub step: StepState,
     /// Recoverable retry dispatches reserved across the entire run.
@@ -567,6 +579,10 @@ pub struct RoleSession {
     pub role_id: RoleId,
     /// Backend identifier, or [`PROVIDED_SESSION_BACKEND`] for an imported session.
     pub backend: String,
+    /// Opaque identity of the configured backend that created the session.
+    /// Legacy rows omit it; opted-in recovery does not guess their origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_identity: Option<String>,
     /// Backend-specific session id.
     pub session_id: String,
     /// Last update timestamp.
@@ -581,6 +597,11 @@ pub struct RoleSession {
     /// Canonical static-contract fingerprint delivered for each stable task key.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivered_task_contracts: BTreeMap<String, String>,
+    /// Full frozen action fingerprint by step-record id, recorded only after
+    /// its prompt window sealed in this native session. A role/static-task
+    /// watermark alone cannot prove the current raw prompt or turn arrived.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delivered_actions: BTreeMap<String, String>,
 }
 
 /// Type tag for content-addressed stored objects.
@@ -702,6 +723,8 @@ mod tests {
         assert_eq!(run.config_set, ConfigSetRef::default());
         assert_eq!(run.parent, None);
         assert_eq!(run.restart_source_run_id, None);
+        assert_eq!(run.agent_input_checkpoint, None);
+        assert!(!run.agent_recovery_denied);
         assert_eq!(run.retries_used, 0);
         assert!(run.step.retries_used.is_empty());
     }
@@ -960,6 +983,7 @@ mod tests {
         assert!(!session.role_instructions_sent);
         assert_eq!(session.last_sent_input_sequence, None);
         assert!(session.delivered_task_contracts.is_empty());
+        assert!(session.delivered_actions.is_empty());
     }
 
     #[test]
@@ -978,6 +1002,9 @@ mod tests {
         updated
             .delivered_task_contracts
             .insert("implementation".into(), "fingerprint".into());
+        updated
+            .delivered_actions
+            .insert("run-1-2".into(), "current-action-fingerprint".into());
         let round_trip: RoleSession =
             serde_json::from_value(serde_json::to_value(&updated).unwrap()).unwrap();
         assert_eq!(round_trip, updated);

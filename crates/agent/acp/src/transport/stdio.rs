@@ -9,6 +9,35 @@ use crate::process_tree::ProcessTreeScope;
 
 use super::{StdioConfig, Transport};
 
+/// OS spawn failed before any owned subprocess existed; no PID claim is made.
+#[derive(Debug)]
+pub struct NeverSpawned {
+    owner_token: String,
+    source: std::io::Error,
+}
+
+impl NeverSpawned {
+    pub fn owner_token(&self) -> &str {
+        &self.owner_token
+    }
+}
+
+impl std::fmt::Display for NeverSpawned {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "failed to spawn owned agent process: {}",
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for NeverSpawned {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// Stdio transport: a local subprocess using direct JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
     writer: BufWriter<ChildStdin>,
@@ -20,12 +49,31 @@ pub struct StdioTransport {
     /// pipe, so only tree termination lets the pending read reach EOF.
     tree: Arc<ProcessTreeScope>,
     registration: Option<RegistrationId>,
+    scope_id: Option<String>,
+    verified_absent: bool,
 }
 
 impl StdioTransport {
     /// Spawn agent subprocess and return a connected transport.
     /// Appends `additional_args` after the configured args.
     pub async fn connect(config: &StdioConfig, additional_args: &[&str]) -> anyhow::Result<Self> {
+        Self::connect_inner(config, additional_args, None).await
+    }
+
+    /// The owner token has already been persisted before this method can spawn.
+    pub(crate) async fn connect_owned(
+        config: &StdioConfig,
+        additional_args: &[&str],
+        scope_id: String,
+    ) -> anyhow::Result<Self> {
+        Self::connect_inner(config, additional_args, Some(scope_id)).await
+    }
+
+    async fn connect_inner(
+        config: &StdioConfig,
+        additional_args: &[&str],
+        scope_id: Option<String>,
+    ) -> anyhow::Result<Self> {
         let mut cmd = Command::new(&config.command);
         for arg in &config.args {
             cmd.arg(arg);
@@ -52,17 +100,30 @@ impl StdioTransport {
         let tree = Arc::new(ProcessTreeScope::new()?);
         tree.configure(&mut cmd);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn agent process '{}': {}", config.command, e)
+        let mut child = cmd.spawn().map_err(|source| {
+            if let Some(owner_token) = &scope_id {
+                anyhow::Error::new(NeverSpawned {
+                    owner_token: owner_token.clone(),
+                    source,
+                })
+            } else {
+                anyhow::anyhow!(
+                    "Failed to spawn agent process '{}': {}",
+                    config.command,
+                    source
+                )
+            }
         })?;
 
         if let Err(err) = tree.attach(&child) {
             let _ = child.kill().await;
-            return Err(anyhow::anyhow!(
-                "Failed to take ownership of agent process tree for '{}': {}",
-                config.command,
-                err
-            ));
+            return Err(
+                cowboy_agent_client::AgentSafetyError::CleanupUnverified(format!(
+                    "Failed to take ownership of agent process tree for '{}': {}",
+                    config.command, err
+                ))
+                .into(),
+            );
         }
 
         let registration = agent_processes::register(&tree);
@@ -97,6 +158,8 @@ impl StdioTransport {
             pid,
             tree,
             registration: Some(registration),
+            scope_id,
+            verified_absent: false,
         })
     }
 
@@ -129,6 +192,12 @@ impl StdioTransport {
 
 impl Drop for StdioTransport {
     fn drop(&mut self) {
+        // Drop can happen on cancellation: stop the owned group while the
+        // direct child still pins its PID, before `child` is dropped.
+        if let Err(err) = self.tree.terminate() {
+            tracing::warn!(command = %self.command, error = %err, "agent group termination on drop failed");
+        }
+
         if let Some(registration) = self.registration.take() {
             agent_processes::deregister(registration);
         }
@@ -192,11 +261,11 @@ impl Transport for StdioTransport {
                     return Ok(Some(line));
                 }
                 Ok(None) => {
-                    let status = self.child.try_wait().ok().flatten();
+                    // Do not reap the group leader before group termination:
+                    // its PID pins the process-group identity against reuse.
                     tracing::debug!(
                         command = %self.command,
                         pid = ?self.pid,
-                        status = ?status,
                         "Agent subprocess stdout closed"
                     );
                     return Ok(None);
@@ -238,21 +307,80 @@ impl Transport for StdioTransport {
     }
 
     async fn force_terminate(&mut self) -> anyhow::Result<()> {
+        // Legacy watchdog policy: group-kill failure still attempts to kill
+        // and reap the direct child. This does not prove descendant cleanup.
         let status = self.child.try_wait()?;
         if status.is_none() {
             let tree_terminated = self.terminate_tree();
-            tracing::warn!(
-                command = %self.command,
-                pid = ?self.pid,
-                tree_terminated,
-                "Force terminating agent subprocess"
-            );
+            tracing::warn!(command = %self.command, pid = ?self.pid, tree_terminated,
+                "Force terminating agent subprocess");
             self.child.kill().await?;
             let _ = self.child.wait().await?;
         } else {
             self.terminate_tree();
         }
+
         Ok(())
+    }
+
+    async fn force_terminate_verified(&mut self) -> anyhow::Result<()> {
+        if let Err(error) = self.tree.terminate() {
+            #[cfg(unix)]
+            if self.child.try_wait()?.is_some() {
+                self.tree.confirm_absent_after_reap().map_err(|_| error)?;
+            } else {
+                return Err(error);
+            }
+
+            #[cfg(not(unix))]
+            return Err(error);
+        }
+        if let Some(registration) = self.registration.take() {
+            agent_processes::deregister(registration);
+        }
+
+        if self.child.try_wait()?.is_none() {
+            self.child.wait().await?;
+        }
+
+        #[cfg(any(unix, windows))]
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if self.tree.verify_absent_after_reap().is_ok() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!("owned ACP process tree could not be proven stopped");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            self.verified_absent = true;
+            Ok(())
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            anyhow::bail!("verified ACP process cleanup is unavailable on this platform");
+        }
+    }
+
+    fn verified_shutdown_scope(&self) -> Option<cowboy_agent_client::VerifiedProcessScope> {
+        self.scope_id
+            .as_ref()
+            .filter(|_| self.verified_absent)
+            .map(|id| cowboy_agent_client::VerifiedProcessScope {
+                scope_id: id.clone(),
+                method: if cfg!(windows) {
+                    "windows_job_empty_after_reap"
+                } else {
+                    "unix_group_absent_after_reap"
+                },
+            })
+    }
+
+    fn scope_id(&self) -> Option<&str> {
+        self.scope_id.as_deref()
     }
 }
 
@@ -463,5 +591,58 @@ mod tests {
 
         assert!(transport.child.try_wait().unwrap().is_some());
         assert_eq!(transport.pid, Some(pid));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn force_terminate_accepts_only_a_verified_empty_group_after_eof() {
+        let config = StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            clear_env: false,
+            allowed_env: vec![],
+            env: vec![],
+        };
+        let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), transport.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+
+        transport.force_terminate_verified().await.unwrap();
+        assert!(transport.child.try_wait().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn legacy_kills_direct_child_after_group_failure_but_human_wait_refuses() {
+        let config = StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 60".to_string()],
+            clear_env: false,
+            allowed_env: vec![],
+            env: vec![],
+        };
+        let mut legacy = StdioTransport::connect(&config, &[]).await.unwrap();
+        legacy.tree.inject_termination_failure(true);
+        legacy.force_terminate().await.unwrap();
+        assert!(
+            legacy.child.try_wait().unwrap().is_some(),
+            "legacy must kill direct child"
+        );
+        legacy.tree.inject_termination_failure(false);
+
+        let mut enabled = StdioTransport::connect(&config, &[]).await.unwrap();
+        enabled.tree.inject_termination_failure(true);
+        assert!(enabled.force_terminate_verified().await.is_err());
+        assert!(
+            enabled.child.try_wait().unwrap().is_none(),
+            "cleanup failure is not success"
+        );
+        enabled.tree.inject_termination_failure(false);
+        enabled.force_terminate_verified().await.unwrap();
+        assert!(enabled.child.try_wait().unwrap().is_some());
     }
 }

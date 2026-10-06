@@ -29,8 +29,8 @@ use cowboy_workflow_core::{
     apply_run_status, apply_step_record,
 };
 use cowboy_workflow_store::{
-    RestartCreationOutcome, RestartSeed, SqliteWorkflowStore, StoreWaitCancellation,
-    StoreWaitObserver,
+    NativeShutdownEvidence, RestartCreationOutcome, RestartSeed, SqliteWorkflowStore,
+    StoreWaitCancellation, StoreWaitObserver,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,6 +38,7 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::active_clock::ActiveRunClock;
+use crate::agent_input::PendingAgentInput;
 use crate::agent_resolver::AgentResolver;
 use crate::events::WORKFLOW_STORE_WAITING_MESSAGE;
 use crate::run_lock::{RunExecutionGuard, RunExecutionLocks};
@@ -144,6 +145,8 @@ pub struct RunnerLimitsConfig {
     pub max_visits_per_step: u32,
     pub max_retries_per_run: u32,
     pub max_retries_per_step: u32,
+    #[serde(default)]
+    pub agent_human_input: bool,
 }
 
 impl Default for RunnerLimitsConfig {
@@ -154,6 +157,7 @@ impl Default for RunnerLimitsConfig {
             max_visits_per_step: limits.max_visits_per_step,
             max_retries_per_run: limits.max_retries_per_run,
             max_retries_per_step: limits.max_retries_per_step,
+            agent_human_input: false,
         }
     }
 }
@@ -407,13 +411,19 @@ pub struct WorkflowRuntime {
 }
 
 /// How far [`WorkflowRuntime`] drives a run in a single call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum RunMode {
     /// Execute steps until the run blocks, fails, or completes.
     UntilBlocked,
     /// Execute exactly one workflow step, then return.
     SingleStep,
+    /// Continue only a validated, originally incomplete agent action.
+    AgentContinuation {
+        action: Box<cowboy_workflow_core::AgentAction>,
+        input: Arc<str>,
+    },
 }
+
 struct ActiveRunExecution {
     request_topic: Option<String>,
     events: Vec<WorkflowEvent>,
@@ -428,6 +438,7 @@ struct CatalogRunSpec {
     request: String,
     parent: Option<ParentRun>,
     start_options: RunStartOptions,
+    selected_by_agent: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -883,8 +894,15 @@ impl WorkflowRuntime {
             "workflow catalog loaded"
         );
         let selection = self.select_workflow(&request, &catalog).await?;
-        self.start_catalog_workflow(request, mode, &catalog, &selection.workflow_id, options)
-            .await
+        self.start_catalog_workflow(
+            request,
+            mode,
+            &catalog,
+            &selection.workflow_id,
+            options,
+            matches!(self.selector, SelectorMode::Agent),
+        )
+        .await
     }
 
     async fn start_with_workflow(
@@ -902,7 +920,7 @@ impl WorkflowRuntime {
             "workflow catalog loaded"
         );
         self.ensure_workflow_exists(&catalog, &workflow_id)?;
-        self.start_catalog_workflow(request, mode, &catalog, &workflow_id, options)
+        self.start_catalog_workflow(request, mode, &catalog, &workflow_id, options, false)
             .await
     }
 
@@ -929,6 +947,7 @@ impl WorkflowRuntime {
         catalog: &WorkflowCatalog,
         workflow_id: &str,
         start_options: RunStartOptions,
+        selected_by_agent: bool,
     ) -> Result<RunReport> {
         self.execute_catalog_run(
             CatalogRunSpec {
@@ -937,6 +956,7 @@ impl WorkflowRuntime {
                 request,
                 parent: None,
                 start_options,
+                selected_by_agent,
             },
             mode,
             catalog,
@@ -950,6 +970,7 @@ impl WorkflowRuntime {
         definition: &WorkflowDefinition,
         options: &RunStartOptions,
         updated_at: DateTime<Utc>,
+        agent_human_input: bool,
     ) -> Result<Vec<RoleSession>> {
         let mut roles = BTreeSet::new();
         let available_roles = definition
@@ -958,6 +979,11 @@ impl WorkflowRuntime {
             .map(String::as_str)
             .collect::<Vec<_>>()
             .join(", ");
+        let resolver = if agent_human_input && !options.role_session_ids.is_empty() {
+            Some(AgentResolver::new(self.config.agents.clone())?)
+        } else {
+            None
+        };
         let mut sessions = Vec::with_capacity(options.role_session_ids.len());
         for (role_id, session_id) in &options.role_session_ids {
             if role_id.trim().is_empty() || session_id.trim().is_empty() {
@@ -979,17 +1005,33 @@ impl WorkflowRuntime {
                 )));
             }
 
+            let backend_identity = resolver
+                .as_ref()
+                .map(|resolver| {
+                    let role = definition.roles.get(role_id).expect("validated role");
+                    resolver.resolve(role).and_then(|agent| {
+                        crate::runtime_dependencies::backend_identity(
+                            agent,
+                            &self.config.allowed_env,
+                            &self.config.cwd,
+                        )
+                    })
+                })
+                .transpose()?;
+
             sessions.push(RoleSession {
                 run_id: run_id.to_string(),
                 role_id: role_id.clone(),
                 // The executor treats this as a required external load and never
                 // falls back to creating a replacement session.
                 backend: PROVIDED_SESSION_BACKEND.to_string(),
+                backend_identity,
                 session_id: session_id.clone(),
                 updated_at,
                 role_instructions_sent: true,
                 last_sent_input_sequence: None,
                 delivered_task_contracts: BTreeMap::new(),
+                delivered_actions: Default::default(),
             });
         }
 
@@ -999,7 +1041,9 @@ impl WorkflowRuntime {
     async fn execute_restart_run(&self, spec: RestartRunSpec, mode: RunMode) -> Result<RunReport> {
         let source_guard = self.run_locks.acquire_wait(&spec.source_run_id).await?;
         let store = self.store()?;
-        let source = store.load_run(&spec.source_run_id).await?;
+        let mut source = store.load_run(&spec.source_run_id).await?;
+        self.reconcile_interrupted_agent(&store, &mut source)
+            .await?;
         ensure_restartable(&source)?;
 
         let snapshot = store
@@ -1029,6 +1073,8 @@ impl WorkflowRuntime {
             parent: spec.parent,
             restart_source_run_id: Some(source.id.clone()),
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             step: StepState {
                 next: definition.head.clone(),
                 head: None,
@@ -1070,6 +1116,14 @@ impl WorkflowRuntime {
                 )));
             }
         }
+        if self
+            .resolve_limits(&target.config_set.name)
+            .agent_human_input
+            && self.dependencies.supports_native_owned_shutdown()
+        {
+            store.enroll_native_run(&target).await?;
+        }
+
         drop(source_guard);
 
         let target_guard = self.run_locks.acquire(&target.id)?;
@@ -1106,11 +1160,13 @@ impl WorkflowRuntime {
                 run_id: target_run_id.to_string(),
                 role_id: role_id.clone(),
                 backend: PROVIDED_SESSION_BACKEND.to_string(),
+                backend_identity: session.backend_identity,
                 session_id: session.session_id,
                 updated_at,
                 role_instructions_sent: session.role_instructions_sent,
                 last_sent_input_sequence: None,
                 delivered_task_contracts: session.delivered_task_contracts,
+                delivered_actions: Default::default(),
             });
         }
         Ok(sessions)
@@ -1129,14 +1185,17 @@ impl WorkflowRuntime {
 
         let run_guard = self.run_locks.acquire(&spec.run_id)?;
         match self.store.load_run(&spec.run_id).await {
-            Ok(run) => {
+            Ok(mut run) => {
                 self.validate_catalog_run_match(&run, &spec)?;
+                let store = self.store_for_run(&run.id)?;
+                self.reconcile_interrupted_agent(&store, &mut run).await?;
                 if !matches!(run.status, RunStatus::Running) {
                     return Ok(RunReport {
                         run,
                         events: Vec::new(),
                     });
                 }
+
                 self.execute_loaded_run(run, mode, run_guard, Vec::new())
                     .await
             }
@@ -1159,6 +1218,7 @@ impl WorkflowRuntime {
                     &definition,
                     &spec.start_options,
                     now,
+                    self.resolve_limits(&config_set.name).agent_human_input,
                 )?;
                 let mut run = Run {
                     id: spec.run_id,
@@ -1174,6 +1234,8 @@ impl WorkflowRuntime {
                     parent: spec.parent,
                     restart_source_run_id: None,
                     status: RunStatus::Running,
+                    agent_input_checkpoint: None,
+                    agent_recovery_denied: false,
                     step: StepState {
                         next: definition.head.clone(),
                         head: None,
@@ -1188,12 +1250,25 @@ impl WorkflowRuntime {
                 };
                 let store = self.store_for_run(&run.id)?;
                 store.save_run(&run).await?;
+                if !spec.selected_by_agent
+                    && self.resolve_limits(&run.config_set.name).agent_human_input
+                    && self.dependencies.supports_native_owned_shutdown()
+                {
+                    store.enroll_native_run(&run).await?;
+                }
+
                 for session in provided_sessions {
                     store.save_role_session(session).await?;
                 }
                 let active_clock = ActiveRunClock::open(&run);
                 tracing::info!(run_id = %run.id, workflow = %run.workflow.name, "created workflow run");
-                let request_topic = self.generate_request_topic(&run.original_request).await;
+                // Topic generation is presentation-only, but its own ACP client
+                // would be an unregistered writer for an attested run.
+                let request_topic = if store.native_enrollment(&run.id).await?.is_some() {
+                    None
+                } else {
+                    self.generate_request_topic(&run.original_request).await
+                };
                 if let Some(topic) = &request_topic {
                     run.request_topic = Some(topic.clone());
                     run.updated_at = Utc::now();
@@ -1317,6 +1392,7 @@ impl WorkflowRuntime {
                     request: action.request,
                     parent: Some(parent),
                     start_options: RunStartOptions::default(),
+                    selected_by_agent: false,
                 },
                 RunMode::UntilBlocked,
                 &catalog,
@@ -1485,6 +1561,7 @@ impl WorkflowRuntime {
                     .load_run(child_run_id)
                     .await;
                 match run {
+                    Ok(run) if run.agent_recovery_denied => Err(WorkflowError::AgentUnsafe),
                     Ok(run) if matches!(run.status, RunStatus::Failed { .. }) => Ok(run),
                     _ => Err(err),
                 }
@@ -1713,6 +1790,7 @@ impl WorkflowRuntime {
             return ResolvedRuntimePolicy {
                 name: name.to_string(),
                 limits: config_set.into(),
+                agent_human_input: config_set.agent_human_input,
             };
         }
 
@@ -1729,6 +1807,7 @@ impl WorkflowRuntime {
             return ResolvedRuntimePolicy {
                 name: DEFAULT_CONFIG_SET_NAME.to_string(),
                 limits: config_set.into(),
+                agent_human_input: config_set.agent_human_input,
             };
         }
 
@@ -1739,6 +1818,7 @@ impl WorkflowRuntime {
         ResolvedRuntimePolicy {
             name: DEFAULT_CONFIG_SET_NAME.to_string(),
             limits: RunnerLimits::default(),
+            agent_human_input: false,
         }
     }
 
@@ -1799,9 +1879,18 @@ impl WorkflowRuntime {
         let run_guard = match mode {
             RunMode::UntilBlocked => self.run_locks.acquire_wait(run_id).await?,
             RunMode::SingleStep => self.run_locks.acquire(run_id)?,
+            RunMode::AgentContinuation { .. } => unreachable!("continuation uses provide-input"),
         };
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
+        self.reconcile_interrupted_agent(&store, &mut run).await?;
+        if PendingAgentInput::from_wait(&run)?.is_some() {
+            return Ok(RunReport {
+                run,
+                events: Vec::new(),
+            });
+        }
+
         tracing::debug!(
             run_id = %run.id,
             status = %run_status_kind(&run.status),
@@ -1843,6 +1932,85 @@ impl WorkflowRuntime {
             .await
     }
 
+    /// A process that did not durably prove its ACP tree stopped must not turn
+    /// an interrupted checkpoint into another executable human wait. A hard
+    /// kill runs no Drop handlers; a new answer cannot establish old ownership.
+    async fn reconcile_interrupted_agent(
+        &self,
+        store: &SqliteWorkflowStore,
+        run: &mut Run,
+    ) -> Result<()> {
+        if run.agent_recovery_denied {
+            return Err(WorkflowError::AgentUnsafe);
+        }
+
+        if run.agent_input_checkpoint.is_none() && !store.native_pending_writers(&run.id).await? {
+            return Ok(());
+        }
+
+        let parent_update = if let Some(lineage) = &run.parent {
+            let mut parent = store.load_run(&lineage.run_id).await?;
+            let waiting_for_child = match &parent.status {
+                RunStatus::WaitingForInput {
+                    step,
+                    resume_callback,
+                    ..
+                } if step == &lineage.step_id
+                    && parent.step.next == lineage.step_id
+                    && parent.step.head == lineage.previous_head
+                    && resume_callback.kind() == WORKFLOW_CHILD_CALLBACK_KIND =>
+                {
+                    serde_json::from_value::<PendingWorkflowChild>(
+                        resume_callback.payload().clone(),
+                    )
+                    .map_or(true, |pending| {
+                        pending.child_run_id == run.id
+                            && pending.parent_run_id == parent.id
+                            && pending.invocation_id == lineage.invocation_id
+                            && pending.parent_previous_head == lineage.previous_head
+                    })
+                }
+                _ => false,
+            };
+            if waiting_for_child {
+                let expected = serde_json::to_vec(&parent).expect("persisted parent serializes");
+                parent.agent_recovery_denied = true;
+                parent.status = RunStatus::Failed {
+                    reason: "child agent process cleanup could not be verified".to_string(),
+                };
+                parent.updated_at = Utc::now();
+                Some((expected, parent))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let observed = serde_json::to_vec(run).expect("persisted run serializes");
+        run.agent_recovery_denied = true;
+        run.status = RunStatus::Failed {
+            reason: "interrupted agent process cleanup could not be verified".to_string(),
+        };
+        run.updated_at = Utc::now();
+        if !store
+            .compare_and_save_run_with_parent(
+                &observed,
+                run,
+                parent_update
+                    .as_ref()
+                    .map(|(expected, parent)| (expected.as_slice(), parent)),
+            )
+            .await?
+        {
+            return Err(WorkflowError::InvalidAction(
+                "agent checkpoint changed during reconciliation".to_string(),
+            ));
+        }
+
+        Err(WorkflowError::AgentUnsafe)
+    }
+
     pub async fn provide_input_run(
         &self,
         run_id: &str,
@@ -1858,11 +2026,89 @@ impl WorkflowRuntime {
         let run_guard = self.run_locks.acquire(run_id)?;
         let store = self.store_for_run(run_id)?;
         let mut run = store.load_run(run_id).await?;
+        self.reconcile_interrupted_agent(&store, &mut run).await?;
+        if matches!(&run.status, RunStatus::WaitingForInput { resume_callback, .. }
+            if resume_callback.kind() == crate::agent_input::CALLBACK_KIND)
+        {
+            ResumeRouter::validate_wait(&run, input_id, input)?;
+            let pending = PendingAgentInput::from_wait(&run)?.expect("agent callback kind checked");
+            if !self.resolve_limits(&run.config_set.name).agent_human_input {
+                return Err(WorkflowError::InvalidAction(
+                    "agent human input is disabled for this config set".to_string(),
+                ));
+            }
+
+            PendingAgentInput::validate_answer(input)?;
+            let snapshot = snapshot_from_run(&run);
+            let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
+                .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
+            definition.name = run.workflow.name.clone();
+            definition.source_hash = run.workflow.hash.clone();
+            if !definition.roles.contains_key(&pending.role) {
+                return Err(WorkflowError::UnknownRole {
+                    step: pending.step,
+                    role: pending.role,
+                });
+            }
+
+            let supplemental = if let Some(guard_id) = pending.action.pre_input.as_deref() {
+                crate::preflight::check(
+                    &run,
+                    &definition,
+                    &snapshot,
+                    guard_id,
+                    input,
+                    &store,
+                    &self.config,
+                )
+                .await?
+            } else {
+                Arc::<str>::from(input)
+            };
+
+            let observed = serde_json::to_vec(&run).expect("persisted run serializes");
+            let active_clock = ActiveRunClock::open(&run);
+            let interrupted = PendingAgentInput::wait(
+                &run,
+                pending.action.clone(),
+                cowboy_workflow_core::AgentFailureCategory::Interrupted,
+            );
+            run.agent_input_checkpoint = Some(Box::new(interrupted));
+            run.status = RunStatus::Running;
+            run.updated_at = Utc::now();
+            if !store.compare_and_save_run(&observed, &run).await? {
+                return Err(WorkflowError::InvalidAction(
+                    "agent input generation changed before continuation".to_string(),
+                ));
+            }
+            let event = active_clock.run_status_for_run(&run, &run.status);
+            self.events.emit(event.clone());
+            let request_topic = run.request_topic.clone();
+            return self
+                .run_existing_with_events(
+                    run,
+                    definition,
+                    snapshot,
+                    RunMode::AgentContinuation {
+                        action: Box::new(pending.action),
+                        input: supplemental,
+                    },
+                    ActiveRunExecution {
+                        request_topic,
+                        events: vec![event],
+                        active_clock,
+                        run_guard,
+                    },
+                )
+                .await;
+        }
+
         let router = self.resume_router();
-        let input = router.validate_input(&run, input_id, input)?;
+        let validated = router.validate_input(&run, input_id, input)?;
+
         let active_clock = ActiveRunClock::open(&run);
         let mut rx = self.events.subscribe();
-        let result = router.dispatch_validated_input(input).await?;
+        let result = router.dispatch_validated_input(validated).await?;
         let snapshot = snapshot_from_run(&run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -1926,6 +2172,10 @@ impl WorkflowRuntime {
         store: &SqliteWorkflowStore,
     ) -> Result<ResolutionOptions> {
         ensure_resolvable(run)?;
+        if store.native_pending_writers(&run.id).await? {
+            return Err(WorkflowError::AgentUnsafe);
+        }
+
         let snapshot = snapshot_from_run(run);
         let mut definition = cowboy_workflow_lua::compile_snapshot(&snapshot)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
@@ -2050,6 +2300,7 @@ impl WorkflowRuntime {
             role: None,
             attempt: 1,
             retry_reason: None,
+            agent_human_input: None,
             initial_input_kind: run.initial_input_kind(),
             step_visit: run.step.visits.get(&run.step.next).copied().unwrap_or(0),
             original_request: run.original_request.clone(),
@@ -2236,6 +2487,20 @@ impl WorkflowRuntime {
         let mut rx = self.events.subscribe();
         let store = self.store_for_run(&run_id)?;
         store.clear_agent_prompt_window(&run_id).await?;
+        let policy = self.resolve_limits(&run.config_set.name);
+        let marker = store.native_enrollment(&run_id).await?;
+        if marker.is_some() && !policy.agent_human_input {
+            store.invalidate_native_run(&run_id).await?;
+        }
+
+        let native_writer = (policy.agent_human_input
+            && self.dependencies.supports_native_owned_shutdown()
+            && marker.as_deref() == Some(run.workflow.hash.as_str()))
+        .then(|| {
+            Arc::new(crate::native_ownership::SqliteNativeWriterTracker(
+                store.clone(),
+            )) as Arc<dyn cowboy_workflow_agent::NativeWriterTracker>
+        });
         let mut cancellation_guard = ActiveRunCancellationGuard::new(
             store.clone(),
             run_id.clone(),
@@ -2253,12 +2518,15 @@ impl WorkflowRuntime {
                     &progress_clock,
                 ));
             })),
+            agent_human_input: policy.agent_human_input,
+            native_writer,
             #[cfg(feature = "test-support")]
             handoff_observer: self.handoff_observer.clone(),
         };
         let factory = self.dependencies.agent_factory(&self.config)?;
         let executor = AgentExecutor::new(factory, agent_store, agent_config)
             .with_prompt_turn_controls(self.prompt_turn_controls.clone());
+        let shutdown_executor = executor.clone();
         let dispatcher = EngineActionDispatcher::with_workflow_handler(
             executor,
             self.clone(),
@@ -2266,7 +2534,7 @@ impl WorkflowRuntime {
             self.config.allowed_env.clone(),
         );
         let provider = LuaStepActionProvider::new(snapshot);
-        let policy = self.resolve_limits(&run.config_set.name);
+        let ledger_store = store.clone();
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone(), policy)
             .with_request_topic(request_topic)
             .with_active_clock(active_clock);
@@ -2274,6 +2542,11 @@ impl WorkflowRuntime {
             match mode {
                 RunMode::UntilBlocked => runner.run_until_blocked(&definition, run).await,
                 RunMode::SingleStep => runner.step_once(&definition, run).await,
+                RunMode::AgentContinuation { action, input } => {
+                    runner
+                        .continue_agent(&definition, run, *action, input)
+                        .await
+                }
             }
         };
         tokio::pin!(run_future);
@@ -2281,7 +2554,7 @@ impl WorkflowRuntime {
         if prefix_len > 0 {
             self.persist_events(&run_id, &events)?;
         }
-        let run_result = loop {
+        let mut run_result = loop {
             tokio::select! {
                 result = &mut run_future => break result,
                 received = rx.recv() => match received {
@@ -2297,7 +2570,61 @@ impl WorkflowRuntime {
                 }
             }
         };
+        let shutdown_failed = shutdown_executor
+            .close_owned_writers(&run_id)
+            .await
+            .is_err();
+        let unsealed = if marker.is_some() {
+            ledger_store.native_pending_writers(&run_id).await?
+        } else {
+            false
+        };
+        if shutdown_failed || unsealed {
+            let mut current = ledger_store.load_run(&run_id).await?;
+            if !current.agent_recovery_denied && current.agent_input_checkpoint.is_none() {
+                let expected = serde_json::to_vec(&current).expect("persisted run serializes");
+                current.agent_recovery_denied = true;
+                current.status = RunStatus::Failed {
+                    reason: "owned agent process shutdown could not be verified".to_string(),
+                };
+                current.updated_at = Utc::now();
+                if !ledger_store
+                    .compare_and_save_run(&expected, &current)
+                    .await?
+                {
+                    return Err(WorkflowError::AgentUnsafe);
+                }
+            }
+
+            if run_result.is_ok() {
+                run_result = Err(WorkflowError::AgentUnsafe);
+            }
+        }
+
         drain_available_workflow_events(&mut rx, &mut events, &run_id);
+        match &run_result {
+            Ok(Run {
+                status:
+                    RunStatus::WaitingForInput {
+                        step,
+                        resume_callback,
+                        ..
+                    },
+                ..
+            }) if resume_callback.kind() == crate::agent_input::CALLBACK_KIND => {
+                redact_incomplete_agent_progress(&mut events, step);
+            }
+            Err(WorkflowError::AgentUnsafe | WorkflowError::AgentCommitFailed) => {
+                if let Some(step) = events.iter().rev().find_map(|event| match &event.kind {
+                    WorkflowEventKind::StepStarted { step_id } => Some(step_id.clone()),
+                    _ => None,
+                }) {
+                    redact_incomplete_agent_progress(&mut events, &step);
+                }
+            }
+            _ => {}
+        }
+
         match &run_result {
             Ok(run) => {
                 tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
@@ -2429,6 +2756,14 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    /// Read-only, redacted native shutdown candidate; never a release command.
+    pub async fn native_shutdown_evidence(&self, run_id: &str) -> Result<NativeShutdownEvidence> {
+        self.store_for_run(run_id)?
+            .native_shutdown_evidence(run_id)
+            .await
+            .map_err(Into::into)
+    }
+
     pub fn load_events(&self, run_id: &str) -> Result<Vec<WorkflowEvent>> {
         let path = self
             .config
@@ -2520,9 +2855,53 @@ fn drain_available_workflow_events(
     }
 }
 
+/// An incomplete agent action is persisted as a safe wait, not a transcript.
+/// Retain completed earlier steps, retry counters and the safe wait event.
+fn redact_incomplete_agent_progress(events: &mut Vec<WorkflowEvent>, step: &str) {
+    let Some(start) = events.iter().rposition(|event| {
+        matches!(&event.kind, WorkflowEventKind::StepStarted { step_id } if step_id == step)
+    }) else {
+        return;
+    };
+
+    let mut index = 0;
+    events.retain(|event| {
+        let current = index;
+        index += 1;
+        if current < start {
+            return true;
+        }
+
+        !matches!(
+            &event.kind,
+            WorkflowEventKind::AgentSessionReady { step_id, .. }
+                | WorkflowEventKind::AgentPromptWindowOpened { step_id, .. }
+                | WorkflowEventKind::AgentPromptWindowClosed { step_id, .. }
+                | WorkflowEventKind::AgentPrompt { step_id, .. }
+                | WorkflowEventKind::AgentResponse { step_id, .. }
+                | WorkflowEventKind::AgentThought { step_id, .. }
+                | WorkflowEventKind::AgentToolCall { step_id, .. }
+                | WorkflowEventKind::AgentToolCallUpdate { step_id, .. }
+                | WorkflowEventKind::AgentPlan { step_id, .. }
+                | WorkflowEventKind::StepProgress { step_id, .. }
+                if step_id == step
+        )
+    });
+}
+
 /// A run can be manually resolved only when it is stopped on a step, i.e. it is
 /// `Failed` (after giving up) or still `Running` on the failed step.
 fn ensure_resolvable(run: &Run) -> Result<()> {
+    if run.agent_input_checkpoint.is_some() {
+        return Err(WorkflowError::InvalidAction(
+            "agent continuation requires validated human input; manual resolution is unavailable"
+                .to_string(),
+        ));
+    }
+    if run.agent_recovery_denied {
+        return Err(WorkflowError::AgentUnsafe);
+    }
+
     if matches!(run.status, RunStatus::Failed { .. } | RunStatus::Running) {
         Ok(())
     } else {
@@ -2534,6 +2913,10 @@ fn ensure_resolvable(run: &Run) -> Result<()> {
 }
 
 fn ensure_restartable(run: &Run) -> Result<()> {
+    if run.agent_recovery_denied {
+        return Err(WorkflowError::AgentUnsafe);
+    }
+
     if matches!(run.status, RunStatus::Completed | RunStatus::Failed { .. }) {
         Ok(())
     } else {
@@ -2921,6 +3304,7 @@ mod tests {
                     provider: Some("test".to_string()),
                 }),
                 backend: "scripted-agent".to_string(),
+                backend_identity: None,
             })
         }
     }
@@ -3350,6 +3734,7 @@ mod tests {
                     max_visits_per_step: 20,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -3456,6 +3841,7 @@ return workflow("runtime-contract", seed)
                     max_visits_per_step: 5,
                     max_retries_per_run: 10,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -3842,6 +4228,7 @@ implementation_evidence: []
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -3864,6 +4251,7 @@ implementation_evidence: []
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         )
@@ -4353,6 +4741,7 @@ done
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -4376,6 +4765,8 @@ done
             parent: None,
             restart_source_run_id: None,
             status,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             step: StepState {
                 next: "start".to_string(),
                 head: None,
@@ -4520,6 +4911,7 @@ done
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -4857,6 +5249,7 @@ exit 0
             max_visits_per_step: 8,
             max_retries_per_run: 7,
             max_retries_per_step: 6,
+            agent_human_input: false,
         };
         let runtime = runtime_for_workflow_dir_with_config_sets(
             &dir,
@@ -4903,6 +5296,7 @@ exit 0
             max_visits_per_step: 8,
             max_retries_per_run: 7,
             max_retries_per_step: 6,
+            agent_human_input: false,
         };
         let runtime = runtime_with_config_sets(
             &dir,
@@ -5001,6 +5395,7 @@ exit 0
             max_visits_per_step: 5,
             max_retries_per_run: 5,
             max_retries_per_step: 2,
+            agent_human_input: false,
         };
         let creator = runtime_for_workflow_dir_with_config_sets(
             &dir,
@@ -6095,6 +6490,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -6245,6 +6641,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -6385,6 +6782,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -6564,6 +6962,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -6720,6 +7119,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -6825,6 +7225,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -7122,6 +7523,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: limit,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -7218,6 +7620,7 @@ exit 0
                 max_visits_per_step: 5,
                 max_retries_per_run: 200,
                 max_retries_per_step,
+                agent_human_input: false,
             },
         )])
     }
@@ -7427,6 +7830,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             ),
         ]);
@@ -7512,6 +7916,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -7562,6 +7967,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -7621,6 +8027,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -7693,6 +8100,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         };
@@ -7789,6 +8197,7 @@ exit 0
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -9031,6 +9440,7 @@ Recovery implementation review"#
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -9063,11 +9473,11 @@ Recovery implementation review"#
                     (
                         "workflows/feature.lua".to_string(),
                         r#"
-                    local planner = require("roles/planner.lua")
-                    local start = step("start", { role = planner })
-                    start.run = function(ctx) return action.status { status = "success" } end
-                    return workflow("feature", start)
-                    "#
+                local planner = require("roles/planner.lua")
+                local start = step("start", { role = planner })
+                start.run = function(ctx) return action.status { status = "success" } end
+                return workflow("feature", start)
+                "#
                         .to_string(),
                     ),
                 ]),
@@ -9078,6 +9488,8 @@ Recovery implementation review"#
             parent: None,
             restart_source_run_id: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             retries_used: 0,
             step: StepState {
                 next: "start".to_string(),
@@ -9742,6 +10154,7 @@ return workflow("{label}", plan)
             max_visits_per_step: 4,
             max_retries_per_run: 0,
             max_retries_per_step: 0,
+            agent_human_input: false,
         };
         let runtime = WorkflowRuntime::with_dependencies(
             RuntimeConfig {
@@ -9956,6 +10369,7 @@ return workflow("{label}", plan)
                     max_visits_per_step: 5,
                     max_retries_per_run: 200,
                     max_retries_per_step: 2,
+                    agent_human_input: false,
                 },
             )]),
         })
@@ -10176,6 +10590,8 @@ return workflow("{label}", plan)
             parent,
             restart_source_run_id: None,
             status: RunStatus::Running,
+            agent_input_checkpoint: None,
+            agent_recovery_denied: false,
             step: StepState {
                 next: "start".to_string(),
                 head: None,
@@ -10198,6 +10614,7 @@ return workflow("{label}", plan)
             max_visits_per_step: 8,
             max_retries_per_run: 7,
             max_retries_per_step: 6,
+            agent_human_input: false,
         };
         let config_sets = BTreeMap::from([
             ("default".to_string(), RunnerLimitsConfig::default()),
@@ -10382,6 +10799,7 @@ return workflow("{label}", plan)
             role: None,
             attempt: 2,
             retry_reason: Some("transient".to_string()),
+            agent_human_input: None,
             initial_input_kind: cowboy_workflow_core::UserInputKind::Initial,
             step_visit: 1,
             original_request: started.run.original_request.clone(),
@@ -10461,6 +10879,7 @@ return workflow("{label}", plan)
             request: "child req".to_string(),
             parent: Some(parent.clone()),
             start_options: RunStartOptions::default(),
+            selected_by_agent: false,
         };
         let matching = lineage_run("run-child", "child", "child req", Some(parent.clone()));
         runtime

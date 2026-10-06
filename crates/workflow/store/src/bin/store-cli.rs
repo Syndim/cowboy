@@ -121,6 +121,8 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
         parent: None,
         restart_source_run_id: None,
         status: RunStatus::Running,
+        agent_input_checkpoint: None,
+        agent_recovery_denied: false,
         retries_used: 0,
         step: StepState {
             next: current_step.to_string(),

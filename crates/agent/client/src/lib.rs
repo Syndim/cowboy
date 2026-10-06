@@ -7,5 +7,7 @@
 pub mod traits;
 pub mod types;
 
-pub use traits::{Client, PromptTurnCancellation};
+pub use traits::{
+    AgentSafetyError, Client, PromptTurnCancellation, VerifiedClientShutdown, VerifiedProcessScope,
+};
 pub use types::{AgentInfo, AgentSessionDescriptor, Event, ModelInfo, PromptContent, StopReason};

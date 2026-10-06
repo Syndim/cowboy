@@ -106,6 +106,13 @@ Provide waiting input:
 cowboy provide-input <run-id> <input-id> <input>
 ```
 
+Inspect native owned-writer shutdown evidence without exposing process, backend,
+session or prompt internals:
+
+```bash
+cowboy ownership <run-id>
+```
+
 Ask Cowboy to summarize and apply workflow-file improvements from a completed run:
 
 ```bash
@@ -134,11 +141,11 @@ strings, while valid JSON literals retain their types:
 cowboy resolve <run-id> planned --field summary "manual resolution" --field retry false --field files '["src/a.rs"]'
 ```
 
-Recoverable step failures (for example, an agent reply missing its YAML
-frontmatter, or a transient backend error) consume both the run-wide
-`max_retries_per_run` budget and the current step id's cumulative
-`max_retries_per_step` budget. Initial attempts do not count as retries, and
-retries do not consume step or visit budgets.
+With missing/disabled `agent_human_input`, recoverable step failures (for
+example, missing YAML frontmatter or a transient backend error) consume both
+the run-wide `max_retries_per_run` and per-step `max_retries_per_step` budgets.
+Initial attempts do not count as retries; retries do not consume step/visit
+budgets. Opted-in agent failures instead ask for input on the first failure.
 
 ## TUI
 
@@ -174,7 +181,18 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /exit                                             quit Cowboy
 ```
 
-`step` advances exactly one workflow step. `resume` keeps executing a running workflow until it waits for input, fails, suspends, or completes. Both also re-execute the retained current step of any non-terminal run — `Running`, `Failed` (for example one that gave up after exhausting its recoverable-retry budget), and `WaitingForInput`: `step` takes one fresh attempt and `resume` continues until the run blocks, fails, or completes. Re-executing a `WaitingForInput` run re-prompts its retained `wait_for_input` step and safely replaces the durable pending callback. Only `Completed` and `Cancelled` runs are non-resumable no-ops and left unchanged; `provide-input` remains the way to supply input explicitly.
+`step` advances exactly one workflow step. `resume` continues a running workflow
+until it waits, fails, or completes. With agent human-input recovery disabled,
+both retain the existing behavior: they re-execute the current step of
+`Running`, `Failed`, and `WaitingForInput` runs (including re-prompting an
+ordinary `action.wait_for_input`). `Completed` and `Cancelled` are no-ops.
+
+With `agent_human_input = true` in the selected config set, an incomplete agent
+step instead has a durable `WaitingForInput` callback. `step` and `resume` leave
+that wait unchanged; use `provide-input` with its current `input_id` to
+continue the **same** incomplete agent action. A process crash or cancellation
+during a continuation has no verified old-ACP ownership proof. `resume` fails
+closed and marks the run unsafe; another answer cannot unlock it.
 
 `/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
@@ -227,6 +245,7 @@ max_steps_per_run = 100
 max_visits_per_step = 20
 max_retries_per_run = 200
 max_retries_per_step = 2
+# agent_human_input = true  # Explicitly opt in to agent failure/blocked recovery.
 
 [config_sets.careful]
 # Omitted fields independently inherit 100, 20, 200, and 2.
@@ -376,7 +395,6 @@ Blank set names and unknown fields are rejected.
 `mouse_scroll_lines` controls how many transcript visual rows one mouse-wheel
 detent scrolls in the TUI. It defaults to `3` and must be greater than zero.
 
-
 Workflows select a set with
 `workflow(name, head, { config_set = "careful" })`; omission selects `default`.
 An unknown selection fails before the new run is persisted. A run persists only
@@ -390,14 +408,84 @@ raised limit adds budget without resetting accounting. Retry events retain
 visit-local attempt numbers (`2..=max_attempts`) and use one fixed
 `max_attempts` for that visit.
 
-A long-lived TUI still loads config once per process, so **new** runs pick up
-config edits only after a restart.
+`agent_human_input` is a per-config-set boolean, defaulting to `false` when
+omitted. Only an explicitly enabled selected set parks an incomplete agent
+action. A named workflow's `config_set` selects its own value (omitted fields
+inherit the built-in `false`, not the `default` set's value); if a named set is
+deleted, the live `default` set applies, then the built-in `false`. There is no
+agent-level or environment override. Missing/disabled mode retains the prior
+agent output routing, retries, failures, and ordinary input callbacks.
+
+Enabled agent `blocked` output or the **first** safe ACP launch, session,
+prompt/timeout, or invalid-result failure persists a real `WaitingForInput`
+with a safe question and fresh input id. Enabled mode does not automatically
+retry the workflow agent or send ACP `Continue`/watchdog replacement prompts;
+missing/disabled mode retains the previous retry and ACP watchdog behavior.
+Reply with nonempty context of at most 4096 bytes via
+`cowboy provide-input <run-id> <input-id> <context>`. Cowboy verifies the wait
+generation and failed ACP process-tree cleanup, then continues the frozen
+action in its native role session. Saved sessions must load on the original
+configured backend and working directory; an unknown session cannot be
+silently replaced. Role instructions or an earlier matching task key cannot
+prove this action's raw task/new turn was delivered. If its prompt window never
+sealed, Cowboy sends the frozen task or turn again with verify-existing-work
+instructions; after confirmed delivery, later human answers omit it. A second
+inability parks under a new id. An interrupted continuation without durable
+cleanup proof is **terminal unsafe** (including a hard process kill):
+`resume`, `step`, restart, manual `resolve`, and new input
+cannot redispatch or forge success. Ordinary `action.wait_for_input` and
+non-agent command failures do not change.
+
+An enabled agent action can optionally name a trusted workflow `pre_input`
+step. Before accepting a human reply, Cowboy evaluates its snapshotted
+command and verifier against current external context; a stale or
+unverifiable reply keeps the original wait and never dispatches ACP. The
+workflow author must ensure the command is read-only and safe to rerun:
+`action.command` is not a sandbox, and an authority read is not atomic with
+later agent work.
+See [workflow authoring](docs/workflow-authoring.md#optional-current-context-preflight)
+for the API and bounded result contract.
+
+Enabled **new** runs started with a specified workflow also register a private
+writer generation before each agent dispatch. On a normal completion, stepwise
+return or human wait, Cowboy stops every owned ACP client, reaps its direct
+child and verifies the original Unix process group / Windows Job is empty
+before sealing that generation. An OS-confirmed spawn failure records that no
+child was created. `cowboy ownership <run-id>` returns redacted JSON:
+`version`, `run_id`, current `status`, current step-record `head`,
+`state: "verified" | "unknown"`, `attempt_count` and `process_count` (distinct
+actually spawned, verified scopes). A `verified` result describes **native
+process quiescence**, not workflow success or permission to release a resource.
+Check the current run/head, physical reservation and preserved artifacts again
+under the consumer's own atomic release lock. A waiting run can be quiescent
+but still needs its human decision.
+
+Missing/false `agent_human_input`, old runs, deleted/mismatched source lineage,
+unsafe checkpoints, incomplete cleanup and process interruption yield
+`unknown`; no historical run is retroactively attested. Child runs, their
+ancestors and restart sources must each have valid proof. A plain request that
+uses an ACP agent to select its workflow cannot be enrolled before that
+selection, so its ownership result stays `unknown`; specify `--workflow` to
+create an eligible run. When the optional TUI request-topic agent is enabled,
+an enrolled run skips that presentation-only agent rather than leaving an
+unregistered writer. Normal retry, input and status behavior with the option
+missing or false is unchanged. Hard-killing Cowboy does **not** reap an old
+ACP writer or create proof. An escaped process-group/Job child is outside this
+native proof; do not infer global checkout safety from this command alone.
+
+A long-lived TUI loads the config file once; file edits require a process
+restart before they affect either new runs or later operations on existing
+runs. Each operation resolves policy from the currently loaded config.
 
 SQLite persistence is a clean cutover with no automatic conversion of an old
 store file. Preserve the old file and choose a new SQLite `workflow_store` path,
 or stop all Cowboy processes before clearing the configured path. The default is
 `${XDG_STATE_HOME:-~/.local/state}/cowboy/data.db`, which may be configured
 outside `state_dir`. Event logs remain under `<state_dir>/events`.
+
+Existing SQLite schema-v1 databases upgrade transactionally to schema v2 for
+the private writer ledger. This does not convert older workflow runs into
+verified owners; non-SQLite files remain rejected without modification.
 
 This is a clean cutover: old top-level `max_steps_per_run`,
 `max_visits_per_step`, and `max_retries_per_step` keys are rejected. Move them
