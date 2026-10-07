@@ -32,15 +32,16 @@ const DDL: &[&str] = &[
 ];
 
 pub(crate) async fn connect(path: &Path) -> Result<SqlitePool> {
-    preflight_existing_file(path).await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // The whole connect sequence runs with a zero busy timeout, so a
-    // transient lock (for example a just-closed pool still releasing its WAL
-    // handles) surfaces as an immediate BUSY error anywhere in the sequence.
-    // Retry the full sequence on retryable errors, bounded like bootstrap.
+    // The whole connect sequence — preflight validation, bootstrap, WAL
+    // setup, and the initial pool connection — runs with a zero busy timeout,
+    // so a transient lock (for example a just-closed pool still releasing its
+    // WAL handles) surfaces as an immediate BUSY error anywhere in the
+    // sequence. Retry the full sequence on retryable errors, bounded like
+    // bootstrap.
     let started = Instant::now();
     loop {
         match connect_once(path).await {
@@ -61,6 +62,7 @@ fn is_retryable(error: &Error) -> bool {
 }
 
 async fn connect_once(path: &Path) -> Result<SqlitePool> {
+    preflight_existing_file(path).await?;
     let options = connect_options(path, true);
     let mut connection = SqliteConnection::connect_with(&options).await?;
     wait_at_test_bootstrap_barrier(path).await;
