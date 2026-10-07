@@ -956,8 +956,7 @@ mod tests {
             "--field",
             "reason=needs work",
             "--field",
-            "link",
-            "https://example.test?a=b=c",
+            "link=https://example.test?a=b=c",
         ]);
         assert_eq!(
             command,
