@@ -114,6 +114,7 @@ Runtime context passed to `run(ctx)`:
 | `ctx.request` | Original user request for the run. |
 | `ctx.user_inputs` | Ordered initial request plus every durably accepted on-the-fly prompt; see schema below. |
 | `ctx.run_id` | Stable run id. |
+| `ctx.fields` | Trusted caller-supplied fields (`cowboy run --field key=value`), or an empty table. |
 | `ctx.workflow.name` | Current workflow name. |
 | `ctx.workflow.head` | Workflow head step id. |
 | `ctx.current_step` | Current step id. |

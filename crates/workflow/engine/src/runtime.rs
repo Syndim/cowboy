@@ -214,6 +214,7 @@ impl From<RunnerLimitsConfig> for RunnerLimits {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunStartOptions {
     role_session_ids: Vec<(String, String)>,
+    fields: BTreeMap<String, String>,
 }
 
 impl RunStartOptions {
@@ -222,8 +223,52 @@ impl RunStartOptions {
     ) -> Self {
         Self {
             role_session_ids: role_session_ids.into_iter().collect(),
+            fields: BTreeMap::new(),
         }
     }
+
+    /// Trusted caller-supplied key/value fields exposed to every workflow
+    /// step as `ctx.fields` for the lifetime of the run.
+    pub fn with_fields(mut self, fields: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.fields = fields.into_iter().collect();
+        self
+    }
+}
+
+/// Maximum number of caller-supplied fields accepted for one run.
+pub const MAX_RUN_FIELDS: usize = 16;
+/// Maximum length of a caller-supplied field key.
+pub const MAX_RUN_FIELD_KEY_CHARS: usize = 64;
+/// Maximum length of a caller-supplied field value.
+pub const MAX_RUN_FIELD_VALUE_CHARS: usize = 256;
+
+fn validate_run_fields(fields: &BTreeMap<String, String>) -> Result<()> {
+    if fields.len() > MAX_RUN_FIELDS {
+        return Err(WorkflowError::InvalidAction(format!(
+            "at most {MAX_RUN_FIELDS} run fields are accepted"
+        )));
+    }
+
+    for (key, value) in fields {
+        if key.is_empty()
+            || key.chars().count() > MAX_RUN_FIELD_KEY_CHARS
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(WorkflowError::InvalidAction(format!(
+                "run field keys must be 1-{MAX_RUN_FIELD_KEY_CHARS} characters of [a-z0-9_]; got {key:?}"
+            )));
+        }
+
+        if value.chars().count() > MAX_RUN_FIELD_VALUE_CHARS {
+            return Err(WorkflowError::InvalidAction(format!(
+                "run field {key:?} value exceeds {MAX_RUN_FIELD_VALUE_CHARS} characters"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1024,6 +1069,7 @@ impl WorkflowRuntime {
             id: spec.target_run_id.clone(),
             workflow: source.workflow.clone(),
             original_request: spec.request,
+            fields: source.fields.clone(),
             request_topic: None,
             config_set: source.config_set.clone(),
             parent: spec.parent,
@@ -1154,6 +1200,7 @@ impl WorkflowRuntime {
                     "workflow source compiled"
                 );
                 let now = Utc::now();
+                validate_run_fields(&spec.start_options.fields)?;
                 let provided_sessions = self.role_sessions_for_start(
                     &spec.run_id,
                     &definition,
@@ -1169,6 +1216,7 @@ impl WorkflowRuntime {
                         sources: snapshot.files.clone(),
                     },
                     original_request: spec.request,
+                    fields: spec.start_options.fields.clone(),
                     request_topic: None,
                     config_set,
                     parent: spec.parent,
@@ -2580,9 +2628,8 @@ fn resolution_field_arguments(fields: &[String]) -> String {
         .iter()
         .map(|field| {
             format!(
-                "--field {} {}",
-                quote_command_argument(field),
-                quote_command_argument("...")
+                "--field {}",
+                quote_command_argument(&format!("{field}=..."))
             )
         })
         .collect::<Vec<_>>()
@@ -3667,6 +3714,106 @@ implementation_evidence: []
     }
 
     #[tokio::test]
+    async fn run_fields_are_persisted_and_exposed_to_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("fields.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              if ctx.fields.dispatch_mode ~= "fresh" then
+                error("missing dispatch_mode field")
+              end
+              return action.status { status = "success" }
+            end
+            return workflow("fields", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+        let options = RunStartOptions::default()
+            .with_fields([("dispatch_mode".to_string(), "fresh".to_string())]);
+
+        let report = runtime
+            .start_run_with_workflow_and_options("fields", "request", options)
+            .await
+            .unwrap();
+
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(
+            report.run.fields.get("dispatch_mode"),
+            Some(&"fresh".to_string())
+        );
+        let persisted = runtime
+            .store()
+            .unwrap()
+            .load_run(&report.run.id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.fields, report.run.fields);
+    }
+
+    #[tokio::test]
+    async fn run_fields_reject_invalid_keys_before_persisting_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir(&workflow_dir).unwrap();
+        fs::write(
+            workflow_dir.join("fields.lua"),
+            r#"
+            local start = step("start")
+            start.run = function(ctx)
+              return action.status { status = "success" }
+            end
+            return workflow("fields", start)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+
+        for key in ["", "Dispatch-Mode", "dispatch mode", "mode.x"] {
+            let options =
+                RunStartOptions::default().with_fields([(key.to_string(), "fresh".to_string())]);
+            let error = runtime
+                .start_run_with_workflow_and_options("fields", "request", options)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("run field keys"),
+                "unexpected error for key {key:?}: {error}"
+            );
+        }
+
+        let too_long_key = "k".repeat(65);
+        let options = RunStartOptions::default().with_fields([(too_long_key, "fresh".to_string())]);
+        let error = runtime
+            .start_run_with_workflow_and_options("fields", "request", options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("run field keys"));
+
+        let options = RunStartOptions::default()
+            .with_fields([("dispatch_mode".to_string(), "v".repeat(257))]);
+        let error = runtime
+            .start_run_with_workflow_and_options("fields", "request", options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+
+        let options = RunStartOptions::default()
+            .with_fields((0..17).map(|index| (format!("field_{index}"), "value".to_string())));
+        let error = runtime
+            .start_run_with_workflow_and_options("fields", "request", options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at most"));
+
+        assert!(runtime.list_runs(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn workflow_runtime_implementation_retry_sends_only_retry_nudge() {
         let dir = tempfile::tempdir().unwrap();
         let factory = ScriptedAgentFactory::new(vec![
@@ -4371,6 +4518,7 @@ done
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            fields: BTreeMap::new(),
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
             parent: None,
@@ -6120,7 +6268,6 @@ exit 0
     #[tokio::test]
     async fn resolution_field_guidance_quotes_boundary_names() {
         let fields = vec![
-            "foo=bar".to_string(),
             "-review".to_string(),
             " review ".to_string(),
             "quote ' $(printf unsafe)".to_string(),
@@ -6128,7 +6275,7 @@ exit 0
 
         assert_eq!(
             resolution_field_arguments(&fields),
-            r#"--field 'foo=bar' '...' --field '-review' '...' --field ' review ' '...' --field 'quote '"'"' $(printf unsafe)' '...'"#
+            r#"--field '-review=...' --field ' review =...' --field 'quote '"'"' $(printf unsafe)=...'"#
         );
     }
 
@@ -6172,9 +6319,8 @@ exit 0
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains(
-                "requires field(s): \"summary\". Provide them via --field 'summary' '...'"
-            ),
+            err.to_string()
+                .contains("requires field(s): \"summary\". Provide them via --field 'summary=...'"),
             "{err}"
         );
 
@@ -9073,6 +9219,7 @@ Recovery implementation review"#
                 ]),
             },
             original_request: "do it".to_string(),
+            fields: BTreeMap::new(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
@@ -10171,6 +10318,7 @@ return workflow("{label}", plan)
                 sources: BTreeMap::new(),
             },
             original_request: request.to_string(),
+            fields: BTreeMap::new(),
             request_topic: None,
             config_set: Default::default(),
             parent,

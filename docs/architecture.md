@@ -355,12 +355,13 @@ cowboy tui                              # launch TUI explicitly
 cowboy run <request...>                 # start a run; --step runs only the first step
 cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
 cowboy run --session-id <role=session-id> <request...>  # load an existing role session
+cowboy run --field <key=value> <request...>  # store trusted fields exposed as ctx.fields
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
 cowboy provide-input <run-id> <input-id> <input>  # provide waiting external input
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
-cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
+cowboy resolve <run-id> <status> [--field <name=value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 cowboy export <run-id>                  # write a searchable HTML transcript
 ```
@@ -379,10 +380,17 @@ delivered, and fails if the session cannot load rather than creating a new one.
 When an agent-backed CLI run finishes or the TUI exits, Cowboy prints each
 observed role session as `role: session-id`.
 
-Each `--field` accepts an exact field name followed by its value. Names may
-include spaces, `=`, or a leading `-`; quote them when needed. Plain values
-remain strings while valid JSON literals preserve structured types, for example
-`--field summary "manual resolution" --field retry false --field files '["src/a.rs"]'`.
+`run --field` accepts repeatable or comma-separated `key=value` pairs. Fields
+are trusted caller-supplied data: keys must be 1-64 characters of
+`[a-z0-9_]`, values are bounded to 256 characters, and at most 16 fields are
+accepted. Fields are stored durably on the run and exposed to every workflow
+step as `ctx.fields`; a restarted run inherits the source run's fields.
+
+Each `--field` accepts one `name=value` token; the value keeps everything
+after the first `=`. Names may include spaces or a leading `-` (but not `=`);
+quote the whole token when needed. Plain values remain strings while valid JSON
+literals preserve structured types, for example
+`--field "summary=manual resolution" --field retry=false --field 'files=["src/a.rs"]'`.
 
 Recoverable step failures consume the live-resolved cumulative run-wide and
 per-step-id retry budgets described above. Exhaustion persists `Failed` while
@@ -442,7 +450,7 @@ Current vertical layout:
 Slash commands:
 
 ```text
-/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>
+/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>
 /step <run-id>
 /resume <run-id>
 /provide-input <run-id> <input-id> <input>

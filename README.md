@@ -68,6 +68,10 @@ supplied backend session, omits that role's static prompt, and sends the new
 run request; a supplied session that cannot load fails instead of being
 replaced.
 
+Trusted callers can attach bounded key/value fields with `--field
+key=value` (repeatable or comma-separated). Fields are stored on the run and
+visible to every workflow step as `ctx.fields`.
+
 ```bash
 cowboy run --session-id developer=<session-id> add a /healthz route
 cowboy run --session-id developer=<session-id>,reviewer=<session-id> review the change
@@ -123,7 +127,7 @@ statuses the failed step can be resolved to along with the fields each requires:
 
 ```bash
 cowboy resolve <run-id>
-cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]
+cowboy resolve <run-id> <status> [--field <name=value>]... [--body <text>]
 ```
 
 Repeat `--field` for each output field. Field names are exact and may include
@@ -131,7 +135,7 @@ spaces, `=`, or a leading `-`; quote them when needed. Ordinary values are
 strings, while valid JSON literals retain their types:
 
 ```bash
-cowboy resolve <run-id> planned --field summary "manual resolution" --field retry false --field files '["src/a.rs"]'
+cowboy resolve <run-id> planned --field "summary=manual resolution" --field retry=false --field 'files=["src/a.rs"]'
 ```
 
 Recoverable step failures (for example, an agent reply missing its YAML
@@ -168,7 +172,7 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 /workflows                                        list known workflows
 /improve <run-id>                                 improve workflow source from a run
 /resolve <run-id>                                 list statuses a failed run can resolve to
-/resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  resolve a failed step and continue the run
+/resolve <run-id> <status> [--field <name=value>]... [--body <text>]  resolve a failed step and continue the run
 /cancel                                           cancel active background tasks
 /help                                             show built-in commands
 /exit                                             quit Cowboy

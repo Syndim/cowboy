@@ -106,6 +106,7 @@ async fn ensure_standalone_run(
                     sources: Default::default(),
                 },
                 original_request: config.prompt.clone(),
+                fields: Default::default(),
                 request_topic: None,
                 config_set: Default::default(),
                 parent: None,

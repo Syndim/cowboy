@@ -37,6 +37,30 @@ pub(crate) async fn connect(path: &Path) -> Result<SqlitePool> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    // The whole connect sequence runs with a zero busy timeout, so a
+    // transient lock (for example a just-closed pool still releasing its WAL
+    // handles) surfaces as an immediate BUSY error anywhere in the sequence.
+    // Retry the full sequence on retryable errors, bounded like bootstrap.
+    let started = Instant::now();
+    loop {
+        match connect_once(path).await {
+            Ok(pool) => return Ok(pool),
+            Err(error) if started.elapsed() < BOOTSTRAP_TIMEOUT && is_retryable(&error) => {
+                tokio::time::sleep(RETRY_BACKOFF).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable(error: &Error) -> bool {
+    match error {
+        Error::Sqlx(error) => is_retryable_sqlite_error(error),
+        _ => false,
+    }
+}
+
+async fn connect_once(path: &Path) -> Result<SqlitePool> {
     let options = connect_options(path, true);
     let mut connection = SqliteConnection::connect_with(&options).await?;
     wait_at_test_bootstrap_barrier(path).await;

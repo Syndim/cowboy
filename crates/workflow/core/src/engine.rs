@@ -705,6 +705,7 @@ mod tests {
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            fields: BTreeMap::new(),
             request_topic: None,
             status: RunStatus::Running,
             step: StepState {

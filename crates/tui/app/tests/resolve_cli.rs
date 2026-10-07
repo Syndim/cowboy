@@ -5,12 +5,7 @@ use cowboy::resolution::resolution_command;
 use cowboy_workflow_engine::ResolutionStatus;
 
 const RESOLUTION_STATUS: &str = "needs 'review' $(printf unsafe)";
-const REQUIRED_FIELDS: [&str; 4] = [
-    "review 'summary' $(printf unsafe)",
-    "foo=bar",
-    "-review",
-    " review ",
-];
+const REQUIRED_FIELDS: [&str; 3] = ["review 'summary' $(printf unsafe)", "-review", " review "];
 
 fn cowboy(config: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cowboy"));
@@ -37,7 +32,6 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
         local developer = role("developer", { instructions = "Implement" })
         local resolution_status = [[needs 'review' $(printf unsafe)]]
         local required_field = [[review 'summary' $(printf unsafe)]]
-        local equals_field = [[foo=bar]]
         local hyphen_field = [[-review]]
         local spaced_field = [[ review ]]
         local start = step("start", { role = developer })
@@ -49,11 +43,10 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
               status = { resolution_status },
               fields = {
                 [required_field] = "string",
-                [equals_field] = "string",
                 [hyphen_field] = "boolean",
                 [spaced_field] = "array"
               },
-              required_fields = { spaced_field, hyphen_field, equals_field, required_field }
+              required_fields = { spaced_field, hyphen_field, required_field }
             }
           }
         end
@@ -64,11 +57,10 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
             status = "success",
             fields = {
               required = fields[required_field],
-              equals_name = fields[equals_field],
               hyphen_name = fields[hyphen_field],
               spaced_name = fields[spaced_field][1]
             },
-            body = fields[required_field] .. "|" .. fields[equals_field] .. "|" .. type(fields[hyphen_field]) .. "|" .. fields[spaced_field][1]
+            body = fields[required_field] .. "|" .. type(fields[hyphen_field]) .. "|" .. fields[spaced_field][1]
           }
         end
         start:on(resolution_status, finish)
@@ -146,17 +138,11 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
             run_id,
             RESOLUTION_STATUS,
             "--field",
-            REQUIRED_FIELDS[0],
-            "manual resolution",
+            &format!("{}=manual resolution", REQUIRED_FIELDS[0]),
             "--field",
-            REQUIRED_FIELDS[1],
-            "equals-value",
+            &format!("{}=false", REQUIRED_FIELDS[1]),
             "--field",
-            REQUIRED_FIELDS[2],
-            "false",
-            "--field",
-            REQUIRED_FIELDS[3],
-            r#"["src/a.rs"]"#,
+            &format!(r#"{}=["src/a.rs"]"#, REQUIRED_FIELDS[2]),
             "--body",
             "manual body",
         ])
@@ -169,7 +155,7 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
         "{resolved_stdout}"
     );
     assert!(
-        resolved_stdout.contains("body: \"manual resolution|equals-value|boolean|src/a.rs\""),
+        resolved_stdout.contains("body: \"manual resolution|boolean|src/a.rs\""),
         "{resolved_stdout}"
     );
 
@@ -180,8 +166,7 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
             run_id,
             RESOLUTION_STATUS,
             "--field",
-            "credentials",
-            malformed_value,
+            &format!("credentials={malformed_value}"),
         ])
         .output()
         .unwrap();
@@ -210,11 +195,9 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
             run_id,
             RESOLUTION_STATUS,
             "--field",
-            "summary",
-            "one",
+            "summary=one",
             "--field",
-            "summary",
-            "two",
+            "summary=two",
         ])
         .output()
         .unwrap();
@@ -227,7 +210,12 @@ fn cli_resolve_dispatches_fields_and_renders_quoted_guidance() {
 
     for arguments in [
         vec![
-            "resolve", run_id, "--field", "summary", "one", "--field", "summary", "two",
+            "resolve",
+            run_id,
+            "--field",
+            "summary=one",
+            "--field",
+            "summary=two",
         ],
         vec!["resolve", run_id, "--body", "details"],
     ] {
