@@ -11,9 +11,7 @@ pub fn resolution_command(command_prefix: &str, run_id: &str, status: &Resolutio
     );
     for field in status.required_fields.iter().chain(&status.optional_fields) {
         command.push_str(" --field ");
-        command.push_str(&quote_command_argument(field));
-        command.push(' ');
-        command.push_str(&quote_command_argument("..."));
+        command.push_str(&quote_command_argument(&format!("{field}=...")));
     }
 
     if status.body_expected {
@@ -46,23 +44,17 @@ mod tests {
     fn builds_copyable_cli_and_tui_commands() {
         assert_eq!(
             resolution_command("cowboy resolve", "run-1", &status()),
-            "cowboy resolve 'run-1' 'planned' --field 'summary' '...' --field 'files' '...' --body '...'"
+            "cowboy resolve 'run-1' 'planned' --field 'summary=...' --field 'files=...' --body '...'"
         );
         assert_eq!(
             resolution_command("/resolve", "run-1", &status()),
-            "/resolve 'run-1' 'planned' --field 'summary' '...' --field 'files' '...' --body '...'"
+            "/resolve 'run-1' 'planned' --field 'summary=...' --field 'files=...' --body '...'"
         );
     }
 
     #[test]
     fn boundary_names_round_trip_through_slash_tokenizer() {
-        let names = [
-            "foo=bar",
-            "-review",
-            " review ",
-            "",
-            "review 'summary' $(printf unsafe)",
-        ];
+        let names = ["-review", " review ", "review 'summary' $(printf unsafe)"];
         let status = ResolutionStatus {
             status: "needs 'review' $(printf unsafe)".to_string(),
             required_fields: names.iter().map(|name| (*name).to_string()).collect(),
@@ -82,7 +74,7 @@ mod tests {
             args.fields,
             names
                 .into_iter()
-                .flat_map(|name| [name.to_string(), "...".to_string()])
+                .map(|name| format!("{name}=..."))
                 .collect::<Vec<_>>()
         );
     }
@@ -93,10 +85,8 @@ mod tests {
         let status = ResolutionStatus {
             status: "needs 'review' $(printf unsafe)".to_string(),
             required_fields: vec![
-                "foo=bar".to_string(),
                 "-review".to_string(),
                 " review ".to_string(),
-                String::new(),
                 "review 'summary' $(printf unsafe)".to_string(),
             ],
             ..status()
@@ -112,11 +102,9 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             "<run $(printf unsafe)>\n\
              <needs 'review' $(printf unsafe)>\n\
-             <--field>\n<foo=bar>\n<...>\n\
-             <--field>\n<-review>\n<...>\n\
-             <--field>\n< review >\n<...>\n\
-             <--field>\n<>\n<...>\n\
-             <--field>\n<review 'summary' $(printf unsafe)>\n<...>\n\
+             <--field>\n<-review=...>\n\
+             <--field>\n< review =...>\n\
+             <--field>\n<review 'summary' $(printf unsafe)=...>\n\
              <--body>\n<...>\n"
         );
     }

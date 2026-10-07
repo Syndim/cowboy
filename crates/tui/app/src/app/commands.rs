@@ -2277,7 +2277,7 @@ return workflow("restartable", start)
             ("/improve", "/improve <run-id>"),
             (
                 "/resolve",
-                "/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]",
+                "/resolve <run-id> [status] [--field <name=value>]... [--body <text>]",
             ),
             (
                 "/run --workflow review",
@@ -2321,12 +2321,11 @@ return workflow("restartable", start)
                     summary = "string",
                     retry = "boolean",
                     files = "array",
-                    ["foo=bar"] = "string",
                     ["-review"] = "string",
                     [" review "] = "string"
                   },
                   required_fields = {
-                    "summary", "retry", "files", "foo=bar", "-review", " review "
+                    "summary", "retry", "files", "-review", " review "
                   }
                 }
               }
@@ -2340,7 +2339,6 @@ return workflow("restartable", start)
                   summary = fields.summary,
                   retry = fields.retry,
                   first_file = fields.files[1],
-                  equals_name = fields["foo=bar"],
                   hyphen_name = fields["-review"],
                   spaced_name = fields[" review "]
                 },
@@ -2402,20 +2400,18 @@ return workflow("restartable", start)
             "{rendered}"
         );
         assert!(rendered.contains("'planned'"), "{rendered}");
-        for field in [
-            "files", "retry", "summary", "foo=bar", "-review", " review ",
-        ] {
+        for field in ["files", "retry", "summary", "-review", " review "] {
             assert!(
-                rendered.contains(&format!("field '{field}' '...'")),
+                rendered.contains(&format!("field '{field}=...'")),
                 "{rendered}"
             );
         }
 
         let resolve_input = format!(
-            "/resolve {run_id} planned --field summary \"manual resolution\" \
-             --field retry false --field files '[\"src/a.rs\"]' \
-             --field foo=bar equals-value --field -review -declined \
-             --field \" review \" \" spaced value \" --body \"manual body\""
+            "/resolve {run_id} planned --field \"summary=manual resolution\" \
+             --field retry=false --field 'files=[\"src/a.rs\"]' \
+             --field -review=-declined \
+             --field \" review = spaced value \" --body \"manual body\""
         );
 
         assert!(!state.workflow_execution_running());
@@ -2452,7 +2448,6 @@ return workflow("restartable", start)
         assert_eq!(output.fields["summary"], "manual resolution");
         assert_eq!(output.fields["retry"], false);
         assert_eq!(output.fields["first_file"], "src/a.rs");
-        assert_eq!(output.fields["equals_name"], "equals-value");
         assert_eq!(output.fields["hyphen_name"], "-declined");
         assert_eq!(output.fields["spaced_name"], " spaced value ");
         assert_eq!(output.body, "manual body");
@@ -2483,12 +2478,12 @@ return workflow("restartable", start)
         let (_dir, runtime, mut state) = test_runtime_state().await;
 
         state
-            .push_input(r#"/resolve run-1 success --field credentials '{"token":"private-token"'"#);
+            .push_input(r#"/resolve run-1 success --field 'credentials={"token":"private-token"'"#);
         submit_input(&mut state, &runtime).await;
 
         assert_eq!(
             state.status(),
-            "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+            "usage: /resolve <run-id> [status] [--field <name=value>]... [--body <text>]"
         );
         assert_eq!(state.background_task_count(), 0);
         let rendered = rendered_entries(&state);
@@ -2507,7 +2502,7 @@ return workflow("restartable", start)
     #[tokio::test]
     async fn resolve_payload_without_status_is_rejected_before_dispatch() {
         for input in [
-            "/resolve run-1 --field summary one --field summary two",
+            "/resolve run-1 --field summary=one --field summary=two",
             "/resolve run-1 --body details",
         ] {
             let (_dir, runtime, mut state) = test_runtime_state().await;
@@ -2517,7 +2512,7 @@ return workflow("restartable", start)
 
             assert_eq!(
                 state.status(),
-                "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+                "usage: /resolve <run-id> [status] [--field <name=value>]... [--body <text>]"
             );
             assert_eq!(state.background_task_count(), 0);
             let rendered = rendered_entries(&state);
@@ -2530,12 +2525,12 @@ return workflow("restartable", start)
     async fn duplicate_resolve_fields_with_status_are_actionable() {
         let (_dir, runtime, mut state) = test_runtime_state().await;
 
-        state.push_input("/resolve run-1 success --field summary one --field summary two");
+        state.push_input("/resolve run-1 success --field summary=one --field summary=two");
         submit_input(&mut state, &runtime).await;
 
         assert_eq!(
             state.status(),
-            "usage: /resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+            "usage: /resolve <run-id> [status] [--field <name=value>]... [--body <text>]"
         );
         assert_eq!(state.background_task_count(), 0);
         let rendered = rendered_entries(&state);

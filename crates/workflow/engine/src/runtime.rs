@@ -2628,9 +2628,8 @@ fn resolution_field_arguments(fields: &[String]) -> String {
         .iter()
         .map(|field| {
             format!(
-                "--field {} {}",
-                quote_command_argument(field),
-                quote_command_argument("...")
+                "--field {}",
+                quote_command_argument(&format!("{field}=..."))
             )
         })
         .collect::<Vec<_>>()
@@ -6269,7 +6268,6 @@ exit 0
     #[tokio::test]
     async fn resolution_field_guidance_quotes_boundary_names() {
         let fields = vec![
-            "foo=bar".to_string(),
             "-review".to_string(),
             " review ".to_string(),
             "quote ' $(printf unsafe)".to_string(),
@@ -6277,7 +6275,7 @@ exit 0
 
         assert_eq!(
             resolution_field_arguments(&fields),
-            r#"--field 'foo=bar' '...' --field '-review' '...' --field ' review ' '...' --field 'quote '"'"' $(printf unsafe)' '...'"#
+            r#"--field '-review=...' --field ' review =...' --field 'quote '"'"' $(printf unsafe)=...'"#
         );
     }
 
@@ -6321,9 +6319,8 @@ exit 0
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains(
-                "requires field(s): \"summary\". Provide them via --field 'summary' '...'"
-            ),
+            err.to_string()
+                .contains("requires field(s): \"summary\". Provide them via --field 'summary=...'"),
             "{err}"
         );
 

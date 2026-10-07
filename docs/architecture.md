@@ -361,7 +361,7 @@ cowboy resume <run-id>                  # continue until the workflow blocks, fa
 cowboy provide-input <run-id> <input-id> <input>  # provide waiting external input
 cowboy improve <run-id>                 # summarize and apply workflow-file improvements
 cowboy resolve <run-id>                 # list statuses a failed run can resolve to
-cowboy resolve <run-id> <status> [--field <name> <value>]... [--body <text>]  # resolve a failed step
+cowboy resolve <run-id> <status> [--field <name=value>]... [--body <text>]  # resolve a failed step
 cowboy runs                             # list workflow runs
 cowboy export <run-id>                  # write a searchable HTML transcript
 ```
@@ -386,10 +386,11 @@ are trusted caller-supplied data: keys must be 1-64 characters of
 accepted. Fields are stored durably on the run and exposed to every workflow
 step as `ctx.fields`; a restarted run inherits the source run's fields.
 
-Each `--field` accepts an exact field name followed by its value. Names may
-include spaces, `=`, or a leading `-`; quote them when needed. Plain values
-remain strings while valid JSON literals preserve structured types, for example
-`--field summary "manual resolution" --field retry false --field files '["src/a.rs"]'`.
+Each `--field` accepts one `name=value` token; the value keeps everything
+after the first `=`. Names may include spaces or a leading `-` (but not `=`);
+quote the whole token when needed. Plain values remain strings while valid JSON
+literals preserve structured types, for example
+`--field "summary=manual resolution" --field retry=false --field 'files=["src/a.rs"]'`.
 
 Recoverable step failures consume the live-resolved cumulative run-wide and
 per-step-id retry budgets described above. Exhaustion persists `Failed` while

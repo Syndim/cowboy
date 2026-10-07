@@ -280,7 +280,7 @@ fn parse_field_value(name: &str, raw_value: &str) -> Result<serde_json::Value, R
     }
 }
 
-/// Assemble raw name/value pairs into the object expected by the runtime.
+/// Assemble raw `name=value` pairs into the object expected by the runtime.
 pub fn resolve_fields_object(
     field_values: Vec<String>,
 ) -> Result<Option<serde_json::Value>, ResolveFieldError> {
@@ -289,19 +289,27 @@ pub fn resolve_fields_object(
     }
 
     let mut fields = serde_json::Map::new();
-    let (pairs, remainder) = field_values.as_chunks::<2>();
-    for pair in pairs {
-        let name = &pair[0];
+    for field_value in &field_values {
+        let Some((name, raw_value)) = field_value.split_once('=') else {
+            return Err(ResolveFieldError::new(format!(
+                "field {field_value:?} must use name=value"
+            )));
+        };
+        if name.is_empty() {
+            return Err(ResolveFieldError::new(format!(
+                "field {field_value:?} must use name=value with a non-empty name"
+            )));
+        }
+
         if fields.contains_key(name) {
             return Err(ResolveFieldError::new(format!(
                 "field {name:?} was provided more than once"
             )));
         }
 
-        fields.insert(name.clone(), parse_field_value(name, &pair[1])?);
+        fields.insert(name.to_string(), parse_field_value(name, raw_value)?);
     }
 
-    debug_assert!(remainder.is_empty());
     Ok(Some(serde_json::Value::Object(fields)))
 }
 
@@ -319,11 +327,10 @@ pub struct ResolveArgs {
     #[arg(value_name = "status", allow_hyphen_values = true)]
     pub status: Option<String>,
 
-    /// Output field name and value. Repeat for multiple fields.
+    /// Output field as name=value. Repeat for multiple fields.
     #[arg(
         long = "field",
-        value_names = ["name", "value"],
-        num_args = 2,
+        value_name = "name=value",
         action = ArgAction::Append,
         allow_hyphen_values = true,
         requires = "status"
@@ -932,13 +939,12 @@ mod tests {
                 "run-1",
                 "approved",
                 "--field",
-                "summary",
-                "work completed",
+                "summary=work completed",
                 "--body",
                 "looks good",
             ]),
             shared_slash_command(
-                r#"/resolve run-1 approved --field summary "work completed" --body "looks good""#,
+                r#"/resolve run-1 approved --field "summary=work completed" --body "looks good""#,
             )
         );
 
@@ -948,8 +954,7 @@ mod tests {
             "run-1",
             "failed",
             "--field",
-            "reason",
-            "needs work",
+            "reason=needs work",
             "--field",
             "link",
             "https://example.test?a=b=c",
@@ -957,7 +962,7 @@ mod tests {
         assert_eq!(
             command,
             shared_slash_command(
-                r#"/resolve run-1 failed --field reason "needs work" --field link https://example.test?a=b=c"#,
+                r#"/resolve run-1 failed --field "reason=needs work" --field link=https://example.test?a=b=c"#,
             )
         );
 
@@ -981,23 +986,17 @@ mod tests {
             "run-1",
             "success",
             "--field",
-            "summary",
-            "done",
+            "summary=done",
             "--field",
-            "retry",
-            "false",
+            "retry=false",
             "--field",
-            "count",
-            "3",
+            "count=3",
             "--field",
-            "files",
-            r#"["src/a.rs"]"#,
+            r#"files=["src/a.rs"]"#,
             "--field",
-            "metadata",
-            r#"{"owner":"dev"}"#,
+            r#"metadata={"owner":"dev"}"#,
             "--field",
-            "note",
-            "null",
+            "note=null",
         ]);
         let SharedCommand::Resolve(args) = command else {
             panic!("expected resolve command");
@@ -1017,33 +1016,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_preserves_boundary_names_and_hyphen_values() {
+    fn resolve_preserves_value_separators_and_hyphen_values() {
         let arguments = [
             "cowboy",
             "resolve",
             "run-1",
             "success",
             "--field",
-            "foo=bar",
-            "value=with=equals",
+            "link=https://example.test?a=b=c",
             "--field",
-            "-review",
-            "-declined",
+            "note=-declined",
             "--field",
-            " review ",
-            " spaced value ",
-            "--field",
-            "",
-            "empty name",
-            "--field",
-            "--body",
-            "--field",
+            " spaced = value ",
         ];
         let command = shared_cli_command(arguments);
         assert_eq!(
             command,
             shared_slash_command(
-                r#"/resolve run-1 success --field foo=bar value=with=equals --field -review -declined --field " review " " spaced value " --field "" "empty name" --field --body --field"#,
+                r#"/resolve run-1 success --field link=https://example.test?a=b=c --field note=-declined --field " spaced = value ""#,
             )
         );
         let SharedCommand::Resolve(args) = command else {
@@ -1053,13 +1043,19 @@ mod tests {
         assert_eq!(
             resolve_fields_object(args.fields).unwrap(),
             Some(serde_json::json!({
-                "foo=bar": "value=with=equals",
-                "-review": "-declined",
-                " review ": " spaced value ",
-                "": "empty name",
-                "--body": "--field",
+                "link": "https://example.test?a=b=c",
+                "note": "-declined",
+                " spaced ": " value ",
             }))
         );
+    }
+
+    #[test]
+    fn resolve_rejects_fields_without_name_or_separator() {
+        for raw in ["no-separator", "=empty-name", ""] {
+            let err = resolve_fields_object(vec![raw.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("name=value"), "{err}");
+        }
     }
 
     #[test]
@@ -1069,9 +1065,10 @@ mod tests {
             ("credentials", "{\"token\":\"private-token\""),
             ("quoted", "\"private-content"),
         ] {
-            let SharedCommand::Resolve(args) = shared_cli_command([
-                "cowboy", "resolve", "run-1", "success", "--field", name, value,
-            ]) else {
+            let field: &'static str = Box::leak(format!("{name}={value}").into_boxed_str());
+            let SharedCommand::Resolve(args) =
+                shared_cli_command(["cowboy", "resolve", "run-1", "success", "--field", field])
+            else {
                 panic!("expected resolve command");
             };
             let err = resolve_fields_object(args.fields).unwrap_err();
@@ -1083,8 +1080,14 @@ mod tests {
         }
 
         let SharedCommand::Resolve(args) = shared_cli_command([
-            "cowboy", "resolve", "run-1", "success", "--field", "summary", "first", "--field",
-            "summary", "second",
+            "cowboy",
+            "resolve",
+            "run-1",
+            "success",
+            "--field",
+            "summary=first",
+            "--field",
+            "summary=second",
         ]) else {
             panic!("expected resolve command");
         };
@@ -1095,13 +1098,8 @@ mod tests {
         );
 
         assert_eq!(
-            resolve_fields_object(vec![
-                " summary".to_string(),
-                "one".to_string(),
-                "summary".to_string(),
-                "two".to_string(),
-            ])
-            .unwrap(),
+            resolve_fields_object(vec![" summary=one".to_string(), "summary=two".to_string(),])
+                .unwrap(),
             Some(serde_json::json!({" summary": "one", "summary": "two"}))
         );
     }
@@ -1109,7 +1107,7 @@ mod tests {
     #[test]
     fn resolve_fields_and_body_require_status_on_both_surfaces() {
         for args in [
-            vec!["cowboy", "resolve", "run-1", "--field", "summary", "one"],
+            vec!["cowboy", "resolve", "run-1", "--field", "summary=one"],
             vec!["cowboy", "resolve", "run-1", "--body", "details"],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
@@ -1118,7 +1116,7 @@ mod tests {
         }
 
         for input in [
-            "/resolve run-1 --field summary one",
+            "/resolve run-1 --field summary=one",
             "/resolve run-1 --body details",
         ] {
             let Err(SlashParseError::Validation { message, .. }) = parse_slash_command(input)
@@ -1139,9 +1137,9 @@ mod tests {
         resolve.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("--field <name> <value>"), "{help}");
+        assert!(help.contains("--field <name=value>"), "{help}");
         assert!(help.contains("--body <text>"), "{help}");
-        assert!(!help.contains("name=value"), "{help}");
+        assert!(!help.contains("<name> <value>"), "{help}");
         assert!(!help.contains("--fields"), "{help}");
         assert!(!help.contains("fields-json"), "{help}");
 
@@ -1175,7 +1173,7 @@ mod tests {
         }
         assert_eq!(
             slash_command_usage("resolve").as_deref(),
-            Some("/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]")
+            Some("/resolve <run-id> [status] [--field <name=value>]... [--body <text>]")
         );
     }
 
@@ -1291,7 +1289,7 @@ mod tests {
 
         assert!(suggestions.contains(&"/resume <run-id>".to_string()));
         assert!(suggestions.contains(
-            &"/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]".to_string()
+            &"/resolve <run-id> [status] [--field <name=value>]... [--body <text>]".to_string()
         ));
     }
 
@@ -1314,7 +1312,7 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.name == "/resolve"
                 && row.usage
-                    == "/resolve <run-id> [status] [--field <name> <value>]... [--body <text>]"
+                    == "/resolve <run-id> [status] [--field <name=value>]... [--body <text>]"
                 && row.description == "list or resolve a failed step"
                 && row.takes_arguments
         }));
