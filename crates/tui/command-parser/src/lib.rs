@@ -1144,14 +1144,6 @@ mod tests {
         assert!(!help.contains("fields-json"), "{help}");
 
         for args in [
-            vec![
-                "cowboy",
-                "resolve",
-                "run-1",
-                "success",
-                "--field",
-                "summary=value",
-            ],
             vec!["cowboy", "resolve", "run-1", "success", "--fields", "{}"],
             vec!["cowboy", "resolve", "run-1", "success", "{}"],
         ] {
@@ -1159,7 +1151,6 @@ mod tests {
         }
 
         for input in [
-            "/resolve run-1 success --field summary=value",
             "/resolve run-1 success --fields '{}'",
             "/resolve run-1 success '{}'",
         ] {

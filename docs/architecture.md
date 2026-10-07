@@ -355,7 +355,7 @@ cowboy tui                              # launch TUI explicitly
 cowboy run <request...>                 # start a run; --step runs only the first step
 cowboy run --workflow <workflow-id> <request...>  # start a specific catalog workflow id
 cowboy run --session-id <role=session-id> <request...>  # load an existing role session
-cowboy run --field <key=value> <request...>  # store trusted start fields exposed as ctx.fields
+cowboy run --field <key=value> <request...>  # store trusted fields exposed as ctx.fields
 cowboy step <run-id>                    # execute exactly one further workflow step
 cowboy resume <run-id>                  # continue until the workflow blocks, fails, or completes
 cowboy provide-input <run-id> <input-id> <input>  # provide waiting external input

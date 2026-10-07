@@ -235,35 +235,35 @@ impl RunStartOptions {
     }
 }
 
-/// Maximum number of caller-supplied start fields accepted for one run.
-pub const MAX_RUN_START_FIELDS: usize = 16;
-/// Maximum length of a caller-supplied start field key.
-pub const MAX_RUN_START_FIELD_KEY_CHARS: usize = 64;
-/// Maximum length of a caller-supplied start field value.
-pub const MAX_RUN_START_FIELD_VALUE_CHARS: usize = 256;
+/// Maximum number of caller-supplied fields accepted for one run.
+pub const MAX_RUN_FIELDS: usize = 16;
+/// Maximum length of a caller-supplied field key.
+pub const MAX_RUN_FIELD_KEY_CHARS: usize = 64;
+/// Maximum length of a caller-supplied field value.
+pub const MAX_RUN_FIELD_VALUE_CHARS: usize = 256;
 
-fn validate_run_start_fields(fields: &BTreeMap<String, String>) -> Result<()> {
-    if fields.len() > MAX_RUN_START_FIELDS {
+fn validate_run_fields(fields: &BTreeMap<String, String>) -> Result<()> {
+    if fields.len() > MAX_RUN_FIELDS {
         return Err(WorkflowError::InvalidAction(format!(
-            "at most {MAX_RUN_START_FIELDS} run start fields are accepted"
+            "at most {MAX_RUN_FIELDS} run fields are accepted"
         )));
     }
 
     for (key, value) in fields {
         if key.is_empty()
-            || key.chars().count() > MAX_RUN_START_FIELD_KEY_CHARS
+            || key.chars().count() > MAX_RUN_FIELD_KEY_CHARS
             || !key
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
             return Err(WorkflowError::InvalidAction(format!(
-                "run start field keys must be 1-{MAX_RUN_START_FIELD_KEY_CHARS} characters of [a-z0-9_]; got {key:?}"
+                "run field keys must be 1-{MAX_RUN_FIELD_KEY_CHARS} characters of [a-z0-9_]; got {key:?}"
             )));
         }
 
-        if value.chars().count() > MAX_RUN_START_FIELD_VALUE_CHARS {
+        if value.chars().count() > MAX_RUN_FIELD_VALUE_CHARS {
             return Err(WorkflowError::InvalidAction(format!(
-                "run start field {key:?} value exceeds {MAX_RUN_START_FIELD_VALUE_CHARS} characters"
+                "run field {key:?} value exceeds {MAX_RUN_FIELD_VALUE_CHARS} characters"
             )));
         }
     }
@@ -1069,7 +1069,7 @@ impl WorkflowRuntime {
             id: spec.target_run_id.clone(),
             workflow: source.workflow.clone(),
             original_request: spec.request,
-            start_fields: source.start_fields.clone(),
+            fields: source.fields.clone(),
             request_topic: None,
             config_set: source.config_set.clone(),
             parent: spec.parent,
@@ -1200,7 +1200,7 @@ impl WorkflowRuntime {
                     "workflow source compiled"
                 );
                 let now = Utc::now();
-                validate_run_start_fields(&spec.start_options.fields)?;
+                validate_run_fields(&spec.start_options.fields)?;
                 let provided_sessions = self.role_sessions_for_start(
                     &spec.run_id,
                     &definition,
@@ -1216,7 +1216,7 @@ impl WorkflowRuntime {
                         sources: snapshot.files.clone(),
                     },
                     original_request: spec.request,
-                    start_fields: spec.start_options.fields.clone(),
+                    fields: spec.start_options.fields.clone(),
                     request_topic: None,
                     config_set,
                     parent: spec.parent,
@@ -3714,7 +3714,7 @@ implementation_evidence: []
     }
 
     #[tokio::test]
-    async fn start_fields_are_persisted_and_exposed_to_steps() {
+    async fn run_fields_are_persisted_and_exposed_to_steps() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -3743,7 +3743,7 @@ implementation_evidence: []
 
         assert_eq!(report.run.status, RunStatus::Completed);
         assert_eq!(
-            report.run.start_fields.get("dispatch_mode"),
+            report.run.fields.get("dispatch_mode"),
             Some(&"fresh".to_string())
         );
         let persisted = runtime
@@ -3752,11 +3752,11 @@ implementation_evidence: []
             .load_run(&report.run.id)
             .await
             .unwrap();
-        assert_eq!(persisted.start_fields, report.run.start_fields);
+        assert_eq!(persisted.fields, report.run.fields);
     }
 
     #[tokio::test]
-    async fn start_fields_reject_invalid_keys_before_persisting_run() {
+    async fn run_fields_reject_invalid_keys_before_persisting_run() {
         let dir = tempfile::tempdir().unwrap();
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
@@ -3781,7 +3781,7 @@ implementation_evidence: []
                 .await
                 .unwrap_err();
             assert!(
-                error.to_string().contains("run start field keys"),
+                error.to_string().contains("run field keys"),
                 "unexpected error for key {key:?}: {error}"
             );
         }
@@ -3792,7 +3792,7 @@ implementation_evidence: []
             .start_run_with_workflow_and_options("fields", "request", options)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("run start field keys"));
+        assert!(error.to_string().contains("run field keys"));
 
         let options = RunStartOptions::default()
             .with_fields([("dispatch_mode".to_string(), "v".repeat(257))]);
@@ -4518,7 +4518,7 @@ done
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
-            start_fields: BTreeMap::new(),
+            fields: BTreeMap::new(),
             request_topic: request_topic.map(str::to_string),
             config_set: Default::default(),
             parent: None,
@@ -9219,7 +9219,7 @@ Recovery implementation review"#
                 ]),
             },
             original_request: "do it".to_string(),
-            start_fields: BTreeMap::new(),
+            fields: BTreeMap::new(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,
@@ -10318,7 +10318,7 @@ return workflow("{label}", plan)
                 sources: BTreeMap::new(),
             },
             original_request: request.to_string(),
-            start_fields: BTreeMap::new(),
+            fields: BTreeMap::new(),
             request_topic: None,
             config_set: Default::default(),
             parent,

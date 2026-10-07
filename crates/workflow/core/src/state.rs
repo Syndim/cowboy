@@ -50,7 +50,7 @@ pub struct Run {
     /// Trusted caller-supplied key/value fields captured at run start and
     /// exposed to every step as `ctx.fields`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub start_fields: BTreeMap<String, String>,
+    pub fields: BTreeMap<String, String>,
     /// Short generated topic shown in run listings when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_topic: Option<String>,
@@ -708,11 +708,11 @@ mod tests {
         assert_eq!(run.restart_source_run_id, None);
         assert_eq!(run.retries_used, 0);
         assert!(run.step.retries_used.is_empty());
-        assert!(run.start_fields.is_empty());
+        assert!(run.fields.is_empty());
     }
 
     #[test]
-    fn run_start_fields_round_trip_and_skip_when_empty() {
+    fn run_fields_round_trip_and_skip_when_empty() {
         let run: Run = serde_json::from_value(serde_json::json!({
             "id": "run",
             "workflow": {
@@ -722,7 +722,7 @@ mod tests {
                 "sources": {}
             },
             "original_request": "do it",
-            "start_fields": { "dispatch_mode": "fresh" },
+            "fields": { "dispatch_mode": "fresh" },
             "status": { "status": "running" },
             "step": {
                 "next": "start",
@@ -734,21 +734,18 @@ mod tests {
             "updated_at": "2026-01-01T00:00:00Z"
         }))
         .unwrap();
-        assert_eq!(
-            run.start_fields.get("dispatch_mode"),
-            Some(&"fresh".to_string())
-        );
+        assert_eq!(run.fields.get("dispatch_mode"), Some(&"fresh".to_string()));
 
         let serialized = serde_json::to_value(&run).unwrap();
         assert_eq!(
-            serialized["start_fields"],
+            serialized["fields"],
             serde_json::json!({ "dispatch_mode": "fresh" })
         );
 
         let mut empty = run;
-        empty.start_fields.clear();
+        empty.fields.clear();
         let serialized = serde_json::to_value(&empty).unwrap();
-        assert!(serialized.get("start_fields").is_none());
+        assert!(serialized.get("fields").is_none());
     }
 
     #[test]

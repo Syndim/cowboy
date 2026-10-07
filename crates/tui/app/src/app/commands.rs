@@ -765,7 +765,7 @@ mod tests {
                 sources: Default::default(),
             },
             original_request: format!("request for {id}"),
-            start_fields: Default::default(),
+            fields: Default::default(),
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
             parent: None,
