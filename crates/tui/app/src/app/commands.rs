@@ -237,10 +237,11 @@ fn spawn_start_run_from_args(
         step,
         workflow,
         session_ids,
+        fields,
         request,
     } = args;
     let request = request.join(" ");
-    if session_ids.is_empty() {
+    if session_ids.is_empty() && fields.is_empty() {
         match (step, workflow) {
             (true, Some(workflow_id)) => {
                 spawn_start_run_with_workflow_stepwise(state, runtime, workflow_id, request);
@@ -259,7 +260,8 @@ fn spawn_start_run_from_args(
         session_ids
             .into_iter()
             .map(|session| (session.role, session.session_id)),
-    );
+    )
+    .with_fields(fields.into_iter().map(|field| (field.key, field.value)));
     spawn_start_run_with_options(state, runtime, step, workflow, request, options);
 }
 
@@ -763,6 +765,7 @@ mod tests {
                 sources: Default::default(),
             },
             original_request: format!("request for {id}"),
+            start_fields: Default::default(),
             request_topic: topic.map(ToString::to_string),
             config_set: Default::default(),
             parent: None,
@@ -2168,7 +2171,7 @@ return workflow("restartable", start)
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(
-            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>"
                 .to_string()
         ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
@@ -2259,7 +2262,7 @@ return workflow("restartable", start)
         for (input, usage) in [
             (
                 "/run",
-                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>",
             ),
             ("/step", "/step <run-id>"),
             ("/resume", "/resume <run-id>"),
@@ -2278,7 +2281,7 @@ return workflow("restartable", start)
             ),
             (
                 "/run --workflow review",
-                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>",
+                "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>",
             ),
         ] {
             let (_dir, runtime, mut state) = test_runtime_state().await;

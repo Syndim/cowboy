@@ -137,6 +137,7 @@ mod tests {
                 sources: BTreeMap::new(),
             },
             original_request: "do it".to_string(),
+            start_fields: BTreeMap::new(),
             request_topic: None,
             config_set: Default::default(),
             parent: None,

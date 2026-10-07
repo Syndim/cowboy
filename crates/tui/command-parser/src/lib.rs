@@ -143,6 +143,36 @@ impl std::str::FromStr for RoleSessionId {
     }
 }
 
+/// A trusted key/value field supplied when starting a workflow run.
+///
+/// Fields are stored on the run and exposed to every workflow step as
+/// `ctx.fields`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunField {
+    pub key: String,
+    pub value: String,
+}
+
+impl std::str::FromStr for RunField {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let Some((key, field_value)) = value.split_once('=') else {
+            return Err("expected key=value".to_string());
+        };
+
+        let key = key.trim();
+        if key.is_empty() {
+            return Err("expected non-empty field key".to_string());
+        }
+
+        Ok(Self {
+            key: key.to_string(),
+            value: field_value.to_string(),
+        })
+    }
+}
+
 /// Arguments for starting a workflow run.
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
 pub struct RunArgs {
@@ -161,6 +191,10 @@ pub struct RunArgs {
         value_delimiter = ','
     )]
     pub session_ids: Vec<RoleSessionId>,
+
+    /// Trusted key=value fields stored on the run and exposed as ctx.fields.
+    #[arg(long = "field", value_name = "key=value", value_delimiter = ',')]
+    pub fields: Vec<RunField>,
 
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "request")]
     pub request: Vec<String>,
@@ -646,6 +680,58 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_fields_on_cli_and_slash_surfaces() {
+        for command in [
+            shared_cli_command([
+                "cowboy",
+                "run",
+                "--field",
+                "dispatch_mode=fresh,source=peon",
+                "do",
+                "work",
+            ]),
+            shared_slash_command("/run --field dispatch_mode=fresh --field source=peon do work"),
+        ] {
+            let SharedCommand::Run(args) = command else {
+                panic!("expected run command");
+            };
+
+            assert_eq!(
+                args.fields,
+                vec![
+                    RunField {
+                        key: "dispatch_mode".to_string(),
+                        value: "fresh".to_string(),
+                    },
+                    RunField {
+                        key: "source".to_string(),
+                        value: "peon".to_string(),
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn run_rejects_malformed_field() {
+        for raw in ["no-separator", "=empty-key"] {
+            let error = Cli::try_parse_from(["cowboy", "run", "--field", raw, "do"]).unwrap_err();
+            assert!(
+                error.to_string().contains("key=value")
+                    || error.to_string().contains("non-empty field key"),
+                "unexpected error for {raw}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_field_value_keeps_everything_after_the_first_separator() {
+        let field: RunField = "note=a=b=c".parse().unwrap();
+        assert_eq!(field.key, "note");
+        assert_eq!(field.value, "a=b=c");
+    }
+
+    #[test]
     fn run_rejects_malformed_role_session_id() {
         let error =
             Cli::try_parse_from(["cowboy", "run", "--session-id", "developer", "do"]).unwrap_err();
@@ -755,6 +841,7 @@ mod tests {
             step: false,
             workflow: None,
             session_ids: Vec::new(),
+            fields: Vec::new(),
             request: vec!["do work".to_string()],
         });
 
@@ -1178,7 +1265,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(suggestions.contains(
-            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+            &"/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>"
                 .to_string()
         ));
         assert!(suggestions.contains(&"/runs [partial-run-id]".to_string()));
@@ -1214,7 +1301,7 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.name == "/run"
                 && row.usage
-                    == "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... <request>"
+                    == "/run [--step] [--workflow <workflow-id>] [--session-id <role=session-id>]... [--field <key=value>]... <request>"
                 && row.description == "start a workflow run"
                 && row.takes_arguments
         }));

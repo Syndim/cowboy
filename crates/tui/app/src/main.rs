@@ -59,13 +59,15 @@ async fn run_shared_command(
                 step,
                 workflow,
                 session_ids,
+                fields,
                 request,
             } = args;
             let options = cowboy_workflow_engine::RunStartOptions::with_role_session_ids(
                 session_ids
                     .into_iter()
                     .map(|session| (session.role, session.session_id)),
-            );
+            )
+            .with_fields(fields.into_iter().map(|field| (field.key, field.value)));
             let request = request.join(" ");
             let report = match (step, workflow) {
                 (true, Some(workflow_id)) => {

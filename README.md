@@ -68,6 +68,10 @@ supplied backend session, omits that role's static prompt, and sends the new
 run request; a supplied session that cannot load fails instead of being
 replaced.
 
+Trusted callers can attach bounded key/value start fields with `--field
+key=value` (repeatable or comma-separated). Fields are stored on the run and
+visible to every workflow step as `ctx.fields`.
+
 ```bash
 cowboy run --session-id developer=<session-id> add a /healthz route
 cowboy run --session-id developer=<session-id>,reviewer=<session-id> review the change
