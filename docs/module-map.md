@@ -227,6 +227,9 @@ fails or times out, Cowboy kills the recorded PID, waits for exit, restarts the
 agent with `--resume=<session-id>`, initializes ACP, and sends `"Continue"`.
 The recovery-operation timeout separately bounds termination, restart,
 initialization, and continuation dispatch.
+A recovery whose continuation produces no session output at all is a backend that
+will not resume, not a slow turn: after three consecutive such recoveries the
+turn fails instead of repeating forever.
 This ACP recovery does not consume workflow retry budgets. All values must be
 greater than zero, and Cowboy must be restarted after watchdog configuration
 changes.
