@@ -12,6 +12,21 @@ use super::transport::{Transport, TransportConfig};
 use async_trait::async_trait;
 
 const CONTINUE_PROMPT: &str = "Continue";
+/// How many watchdog soft recoveries may run without the turn making progress.
+///
+/// Soft recovery deliberately has no bound *while the backend is producing
+/// output*: a live agent answering a truncated turn must be continued rather
+/// than failed, and the cancel-grace deadline already handles a backend that
+/// stops answering at all. What was missing is the case a real backend
+/// produces: the agent acknowledges every `session/cancel` immediately and then
+/// ignores the `Continue` prompt, so each cycle costs only a watchdog window and
+/// the turn spins forever without emitting a single fragment.
+///
+/// Counting recoveries that observed **no new session output** bounds exactly
+/// that case. Any output at all - a message chunk, a tool call, a progress
+/// update - resets the count, so a genuinely slow agent that keeps talking is
+/// never interrupted, while a backend that will not resume fails the turn.
+const MAX_PROGRESSLESS_SOFT_RECOVERIES: u32 = 3;
 const DENIED_TOOL_ERROR: &str = "ACP tool use is disabled for this agent";
 
 /// Agent tool and permission boundary. The backend must enforce its own sandbox.
@@ -1438,6 +1453,12 @@ impl Client {
         let mut activity = PromptTurnActivity::Empty;
         let mut last_activity = LastObservedActivity::default();
         let mut watchdog_soft_recoveries: u32 = 0;
+        // Recoveries that observed no new output since the previous one. Reset by
+        // any session update, so it measures "the backend is not resuming" rather
+        // than "the backend is slow".
+        let mut progressless_soft_recoveries: u32 = 0;
+        // Whether any session output has arrived since the last soft recovery.
+        let mut output_since_recovery = false;
         let mut external_cancellation_sent = false;
         let mut deferred_updates_after_external_cancellation = 0usize;
         let mut replacement_continuation_active = false;
@@ -1647,6 +1668,10 @@ impl Client {
                             Message::SessionUpdate { update, .. } => {
                                 activity.observe_event(&update);
                                 last_activity.observe_event(&update);
+                                // Output inside the grace window is progress too:
+                                // the backend is still talking, so this recovery is
+                                // not a backend that refused to resume.
+                                output_since_recovery = true;
                                 event_handler(update);
                             }
                             Message::PermissionRequest {
@@ -1695,7 +1720,40 @@ impl Client {
                                 if external_cancellation_sent {
                                     break 'monitor StopReason::Cancelled;
                                 }
+                                // A recovery that saw no new output at all is the
+                                // backend refusing to resume, not a slow turn. Fail
+                                // rather than continue an agent that answers every
+                                // cancel and ignores every continuation, which
+                                // otherwise spins on the watchdog window forever.
+                                if !output_since_recovery {
+                                    progressless_soft_recoveries += 1;
+                                } else {
+                                    progressless_soft_recoveries = 0;
+                                }
+                                if progressless_soft_recoveries > MAX_PROGRESSLESS_SOFT_RECOVERIES {
+                                    tracing::error!(
+                                        event = "agent_watchdog_resume_failed",
+                                        session_id,
+                                        id,
+                                        soft_recoveries = watchdog_soft_recoveries,
+                                        progressless = progressless_soft_recoveries,
+                                        timeout_seconds = self.watchdog.response_timeout_seconds,
+                                        "Agent acknowledged the cancel but produced no output \
+                                         after repeated continuations"
+                                    );
+                                    self.invalidate_session_after_failed_recovery(
+                                        session_id,
+                                        "agent acknowledged the cancel but stopped producing output",
+                                    )
+                                    .await;
+                                    anyhow::bail!(
+                                        "agent acknowledged {progressless_soft_recoveries} watchdog \
+                                         cancellations without producing any output; the turn \
+                                         cannot be resumed"
+                                    );
+                                }
                                 watchdog_soft_recoveries += 1;
+                                output_since_recovery = false;
                                 tracing::warn!(
                                     event = "agent_watchdog_soft_recovered",
                                     session_id,
@@ -1743,6 +1801,7 @@ impl Client {
                 Message::SessionUpdate { update, .. } => {
                     activity.observe_event(&update);
                     last_activity.observe_event(&update);
+                    output_since_recovery = true;
                     event_handler(update);
                 }
                 Message::PermissionRequest {
@@ -7677,6 +7736,137 @@ sent no continuation after cancelling and returned {result:?} with the truncated
         assert!(matches!(result.unwrap(), StopReason::EndTurn));
         assert_eq!(client.replacement_factory_calls(), 0);
         assert!(outgoing_rx.try_recv().is_err());
+    }
+
+    /// A backend that acknowledges every cancel and ignores every continuation
+    /// must fail the turn instead of spinning on the watchdog window forever.
+    ///
+    /// This is the real `omp` behavior observed against peon2: it answers
+    /// `session/cancel` immediately with `end_turn` and then never responds to
+    /// the `Continue` prompt, so the turn produced no output and never ended. The
+    /// soft-recovery ladder is unbounded by design for a *slow* backend, so the
+    /// bound has to key on the absence of output, which is what this drives.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_fails_a_turn_that_never_resumes_after_cancellation() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        // Every cycle: one cancel, one acknowledgement, one continuation, and no
+        // output at all. The turn must give up rather than repeat forever, so the
+        // loop runs until the client stops sending continuations.
+        let mut cycles = 0u64;
+        loop {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let Some(message) = tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv())
+                .await
+                .expect("client settles within the watchdog window")
+            else {
+                break;
+            };
+            let cancel: Value = serde_json::from_str(&message).unwrap();
+            // The cancel arrives first; its acknowledgement is answered by a
+            // continuation until the cap is reached, and the cycle after that
+            // fails the turn instead.
+            if cancel["method"] != "session/cancel" {
+                break;
+            }
+            incoming_tx
+                .send(prompt_response(1 + cycles, "end_turn"))
+                .unwrap();
+            match tokio::time::timeout(Duration::from_secs(1), outgoing_rx.recv()).await {
+                Ok(Some(continuation)) => {
+                    let continuation: Value = serde_json::from_str(&continuation).unwrap();
+                    assert_eq!(
+                        continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT,
+                        "cycle {cycles}"
+                    );
+                }
+                _ => break,
+            }
+            cycles += 1;
+            assert!(
+                cycles <= MAX_PROGRESSLESS_SOFT_RECOVERIES as u64 + 2,
+                "the turn must stop after a bounded number of progressless recoveries"
+            );
+        }
+
+        let (_client, result) = prompt.await.unwrap();
+        let error = result.expect_err("a backend that never resumes must end the turn");
+        assert!(
+            error.to_string().contains("without producing any output"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The bound must not fire while the backend is still producing output.
+    ///
+    /// A slow agent that keeps talking is exactly what soft recovery exists to
+    /// preserve: output resets the count, so many recoveries in a row are fine as
+    /// long as the backend is making progress between them.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_keeps_recovering_a_slow_backend_that_produces_output() {
+        let (mut client, incoming_tx, mut outgoing_rx) = controlled_watchdog_client().await;
+        let prompt = tokio::spawn(async move {
+            let result = client
+                .prompt(
+                    "sess_1",
+                    vec![PromptContent::text("work")],
+                    PromptTurnCancellation::disabled(),
+                    &mut |_| {},
+                )
+                .await;
+            (client, result)
+        });
+        let _initial = next_outgoing(&mut outgoing_rx).await;
+
+        // Each cycle: a chunk inside the grace window (so the turn made progress
+        // and the count resets), then the acknowledgement, then the continuation.
+        for cycle in 0..=(MAX_PROGRESSLESS_SOFT_RECOVERIES as u64 * 2) {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let cancel = next_outgoing(&mut outgoing_rx).await;
+            assert_eq!(cancel["method"], "session/cancel", "cycle {cycle}");
+            incoming_tx
+                .send(text_chunk_update("sess_1", "still working"))
+                .unwrap();
+            incoming_tx
+                .send(prompt_response(1 + cycle, "end_turn"))
+                .unwrap();
+            let continuation = next_outgoing(&mut outgoing_rx).await;
+            assert_eq!(
+                continuation["params"]["prompt"][0]["text"], CONTINUE_PROMPT,
+                "cycle {cycle}"
+            );
+        }
+
+        // The final continuation completes normally: output plus a terminal
+        // response for the continuation request the client is waiting on.
+        incoming_tx
+            .send(text_chunk_update("sess_1", "done"))
+            .unwrap();
+        incoming_tx
+            .send(prompt_response(
+                2 + MAX_PROGRESSLESS_SOFT_RECOVERIES as u64 * 2,
+                "end_turn",
+            ))
+            .unwrap();
+
+        let (client, result) = prompt.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "a backend that keeps producing output must not be failed: {result:?}"
+        );
+        assert_eq!(client.replacement_factory_calls(), 0);
     }
 
     #[test]
