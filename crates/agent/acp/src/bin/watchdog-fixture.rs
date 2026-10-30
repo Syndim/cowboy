@@ -2050,9 +2050,11 @@ impl EventWriter {
 fn write_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
     let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
     fs::create_dir_all(parent)?;
-    let mut file = File::create(path)?;
+    // Keep incomplete identities out of cleanup's .json discovery until publication.
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
     serde_json::to_writer_pretty(&mut file, value)?;
     file.write_all(b"\n")?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -2067,6 +2069,35 @@ fn read_events(path: &Path) -> anyhow::Result<Vec<FixtureEvent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watchdog_fixture_identity_is_discoverable_only_after_serialization() {
+        struct ObservedIdentity<'a>(&'a Path);
+
+        impl Serialize for ObservedIdentity<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                use serde::ser::SerializeMap;
+
+                let mut fields = serializer.serialize_map(Some(1))?;
+                fields.serialize_entry("pid", &42)?;
+                assert!(find_identity_files(self.0).unwrap().is_empty());
+                fields.end()
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = marked_workspace(directory.path(), "publication");
+        let path = workspace.join("identities/42.json");
+
+        write_json(&path, &ObservedIdentity(&workspace)).unwrap();
+
+        assert_eq!(find_identity_files(&workspace).unwrap(), vec![path.clone()]);
+        let published: Value = serde_json::from_reader(File::open(path).unwrap()).unwrap();
+        assert_eq!(published, json!({ "pid": 42 }));
+    }
 
     #[test]
     fn watchdog_fixture_parses_resume_forms() {

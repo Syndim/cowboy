@@ -207,7 +207,7 @@ ACP backend implementation.
 | `agent_processes.rs` | Process-wide registry of live agent process trees, exposed as `terminate_all_agent_processes(timeout)` for bounded shutdown. |
 | `transport/` | stdio and Zellij line transports, including recorded-PID force termination before replacement startup with `--resume=<session-id>`. `StdioTransport` owns a `ProcessTreeScope` and terminates the whole tree on `force_terminate`/`close`/drop, so the agent's stdio pipes are actually released. |
 | `bin/acp-chat.rs` | Test app for chatting with an ACP agent. |
-| `bin/watchdog-fixture.rs` | Deterministic soft/hard watchdog smoke fixture and authenticated cleanup verifier. |
+| `bin/watchdog-fixture.rs` | Deterministic soft/hard watchdog smoke fixture and authenticated cleanup verifier. Publishes complete identity JSON atomically so cleanup never reads an in-progress record. |
 
 <!-- cowboy-agent-watchdog-contract:start -->
 ```toml
