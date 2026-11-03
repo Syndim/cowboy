@@ -959,8 +959,14 @@ fn identity_server(listener: TcpListener, identity: Identity, shutdown: Arc<Atom
 }
 
 fn authenticate_stream(mut stream: TcpStream, identity: &Identity, shutdown: &AtomicBool) -> bool {
+    if stream.set_nonblocking(false).is_err()
+        || stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .is_err()
+    {
+        return false;
+    }
     let mut line = String::new();
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let read = BufReader::new(&mut stream).read_line(&mut line);
     let challenge = read
         .ok()
@@ -2498,22 +2504,29 @@ mod tests {
     }
 
     fn cleanup_and_wait_for_child(workspace: &Path, child: &mut std::process::Child) {
-        match cleanup(workspace) {
-            Ok(()) => {
-                assert!(child.wait().unwrap().success());
-            }
-            Err(error) => {
-                #[cfg(target_os = "macos")]
-                {
-                    assert!(error.to_string().contains("did not exit"));
-                    assert!(child.wait().unwrap().success());
-                    cleanup(workspace).unwrap();
+        thread::scope(|scope| {
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+            let reaper = scope.spawn(move || {
+                loop {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        return status;
+                    }
+                    if stop_rx.recv_timeout(Duration::from_millis(10))
+                        != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    {
+                        let _ = child.kill();
+                        return child.wait().unwrap();
+                    }
                 }
-
-                #[cfg(not(target_os = "macos"))]
-                panic!("cleanup failed: {error:#}");
+            });
+            let result = cleanup(workspace);
+            if result.is_err() {
+                let _ = stop_tx.send(());
             }
-        }
+            let status = reaper.join().unwrap();
+            result.unwrap();
+            assert!(status.success());
+        });
     }
 
     #[test]
@@ -2689,7 +2702,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = Arc::clone(&shutdown);
-        thread::spawn(move || identity_server(listener, identity, server_shutdown));
+        let server = thread::spawn(move || identity_server(listener, identity, server_shutdown));
         let mut stream = TcpStream::connect(address).unwrap();
         write_json_line(&mut stream, &json!({
             "invocation_token": "token", "start_nonce": "wrong", "pid": 1, "executable": "/fixture", "action": "shutdown"
@@ -2701,6 +2714,58 @@ mod tests {
             false
         );
         assert!(!shutdown.load(Ordering::SeqCst));
+        let mut stream = TcpStream::connect(address).unwrap();
+        write_json_line(
+            &mut stream,
+            &json!({
+                "invocation_token": "token", "start_nonce": "nonce", "pid": 1, "executable": "/fixture", "action": "shutdown"
+            }),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(shutdown.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn watchdog_fixture_identity_challenge_waits_for_request_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let identity = Identity {
+            endpoint: listener.local_addr().unwrap().to_string(),
+            invocation_token: "token".into(),
+            start_nonce: "nonce".into(),
+            pid: 1,
+            executable: "/fixture".into(),
+        };
+        let shutdown = AtomicBool::new(false);
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let sender = thread::spawn(move || {
+            if finished_rx.recv_timeout(Duration::from_millis(50))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                write_json_line(
+                    &mut client,
+                    &json!({
+                        "invocation_token": "token", "start_nonce": "nonce", "pid": 1, "executable": "/fixture", "action": "shutdown"
+                    }),
+                )
+                .unwrap();
+                let mut response = String::new();
+                BufReader::new(client).read_line(&mut response).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Value>(&response).unwrap()["ok"],
+                    true
+                );
+            }
+        });
+
+        let matched = authenticate_stream(stream, &identity, &shutdown);
+        let _ = finished_tx.send(());
+        sender.join().unwrap();
+        assert!(matched);
+        assert!(shutdown.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2716,7 +2781,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server_shutdown = Arc::clone(&shutdown);
-        thread::spawn(move || identity_server(listener, identity, server_shutdown));
+        let server = thread::spawn(move || identity_server(listener, identity, server_shutdown));
         let mut stream = TcpStream::connect(address).unwrap();
         write_json_line(
             &mut stream,
@@ -2731,12 +2796,7 @@ mod tests {
             serde_json::from_str::<Value>(&response).unwrap()["ok"],
             true
         );
-        for _ in 0..40 {
-            if shutdown.load(Ordering::SeqCst) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        panic!("matched identity challenge did not request shutdown");
+        server.join().unwrap();
+        assert!(shutdown.load(Ordering::SeqCst));
     }
 }

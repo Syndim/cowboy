@@ -930,11 +930,14 @@ mod tests {
     async fn command_runner_retains_timeout_diagnostics() {
         let _guard = command_test_lock().await;
         let dir = tempfile::tempdir().unwrap();
-        let program = helper_program(dir.path(), "inherited_pipe");
-        let mut args = helper_args();
-        args.push(dir.path().join("survived").to_string_lossy().into_owned());
         let runner = CommandActionRunner::new(dir.path(), Vec::new());
-        let mut command = action(program, args);
+        let mut command = action(
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".to_string(),
+                "printf '%s\\n' 'parent diagnostic' >&2; exec /bin/sleep 5".to_string(),
+            ],
+        );
         command.timeout_ms = Some(200);
         command.status_map.insert("_".into(), "success".into());
         let output = command_output(runner.run(command, context()).await.unwrap());
@@ -947,6 +950,7 @@ mod tests {
                 .unwrap()
                 .contains("parent diagnostic")
         );
+        assert!(output.body.contains("parent diagnostic"));
         assert_eq!(output.fields["stderr_incomplete"], true);
         assert_eq!(output.fields["stdout_incomplete"], true);
     }
