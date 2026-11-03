@@ -157,7 +157,7 @@ mod tests {
     use cowboy_workflow_core::{
         ActionDispatcher, AgentAction, Choice, CommandAction, ExecutionContext, FailAction, Fields,
         ResumeCallback, ResumeCallbackHandler, ResumeInput, RunStatus, StatusAction, StepDetail,
-        StepInput, StepOutput, StepRecord, WaitForInputAction, WorkflowAction,
+        StepInput, StepOutput, StepRecord, WaitForInputAction, WorkflowAction, WorkflowCall,
     };
     use serde_json::{Value, json};
 
@@ -451,8 +451,18 @@ mod tests {
                 Vec::new(),
             );
             let action = WorkflowAction {
-                workflow: "child".to_string(),
-                request: "exact request".to_string(),
+                workflows: vec![
+                    WorkflowCall {
+                        id: "first".to_string(),
+                        workflow: "child".to_string(),
+                        request: "  exact\nrequest  ".to_string(),
+                    },
+                    WorkflowCall {
+                        id: "second".to_string(),
+                        workflow: "other-child".to_string(),
+                        request: String::new(),
+                    },
+                ],
             };
             let execution = context();
             let actual = dispatcher
@@ -462,6 +472,108 @@ mod tests {
             assert_eq!(actual, expected);
             assert_eq!(calls.lock().unwrap().as_slice(), &[(action, execution)]);
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_runner_accepts_more_than_128_branches() {
+        let expected = ActionResult::blocked(RunStatus::Failed {
+            reason: "child failure".to_string(),
+        });
+        let workflow = FakeWorkflow {
+            result: Arc::new(std::sync::Mutex::new(Some(expected.clone()))),
+            ..Default::default()
+        };
+        let runner = WorkflowActionRunner::new(workflow.clone());
+        let action = WorkflowAction {
+            workflows: (0..256)
+                .map(|index| WorkflowCall {
+                    id: format!("branch-{index}"),
+                    workflow: "child".to_string(),
+                    request: "  exact\nrequest  ".to_string(),
+                })
+                .collect(),
+        };
+        let execution = context();
+        assert_eq!(
+            runner.run(action.clone(), execution.clone()).await.unwrap(),
+            expected
+        );
+        assert_eq!(
+            workflow.calls.lock().unwrap().as_slice(),
+            &[(action, execution)]
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_runner_rejects_invalid_programmatic_actions_before_delegation() {
+        let workflow = FakeWorkflow::default();
+        let calls = workflow.calls.clone();
+        let runner = WorkflowActionRunner::new(workflow.clone());
+        let dispatcher = EngineActionDispatcher::with_workflow_handler(
+            FakeAgent,
+            workflow,
+            std::env::current_dir().unwrap(),
+            Vec::new(),
+        );
+        let valid = WorkflowAction {
+            workflows: vec![WorkflowCall {
+                id: "first".to_string(),
+                workflow: "child".to_string(),
+                request: String::new(),
+            }],
+        };
+        let mut cases = Vec::new();
+        let mut action = valid.clone();
+        action.workflows.clear();
+        cases.push(action);
+        for blank in ["", " \n\t"] {
+            let mut action = valid.clone();
+            action.workflows[0].id = blank.to_string();
+            cases.push(action);
+            let mut action = valid.clone();
+            action.workflows[0].workflow = blank.to_string();
+            cases.push(action);
+        }
+        let mut action = valid.clone();
+        action.workflows.push(valid.workflows[0].clone());
+        cases.push(action);
+        for action in cases {
+            let expected = action.validate().unwrap_err();
+            assert_eq!(
+                runner.run(action.clone(), context()).await.unwrap_err(),
+                expected
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(StepAction::Workflow(action), context())
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+            assert!(calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_without_workflow_handler_rejects_valid_workflow_action() {
+        let dispatcher =
+            EngineActionDispatcher::new(FakeAgent, std::env::current_dir().unwrap(), Vec::new());
+        let err = dispatcher
+            .dispatch(
+                StepAction::Workflow(WorkflowAction {
+                    workflows: vec![WorkflowCall {
+                        id: "first".to_string(),
+                        workflow: "child".to_string(),
+                        request: "exact request".to_string(),
+                    }],
+                }),
+                context(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::InvalidAction(message) if message.contains("not configured"))
+        );
     }
 
     #[derive(Debug, Clone)]

@@ -113,6 +113,7 @@ async fn ensure_standalone_run(
                 restart_source_run_id: None,
                 status: RunStatus::Running,
                 step: StepState {
+                    pending_workflow: None,
                     next: config.step_id.clone(),
                     head: None,
                     executed: 0,

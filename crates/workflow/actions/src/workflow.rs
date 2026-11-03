@@ -47,6 +47,7 @@ where
         action: WorkflowAction,
         context: ExecutionContext,
     ) -> Result<ActionResult> {
+        action.validate()?;
         self.handler.run_workflow(action, context).await
     }
 }

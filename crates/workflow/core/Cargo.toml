@@ -13,6 +13,7 @@ chrono = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
+uuid = { workspace = true, features = ["v5"] }
 
 [dev-dependencies]
 parking_lot.workspace = true

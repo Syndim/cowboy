@@ -36,6 +36,8 @@ pub enum WorkflowError {
     UnknownRuntimeTransition { step: StepId, status: Status },
     #[error("invalid action: {0}")]
     InvalidAction(String),
+    #[error("invalid action: {0}")]
+    RetryExhausted(String),
     #[error("recoverable action failure: {0}")]
     RecoverableAction(String),
 }
@@ -55,9 +57,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_exhausted_preserves_invalid_action_display() {
+        let reason = "budget exhausted".to_string();
+        assert_eq!(
+            WorkflowError::RetryExhausted(reason.clone()).to_string(),
+            WorkflowError::InvalidAction(reason).to_string()
+        );
+    }
+
+    #[test]
     fn only_recoverable_action_is_recoverable() {
         assert!(WorkflowError::RecoverableAction("nudge me".to_string()).recoverable());
         assert!(!WorkflowError::InvalidAction("bad".to_string()).recoverable());
+        assert!(!WorkflowError::RetryExhausted("budget exhausted".to_string()).recoverable());
         assert!(
             !WorkflowError::UnknownStep {
                 step: "plan".to_string()

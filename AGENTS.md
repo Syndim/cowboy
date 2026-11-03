@@ -204,7 +204,7 @@ Owns:
 
 Important modules:
 
-- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default name resolution, live per-operation limit resolution (`resolve_limits`), start/resume/step/provide-input/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
+- `runtime.rs` — `WorkflowRuntime`, runtime config sets, pre-persistence explicit/default name resolution, durable workflow branches that all execute concurrently without a per-action throttle or branch-count ceiling, plus namespaced child-input routing, live per-operation limit resolution (`resolve_limits`), start/resume/step/provide-input/improve/resolve/list operations, catalog/store/Lua/action/agent wiring, and event-log persistence.
 - `runner.rs` — `WorkflowRunner<S, D, P>` over `cowboy-workflow-core::execute_step`; owns event emission and cumulative run/per-step retry enforcement, reserves retry counters before dispatch, and persists `Failed` on give-up; `LuaStepActionProvider` builds Lua `ctx`.
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `ResumeRouter` for `RunStatus::WaitingForInput` answers and persisted resume callbacks.
@@ -218,8 +218,8 @@ Owns:
 
 - `EngineActionDispatcher`
 - `ResumeCallbackRegistry`
-- action runners for `agent`, `command`, `status`, `wait_for_input`, `workflow`, and `fail`
-- `wait_for_input` resume callback payloads and callback-to-`StepRecord` handling
+- action runners for `agent`, `command`, `status`, `wait_for_input`, plural-branch `workflow`, and `fail`
+- `wait_for_input` and workflow-child resume callback payloads and callback-to-`StepRecord` handling
 
 Important modules:
 
@@ -406,6 +406,7 @@ WorkflowRun.current_step
        command  -> CommandActionRunner -> tokio::process::Command -> StepRecord
        status   -> StatusActionRunner -> StepRecord
        wait_for_input -> WaitForInputActionRunner -> RunStatus::WaitingForInput + ResumeCallback
+       workflow -> WorkflowActionRunner -> concurrently executing child runs -> one aggregate StepRecord (or WaitingForInput)
        fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed stores a StepRecord and routes by output.status
   -> ActionResult::Blocked stores the run status

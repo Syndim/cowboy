@@ -109,6 +109,8 @@ pub struct StepState {
     /// Recoverable retry dispatches reserved for each step id across all visits.
     #[serde(default)]
     pub retries_used: BTreeMap<StepId, u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_workflow: Option<crate::WorkflowAction>,
 }
 
 /// Durable identity linking a child run to one parent workflow-step invocation.
@@ -708,6 +710,12 @@ mod tests {
         assert_eq!(run.restart_source_run_id, None);
         assert_eq!(run.retries_used, 0);
         assert!(run.step.retries_used.is_empty());
+        assert!(run.step.pending_workflow.is_none());
+        assert!(
+            serde_json::to_value(&run).unwrap()["step"]
+                .get("pending_workflow")
+                .is_none()
+        );
         assert!(run.fields.is_empty());
     }
 

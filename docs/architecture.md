@@ -112,7 +112,7 @@ current `Run`
       command  -> CommandActionRunner -> tokio::process::Command -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
       wait_for_input -> WaitForInputActionRunner -> WaitingForInput with ResumeCallback descriptor
-      workflow -> WorkflowActionRunner -> WorkflowRuntime child run -> completed StepRecord (or mirrored WaitingForInput)
+      workflow -> WorkflowActionRunner -> concurrently executing child runs -> one aggregate StepRecord (or mirrored WaitingForInput)
       fail     -> FailActionRunner -> RunStatus::Failed
   -> ActionResult::Completed -> one transaction stores the record and advances run/head
   -> ActionResult::Blocked   -> one transaction persists the run and derived head
@@ -272,27 +272,33 @@ No Lua coroutine or host-call replay cache is persisted.
 
 ### Nested workflow calls
 
-`StepAction::Workflow` lets a step invoke another catalog workflow (by the id
-shown by `/workflows`) as a durable child `Run`. The engine reuses one
-internal execution helper for both top-level starts and children, so a child
-independently compiles/snapshots its source, resolves its own config set,
-acquires its own run lock, and runs through the same `WorkflowRunner` and event
-bus. The child run id is a stable UUID-v5 of `(parent run id, calling step id,
-parent previous head)`, making creation idempotent across retries, resume, and
-process interruption; durable child lineage records the parent run/step/previous
-head and invocation id. Direct and indirect workflow-call cycles are rejected by
-walking that lineage before any child lock is acquired.
+`StepAction::Workflow` invokes a non-empty dense `workflows` list of catalog
+workflows, each with a unique non-blank branch id, workflow id, and request.
+The legacy top-level `workflow` and `request` properties are rejected. All
+declared children run concurrently; there is no per-action `concurrency` option,
+throttle, or branch-count ceiling. The engine uses its top-level execution
+helper for every child, so each branch independently compiles/snapshots source,
+resolves its config set, acquires its run lock, and runs through the same runner
+and event bus. The durable branch manifest is stored before side effects;
+deterministic child ids include the branch id, making retries, resume,
+interruption, snapshot/restart, and lineage reuse independent per branch. Cycle
+detection walks lineage before a child lock is acquired.
 
-On a terminal child, the parent workflow step record copies the child terminal
-`StepOutput` unchanged (recording the workflow id, request, and child run id in
-`StepInput.context`, with `StepDetail.backend = "workflow"` and
-`session_id = <child run id>`), so the parent routes directly on the child's
-status. A failed child maps to a `"failed"` output, a cancelled child to
-`"cancelled"`. When a child waits for input, the parent mirrors the child prompt
-through its own `WaitingForInput` with a durable workflow-child resume callback;
-providing the parent inputs and continues the child through the shared executor.
-Parent and child keep isolated per-run event logs, and the active parent emits
-`child workflow <id> started/waiting for input/resumed/finished` progress.
+All branches reach a terminal state or input wait before the action completes.
+When multiple branches wait, the parent exposes one namespaced input id at a
+time in declaration order; callers must use that advertised id, which forwards
+to the matching child. No sibling is detached. The action creates exactly one
+aggregate parent record with `fields.results.<branch-id> = { child_run_id,
+state, output = { status, fields, body, raw } }`. Terminal child outputs are
+preserved in full; failed-child output is normalized with its reason. Aggregate
+status is `"completed"` when all child lifecycle states are `Completed`,
+regardless of domain statuses; otherwise it is `"failed"` if any child failed,
+or `"cancelled"` if any child was cancelled. Parent transitions therefore route
+on lifecycle status and subsequent Lua evaluates domain outcomes in `results`.
+
+Parent and children have separate event logs; parent lifecycle progress includes
+branch identity and started/waiting/resumed/finished state. Branches share the
+runtime cwd rather than isolated workspaces, so simultaneous edits can conflict.
 
 Terminal restart is a new-run operation, not resume. `WorkflowRuntime::restart_run`
 locks and revalidates a `Completed` or `Failed` source, compiles its stored

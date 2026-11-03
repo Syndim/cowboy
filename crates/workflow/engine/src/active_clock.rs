@@ -179,6 +179,7 @@ mod tests {
             status: RunStatus::Running,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
+                pending_workflow: None,
                 next: "start".to_string(),
                 head: None,
                 executed: 0,

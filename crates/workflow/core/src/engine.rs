@@ -50,8 +50,10 @@ where
     D: ActionDispatcher,
     P: StepActionProvider,
 {
-    enforce_budget(run, limits)?;
-    increment_budget(run);
+    if run.step.pending_workflow.is_none() {
+        enforce_budget(run, limits)?;
+        increment_budget(run);
+    }
     dispatch_current_step(store, dispatcher, provider, definition, run, 1, None).await
 }
 
@@ -113,8 +115,21 @@ where
         None => None,
     };
     let user_prompts = store.load_user_prompts(&run.id).await?;
-    let action =
-        provider.step_action(definition, run, step, prev_record.as_ref(), &user_prompts)?;
+    let action = match &run.step.pending_workflow {
+        Some(action) => StepAction::Workflow(action.clone()),
+        None => provider.step_action(definition, run, step, prev_record.as_ref(), &user_prompts)?,
+    };
+    if let StepAction::Workflow(action) = &action {
+        action.validate()?;
+        if run.step.pending_workflow.is_none() {
+            run.step.pending_workflow = Some(action.clone());
+            run.updated_at = Utc::now();
+            if let Err(err) = store.save_run(run).await {
+                run.step.pending_workflow = None;
+                return Err(err);
+            }
+        }
+    }
     let role = match &action {
         StepAction::Agent(action) => Some(
             definition
@@ -183,6 +198,9 @@ pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
         .as_ref()
         .ok_or_else(|| WorkflowError::InvalidAction("step record missing output".to_string()))?;
     let next = next_step(definition, &record.step, &output.status)?.cloned();
+    let previous_step = run.step.next.clone();
+    let previous_status = run.status.clone();
+    let previous_updated_at = run.updated_at;
     run.updated_at = Utc::now();
 
     let status = if let Some(next) = next {
@@ -192,7 +210,17 @@ pub async fn apply_step_record<S: WorkflowStateStore + ?Sized>(
         RunStatus::Completed
     };
     run.status = status.clone();
-    let hash = store.commit_completed_step(run, &record).await?;
+    let pending_workflow = run.step.pending_workflow.take();
+    let hash = match store.commit_completed_step(run, &record).await {
+        Ok(hash) => hash,
+        Err(err) => {
+            run.step.next = previous_step;
+            run.status = previous_status;
+            run.updated_at = previous_updated_at;
+            run.step.pending_workflow = pending_workflow;
+            return Err(err);
+        }
+    };
     run.step.head = Some(hash);
     Ok(status)
 }
@@ -410,8 +438,7 @@ mod tests {
                     input: StepInput {
                         prompt: None,
                         context: serde_json::json!({
-                            "workflow": action.workflow,
-                            "request": action.request,
+                            "workflows": action.workflows,
                         }),
                     },
                     output: Some(StepOutput {
@@ -444,11 +471,16 @@ mod tests {
         sessions: Mutex<HashMap<(String, String), crate::RoleSession>>,
         objects: Mutex<HashMap<String, Vec<u8>>>,
         prompts: Mutex<HashMap<String, Vec<crate::FollowUpPrompt>>>,
+        fail_commit: Mutex<bool>,
+        fail_save: Mutex<bool>,
     }
 
     #[async_trait]
     impl WorkflowStateStore for MemoryStore {
         async fn save_run(&self, run: &Run) -> Result<()> {
+            if *self.fail_save.lock() {
+                return Err(WorkflowError::InvalidAction("save failed".to_string()));
+            }
             self.runs.lock().insert(run.id.clone(), run.clone());
             self.heads
                 .lock()
@@ -481,6 +513,9 @@ mod tests {
             run: &Run,
             record: &StepRecord,
         ) -> Result<crate::ObjectHash> {
+            if *self.fail_commit.lock() {
+                return Err(WorkflowError::InvalidAction("commit failed".to_string()));
+            }
             let bytes = serde_json::to_vec(record).unwrap();
             let hash = format!("hash-{}", self.objects.lock().len() + 1);
             self.objects.lock().insert(hash.clone(), bytes);
@@ -709,6 +744,7 @@ mod tests {
             request_topic: None,
             status: RunStatus::Running,
             step: StepState {
+                pending_workflow: None,
                 next: "start".to_string(),
                 head: None,
                 executed: 0,
@@ -723,6 +759,190 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    struct InterruptedWorkflowDispatcher<'a> {
+        store: &'a MemoryStore,
+    }
+
+    #[async_trait]
+    impl ActionDispatcher for InterruptedWorkflowDispatcher<'_> {
+        async fn dispatch(
+            &self,
+            action: StepAction,
+            context: crate::ExecutionContext,
+        ) -> Result<ActionResult> {
+            let StepAction::Workflow(action) = action else {
+                panic!("expected workflow action");
+            };
+            let saved = self.store.load_run(&context.run_id).await?;
+            assert_eq!(saved.step.pending_workflow.as_ref(), Some(&action));
+            assert_eq!(saved.step.executed, 1);
+            Err(WorkflowError::InvalidAction("interrupted".to_string()))
+        }
+    }
+
+    fn workflow_action() -> crate::WorkflowAction {
+        crate::WorkflowAction {
+            workflows: vec![crate::WorkflowCall {
+                id: "review".to_string(),
+                workflow: "review/security".to_string(),
+                request: "original child request".to_string(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_is_durable_before_dispatch_and_reused_on_recovery() {
+        let store = MemoryStore::default();
+        let action = workflow_action();
+        let provider = StaticProvider::new(vec![StepAction::Workflow(action.clone())]);
+        let mut interrupted = run();
+        let error = execute_step(
+            &store,
+            &InterruptedWorkflowDispatcher { store: &store },
+            &provider,
+            &definition(),
+            &mut interrupted,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        let mut recovered = store.load_run(&interrupted.id).await.unwrap();
+        assert_eq!(recovered.step.pending_workflow.as_ref(), Some(&action));
+        let executor = NoopDispatcher::default();
+        let empty_provider = StaticProvider::new(Vec::new());
+        let limits = RunnerLimits {
+            max_steps_per_run: 1,
+            max_visits_per_step: 1,
+            ..RunnerLimits::default()
+        };
+        execute_step(
+            &store,
+            &executor,
+            &empty_provider,
+            &definition(),
+            &mut recovered,
+            &limits,
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.step.executed, 1);
+        assert_eq!(recovered.step.visits["start"], 1);
+        assert!(recovered.step.pending_workflow.is_none());
+        assert!(
+            store
+                .load_run(&recovered.id)
+                .await
+                .unwrap()
+                .step
+                .pending_workflow
+                .is_none()
+        );
+        let record = store
+            .load_step_record(recovered.step.head.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            record.input.context,
+            serde_json::json!({ "workflows": action.workflows })
+        );
+        assert!(empty_provider.seen_prompts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn workflow_manifest_save_failure_prevents_child_dispatch() {
+        let store = MemoryStore::default();
+        *store.fail_save.lock() = true;
+        let executor = NoopDispatcher::default();
+        let provider = StaticProvider::new(vec![StepAction::Workflow(workflow_action())]);
+        let mut run = run();
+        let error = execute_step(
+            &store,
+            &executor,
+            &provider,
+            &definition(),
+            &mut run,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("save failed"));
+        assert!(executor.dispatched.lock().is_empty());
+        assert!(run.step.pending_workflow.is_none());
+        assert!(store.runs.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_workflow_commit_keeps_manifest_and_cursor_for_recovery() {
+        let store = MemoryStore::default();
+        *store.fail_commit.lock() = true;
+        let executor = NoopDispatcher::default();
+        let provider = StaticProvider::new(Vec::new());
+        let mut run = run();
+        run.step.pending_workflow = Some(workflow_action());
+        run.step.executed = 1;
+        run.step.visits.insert("start".to_string(), 1);
+        let before = run.clone();
+        let mut definition = definition();
+        definition
+            .steps
+            .get_mut("start")
+            .unwrap()
+            .transitions
+            .insert("success", "next");
+        let error = execute_step(
+            &store,
+            &executor,
+            &provider,
+            &definition,
+            &mut run,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("commit failed"));
+        assert_eq!(run, before);
+        *store.fail_commit.lock() = false;
+        execute_step(
+            &store,
+            &executor,
+            &provider,
+            &definition,
+            &mut run,
+            &RunnerLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(run.step.next, "next");
+        assert_eq!(run.step.executed, 1);
+        assert!(run.step.pending_workflow.is_none());
+    }
+
+    #[tokio::test]
+    async fn invalid_workflow_manifest_is_not_dispatched_or_persisted() {
+        let store = MemoryStore::default();
+        let executor = NoopDispatcher::default();
+        let mut action = workflow_action();
+        action.workflows.clear();
+        let provider = StaticProvider::new(vec![StepAction::Workflow(action)]);
+        let mut run = run();
+        assert!(
+            execute_step(
+                &store,
+                &executor,
+                &provider,
+                &definition(),
+                &mut run,
+                &RunnerLimits::default(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(executor.dispatched.lock().is_empty());
+        assert!(store.runs.lock().is_empty());
+        assert!(run.step.pending_workflow.is_none());
     }
 
     #[tokio::test]
@@ -1050,6 +1270,7 @@ mod tests {
             StepAction::Fail(FailAction {
                 reason: "bad".to_string(),
             }),
+            StepAction::Workflow(workflow_action()),
             StepAction::Agent(AgentAction {
                 role: "developer".to_string(),
                 prompt: "do it".to_string(),

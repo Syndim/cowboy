@@ -287,7 +287,7 @@ where
     ) -> Option<WorkflowError> {
         let limits = self.policy.limits;
         if run.retries_used >= limits.max_retries_per_run {
-            return Some(WorkflowError::InvalidAction(format!(
+            return Some(WorkflowError::RetryExhausted(format!(
                 "config set {:?} exhausted run retry budget: {}/{} retries used; last recoverable error: {last_error}",
                 self.policy.name, run.retries_used, limits.max_retries_per_run
             )));
@@ -295,7 +295,7 @@ where
 
         let step_retries_used = run.step.retries_used.get(step_id).copied().unwrap_or(0);
         if step_retries_used >= limits.max_retries_per_step {
-            return Some(WorkflowError::InvalidAction(format!(
+            return Some(WorkflowError::RetryExhausted(format!(
                 "config set {:?} exhausted retry budget for step {step_id:?}: {step_retries_used}/{} retries used; last recoverable error: {last_error}",
                 self.policy.name, limits.max_retries_per_step
             )));
@@ -741,6 +741,7 @@ mod tests {
             status: RunStatus::Running,
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
+                pending_workflow: None,
                 next: "start".to_string(),
                 head: None,
                 executed: 0,
@@ -1235,16 +1236,27 @@ mod tests {
             .run_until_blocked(&definition(), initial_run)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("exhausted retry budget for step \"agent\"")
+        assert_eq!(
+            err,
+            WorkflowError::RetryExhausted(
+                "config set \"default\" exhausted retry budget for step \"agent\": 2/2 retries used; last recoverable error: recoverable action failure: needs frontmatter".to_string()
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid action: config set \"default\" exhausted retry budget for step \"agent\": 2/2 retries used; last recoverable error: recoverable action failure: needs frontmatter"
         );
 
         // Initial attempt + 2 retries.
         assert_eq!(*dispatches.lock(), 3);
 
         let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
-        assert!(matches!(stored.status, RunStatus::Failed { .. }));
+        assert_eq!(
+            stored.status,
+            RunStatus::Failed {
+                reason: err.to_string()
+            }
+        );
         // The failed step stays current so it can be resolved manually.
         assert_eq!(stored.step.next, "agent");
         assert_eq!(stored.retries_used, 2);
@@ -1297,7 +1309,10 @@ mod tests {
         );
 
         let result = runner.run_until_blocked(&definition(), initial_run).await;
-        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            WorkflowError::InvalidAction("fatal".to_string())
+        );
         // No retry attempted for a non-recoverable error.
         assert_eq!(*dispatches.lock(), 1);
 
@@ -1339,6 +1354,7 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert!(matches!(err, WorkflowError::RetryExhausted(_)));
         assert!(err.to_string().contains("exhausted run retry budget"));
         assert!(err.to_string().contains("0/0 retries used"));
         assert_eq!(*dispatches.lock(), 1);
@@ -1369,7 +1385,23 @@ mod tests {
             .run_until_blocked(&definition(), initial_run)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("exhausted run retry budget"));
+        assert_eq!(
+            err,
+            WorkflowError::RetryExhausted(
+                "config set \"default\" exhausted run retry budget: 1/1 retries used; last recoverable error: recoverable action failure: needs frontmatter".to_string()
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid action: config set \"default\" exhausted run retry budget: 1/1 retries used; last recoverable error: recoverable action failure: needs frontmatter"
+        );
+        let stored = runner.store().load_run(&"run-1".to_string()).await.unwrap();
+        assert_eq!(
+            stored.status,
+            RunStatus::Failed {
+                reason: err.to_string()
+            }
+        );
 
         let retrying = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event.kind {
@@ -1521,6 +1553,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, WorkflowError::RetryExhausted(_)));
         assert!(error.to_string().contains("exhausted run retry budget"));
         assert_eq!(dispatches, 1);
     }
@@ -1539,6 +1572,7 @@ mod tests {
         )
         .await;
 
+        assert!(matches!(error, WorkflowError::RetryExhausted(_)));
         assert!(
             error
                 .to_string()

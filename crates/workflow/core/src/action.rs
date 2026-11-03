@@ -1,9 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
-use crate::{RoleId, Status};
+use crate::{Result, RoleId, Status, WorkflowError};
+
+const WORKFLOW_INVOCATION_NAMESPACE: Uuid = Uuid::from_u128(0xd31e45ed_1aac_578f_9314_765ee417df28);
 
 /// Named field values exposed to later steps, e.g. as `ctx.prev.fields`.
 pub type Fields = BTreeMap<String, Value>;
@@ -214,11 +217,71 @@ fn default_wait_for_input_status() -> Status {
 
 /// Request to invoke another workflow from the catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowAction {
-    /// Catalog workflow id, matching the id shown by `/workflows`.
+    pub workflows: Vec<WorkflowCall>,
+}
+
+impl WorkflowAction {
+    pub fn validate(&self) -> Result<()> {
+        if self.workflows.is_empty() {
+            return Err(WorkflowError::InvalidAction(
+                "workflow action workflows must contain at least one entry".to_string(),
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for (index, call) in self.workflows.iter().enumerate() {
+            if call.id.trim().is_empty() {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "workflow action workflows[{}].id must be a nonblank string",
+                    index + 1
+                )));
+            }
+            if !ids.insert(&call.id) {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "workflow action workflows contains duplicate id {:?}",
+                    call.id
+                )));
+            }
+            if call.workflow.trim().is_empty() {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "workflow action workflows[{}].workflow must be a nonblank string",
+                    index + 1
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCall {
+    pub id: String,
     pub workflow: String,
-    /// Exact initial request supplied to the child workflow.
     pub request: String,
+}
+
+pub fn workflow_branch_invocation_id(
+    parent_run_id: &str,
+    step_id: &str,
+    previous_head: Option<&str>,
+    branch_id: &str,
+) -> Uuid {
+    let mut name = b"cowboy.workflow.invocation.v2\0".to_vec();
+    for component in [parent_run_id, step_id, branch_id] {
+        name.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        name.extend_from_slice(component.as_bytes());
+    }
+    match previous_head {
+        None => name.push(0),
+        Some(head) => {
+            name.push(1);
+            name.extend_from_slice(&(head.len() as u64).to_be_bytes());
+            name.extend_from_slice(head.as_bytes());
+        }
+    }
+    Uuid::new_v5(&WORKFLOW_INVOCATION_NAMESPACE, &name)
 }
 
 /// Request to fail the workflow run.
@@ -332,8 +395,11 @@ mod tests {
     #[test]
     fn workflow_action_serializes_and_names_variant() {
         let action = StepAction::Workflow(WorkflowAction {
-            workflow: "review/security".to_string(),
-            request: "  Review this\nexactly  ".to_string(),
+            workflows: vec![WorkflowCall {
+                id: "security".to_string(),
+                workflow: "review/security".to_string(),
+                request: "  Review this\nexactly  ".to_string(),
+            }],
         });
 
         let json = serde_json::to_value(&action).unwrap();
@@ -341,12 +407,209 @@ mod tests {
             json,
             serde_json::json!({
                 "action": "workflow",
-                "workflow": "review/security",
-                "request": "  Review this\nexactly  ",
+                "workflows": [{
+                    "id": "security",
+                    "workflow": "review/security",
+                    "request": "  Review this\nexactly  ",
+                }],
             })
         );
         assert_eq!(action.action_name(), "workflow");
         assert_eq!(serde_json::from_value::<StepAction>(json).unwrap(), action);
+    }
+
+    #[test]
+    fn workflow_branch_invocation_id_preserves_v2_encoding() {
+        for (parent, step, head, branch, expected) in [
+            (
+                "run-parent",
+                "delegate",
+                None,
+                "child",
+                "f7513f4c-10d2-533a-a74e-f0568809e63f",
+            ),
+            (
+                "run-parent",
+                "delegate",
+                Some("abc123"),
+                "child",
+                "891918aa-8604-51e3-a7e9-eb3a259136e5",
+            ),
+            (
+                "run-parent",
+                "delegate",
+                Some(""),
+                "child",
+                "026f26c9-fc5c-57fd-9b43-7835a05fa6a7",
+            ),
+            (
+                "親",
+                "呼出",
+                Some("前"),
+                "枝",
+                "0e7757fc-d890-5627-9611-eccc4f0b3a60",
+            ),
+        ] {
+            assert_eq!(
+                workflow_branch_invocation_id(parent, step, head, branch).to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_branch_invocation_ids_are_deterministic_and_unambiguous() {
+        let parent = "run-parent";
+        let step = "delegate";
+        let first = workflow_branch_invocation_id(parent, step, None, "child");
+        assert_eq!(
+            first,
+            workflow_branch_invocation_id(parent, step, None, "child")
+        );
+        let ids = [
+            first,
+            workflow_branch_invocation_id(parent, step, None, "sibling"),
+            workflow_branch_invocation_id("run-other", step, None, "child"),
+            workflow_branch_invocation_id(parent, "other-step", None, "child"),
+            workflow_branch_invocation_id(parent, step, Some("abc123"), "child"),
+            workflow_branch_invocation_id(parent, step, Some(""), "child"),
+            workflow_branch_invocation_id("ab", "c", None, "child"),
+            workflow_branch_invocation_id("a", "bc", None, "child"),
+            workflow_branch_invocation_id(parent, "a", Some("bc"), "d"),
+            workflow_branch_invocation_id(parent, "ab", Some("c"), "d"),
+            workflow_branch_invocation_id(parent, step, Some("a"), "bc"),
+            workflow_branch_invocation_id(parent, step, Some("ab"), "c"),
+        ];
+        assert_eq!(ids.into_iter().collect::<BTreeSet<_>>().len(), ids.len());
+    }
+
+    fn workflow_action() -> WorkflowAction {
+        WorkflowAction {
+            workflows: vec![WorkflowCall {
+                id: "security".to_string(),
+                workflow: "review/security".to_string(),
+                request: "  Review this\nexactly  ".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn workflow_action_deserializes_calls() {
+        let action: StepAction = serde_json::from_value(serde_json::json!({
+            "action": "workflow",
+            "workflows": [{
+                "id": "security",
+                "workflow": "review/security",
+                "request": "  Review this\nexactly  ",
+            }],
+        }))
+        .unwrap();
+        assert_eq!(action, StepAction::Workflow(workflow_action()));
+    }
+
+    #[test]
+    fn workflow_action_rejects_legacy_unknown_and_missing_fields() {
+        let valid = serde_json::to_value(workflow_action()).unwrap();
+        for field in ["workflow", "request", "concurrency", "concurency", "extra"] {
+            let mut action = valid.clone();
+            action[field] = serde_json::json!("unexpected");
+            let err = serde_json::from_value::<WorkflowAction>(action.clone()).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+            action["action"] = serde_json::json!("workflow");
+            assert!(serde_json::from_value::<StepAction>(action).is_err());
+        }
+        for field in ["extra", "requests", "action"] {
+            let mut action = valid.clone();
+            action["workflows"][0][field] = serde_json::json!("unexpected");
+            let err = serde_json::from_value::<WorkflowAction>(action).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{err}");
+        }
+        for field in ["id", "workflow", "request"] {
+            let mut action = valid.clone();
+            action["workflows"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let err = serde_json::from_value::<WorkflowAction>(action).unwrap_err();
+            assert!(err.to_string().contains("missing field"), "{err}");
+        }
+        for action in [
+            serde_json::json!({"workflow": "child", "request": "legacy"}),
+            serde_json::json!({"concurrency": 4}),
+        ] {
+            assert!(serde_json::from_value::<WorkflowAction>(action).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_action_rejects_concurrency_as_unknown_field() {
+        for concurrency in [serde_json::json!(4), serde_json::json!(0), Value::Null] {
+            let mut action = serde_json::to_value(workflow_action()).unwrap();
+            action["concurrency"] = concurrency;
+            let err = serde_json::from_value::<WorkflowAction>(action.clone()).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field `concurrency`"),
+                "{err}"
+            );
+            action["action"] = serde_json::json!("workflow");
+            let err = serde_json::from_value::<StepAction>(action).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field `concurrency`"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_action_accepts_large_lists_and_preserves_calls() {
+        for count in [1, 128, 129, 256] {
+            let mut action = workflow_action();
+            action.workflows = (0..count)
+                .map(|index| WorkflowCall {
+                    id: format!("branch-{index}"),
+                    workflow: " review/security ".to_string(),
+                    request: if index % 2 == 0 {
+                        "  Review this\nexactly  "
+                    } else {
+                        ""
+                    }
+                    .to_string(),
+                })
+                .collect();
+            let original = action.clone();
+            action.validate().unwrap();
+            assert_eq!(action, original);
+            let json = serde_json::to_value(&action).unwrap();
+            assert_eq!(
+                serde_json::from_value::<WorkflowAction>(json).unwrap(),
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_action_rejects_invalid_programmatic_values() {
+        let mut cases = Vec::new();
+        let mut action = workflow_action();
+        action.workflows.clear();
+        cases.push(action);
+        for blank in ["", " \t\n", "\u{2003}"] {
+            let mut action = workflow_action();
+            action.workflows[0].id = blank.to_string();
+            cases.push(action);
+            let mut action = workflow_action();
+            action.workflows[0].workflow = blank.to_string();
+            cases.push(action);
+        }
+        let mut action = workflow_action();
+        action.workflows.push(action.workflows[0].clone());
+        cases.push(action);
+        for action in cases {
+            assert!(
+                matches!(action.validate(), Err(WorkflowError::InvalidAction(_))),
+                "accepted invalid workflow action: {action:?}"
+            );
+        }
     }
 
     #[test]

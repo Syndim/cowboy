@@ -170,6 +170,7 @@ mod tests {
             },
             retries_used: 0,
             step: cowboy_workflow_core::StepState {
+                pending_workflow: None,
                 next: "approve".to_string(),
                 head: None,
                 executed: 1,

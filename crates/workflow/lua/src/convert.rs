@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use cowboy_workflow_core::{
     AgentAction, AgentTaskContract, Choice, CommandAction, FailAction, Field, FieldType, Fields,
     OutputSpec, RoleDefinition, StatusAction, StepAction, StepDefinition, StepTransitions,
-    WaitForInputAction, WorkflowAction, WorkflowDefinition, default_command_status_map,
+    WaitForInputAction, WorkflowAction, WorkflowCall, WorkflowDefinition,
+    default_command_status_map,
 };
 use mlua::{Lua, Table, Value};
 use serde_json::{Map, Number};
@@ -154,14 +155,102 @@ pub fn action_from_value(value: Value) -> Result<StepAction> {
             status: optional_string(&table, "status")?.unwrap_or_else(|| "provided".to_string()),
             fields: action_fields(table.get::<Value>("fields")?, &action)?,
         })),
-        "workflow" => Ok(StepAction::Workflow(WorkflowAction {
-            workflow: non_empty_required_string(&table, &action, "workflow")?,
-            request: required_string(&table, &action, "request")?,
-        })),
+        "workflow" => workflow_action(&table).map(StepAction::Workflow),
         "fail" => Ok(StepAction::Fail(FailAction {
             reason: required_string(&table, &action, "reason")?,
         })),
         other => Err(Error::UnknownAction(other.to_string())),
+    }
+}
+
+fn workflow_action(table: &Table) -> Result<WorkflowAction> {
+    workflow_known_fields(table, &["action", "workflows"], "action")?;
+    let workflows = match table.get::<Value>("workflows")? {
+        Value::Table(table) => table,
+        Value::Nil => {
+            return Err(Error::MissingActionField {
+                action: "workflow".to_string(),
+                field: "workflows".to_string(),
+            });
+        }
+        _ => {
+            return Err(workflow_field_error(
+                "workflows",
+                "must be an array of workflow calls",
+            ));
+        }
+    };
+    let mut calls = BTreeMap::new();
+    for pair in workflows.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let Value::Integer(index) = key else {
+            return Err(workflow_field_error(
+                "workflows",
+                "must be a contiguous array of workflow calls",
+            ));
+        };
+        if index < 1 {
+            return Err(workflow_field_error(
+                "workflows",
+                "must be a contiguous array of workflow calls",
+            ));
+        }
+        let field = format!("workflows[{index}]");
+        let Value::Table(call) = value else {
+            return Err(workflow_field_error(
+                &field,
+                "must be a workflow call table",
+            ));
+        };
+        workflow_known_fields(&call, &["id", "workflow", "request"], &field)?;
+        calls.insert(
+            index,
+            WorkflowCall {
+                id: required_string(&call, "workflow", "id")?,
+                workflow: required_string(&call, "workflow", "workflow")?,
+                request: required_string(&call, "workflow", "request")?,
+            },
+        );
+    }
+    if calls
+        .keys()
+        .enumerate()
+        .any(|(index, key)| *key != index as i64 + 1)
+    {
+        return Err(workflow_field_error(
+            "workflows",
+            "must be a contiguous array of workflow calls",
+        ));
+    }
+    let action = WorkflowAction {
+        workflows: calls.into_values().collect(),
+    };
+    action.validate()?;
+    Ok(action)
+}
+
+fn workflow_known_fields(table: &Table, allowed: &[&str], field: &str) -> Result<()> {
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair?;
+        let Value::String(key) = key else {
+            return Err(workflow_field_error(field, "field names must be strings"));
+        };
+        let key = key.to_str()?;
+        if !allowed.contains(&key.as_ref()) {
+            return Err(workflow_field_error(
+                field,
+                format!("unknown field {key:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn workflow_field_error(field: &str, reason: impl Into<String>) -> Error {
+    Error::InvalidActionField {
+        action: "workflow".to_string(),
+        field: field.to_string(),
+        reason: reason.into(),
     }
 }
 

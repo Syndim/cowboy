@@ -30,6 +30,7 @@ pub(crate) mod tests {
             status: RunStatus::Running,
             retries_used: 2,
             step: StepState {
+                pending_workflow: None,
                 next: "start".into(),
                 head: None,
                 executed: 1,
@@ -101,6 +102,31 @@ pub(crate) mod tests {
             "careful"
         );
         println!("EVIDENCE contract-run-head round_trip=true deterministic=true");
+    }
+
+    #[tokio::test]
+    async fn pending_workflow_manifest_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let store = SqliteWorkflowStore::connect(&path).await.unwrap();
+        let mut run = run("run-batch");
+        run.step.pending_workflow = Some(cowboy_workflow_core::WorkflowAction {
+            workflows: (0..256)
+                .map(|index| cowboy_workflow_core::WorkflowCall {
+                    id: format!("review-{index}"),
+                    workflow: "review/security".into(),
+                    request: "  exact child request\n".into(),
+                })
+                .collect(),
+        });
+        store.save_run(&run).await.unwrap();
+        store.close().await;
+        let reopened = SqliteWorkflowStore::connect(&path).await.unwrap();
+        assert_eq!(reopened.load_run(&run.id).await.unwrap(), run);
+        assert_eq!(
+            reopened.load_run_head(&run.id).await.unwrap(),
+            cowboy_workflow_core::RunHead::from_run(&run),
+        );
     }
 
     #[tokio::test]

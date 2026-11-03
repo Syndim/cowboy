@@ -124,6 +124,7 @@ fn sample_run(id: &str, workflow: &str, workflow_hash: &str, current_step: &str)
         status: RunStatus::Running,
         retries_used: 0,
         step: StepState {
+            pending_workflow: None,
             next: current_step.to_string(),
             head: None,
             executed: 0,

@@ -249,8 +249,10 @@ mod tests {
             local step = step("delegate")
             step.run = function(ctx)
               return action.workflow {
-                workflow = "review/security",
-                request = "  Review this\nexactly  ",
+                workflows = {
+                  { id = "security", workflow = "review/security", request = "  Review this\nexactly  " },
+                  { id = "style", workflow = "review/style", request = "" },
+                },
               }
             end
             return workflow("wf", step)
@@ -260,31 +262,145 @@ mod tests {
         let StepAction::Workflow(action) = result.action else {
             panic!("expected workflow action")
         };
-        assert_eq!(action.workflow, "review/security");
-        assert_eq!(action.request, "  Review this\nexactly  ");
+        assert_eq!(action.workflows.len(), 2);
+        assert_eq!(action.workflows[0].id, "security");
+        assert_eq!(action.workflows[0].workflow, "review/security");
+        assert_eq!(action.workflows[0].request, "  Review this\nexactly  ");
+        assert_eq!(action.workflows[1].id, "style");
+        assert_eq!(action.workflows[1].workflow, "review/style");
+        assert_eq!(action.workflows[1].request, "");
     }
 
     #[test]
     fn workflow_action_rejects_invalid_fields() {
         let cases = [
-            ("missing workflow", r#"request = "x""#, "workflow"),
+            ("missing workflows", "", "workflows"),
+            ("empty workflows", "workflows = {}", "workflows"),
+            ("non-table workflows", "workflows = 1", "workflows"),
+            (
+                "legacy shape",
+                r#"workflow = "child", request = "x""#,
+                "unknown field",
+            ),
+            (
+                "old workflow alongside list",
+                r#"workflows = {}, workflow = "child""#,
+                "unknown field",
+            ),
+            (
+                "old request alongside list",
+                r#"workflows = {}, request = "x""#,
+                "unknown field",
+            ),
+            (
+                "top-level typo",
+                "workflows = {}, concurency = 2",
+                "unknown field",
+            ),
+            (
+                "non-string top-level key",
+                "workflows = {}, [1] = true",
+                "field names",
+            ),
+            ("non-table entry", "workflows = {false}", "workflows[1]"),
+            (
+                "missing id",
+                r#"workflows = {{workflow = "child", request = "x"}}"#,
+                "id",
+            ),
+            (
+                "blank id",
+                r#"workflows = {{id = " \t", workflow = "child", request = "x"}}"#,
+                "id",
+            ),
+            (
+                "non-string id",
+                r#"workflows = {{id = 1, workflow = "child", request = "x"}}"#,
+                "id",
+            ),
+            (
+                "missing workflow",
+                r#"workflows = {{id = "a", request = "x"}}"#,
+                "workflow",
+            ),
             (
                 "blank workflow",
-                r#"workflow = "  ", request = "x""#,
-                "non-empty",
+                r#"workflows = {{id = "a", workflow = " \n", request = "x"}}"#,
+                "workflow",
             ),
             (
                 "non-string workflow",
-                r#"workflow = 1, request = "x""#,
+                r#"workflows = {{id = "a", workflow = false, request = "x"}}"#,
                 "workflow",
             ),
-            ("missing request", r#"workflow = "child""#, "request"),
             (
-                "non-string request",
-                r#"workflow = "child", request = 1"#,
+                "missing request",
+                r#"workflows = {{id = "a", workflow = "child"}}"#,
                 "request",
             ),
+            (
+                "non-string request",
+                r#"workflows = {{id = "a", workflow = "child", request = 1}}"#,
+                "request",
+            ),
+            (
+                "unknown entry field",
+                r#"workflows = {{id = "a", workflow = "child", request = "x", requests = "typo"}}"#,
+                "unknown field",
+            ),
+            (
+                "non-string entry key",
+                r#"workflows = {{id = "a", workflow = "child", request = "x", [1] = true}}"#,
+                "field names",
+            ),
+            (
+                "duplicate ids",
+                r#"workflows = {{id = "a", workflow = "one", request = "x"}, {id = "a", workflow = "two", request = "y"}}"#,
+                "duplicate id",
+            ),
         ];
+        let valid = r#"{id = "a", workflow = "child", request = "x"}"#;
+        let mut cases: Vec<_> = cases
+            .into_iter()
+            .map(|(name, fields, expected)| (name.to_string(), fields.to_string(), expected))
+            .collect();
+        for key in [
+            "0",
+            "-1",
+            "2",
+            "128",
+            "129",
+            "9223372036854775807",
+            "1.5",
+            "'1'",
+            "true",
+            "'extra'",
+        ] {
+            cases.push((
+                format!("invalid list key {key}"),
+                format!("workflows = {{[{key}] = {valid}}}"),
+                "workflows",
+            ));
+        }
+        cases.push((
+            "sparse list".to_string(),
+            format!("workflows = {{[1] = {valid}, [3] = {valid}}}"),
+            "contiguous",
+        ));
+        cases.push((
+            "mixed list".to_string(),
+            format!("workflows = {{{valid}, extra = {valid}}}"),
+            "contiguous",
+        ));
+        for concurrency in [
+            "0", "1", "4", "128", "129", "-1", "1.5", "'4'", "true", "{}", "1/0", "0/0",
+        ] {
+            cases.push((
+                format!("removed concurrency {concurrency}"),
+                format!("workflows = {{{valid}}}, concurrency = {concurrency}"),
+                "unknown field \"concurrency\"",
+            ));
+        }
 
         for (name, fields, expected) in cases {
             let source = snapshot(&format!(
@@ -301,6 +417,35 @@ mod tests {
                 err.to_string().contains(expected),
                 "{name}: expected error containing {expected:?}, got {err}"
             );
+        }
+    }
+
+    #[test]
+    fn workflow_action_accepts_large_lists() {
+        for count in [1, 128, 129, 256] {
+            let source = snapshot(&format!(
+                r#"
+                local step = step("delegate")
+                step.run = function(ctx)
+                  local calls = {{}}
+                  for i = 1, {count} do
+                    calls[i] = {{ id = "branch-" .. i, workflow = "child", request = "  exact\nrequest  " }}
+                  end
+                  return action.workflow {{ workflows = calls }}
+                end
+                return workflow("wf", step)
+                "#
+            ));
+            let result = run_step(&source, "delegate", serde_json::json!({})).unwrap();
+            let StepAction::Workflow(action) = result.action else {
+                panic!("expected workflow action")
+            };
+            assert_eq!(action.workflows.len(), count);
+            for (index, call) in action.workflows.iter().enumerate() {
+                assert_eq!(call.id, format!("branch-{}", index + 1));
+                assert_eq!(call.workflow, "child");
+                assert_eq!(call.request, "  exact\nrequest  ");
+            }
         }
     }
 

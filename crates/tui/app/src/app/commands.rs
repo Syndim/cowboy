@@ -772,6 +772,7 @@ mod tests {
             restart_source_run_id: None,
             status,
             step: StepState {
+                pending_workflow: None,
                 next: current_step.to_string(),
                 head: head.map(ToString::to_string),
                 executed: 0,

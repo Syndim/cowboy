@@ -10,7 +10,7 @@ use cowboy_workflow_core::{
     CompareAndSealPromptWindowOutcome, FollowUpPrompt, ObjectHash, ObjectKind,
     OpenAgentPromptWindowOutcome, PromptWindowStore, RoleSession, Run, RunHead, RunId, RunStatus,
     StepRecord, TurnRecord, TurnStore, UserPromptStore, WorkflowObjectStore,
-    WorkflowSourceSnapshot, WorkflowStateStore,
+    WorkflowSourceSnapshot, WorkflowStateStore, workflow_branch_invocation_id,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
@@ -35,6 +35,7 @@ pub enum RestartCreationOutcome {
 pub struct RestartSeed {
     pub source_run_id: RunId,
     pub expected_source_workflow_hash: ObjectHash,
+    pub parent_branch_id: Option<String>,
     pub target_run: Run,
     pub inherited_sessions: Vec<RoleSession>,
 }
@@ -178,10 +179,13 @@ impl SqliteWorkflowStore {
             let source = load_run_in_tx(&mut tx, &seed.source_run_id)
                 .await?
                 .ok_or_else(|| Error::RunNotFound(seed.source_run_id.clone()))?;
-            if !matches!(
-                source.status,
-                RunStatus::Completed | RunStatus::Failed { .. }
-            ) {
+            let nested = validate_nested_restart(&mut tx, seed, &source).await?;
+            if !nested
+                && !matches!(
+                    source.status,
+                    RunStatus::Completed | RunStatus::Failed { .. }
+                )
+            {
                 return Ok(RestartCreationOutcome::SourceNotTerminal(source.status));
             }
             if source.workflow.hash != seed.expected_source_workflow_hash {
@@ -665,6 +669,134 @@ impl SqliteWorkflowStore {
     }
 }
 
+async fn validate_nested_restart(
+    tx: &mut Transaction<'_, Sqlite>,
+    seed: &RestartSeed,
+    source: &Run,
+) -> Result<bool> {
+    let invalid = || Error::InvalidRestartSeed("inconsistent nested restart lineage".to_string());
+    let Some(branch_id) = &seed.parent_branch_id else {
+        if seed.target_run.parent.is_some() {
+            return Err(invalid());
+        }
+        return Ok(false);
+    };
+    let target_lineage = seed.target_run.parent.as_ref().ok_or_else(invalid)?;
+    let source_lineage = source.parent.as_ref().ok_or_else(invalid)?;
+    for lineage in [source_lineage, target_lineage] {
+        if lineage.invocation_id
+            != workflow_branch_invocation_id(
+                &lineage.run_id,
+                &lineage.step_id,
+                lineage.previous_head.as_deref(),
+                branch_id,
+            )
+            .to_string()
+        {
+            return Err(invalid());
+        }
+    }
+    let parent = load_run_in_tx(tx, &target_lineage.run_id)
+        .await?
+        .ok_or_else(invalid)?;
+    if parent.restart_source_run_id.as_ref() != Some(&source_lineage.run_id)
+        || target_lineage.step_id != source_lineage.step_id
+        || parent.step.next != target_lineage.step_id
+        || parent.step.head != target_lineage.previous_head
+        || seed.target_run.restart_source_run_id.as_ref() != Some(&source.id)
+        || seed.target_run.workflow != source.workflow
+        || seed.target_run.id != format!("run-{}", target_lineage.invocation_id)
+        || source.id != format!("run-{}", source_lineage.invocation_id)
+    {
+        return Err(invalid());
+    }
+    let action = parent.step.pending_workflow.as_ref().ok_or_else(invalid)?;
+    action.validate().map_err(|_| invalid())?;
+    let branch = action
+        .workflows
+        .iter()
+        .find(|call| &call.id == branch_id)
+        .ok_or_else(invalid)?;
+    if branch.workflow != source.workflow.name || branch.request != seed.target_run.original_request
+    {
+        return Err(invalid());
+    }
+    let visit = parent
+        .step
+        .visits
+        .get(&target_lineage.step_id)
+        .copied()
+        .unwrap_or(0);
+    let source_parent = load_run_in_tx(tx, &source_lineage.run_id)
+        .await?
+        .ok_or_else(invalid)?;
+    let mut records = Vec::new();
+    let mut cursor = source_parent.step.head.clone();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(hash) = cursor {
+        if !seen.insert(hash.clone()) {
+            return Err(invalid());
+        }
+        let data = sqlx::query_scalar::<_, Vec<u8>>("SELECT data FROM objects WHERE hash = ?")
+            .bind(&hash)
+            .fetch_optional(&mut **tx)
+            .await?
+            .ok_or_else(invalid)?;
+        let record: StepRecord = decode_object(&data)?;
+        cursor = record.prev.clone();
+        if record.step == source_lineage.step_id {
+            records.push(record);
+        }
+    }
+    records.reverse();
+    if let Some(record) = visit
+        .checked_sub(1)
+        .and_then(|visit| records.get(visit as usize))
+    {
+        if record.action != "workflow" || record.prev != source_lineage.previous_head {
+            return Err(invalid());
+        }
+        let branches = record.input.context["workflows"]
+            .as_array()
+            .ok_or_else(invalid)?;
+        let mut matches = branches
+            .iter()
+            .filter(|entry| entry["id"].as_str() == Some(branch_id));
+        let entry = matches.next().ok_or_else(invalid)?;
+        if matches.next().is_some()
+            || entry["workflow"].as_str() != Some(&source.workflow.name)
+            || entry["request"].as_str() != Some(&source.original_request)
+            || entry["child_run_id"].as_str() != Some(&source.id)
+            || entry["invocation_id"].as_str() != Some(&source_lineage.invocation_id)
+        {
+            return Err(invalid());
+        }
+    } else {
+        if visit == 0
+            || records.len() + 1 != visit as usize
+            || source_parent.step.next != source_lineage.step_id
+            || source_parent.step.head != source_lineage.previous_head
+            || source_parent.step.visits.get(&source_lineage.step_id) != Some(&visit)
+        {
+            return Err(invalid());
+        }
+        let action = source_parent
+            .step
+            .pending_workflow
+            .as_ref()
+            .ok_or_else(invalid)?;
+        action.validate().map_err(|_| invalid())?;
+        if !action.workflows.iter().any(|call| {
+            &call.id == branch_id
+                && call.workflow == source.workflow.name
+                && call.request == source.original_request
+        }) {
+            return Err(invalid());
+        }
+    }
+    Ok(true)
+}
+
 async fn upsert_run_and_head(tx: &mut Transaction<'_, Sqlite>, run: &Run) -> Result<()> {
     sqlx::query(
         "INSERT INTO runs(run_id, data) VALUES(?, ?) \
@@ -1069,6 +1201,7 @@ mod tests {
         RestartSeed {
             source_run_id: source.id.clone(),
             expected_source_workflow_hash: source.workflow.hash.clone(),
+            parent_branch_id: None,
             target_run: target,
             inherited_sessions: vec![session],
         }
@@ -1101,6 +1234,189 @@ mod tests {
                 .unwrap(),
             seed.inherited_sessions.first().cloned()
         );
+    }
+
+    #[tokio::test]
+    async fn nested_restart_creation_requires_persisted_matching_branch_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("data.db"))
+            .await
+            .unwrap();
+        let action = cowboy_workflow_core::WorkflowAction {
+            workflows: ["branch", "sibling"]
+                .into_iter()
+                .map(|id| cowboy_workflow_core::WorkflowCall {
+                    id: id.to_string(),
+                    workflow: "developer".to_string(),
+                    request: "source request".to_string(),
+                })
+                .collect(),
+        };
+        let mut source_parent = run("run-source-parent");
+        source_parent.status = RunStatus::Failed {
+            reason: "interrupted".to_string(),
+        };
+        source_parent.step.next = "call".to_string();
+        source_parent.step.head = None;
+        source_parent.step.visits.insert("call".to_string(), 1);
+        source_parent.step.pending_workflow = Some(action.clone());
+        store.save_run(&source_parent).await.unwrap();
+        let mut parent = source_parent.clone();
+        parent.id = "run-target-parent".to_string();
+        parent.restart_source_run_id = Some(source_parent.id.clone());
+        parent.status = RunStatus::Running;
+        store.save_run(&parent).await.unwrap();
+        let source_invocation_id =
+            workflow_branch_invocation_id(&source_parent.id, "call", None, "branch").to_string();
+        let target_invocation_id =
+            workflow_branch_invocation_id(&parent.id, "call", None, "branch").to_string();
+        let mut source = run(&format!("run-{source_invocation_id}"));
+        source.workflow.name = "developer".to_string();
+        source.original_request = "source request".to_string();
+        source.parent = Some(cowboy_workflow_core::ParentRun {
+            run_id: source_parent.id.clone(),
+            step_id: "call".to_string(),
+            previous_head: None,
+            invocation_id: source_invocation_id,
+        });
+        store.save_run(&source).await.unwrap();
+        let mut seed = restart_seed(&source, &format!("run-{target_invocation_id}"));
+        seed.parent_branch_id = Some("branch".to_string());
+        seed.target_run.original_request = "target request".to_string();
+        seed.target_run.parent = Some(cowboy_workflow_core::ParentRun {
+            run_id: parent.id.clone(),
+            step_id: "call".to_string(),
+            previous_head: None,
+            invocation_id: target_invocation_id,
+        });
+        for call in &mut parent.step.pending_workflow.as_mut().unwrap().workflows {
+            call.request = "target request".to_string();
+        }
+        store.save_run(&parent).await.unwrap();
+        for corruption in 0..11 {
+            let mut invalid_seed = seed.clone();
+            let mut invalid_parent = parent.clone();
+            let mut invalid_source_parent = source_parent.clone();
+            let mut invalid_source = source.clone();
+            match corruption {
+                0 => invalid_parent.restart_source_run_id = None,
+                1 => invalid_seed.parent_branch_id = Some("other".to_string()),
+                2 => invalid_seed.target_run.parent.as_mut().unwrap().step_id = "other".to_string(),
+                3 => {
+                    invalid_seed
+                        .target_run
+                        .parent
+                        .as_mut()
+                        .unwrap()
+                        .previous_head = Some("wrong".to_string())
+                }
+                4 => invalid_seed.target_run.restart_source_run_id = Some("wrong".to_string()),
+                5 => {
+                    invalid_source_parent
+                        .step
+                        .visits
+                        .insert("call".to_string(), 2);
+                }
+                6 => {
+                    invalid_source_parent
+                        .step
+                        .pending_workflow
+                        .as_mut()
+                        .unwrap()
+                        .workflows[0]
+                        .request = "wrong".to_string()
+                }
+                7 => {
+                    invalid_parent
+                        .step
+                        .pending_workflow
+                        .as_mut()
+                        .unwrap()
+                        .workflows[0]
+                        .workflow = "wrong".to_string()
+                }
+                8 | 10 => {
+                    let branch = if corruption == 8 { "forged" } else { "sibling" };
+                    let invocation_id =
+                        workflow_branch_invocation_id(&source_parent.id, "call", None, branch)
+                            .to_string();
+                    invalid_source.id = format!("run-{invocation_id}");
+                    invalid_source.parent.as_mut().unwrap().invocation_id = invocation_id;
+                    invalid_seed.source_run_id = invalid_source.id.clone();
+                    invalid_seed.target_run.restart_source_run_id = Some(invalid_source.id.clone());
+                }
+                9 => {
+                    let invocation_id =
+                        workflow_branch_invocation_id(&parent.id, "call", None, "forged")
+                            .to_string();
+                    invalid_seed.target_run.id = format!("run-{invocation_id}");
+                    invalid_seed
+                        .target_run
+                        .parent
+                        .as_mut()
+                        .unwrap()
+                        .invocation_id = invocation_id;
+                    for session in &mut invalid_seed.inherited_sessions {
+                        session.run_id = invalid_seed.target_run.id.clone();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            store.save_run(&invalid_source).await.unwrap();
+            store.save_run(&invalid_parent).await.unwrap();
+            store.save_run(&invalid_source_parent).await.unwrap();
+            assert!(
+                matches!(
+                    store.create_restart(&invalid_seed).await,
+                    Err(Error::InvalidRestartSeed(_))
+                ),
+                "accepted corruption {corruption}"
+            );
+            assert!(matches!(
+                store.load_run(&invalid_seed.target_run.id).await,
+                Err(Error::RunNotFound(_))
+            ));
+            assert!(
+                store
+                    .load_role_session(&invalid_seed.target_run.id, "developer")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        store.save_run(&parent).await.unwrap();
+        store.save_run(&source_parent).await.unwrap();
+        assert_eq!(
+            store.create_restart(&seed).await.unwrap(),
+            RestartCreationOutcome::Created
+        );
+        assert_eq!(store.load_run(&source.id).await.unwrap(), source);
+        assert_eq!(
+            store.load_run(&source_parent.id).await.unwrap(),
+            source_parent
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_creation_still_rejects_nonterminal_top_level_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteWorkflowStore::connect(dir.path().join("data.db"))
+            .await
+            .unwrap();
+        for status in [RunStatus::Running, RunStatus::Cancelled] {
+            let mut source = run("run-source");
+            source.status = status.clone();
+            store.save_run(&source).await.unwrap();
+            let seed = restart_seed(&source, "run-target");
+            assert_eq!(
+                store.create_restart(&seed).await.unwrap(),
+                RestartCreationOutcome::SourceNotTerminal(status)
+            );
+            assert!(matches!(
+                store.load_run("run-target").await,
+                Err(Error::RunNotFound(_))
+            ));
+        }
     }
 
     #[tokio::test]

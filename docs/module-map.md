@@ -80,7 +80,7 @@ Owns reusable host-action runners and the dispatcher that maps `StepAction` vari
 | `command.rs` | `CommandActionRunner` for direct non-shell process execution from runtime cwd. |
 | `wait_for_input.rs` | `WaitForInputActionRunner`, callback payload metadata, and resume handling into `StepRecord`. |
 | `status.rs` | `StatusActionRunner` for immediate completed records. |
-| `workflow.rs` | `WorkflowActionHandler` trait and `WorkflowActionRunner` adapter for `StepAction::Workflow`; routed to the engine's runtime handler. |
+| `workflow.rs` | `WorkflowActionHandler` trait and `WorkflowActionRunner` adapter for plural `StepAction::Workflow` branches and aggregate records; routed to the engine's runtime handler. |
 | `fail.rs` | `FailActionRunner` for failed run statuses. |
 
 ## Crate: `cowboy-workflow-engine`
@@ -91,7 +91,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; coordinate durable workflow branches that all execute concurrently without a per-action throttle or branch-count ceiling, plus namespaced child input; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates supplied input for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, persists `Failed` on give-up, and exposes canonical `ctx.prev.output` plus compatibility aliases through `LuaStepActionProvider`. |
@@ -135,8 +135,8 @@ Owns workflow domain data and pure execution rules.
 | --- | --- |
 | `ids.rs` | String aliases for workflow/run/role/step/record/turn ids and object hashes. |
 | `definition.rs` | `WorkflowCatalog`, `WorkflowSource`, `WorkflowLocation`, `WorkflowDefinition` (including optional config-set selection), roles, steps, transitions, validation. |
-| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `wait_for_input`, `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
-| `state.rs` | Durable `Run`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
+| `action.rs` | Declarative `StepAction` variants: `agent`, `command`, `status`, `wait_for_input`, plural-branch `workflow`, `fail`, including legacy agent prompts and structured agent task contracts with stable keys, recovery context, and minimal turns. |
+| `state.rs` | Durable `Run`, name-only config-set pointer (`ConfigSetRef`), retry counters, `RunStatus`, `ResumeCallback`, `StepRecord`, `StepOutput`, workflow-branch manifest/lineage, `RunHead`, `RoleSession` delivery fingerprints/watermarks, and object kinds. |
 | `summary.rs` | `WorkflowSummary` and `WorkflowImprovement` used after a run. |
 | `traits.rs` | Interfaces implemented by outer crates, including object-safe async `WorkflowStateStore`, `WorkflowObjectStore`, `AgentSessionStore`, `TurnStore`, `UserPromptStore`, `PromptWindowStore`, and composite `WorkflowStore`. |
 | `engine.rs` | Serializable/defaulted `RunnerLimits`, `execute_step`, `next_step` routing, and step/visit budget enforcement. |

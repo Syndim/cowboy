@@ -835,6 +835,7 @@ mod tests {
             status: RunStatus::Completed,
             retries_used: 0,
             step: StepState {
+                pending_workflow: None,
                 next: "finish".to_string(),
                 head: None,
                 executed: 0,

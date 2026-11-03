@@ -610,54 +610,68 @@ Fields:
 `fail` does not create a step output record and does not use transitions.
 
 
-### `action.workflow { workflow, request }`
+### `action.workflow { workflows }`
 
-Invokes another catalog workflow as a durable child run and, when the child
-finishes, completes the calling step with the child's terminal output.
+Invokes one or more catalog workflows as durable child runs. This is a
+**breaking API**: `workflows` is required; the legacy top-level `workflow` and
+`request` properties are rejected. Existing workflow files and persisted snapshots
+using the singular form must be updated or replaced; old child-input callbacks
+are not migrated.
 
 ```lua
 return action.workflow {
-  workflow = "review/security",
-  request = "Review the current implementation",
+  workflows = {
+    { id = "security", workflow = "review/security", request = ctx.request },
+    { id = "quality", workflow = "review/quality", request = ctx.request },
+  },
 }
 ```
 
-Fields:
+`workflows` is a non-empty, dense list of branch tables; even a single child
+uses this list. Each branch requires a unique, non-blank `id`, a non-blank
+catalog `workflow` id (as shown by `/workflows`), and a string `request`,
+preserved byte-for-byte. All declared children run concurrently; there is no
+per-action concurrency option, throttle, or branch-count ceiling. Children
+share the runtime cwd rather than isolated working directories, so simultaneous
+edits can conflict.
 
-- `workflow` (required): the catalog workflow id shown by `/workflows`, exactly
-  as used with `cowboy run --workflow` — not necessarily the Lua-declared
-  display name. Must be a non-blank string.
-- `request` (required): the initial request handed to the child workflow,
-  preserved byte-for-byte (including leading/trailing whitespace and newlines).
+Each branch is a normal durable `WorkflowRun` using the catalog, store, locks,
+agent factory, config-set resolution, runner, event bus, retry policy, and
+cancellation path of a top-level run. A durable branch manifest is persisted
+before side effects. Child ids deterministically include the branch id, so
+retries, resume, and process interruption reuse each branch. Snapshots,
+restart, and lineage reuse also apply independently per branch. Restarting a
+failed parent also inherits existing child snapshots and sessions from its
+retained, uncommitted batch, including children still running or waiting for
+input. Top-level restart remains restricted to completed or failed runs.
+Direct and indirect workflow-call cycles are rejected before a child lock is
+acquired.
 
-Behavior:
+All branches run to a terminal state or input wait. If several branches wait,
+the parent exposes exactly one pending prompt at a time in declaration order;
+the advertised, namespaced parent input id must be supplied and is forwarded to
+its matching child. Siblings are not detached: the action waits for every
+branch before producing its one aggregate parent record. Parent lifecycle
+progress identifies the branch, child run, and execution state.
 
-- The child is a normal, durable `WorkflowRun`. It uses the same catalog, store,
-  run locks, agent factory, config-set resolution, `WorkflowRunner`, event bus,
-  retry policy, and cancellation path as a top-level run, and runs until it
-  completes, fails, is cancelled, or asks for input.
-- On completion, the calling step's `StepOutput` copies the child terminal
-  step's `status`, `fields`, `body`, and `raw` unchanged, so the parent routes
-  directly on the status the child returned and its next step reads the child
-  result through `ctx.prev`. The target workflow id, exact request, and child
-  run id are recorded under the parent step's `StepInput.context`, with
-  `StepDetail.backend = "workflow"` and `StepDetail.session_id = <child run id>`.
-- A child `RunStatus::Failed` becomes a completed parent output with status
-  `"failed"` (carrying the child run id and reason). A child cancellation becomes
-  status `"cancelled"`. Route these like any other status.
-- If the child waits for input, its prompt is mirrored on the parent's own
-  `WaitingForInput` state; providing the parent input (`cowboy provide-input <parent-run-id> <input-id> <input>`) forwards the value and continues the child. If the child asks again, the parent
-  prompt refreshes; when the child becomes terminal, the parent workflow action
-  completes and the parent continues automatically.
-- Child creation is idempotent across retries, resume, and process interruption:
-  the child run id is a stable UUID-v5 derived from the parent run id, the
-  calling step id, and the parent's previous head. Retrying or resuming reuses
-  the same child rather than creating a new one.
-- Direct (`A -> A`) and indirect (`A -> B -> A`) workflow-call cycles are
-  rejected with a clear error before any child lock is acquired.
-- Parent and child keep separate event logs; the active parent reports child
-  lifecycle progress (`child workflow <id> started/waiting for input/resumed/
-  finished`).
+The aggregate output always has `fields.results.<id>` for every branch:
+
+```text
+{ child_run_id, state, output = { status, fields, body, raw } }
+```
+
+A terminal child output is preserved in full. A failed child gets a normalized
+`output` with its reason; `state` remains the child lifecycle state. The
+aggregate output status is `"completed"` when every child lifecycle state is
+`Completed`, regardless of their domain output statuses; otherwise it is
+`"failed"` if any child is `Failed`, or `"cancelled"` if any child is
+`Cancelled`. A child that exhausts its retry budget contributes a failed result
+immediately, so the parent can follow its `"failed"` transition without an extra
+resume. Other execution or infrastructure errors are surfaced after sibling
+branches settle; persisted child runs remain available for recovery.
+Therefore transitions route on aggregate lifecycle status, while
+the next step evaluates each child's domain result through
+`ctx.prev.fields.results`.
 
 
 ## Transitions
@@ -676,7 +690,7 @@ Rules:
 - `status` must be a non-empty string.
 - `target_step` can be a step table or step id string.
 - Validation rejects unknown target steps.
-- If a completed step declares no transitions at all, it is terminal: the workflow completes with whatever status the step returned (this is how a child workflow completes with a domain status such as the one its caller routes on).
+- If a completed step declares no transitions at all, it is terminal: the workflow completes with whatever status the step returned (a caller can inspect that domain status in the child's aggregate result).
 - If a completed step declares transitions and returns `success` without an explicit `success` transition, the workflow completes.
 - If a completed step declares transitions and returns any other status without a matching transition, the run errors with an unknown runtime transition.
 - `wait_for_input` and `fail` are run-state changes, not completed step outputs, so transition tables are not consulted when they initially block or fail the run. The completed wait-for-input record produced after an input is routed by its output status.
