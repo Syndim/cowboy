@@ -123,7 +123,7 @@ fn resolve_program(program: &str, _allowed_env: &[String]) -> PathBuf {
 pub struct CommandActionRunner {
     cwd: PathBuf,
     allowed_env: Vec<String>,
-    allowed_cmd: Option<Vec<String>>,
+    allowed_cmds: Option<Vec<String>>,
     capture_limit_bytes: usize,
 }
 
@@ -132,13 +132,13 @@ impl CommandActionRunner {
         Self {
             cwd: cwd.into(),
             allowed_env,
-            allowed_cmd: None,
+            allowed_cmds: None,
             capture_limit_bytes: CAPTURE_LIMIT_BYTES,
         }
     }
 
-    pub fn with_allowed_cmd(mut self, allowed_cmd: Option<Vec<String>>) -> Self {
-        self.allowed_cmd = allowed_cmd;
+    pub fn with_allowed_cmds(mut self, allowed_cmds: Option<Vec<String>>) -> Self {
+        self.allowed_cmds = allowed_cmds;
         self
     }
 
@@ -151,7 +151,7 @@ impl CommandActionRunner {
         Self {
             cwd: cwd.into(),
             allowed_env,
-            allowed_cmd: None,
+            allowed_cmds: None,
             capture_limit_bytes,
         }
     }
@@ -162,12 +162,12 @@ impl CommandActionRunner {
         context: ExecutionContext,
     ) -> Result<ActionResult> {
         if self
-            .allowed_cmd
+            .allowed_cmds
             .as_ref()
             .is_some_and(|allowed| !allowed.contains(&action.program))
         {
             return Err(WorkflowError::InvalidAction(format!(
-                "command {:?} is not permitted by allowed_cmd",
+                "command {:?} is not permitted by allowed_cmds",
                 action.program
             )));
         }
@@ -639,7 +639,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = helper_program(dir.path(), "success");
         let runner = CommandActionRunner::new(dir.path(), Vec::new())
-            .with_allowed_cmd(Some(vec![program.to_string_lossy().into_owned()]));
+            .with_allowed_cmds(Some(vec![program.to_string_lossy().into_owned()]));
 
         let output = command_output(
             runner
@@ -658,14 +658,14 @@ mod tests {
         let program = dir.path().join("missing-program");
         for allowed in [Vec::new(), vec!["other-program".to_string()]] {
             let runner =
-                CommandActionRunner::new(dir.path(), Vec::new()).with_allowed_cmd(Some(allowed));
+                CommandActionRunner::new(dir.path(), Vec::new()).with_allowed_cmds(Some(allowed));
             let error = runner
                 .run(action(program.clone(), Vec::new()), context())
                 .await
                 .unwrap_err();
 
             assert!(matches!(error, WorkflowError::InvalidAction(_)));
-            assert!(error.to_string().contains("allowed_cmd"));
+            assert!(error.to_string().contains("allowed_cmds"));
             assert!(error.to_string().contains("missing-program"));
         }
     }
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn command_runner_does_not_normalize_or_pattern_match_programs() {
         let runner = CommandActionRunner::new(".", Vec::new())
-            .with_allowed_cmd(Some(vec!["git".to_string(), "tool*".to_string()]));
+            .with_allowed_cmds(Some(vec!["git".to_string(), "tool*".to_string()]));
 
         for program in ["Git", "/usr/bin/git", "./git", " git", "git ", "tool-name"] {
             let error = runner

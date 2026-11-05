@@ -422,8 +422,8 @@ Fields:
 - `status_map` (optional): table mapping an exit code (integer or numeric-string key) to the output status used for that code. The catch-all `"_"` key covers any exit code without an exact match, plus spawn errors and timeouts, which have no exit code. Defaults to `{ ["0"] = "success", ["_"] = "failed" }`. A `status_map` missing a `"_"` entry falls back to `"failed"` for unmatched codes.
 - `timeout_ms` (optional): positive integer wall-clock deadline covering spawn, parent exit, and full stdout/stderr drain. If either pipe remains open past the deadline, `success = false` and `timed_out = true` even if the parent exited with code 0. Captured prefixes remain available, but incomplete streams are not complete command output. The status still follows `status_map`: a custom `"_" = "success"` can route a timeout to `success`, so downstream steps must check `ctx.prev.fields.success` and `ctx.prev.fields.timed_out` before trusting its output. On Unix Cowboy starts a separate process group and kills it on timeout, capture failure, or cancellation, including descendants that inherited pipes. On Windows Cowboy kills the direct child on timeout or cancellation but cannot guarantee descendant termination.
 
-The host config can restrict programs with top-level `allowed_cmd`, for example
-`allowed_cmd = ["git", "cargo", "/usr/bin/printf"]`. Omitting it allows all
+The host config can restrict programs with top-level `allowed_cmds`, for example
+`allowed_cmds = ["git", "cargo", "/usr/bin/printf"]`. Omitting it allows all
 commands; an empty list denies all. Matching is exact and case-sensitive against
 `program`, before executable resolution: no glob, basename, path normalization,
 or argument matching is performed. A denied command fails the step before

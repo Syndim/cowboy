@@ -104,7 +104,7 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub allowed_env: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_cmd: Option<Vec<String>>,
+    pub allowed_cmds: Option<Vec<String>>,
     pub agents: Vec<AgentRuntimeConfig>,
     pub config_sets: BTreeMap<String, RunnerLimitsConfig>,
 }
@@ -198,14 +198,14 @@ impl RuntimeConfig {
             workflow_store,
             workflow_dirs,
             allowed_env,
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents,
             config_sets,
         }
     }
 
-    pub fn with_allowed_cmd(mut self, allowed_cmd: Option<Vec<String>>) -> Self {
-        self.allowed_cmd = allowed_cmd;
+    pub fn with_allowed_cmds(mut self, allowed_cmds: Option<Vec<String>>) -> Self {
+        self.allowed_cmds = allowed_cmds;
         self
     }
 }
@@ -2744,7 +2744,7 @@ impl WorkflowRuntime {
             self.config.cwd.clone(),
             self.config.allowed_env.clone(),
         )
-        .with_allowed_cmd(self.config.allowed_cmd.clone());
+        .with_allowed_cmds(self.config.allowed_cmds.clone());
         let provider = LuaStepActionProvider::new(snapshot);
         let policy = self.resolve_limits(&run.config_set.name);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone(), policy)
@@ -3558,7 +3558,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "definitely-missing-topic-agent")],
             config_sets: BTreeMap::new(),
         };
@@ -3579,7 +3579,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::new(),
         };
@@ -3602,7 +3602,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "default-runtime-agent".to_string(),
@@ -3820,7 +3820,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -3856,7 +3856,7 @@ mod tests {
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![examples_root],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -3963,7 +3963,7 @@ return workflow("runtime-contract", seed)
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -4450,7 +4450,7 @@ implementation_evidence: []
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents,
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -4765,7 +4765,7 @@ done
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -4883,7 +4883,7 @@ done
             workflow_store: dir.path().join("state-seal/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         };
@@ -4949,7 +4949,7 @@ done
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
@@ -4965,7 +4965,7 @@ done
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5135,7 +5135,7 @@ done
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -5186,8 +5186,8 @@ exit 0
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_action_runtime_enforces_allowed_cmd_before_spawn() {
-        for allowed_cmd in [
+    async fn command_action_runtime_enforces_allowed_cmds_before_spawn() {
+        for allowed_cmds in [
             None,
             Some(Vec::new()),
             Some(vec!["printf".to_string()]),
@@ -5220,20 +5220,20 @@ exit 0
                 vec![agent("default", "unused-agent")],
                 BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
             );
-            assert!(config.allowed_cmd.is_none());
+            assert!(config.allowed_cmds.is_none());
             let mut serialized = serde_json::to_value(&config).unwrap();
-            assert!(serialized.get("allowed_cmd").is_none());
-            if let Some(commands) = &allowed_cmd {
-                serialized["allowed_cmd"] = serde_json::json!(commands);
+            assert!(serialized.get("allowed_cmds").is_none());
+            if let Some(commands) = &allowed_cmds {
+                serialized["allowed_cmds"] = serde_json::json!(commands);
             }
             let config: RuntimeConfig = serde_json::from_value(serialized).unwrap();
-            assert_eq!(config.allowed_cmd, allowed_cmd);
-            let runtime = WorkflowRuntime::new(config.with_allowed_cmd(allowed_cmd.clone()))
+            assert_eq!(config.allowed_cmds, allowed_cmds);
+            let runtime = WorkflowRuntime::new(config.with_allowed_cmds(allowed_cmds.clone()))
                 .await
                 .unwrap()
                 .with_deterministic_selector();
             let result = runtime.start_run_with_workflow("aaa", "check").await;
-            if allowed_cmd
+            if allowed_cmds
                 .as_ref()
                 .is_none_or(|commands| commands.contains(&"/bin/sh".to_string()))
             {
@@ -5249,7 +5249,7 @@ exit 0
                 let error = result.unwrap_err();
                 assert!(
                     matches!(error, WorkflowError::InvalidAction(ref message)
-                        if message == "command \"/bin/sh\" is not permitted by allowed_cmd"),
+                        if message == "command \"/bin/sh\" is not permitted by allowed_cmds"),
                     "{error}"
                 );
                 assert!(!marker.exists(), "denied command was spawned");
@@ -5585,7 +5585,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets,
         })
@@ -6777,7 +6777,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "definitely-missing-agent-command".to_string(),
@@ -6934,7 +6934,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "definitely-missing-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7067,7 +7067,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
@@ -7255,7 +7255,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7412,7 +7412,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7518,7 +7518,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7816,7 +7816,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir.clone()],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7936,7 +7936,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: Vec::new(),
             config_sets,
         }
@@ -8208,7 +8208,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -8259,7 +8259,7 @@ exit 0
             workflow_store: state_dir.join("data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -8319,7 +8319,7 @@ exit 0
             workflow_store: dir.path().join("shared/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -8392,7 +8392,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -8489,7 +8489,7 @@ exit 0
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![agent("default", "unused-agent")],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -9724,7 +9724,7 @@ Recovery implementation review"#
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
@@ -9952,7 +9952,7 @@ Recovery implementation review"#
                 workflow_store: dir.path().join("state/data.db"),
                 workflow_dirs: vec![workflow_dir],
                 allowed_env: Vec::new(),
-                allowed_cmd: None,
+                allowed_cmds: None,
                 agents: Vec::new(),
                 config_sets: BTreeMap::from([(
                     "default".to_string(),
@@ -10599,7 +10599,7 @@ return workflow("{label}", plan)
                 workflow_store: dir.path().join("state/data.db"),
                 workflow_dirs: vec![workflow_dir],
                 allowed_env: Vec::new(),
-                allowed_cmd: None,
+                allowed_cmds: None,
                 agents: Vec::new(),
                 config_sets: BTreeMap::from([("default".to_string(), limits)]),
             },
@@ -10790,7 +10790,7 @@ return workflow("{label}", plan)
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
-            allowed_cmd: None,
+            allowed_cmds: None,
             agents: vec![AgentRuntimeConfig {
                 name: "default".to_string(),
                 command: "agent".to_string(),

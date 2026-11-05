@@ -291,13 +291,13 @@ The workflow roles select dedicated `planner`, `investigator`, `reviewer`,
 set thinking to `xhigh`, `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;
 `[agents.model]` does not control it.
 
-Top-level `allowed_cmd` optionally restricts workflow `action.command` programs:
+Top-level `allowed_cmds` optionally restricts workflow `action.command` programs:
 
 ```toml
-allowed_cmd = ["git", "cargo", "/usr/bin/printf"]
+allowed_cmds = ["git", "cargo", "/usr/bin/printf"]
 ```
 
-Omitting `allowed_cmd` allows all commands; `allowed_cmd = []` denies all.
+Omitting `allowed_cmds` allows all commands; `allowed_cmds = []` denies all.
 Entries match the workflow's `program` string exactly and case-sensitively,
 before executable resolution or process creation. There is no glob, basename,
 path normalization, or argument matching: `"git"` does not allow `"/usr/bin/git"`.
