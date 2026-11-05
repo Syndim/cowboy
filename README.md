@@ -291,6 +291,26 @@ The workflow roles select dedicated `planner`, `investigator`, `reviewer`,
 set thinking to `xhigh`, `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;
 `[agents.model]` does not control it.
 
+Top-level `allowed_cmd` optionally restricts workflow `action.command` programs:
+
+```toml
+allowed_cmd = ["git", "cargo", "/usr/bin/printf"]
+```
+
+Omitting `allowed_cmd` allows all commands; `allowed_cmd = []` denies all.
+Entries match the workflow's `program` string exactly and case-sensitively,
+before executable resolution or process creation. There is no glob, basename,
+path normalization, or argument matching: `"git"` does not allow `"/usr/bin/git"`.
+Blank entries, NUL characters, and duplicate entries are rejected. A denied
+command fails the workflow step without spawning a process or routing through
+`status_map`. Restart a running Cowboy process to apply config changes.
+
+This policy applies to workflow command actions, including child workflows,
+not ACP agent startup or commands executed by agents. It is not a sandbox:
+allowed shells, interpreters, and programs can execute other commands, and a
+bare program name depends on executable search paths. Only allow trusted
+programs and arguments.
+
 Top-level `allowed_env` controls ambient variables forwarded to every workflow
 child process, including `action.command` children and ACP backends used for
 selection, request topics, role actions, retries, recovery, and workflow

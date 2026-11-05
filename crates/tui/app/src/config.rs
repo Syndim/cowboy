@@ -44,6 +44,8 @@ pub struct AppConfig {
     /// Ambient environment variables forwarded to every workflow child process.
     #[serde(default = "default_allowed_env")]
     pub allowed_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cmd: Option<Vec<String>>,
     /// ACP-compatible agent commands used by workflow agent actions.
     #[serde(default = "default_agents")]
     pub agents: Vec<AgentConfig>,
@@ -195,6 +197,7 @@ impl Default for AppConfig {
             workflow_dirs: vec![config_root().join("workflows")],
             mouse_scroll_lines: default_mouse_scroll_lines(),
             allowed_env: default_allowed_env(),
+            allowed_cmd: None,
             agents: default_agents(),
         }
     }
@@ -241,6 +244,8 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("invalid agent config in {}", path.display()))?;
     validate_allowed_env("allowed_env", &config.allowed_env)
         .with_context(|| format!("invalid environment config in {}", path.display()))?;
+    validate_allowed_cmd(config.allowed_cmd.as_deref())
+        .with_context(|| format!("invalid allowed_cmd in {}", path.display()))?;
     validate_config_sets(&config.config_sets)
         .with_context(|| format!("invalid config set in {}", path.display()))?;
     validate_mouse_scroll_lines(config.mouse_scroll_lines)
@@ -336,6 +341,24 @@ fn validate_allowed_env(field: &str, allowed_env: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_allowed_cmd(allowed_cmd: Option<&[String]>) -> Result<()> {
+    use std::collections::BTreeSet;
+
+    let mut programs = BTreeSet::new();
+    for program in allowed_cmd.into_iter().flatten() {
+        if program.trim().is_empty() {
+            anyhow::bail!("allowed_cmd entries must not be blank");
+        }
+        if program.contains('\0') {
+            anyhow::bail!("allowed_cmd entry must not contain NUL");
+        }
+        if !programs.insert(program.as_str()) {
+            anyhow::bail!("allowed_cmd contains duplicate entry {program:?}");
+        }
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn runtime_config(&self, cwd: PathBuf) -> RuntimeConfig {
         let mut config_sets = self
@@ -389,6 +412,7 @@ impl AppConfig {
                 .collect(),
             config_sets,
         )
+        .with_allowed_cmd(self.allowed_cmd.clone())
     }
 
     fn expand_paths(&mut self) {
@@ -419,6 +443,143 @@ fn expand_tilde(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn allowed_cmd_missing_config_defaults_to_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        for config in [
+            AppConfig::default(),
+            load_config(&dir.path().join("missing.toml")).unwrap(),
+        ] {
+            assert_eq!(config.allowed_cmd, None);
+            assert_eq!(
+                config.runtime_config(dir.path().to_path_buf()).allowed_cmd,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_cmd_omitted_empty_and_nonempty_reach_runtime_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let programs = vec![
+            "git".to_string(),
+            "Git".to_string(),
+            " git ".to_string(),
+            "./git".to_string(),
+            "/usr/bin/git".to_string(),
+            "tool=name".to_string(),
+            "~/bin/tool".to_string(),
+        ];
+        for (raw, expected) in [
+            ("", None),
+            ("allowed_cmd = []\n", Some(Vec::new())),
+            (
+                "allowed_cmd = ['git', 'Git', ' git ', './git', '/usr/bin/git', 'tool=name', '~/bin/tool']\n",
+                Some(programs),
+            ),
+        ] {
+            fs::write(
+                &path,
+                format!("{raw}[[agents]]\nname = 'default'\ncommand = 'unlisted-agent'\nargs = ['--acp']\n"),
+            )
+            .unwrap();
+            let config = load_config(&path).unwrap();
+            assert_eq!(config.allowed_cmd, expected);
+            let runtime = config.runtime_config(dir.path().to_path_buf());
+            assert_eq!(runtime.allowed_cmd, expected);
+            assert_eq!(runtime.agents[0].command, "unlisted-agent");
+            assert_eq!(runtime.agents[0].args, ["--acp"]);
+            assert_eq!(config.allowed_cmd, expected);
+        }
+    }
+
+    #[test]
+    fn allowed_cmd_roundtrip_preserves_omitted_empty_and_nonempty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for allowed_cmd in [
+            None,
+            Some(Vec::new()),
+            Some(vec![
+                "git".to_string(),
+                "Git".to_string(),
+                " git ".to_string(),
+            ]),
+        ] {
+            let config = AppConfig {
+                allowed_cmd: allowed_cmd.clone(),
+                ..AppConfig::default()
+            };
+            let serialized = toml::to_string(&config).unwrap();
+            let value: toml::Value = toml::from_str(&serialized).unwrap();
+            assert_eq!(value.get("allowed_cmd").is_some(), allowed_cmd.is_some());
+            fs::write(&path, serialized).unwrap();
+            let loaded = load_config(&path).unwrap();
+            assert_eq!(loaded.allowed_cmd, allowed_cmd);
+            assert_eq!(
+                loaded.runtime_config(dir.path().to_path_buf()).allowed_cmd,
+                allowed_cmd
+            );
+
+            let json = serde_json::to_value(&config).unwrap();
+            assert_eq!(json.get("allowed_cmd").is_some(), allowed_cmd.is_some());
+            let decoded: AppConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded, config);
+        }
+    }
+
+    #[test]
+    fn allowed_cmd_invalid_types_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in [
+            "'git'",
+            "42",
+            "1.5",
+            "false",
+            "{}",
+            "{ program = 'git' }",
+            "[42]",
+            "['git', false]",
+            "[['git']]",
+            "[{ program = 'git' }]",
+        ] {
+            fs::write(&path, format!("allowed_cmd = {value}\n")).unwrap();
+            let error = load_config(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("allowed_cmd"),
+                "{value}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_cmd_invalid_entries_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (value, expected) in [
+            (r#"[""]"#, "blank"),
+            (r#"["   "]"#, "blank"),
+            (r#"["\t\r\n"]"#, "blank"),
+            (r#"["\u2003"]"#, "blank"),
+            (r#"["\u0000"]"#, "NUL"),
+            (r#"["git\u0000"]"#, "NUL"),
+            (r#"["\u0000git"]"#, "NUL"),
+            (r#"["gi\u0000t"]"#, "NUL"),
+            (r#"["git", "git"]"#, "duplicate"),
+            (r#"["git", "other", "git"]"#, "duplicate"),
+            (r#"[" git ", " git "]"#, "duplicate"),
+            (r#"["./git", "./git"]"#, "duplicate"),
+        ] {
+            fs::write(&path, format!("allowed_cmd = {value}\n")).unwrap();
+            let error = load_config(&path).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("allowed_cmd"), "{value}: {message}");
+            assert!(message.contains(expected), "{value}: {message}");
+        }
+    }
 
     #[test]
     fn configurable_allowed_env_parses_and_reaches_runtime() {
