@@ -123,6 +123,7 @@ fn resolve_program(program: &str, _allowed_env: &[String]) -> PathBuf {
 pub struct CommandActionRunner {
     cwd: PathBuf,
     allowed_env: Vec<String>,
+    allowed_cmds: Option<Vec<String>>,
     capture_limit_bytes: usize,
 }
 
@@ -131,8 +132,14 @@ impl CommandActionRunner {
         Self {
             cwd: cwd.into(),
             allowed_env,
+            allowed_cmds: None,
             capture_limit_bytes: CAPTURE_LIMIT_BYTES,
         }
+    }
+
+    pub fn with_allowed_cmds(mut self, allowed_cmds: Option<Vec<String>>) -> Self {
+        self.allowed_cmds = allowed_cmds;
+        self
     }
 
     #[cfg(test)]
@@ -144,6 +151,7 @@ impl CommandActionRunner {
         Self {
             cwd: cwd.into(),
             allowed_env,
+            allowed_cmds: None,
             capture_limit_bytes,
         }
     }
@@ -153,6 +161,16 @@ impl CommandActionRunner {
         action: CommandAction,
         context: ExecutionContext,
     ) -> Result<ActionResult> {
+        if self
+            .allowed_cmds
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&action.program))
+        {
+            return Err(WorkflowError::InvalidAction(format!(
+                "command {:?} is not permitted by allowed_cmds",
+                action.program
+            )));
+        }
         let started_at = Utc::now();
         let timer = Instant::now();
         let program = resolve_program(&action.program, &self.allowed_env);
@@ -613,6 +631,58 @@ mod tests {
         );
         assert_eq!(output.fields["stderr"], "");
         assert!(output.body.contains("helper stdout"));
+    }
+
+    #[tokio::test]
+    async fn command_runner_allows_exact_configured_program() {
+        let _guard = command_test_lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let program = helper_program(dir.path(), "success");
+        let runner = CommandActionRunner::new(dir.path(), Vec::new())
+            .with_allowed_cmds(Some(vec![program.to_string_lossy().into_owned()]));
+
+        let output = command_output(
+            runner
+                .run(action(program, helper_args()), context())
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(output.status, "ok");
+        assert_eq!(output.fields["success"], true);
+    }
+
+    #[tokio::test]
+    async fn command_runner_denies_unlisted_program_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("missing-program");
+        for allowed in [Vec::new(), vec!["other-program".to_string()]] {
+            let runner =
+                CommandActionRunner::new(dir.path(), Vec::new()).with_allowed_cmds(Some(allowed));
+            let error = runner
+                .run(action(program.clone(), Vec::new()), context())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, WorkflowError::InvalidAction(_)));
+            assert!(error.to_string().contains("allowed_cmds"));
+            assert!(error.to_string().contains("missing-program"));
+        }
+    }
+
+    #[tokio::test]
+    async fn command_runner_does_not_normalize_or_pattern_match_programs() {
+        let runner = CommandActionRunner::new(".", Vec::new())
+            .with_allowed_cmds(Some(vec!["git".to_string(), "tool*".to_string()]));
+
+        for program in ["Git", "/usr/bin/git", "./git", " git", "git ", "tool-name"] {
+            let error = runner
+                .run(action(PathBuf::from(program), Vec::new()), context())
+                .await
+                .unwrap_err();
+
+            assert!(matches!(error, WorkflowError::InvalidAction(_)));
+        }
     }
 
     #[tokio::test]

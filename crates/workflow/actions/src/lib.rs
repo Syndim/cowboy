@@ -48,6 +48,11 @@ impl<A> EngineActionDispatcher<A, UnsupportedWorkflowActionHandler> {
 }
 
 impl<A, W> EngineActionDispatcher<A, W> {
+    pub fn with_allowed_cmds(mut self, allowed_cmds: Option<Vec<String>>) -> Self {
+        self.command = self.command.with_allowed_cmds(allowed_cmds);
+        self
+    }
+
     pub fn with_workflow_handler(
         agent: A,
         workflow: W,

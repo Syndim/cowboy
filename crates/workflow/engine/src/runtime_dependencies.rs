@@ -443,6 +443,7 @@ mod tests {
             workflow_store: "state/workflow.redb".into(),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
+            allowed_cmds: None,
             agents: vec![
                 agent("default", "default-agent-command", 11, 12, 13),
                 agent("named", "named-agent-command", 21, 22, 23),
