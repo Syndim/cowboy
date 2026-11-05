@@ -3069,7 +3069,7 @@ fn describe_resolution_options(options: &ResolutionOptions) -> String {
 }
 
 fn snapshot_from_run(run: &Run) -> WorkflowSourceSnapshot {
-    let workflow_entry = format!("{}.lua", run.workflow.name);
+    let workflow_entry = format!("{}.lua", run.workflow.name).replace('\\', "/");
     let entry = if run.workflow.sources.contains_key(&workflow_entry) {
         workflow_entry
     } else {
@@ -9658,15 +9658,23 @@ Recovery implementation review"#
                 hash: "hash".to_string(),
                 sources: BTreeMap::from([
                     (
+                        "roles/developer.lua".to_string(),
+                        r#"return role("developer", "Implement work")"#.to_string(),
+                    ),
+                    (
                         "roles/planner.lua".to_string(),
                         r#"return role("planner", "Plan work")"#.to_string(),
                     ),
                     (
                         "workflows/feature.lua".to_string(),
                         r#"
+                    local developer = require("roles/developer.lua")
                     local planner = require("roles/planner.lua")
                     local start = step("start", { role = planner })
                     start.run = function(ctx) return action.status { status = "success" } end
+                    local finish = step("finish", { role = developer })
+                    finish.run = function(ctx) return action.status { status = "success" } end
+                    start:on("success", finish)
                     return workflow("feature", start)
                     "#
                         .to_string(),
@@ -9694,9 +9702,133 @@ Recovery implementation review"#
             updated_at: now,
         };
 
+        for (name, entry) in [
+            ("workflows/feature", "workflows/feature.lua"),
+            (r"workflows\feature", "workflows/feature.lua"),
+            ("feature", "feature.lua"),
+        ] {
+            let mut run = run.clone();
+            run.workflow.name = name.to_string();
+            let source = run
+                .workflow
+                .sources
+                .remove("workflows/feature.lua")
+                .unwrap();
+            run.workflow.sources.insert(entry.to_string(), source);
+            let original = run.clone();
+
+            let snapshot = snapshot_from_run(&run);
+            assert_eq!(snapshot.entry, entry);
+            assert_eq!(snapshot.files, run.workflow.sources);
+            assert_eq!(run, original);
+            let definition = cowboy_workflow_lua::compile_snapshot(&snapshot).unwrap();
+            assert_eq!(definition.name, "feature");
+            assert_eq!(definition.head, "start");
+            assert_eq!(definition.roles.len(), 2);
+            assert_eq!(definition.steps.len(), 2);
+        }
+    }
+
+    #[test]
+    fn snapshot_from_run_preserves_missing_entry_fallback() {
+        let mut run = summary_test_run("run-snapshot", RunStatus::Running, None);
+        assert_eq!(snapshot_from_run(&run).entry, "default.lua");
+
+        run.workflow.sources = BTreeMap::from([
+            ("roles/developer.lua".to_string(), "developer".to_string()),
+            ("roles/planner.lua".to_string(), "planner".to_string()),
+        ]);
         let snapshot = snapshot_from_run(&run);
-        assert_eq!(snapshot.entry, "workflows/feature.lua");
-        cowboy_workflow_lua::compile_snapshot(&snapshot).unwrap();
+        assert_eq!(snapshot.entry, "roles/developer.lua");
+        assert_eq!(snapshot.files, run.workflow.sources);
+    }
+
+    #[tokio::test]
+    async fn provide_input_run_restores_windows_named_snapshot_with_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow_dir = dir.path().join("workflows");
+        fs::create_dir_all(workflow_dir.join("roles")).unwrap();
+        fs::create_dir_all(workflow_dir.join("workflows")).unwrap();
+        fs::write(
+            workflow_dir.join("roles/developer.lua"),
+            r#"return role("developer", "Implement work")"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("roles/planner.lua"),
+            r#"return role("planner", "Plan work")"#,
+        )
+        .unwrap();
+        fs::write(
+            workflow_dir.join("workflows/feature.lua"),
+            r#"
+            local developer = require("roles/developer.lua")
+            local planner = require("roles/planner.lua")
+            local ask = step("ask", { role = planner })
+            ask.run = function(ctx)
+              return action.wait_for_input { id = "approval", message = "Approve?", fields = { carried = "ok" } }
+            end
+            local decide = step("decide", { role = developer })
+            decide.run = function(ctx)
+              return action.status { status = ctx.prev.fields.input, fields = { input = ctx.prev.fields.input, carried = ctx.prev.fields.carried } }
+            end
+            ask:on("provided", decide)
+            return workflow("feature", ask)
+            "#,
+        )
+        .unwrap();
+        let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
+        let workflow_id = runtime
+            .catalog()
+            .unwrap()
+            .workflows
+            .keys()
+            .find(|id| id.replace('\\', "/") == "workflows/feature")
+            .unwrap()
+            .clone();
+        let started = runtime
+            .start_run_with_workflow(workflow_id, "request")
+            .await
+            .unwrap();
+        assert!(matches!(
+            &started.run.status,
+            RunStatus::WaitingForInput { input_id, .. } if input_id == "approval"
+        ));
+        assert_eq!(
+            started.run.workflow.sources.keys().next().unwrap(),
+            "roles/developer.lua"
+        );
+        assert_eq!(started.run.workflow.sources.len(), 3);
+
+        let mut waiting = started.run;
+        waiting.workflow.name = r"workflows\feature".to_string();
+        let store = runtime.store().unwrap();
+        store.save_run(&waiting).await.unwrap();
+        assert_eq!(runtime.load_run(&waiting.id).await.unwrap(), waiting);
+
+        let report = runtime
+            .provide_input_run(&waiting.id, "approval", "yes")
+            .await
+            .unwrap();
+        assert_eq!(report.run.status, RunStatus::Completed);
+        assert_eq!(report.run.workflow, waiting.workflow);
+        assert_eq!(report.run.step.executed, 2);
+        assert_eq!(runtime.load_run(&waiting.id).await.unwrap(), report.run);
+        let record = store
+            .load_step_record(report.run.step.head.as_ref().unwrap())
+            .await
+            .unwrap();
+        let output = record.output.unwrap();
+        assert_eq!(output.status, "yes");
+        assert_eq!(output.fields["input"], "yes");
+        assert_eq!(output.fields["carried"], "ok");
+        let input_record = store
+            .load_step_record(record.prev.as_ref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(input_record.step, "ask");
+        assert_eq!(input_record.output.unwrap().status, "provided");
+        assert!(input_record.prev.is_none());
     }
 
     async fn scripted_restart_runtime(
