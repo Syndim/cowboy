@@ -247,11 +247,11 @@ impl RunStartOptions {
 }
 
 /// Maximum number of caller-supplied fields accepted for one run.
-pub const MAX_RUN_FIELDS: usize = 16;
+pub const MAX_RUN_FIELDS: usize = 128;
 /// Maximum length of a caller-supplied field key.
 pub const MAX_RUN_FIELD_KEY_CHARS: usize = 64;
 /// Maximum length of a caller-supplied field value.
-pub const MAX_RUN_FIELD_VALUE_CHARS: usize = 256;
+pub const MAX_RUN_FIELD_VALUE_CHARS: usize = 64 * 1024;
 
 fn validate_run_fields(fields: &BTreeMap<String, String>) -> Result<()> {
     if fields.len() > MAX_RUN_FIELDS {
@@ -4202,8 +4202,11 @@ implementation_evidence: []
         )
         .unwrap();
         let runtime = runtime_for_workflow_dir(&dir, workflow_dir).await;
-        let options = RunStartOptions::default()
-            .with_fields([("dispatch_mode".to_string(), "fresh".to_string())]);
+        let long_value = "v".repeat(1024);
+        let options = RunStartOptions::default().with_fields([
+            ("dispatch_mode".to_string(), "fresh".to_string()),
+            ("long_value".to_string(), long_value.clone()),
+        ]);
 
         let report = runtime
             .start_run_with_workflow_and_options("fields", "request", options)
@@ -4215,6 +4218,7 @@ implementation_evidence: []
             report.run.fields.get("dispatch_mode"),
             Some(&"fresh".to_string())
         );
+        assert_eq!(report.run.fields.get("long_value"), Some(&long_value));
         let persisted = runtime
             .store()
             .unwrap()
@@ -4263,23 +4267,33 @@ implementation_evidence: []
             .unwrap_err();
         assert!(error.to_string().contains("run field keys"));
 
-        let options = RunStartOptions::default()
-            .with_fields([("dispatch_mode".to_string(), "v".repeat(257))]);
+        let options = RunStartOptions::default().with_fields([(
+            "dispatch_mode".to_string(),
+            "v".repeat(MAX_RUN_FIELD_VALUE_CHARS + 1),
+        )]);
         let error = runtime
             .start_run_with_workflow_and_options("fields", "request", options)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("exceeds"));
 
-        let options = RunStartOptions::default()
-            .with_fields((0..17).map(|index| (format!("field_{index}"), "value".to_string())));
+        let options = RunStartOptions::default().with_fields(
+            (0..MAX_RUN_FIELDS).map(|index| (format!("field_{index}"), "value".to_string())),
+        );
+        runtime
+            .start_run_with_workflow_and_options("fields", "request", options)
+            .await
+            .unwrap();
+        let options = RunStartOptions::default().with_fields(
+            (0..=MAX_RUN_FIELDS).map(|index| (format!("field_{index}"), "value".to_string())),
+        );
         let error = runtime
             .start_run_with_workflow_and_options("fields", "request", options)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("at most"));
 
-        assert!(runtime.list_runs(None).await.unwrap().is_empty());
+        assert_eq!(runtime.list_runs(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
