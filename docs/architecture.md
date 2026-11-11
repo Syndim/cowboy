@@ -391,8 +391,8 @@ observed role session as `role: session-id`.
 
 `run --field` accepts repeatable or comma-separated `key=value` pairs. Fields
 are trusted caller-supplied data: keys must be 1-64 characters of
-`[a-z0-9_]`, values are bounded to 256 characters, and at most 16 fields are
-accepted. Fields are stored durably on the run and exposed to every workflow
+`[a-z0-9_]`, values are bounded to 65,536 characters, and at most 128 fields
+are accepted. Fields are stored durably on the run and exposed to every workflow
 step as `ctx.fields`; a restarted run inherits the source run's fields.
 
 Each `--field` accepts one `name=value` token; the value keeps everything
