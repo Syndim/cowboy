@@ -267,9 +267,6 @@ struct ActiveClient {
 struct AcquiredSession {
     /// Backend session id to prompt against.
     session_id: String,
-    /// True only when a brand-new backend session was created this dispatch
-    /// (initial create or load-failure fallback), meaning the session holds no
-    /// prior prompt history and the static role block must be resent.
     fresh: bool,
 }
 
@@ -465,11 +462,7 @@ where
         let active = clients
             .get_mut(&key)
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
-        let force_fresh_session = context.attempt > 1
-            && crate::prompt::requires_fresh_session(context.retry_reason.as_deref());
-        let acquired = self
-            .ensure_session(active, &key, force_fresh_session)
-            .await?;
+        let acquired = self.ensure_session(active, &key).await?;
         let session_id = acquired.session_id;
         // Resolve the per-session prompt-delivery watermark. A brand-new backend
         // session ignores any stale stored row and resends everything; a reused
@@ -846,87 +839,80 @@ where
         &self,
         active: &mut ActiveClient,
         key: &RoleSessionKey,
-        force_fresh: bool,
     ) -> Result<AcquiredSession> {
+        let saved = self
+            .store
+            .load_role_session(&key.run_id, &key.role_id)
+            .await
+            .map_err(Error::from)?;
+        if let Some(saved) = &saved
+            && saved.backend != active.backend
+            && saved.backend != PROVIDED_SESSION_BACKEND
+        {
+            return Err(WorkflowError::InvalidAction(format!(
+                "saved session backend {:?} does not match active backend {:?} for role {:?}",
+                saved.backend, active.backend, key.role_id
+            ))
+            .into());
+        }
+
         let client = active.client.as_mut();
-        if !force_fresh {
-            if let Some(session_id) = client.session_id() {
-                tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
-                return Ok(AcquiredSession {
-                    session_id: session_id.to_string(),
-                    fresh: false,
-                });
-            }
+        if let Some(session_id) = client.session_id() {
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
+            return Ok(AcquiredSession {
+                session_id: session_id.to_string(),
+                fresh: false,
+            });
+        }
 
-            if let Some(saved) = self
-                .store
-                .load_role_session(&key.run_id, &key.role_id)
-                .await
-                .map_err(Error::from)?
-            {
-                if client.supports_load_session() {
-                    tracing::debug!(
-                        run_id = %key.run_id,
-                        role = %key.role_id,
-                        session_id = %saved.session_id,
-                        "agent session: loading saved backend session"
-                    );
-                    match client
-                        .load_session(
-                            &saved.session_id,
-                            &self.config.cwd,
-                            &self.config.mcp_servers,
-                        )
-                        .await
-                    {
-                        Ok(history) => {
-                            tracing::info!(
-                                run_id = %key.run_id,
-                                role = %key.role_id,
-                                session_id = %saved.session_id,
-                                history_events = history.len(),
-                                "agent session loaded"
-                            );
-                            return Ok(AcquiredSession {
-                                session_id: saved.session_id,
-                                fresh: false,
-                            });
-                        }
-                        Err(err) => {
-                            if saved.backend == PROVIDED_SESSION_BACKEND {
-                                return Err(WorkflowError::InvalidAction(format!(
-                                    "failed to load supplied session {:?} for role {:?}: {err}",
-                                    saved.session_id, key.role_id
-                                ))
-                                .into());
-                            }
-
-                            tracing::warn!(
-                                run_id = %key.run_id,
-                                role = %key.role_id,
-                                session_id = %saved.session_id,
-                                error = %err,
-                                "agent session load failed; creating a new session"
-                            );
-                        }
+        if let Some(saved) = saved {
+            if client.supports_load_session() {
+                tracing::debug!(
+                    run_id = %key.run_id,
+                    role = %key.role_id,
+                    session_id = %saved.session_id,
+                    "agent session: loading saved backend session"
+                );
+                match client
+                    .load_session(
+                        &saved.session_id,
+                        &self.config.cwd,
+                        &self.config.mcp_servers,
+                    )
+                    .await
+                {
+                    Ok(history) => {
+                        tracing::info!(
+                            run_id = %key.run_id,
+                            role = %key.role_id,
+                            session_id = %saved.session_id,
+                            history_events = history.len(),
+                            "agent session loaded"
+                        );
+                        return Ok(AcquiredSession {
+                            session_id: saved.session_id,
+                            fresh: false,
+                        });
                     }
-                } else if saved.backend == PROVIDED_SESSION_BACKEND {
-                    return Err(WorkflowError::InvalidAction(format!(
-                        "agent backend cannot load supplied session {:?} for role {:?}",
-                        saved.session_id, key.role_id
-                    ))
-                    .into());
-                } else {
-                    tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent backend cannot load saved sessions");
+                    Err(err) => {
+                        if saved.backend == PROVIDED_SESSION_BACKEND {
+                            return Err(WorkflowError::InvalidAction(format!(
+                                "failed to load supplied session {:?} for role {:?}: {err}",
+                                saved.session_id, key.role_id
+                            ))
+                            .into());
+                        }
+
+                        return Err(err.into());
+                    }
                 }
+            } else {
+                return Err(WorkflowError::InvalidAction(format!(
+                    "agent backend cannot load saved session {:?} for role {:?}",
+                    saved.session_id, key.role_id
+                ))
+                .into());
             }
-        } else {
-            tracing::warn!(
-                run_id = %key.run_id,
-                role = %key.role_id,
-                previous_session = ?client.session_id(),
-                "agent no-result retry: creating a fresh backend session"
-            );
         }
 
         tracing::debug!(
@@ -1379,7 +1365,7 @@ mod tests {
         events: SyncMutex<VecDeque<Event>>,
         supports_load: bool,
         new_sessions: usize,
-        loaded_sessions: Vec<String>,
+        loaded_sessions: Arc<SyncMutex<Vec<String>>>,
         new_session_models: Arc<SyncMutex<Vec<Option<ModelInfo>>>>,
         prompt_calls: Arc<SyncMutex<Vec<Vec<PromptContent>>>>,
         prompt_behavior: FakePromptBehavior,
@@ -1394,7 +1380,7 @@ mod tests {
                 events: SyncMutex::new(events.into()),
                 supports_load: false,
                 new_sessions: 0,
-                loaded_sessions: Vec::new(),
+                loaded_sessions: Arc::new(SyncMutex::new(Vec::new())),
                 new_session_models: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_calls: Arc::new(SyncMutex::new(Vec::new())),
                 prompt_behavior: FakePromptBehavior::Reply,
@@ -1420,7 +1406,7 @@ mod tests {
         fn with_prompt_error_once(events: Vec<Event>, message: impl Into<String>) -> Self {
             Self {
                 prompt_behavior: FakePromptBehavior::ErrorOnce(Some(message.into())),
-                ..Self::new(events)
+                ..Self::with_load(events)
             }
         }
 
@@ -1438,8 +1424,6 @@ mod tests {
             }
         }
 
-        /// A load-capable client whose `load_session` always fails, forcing the
-        /// load-failure fallback path in `ensure_session`.
         fn with_load_error(events: Vec<Event>, message: impl Into<String>) -> Self {
             Self {
                 supports_load: true,
@@ -1491,13 +1475,13 @@ mod tests {
             _cwd: &str,
             _mcp_servers: &[serde_json::Value],
         ) -> anyhow::Result<Vec<Event>> {
+            self.loaded_sessions.lock().push(session_id.to_string());
             if !self.supports_load {
                 return Err(anyhow!("unsupported"));
             }
             if let Some(message) = &self.load_error {
                 return Err(anyhow!(message.clone()));
             }
-            self.loaded_sessions.push(session_id.to_string());
             self.session_id = Some(session_id.to_string());
             Ok(Vec::new())
         }
@@ -1515,6 +1499,7 @@ mod tests {
                 FakePromptBehavior::Error(message) => return Err(anyhow!(message.clone())),
                 FakePromptBehavior::ErrorOnce(message) => {
                     if let Some(message) = message.take() {
+                        self.session_id = None;
                         return Err(anyhow!(message));
                     }
                 }
@@ -2773,7 +2758,7 @@ resending the same instruction as attempt two"
             .save_role_session(RoleSession {
                 run_id: "run".into(),
                 role_id: "developer".into(),
-                backend: "agent".into(),
+                backend: "fake-agent".into(),
                 session_id: "persisted-session".into(),
                 updated_at: Utc::now(),
                 role_instructions_sent: false,
@@ -3655,7 +3640,7 @@ still applies, got non-recoverable: {error:?}"
     }
 
     #[tokio::test]
-    async fn fresh_session_fallback_resends_recovery_context() {
+    async fn new_phase_session_resends_recovery_context() {
         let store = SharedFakeStore::default();
         AgentExecutor::new(
             FakeFactory::new(vec![FakeClient::new(vec![event()])]),
@@ -3669,7 +3654,7 @@ still applies, got non-recoverable: {error:?}"
         .await
         .unwrap();
 
-        let client = FakeClient::with_load_error(vec![event()], "load failed");
+        let client = FakeClient::new(vec![event()]);
         let prompt_calls = client.prompt_calls.clone();
         AgentExecutor::new(
             FakeFactory::new(vec![client]),
@@ -3677,8 +3662,12 @@ still applies, got non-recoverable: {error:?}"
             AgentExecutionConfig::default(),
         )
         .execute_agent(
-            structured_action("developer", "STATIC_TASK_SENTINEL", "fallback turn"),
-            context("run", "record-2"),
+            structured_action(
+                "developer-next-phase",
+                "STATIC_TASK_SENTINEL",
+                "new phase turn",
+            ),
+            context_with_role("run", "record-2", "developer-next-phase"),
         )
         .await
         .unwrap();
@@ -3686,10 +3675,10 @@ still applies, got non-recoverable: {error:?}"
         let calls = prompt_calls.lock();
         let prompt = &calls[0][0].text;
         for expected in [
-            "Instructions for developer",
+            "Instructions for developer-next-phase",
             "STATIC_TASK_SENTINEL",
             "RECOVERY_CONTEXT_SENTINEL",
-            "fallback turn",
+            "new phase turn",
             "## Deliverable Format",
         ] {
             assert!(prompt.contains(expected), "missing {expected}");
@@ -3751,10 +3740,7 @@ still applies, got non-recoverable: {error:?}"
             backend: "fake-agent".to_string(),
         };
 
-        let acquired = executor
-            .ensure_session(&mut active, &key, false)
-            .await
-            .unwrap();
+        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
         assert!(acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
@@ -3778,10 +3764,7 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap();
 
-        let acquired = executor
-            .ensure_session(&mut active, &key, false)
-            .await
-            .unwrap();
+        let acquired = executor.ensure_session(&mut active, &key).await.unwrap();
         assert!(!acquired.fresh);
         let stored = store_handle
             .load_role_session("run", "developer")
@@ -3876,7 +3859,7 @@ still applies, got non-recoverable: {error:?}"
             .save_role_session(RoleSession {
                 run_id: "run".into(),
                 role_id: "developer".into(),
-                backend: "seeded-backend".into(),
+                backend: PROVIDED_SESSION_BACKEND.into(),
                 session_id: "seeded-session".into(),
                 updated_at: seeded_at,
                 role_instructions_sent: false,
@@ -3900,7 +3883,7 @@ still applies, got non-recoverable: {error:?}"
             .unwrap();
         assert!(stored.role_instructions_sent);
         assert_eq!(stored.last_sent_input_sequence, Some(0));
-        assert_eq!(stored.backend, "seeded-backend");
+        assert_eq!(stored.backend, PROVIDED_SESSION_BACKEND);
         assert_eq!(stored.session_id, "seeded-session");
         assert!(stored.updated_at > seeded_at);
     }
@@ -3975,64 +3958,113 @@ still applies, got non-recoverable: {error:?}"
     }
 
     #[tokio::test]
-    async fn load_failure_resends_role() {
-        let store = SharedFakeStore::default();
-        let store_handle = store.clone();
-        store_handle
-            .save_role_session(RoleSession {
+    async fn saved_session_backend_mismatch_rejects_successful_loader_and_active_client() {
+        for already_active in [false, true] {
+            let store = SharedFakeStore::default();
+            let saved = RoleSession {
                 run_id: "run".into(),
                 role_id: "developer".into(),
-                backend: "fake-agent".into(),
-                session_id: "old-session".into(),
+                backend: "different-backend".into(),
+                session_id: "original-session".into(),
+                updated_at: Utc::now(),
+                role_instructions_sent: true,
+                last_sent_input_sequence: Some(3),
+                delivered_task_contracts: [("task".into(), "fingerprint".into())].into(),
+            };
+            store.save_role_session(saved.clone()).await.unwrap();
+            let mut client = FakeClient::with_load(vec![event()]);
+            if already_active {
+                client.session_id = Some(saved.session_id.clone());
+            }
+            let loads = client.loaded_sessions.clone();
+            let new_sessions = client.new_session_models.clone();
+            let prompts = client.prompt_calls.clone();
+            let executor = AgentExecutor::new(
+                FakeFactory::new(vec![client]),
+                store.clone(),
+                AgentExecutionConfig::default(),
+            );
+
+            let error = executor
+                .execute_agent(output_action("developer"), context("run", "record"))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("does not match active backend"));
+            assert!(loads.lock().is_empty());
+            assert!(new_sessions.lock().is_empty());
+            assert!(prompts.lock().is_empty());
+            assert_eq!(
+                store.load_role_session("run", "developer").await.unwrap(),
+                Some(saved)
+            );
+            assert_eq!(store.inner.save_history.lock().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_session_failures_preserve_identity_across_retries_and_replacement() {
+        for (backend, supports_load) in [
+            ("fake-agent", true),
+            ("different-backend", true),
+            ("fake-agent", false),
+            ("different-backend", false),
+        ] {
+            let store = SharedFakeStore::default();
+            let saved = RoleSession {
+                run_id: "run".into(),
+                role_id: "developer".into(),
+                backend: backend.into(),
+                session_id: "original-session".into(),
                 updated_at: Utc::now(),
                 role_instructions_sent: true,
                 last_sent_input_sequence: Some(1),
                 delivered_task_contracts: Default::default(),
-            })
-            .await
-            .unwrap();
-        let seeded_saves = store_handle.inner.save_history.lock().len();
+            };
+            store.save_role_session(saved.clone()).await.unwrap();
 
-        let reload_client = FakeClient::with_load_error(vec![event()], "load boom");
-        let prompt_calls = reload_client.prompt_calls.clone();
-        let executor = AgentExecutor::new(
-            FakeFactory::new(vec![reload_client]),
-            store,
-            AgentExecutionConfig::default(),
-        );
-        let mut ctx = context("run", "record");
-        ctx.user_prompts.push(FollowUpPrompt {
-            sequence: 1,
-            content: "seeded follow-up".to_string(),
-            submitted_at: Utc::now(),
-        });
-        executor
-            .execute_agent(output_action("developer"), ctx)
-            .await
-            .unwrap();
-
-        let calls = prompt_calls.lock();
-        let prompt = &calls[0][0].text;
-        assert!(prompt.contains("Instructions for developer"));
-        assert!(prompt.contains("\"sequence\": 0"));
-        assert!(prompt.contains("\"sequence\": 1"));
-        drop(calls);
-
-        let suffix: Vec<(bool, Option<u64>)> = store_handle
-            .inner
-            .save_history
-            .lock()
-            .iter()
-            .skip(seeded_saves)
-            .filter(|session| session.run_id == "run" && session.role_id == "developer")
-            .map(|session| {
-                (
-                    session.role_instructions_sent,
-                    session.last_sent_input_sequence,
-                )
-            })
-            .collect();
-        assert_eq!(suffix, vec![(false, None), (true, Some(1))]);
+            for _ in 0..2 {
+                let mut client = FakeClient::with_load_error(vec![event()], "SESSION_NOT_FOUND");
+                client.supports_load = supports_load;
+                let new_sessions = client.new_session_models.clone();
+                let prompts = client.prompt_calls.clone();
+                let executor = AgentExecutor::new(
+                    FakeFactory::new(vec![client]),
+                    store.clone(),
+                    AgentExecutionConfig::default(),
+                );
+                for (index, reason) in [
+                    None,
+                    Some("SESSION_NOT_FOUND"),
+                    Some("agent reply did not contain a workflow result"),
+                    Some("ACP prompt received repeated empty end_turn responses"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut ctx = context("run", "record");
+                    ctx.attempt = index as u64 + 1;
+                    ctx.retry_reason = reason.map(str::to_string);
+                    let error = executor
+                        .execute_agent(output_action("developer"), ctx)
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains(if backend != "fake-agent" {
+                        "does not match active backend"
+                    } else if supports_load {
+                        "SESSION_NOT_FOUND"
+                    } else {
+                        "cannot load saved session"
+                    }));
+                    assert_eq!(
+                        store.load_role_session("run", "developer").await.unwrap(),
+                        Some(saved.clone())
+                    );
+                }
+                assert!(new_sessions.lock().is_empty());
+                assert!(prompts.lock().is_empty());
+            }
+            assert_eq!(store.inner.save_history.lock().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -4084,7 +4116,7 @@ still applies, got non-recoverable: {error:?}"
     }
 
     #[tokio::test]
-    async fn no_result_retry_creates_fresh_session() {
+    async fn no_result_retry_reuses_persisted_session() {
         let client = FakeClient::new(vec![
             Event::MessageChunk {
                 content: serde_json::json!({"text": "no workflow result"}),
@@ -4128,18 +4160,58 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(second.session_id, "session-2");
+        assert_eq!(second.session_id, first.session_id);
 
         let calls = prompt_calls.lock();
         assert_eq!(calls.len(), 2);
         let retry_prompt = &calls[1][0].text;
-        assert!(retry_prompt.contains("Instructions for developer"));
-        assert!(retry_prompt.contains("\"sequence\": 0"));
+        assert!(!retry_prompt.contains("Instructions for developer"));
+        assert!(!retry_prompt.contains("\"sequence\": 0"));
         assert!(retry_prompt.contains("## Retry"));
     }
 
     #[tokio::test]
-    async fn repeated_empty_end_turn_retry_creates_fresh_session() {
+    async fn failed_replacement_session_load_does_not_create_or_prompt_a_new_session() {
+        let mut client = FakeClient::with_prompt_error_once(
+            vec![event()],
+            "replacement session/load failed: SESSION_NOT_FOUND",
+        );
+        client.load_error = Some("SESSION_NOT_FOUND".into());
+        let new_sessions = client.new_session_models.clone();
+        let prompts = client.prompt_calls.clone();
+        let store = SharedFakeStore::default();
+        let executor = AgentExecutor::new(
+            FakeFactory::new(vec![client]),
+            store.clone(),
+            AgentExecutionConfig::default(),
+        );
+        let error = executor
+            .execute_agent(output_action("developer"), context("run", "record"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("SESSION_NOT_FOUND"));
+        let original = store.load_role_session("run", "developer").await.unwrap();
+        assert_eq!(original.as_ref().unwrap().session_id, "session-1");
+        for attempt in 2..=3 {
+            let mut retry = context("run", "record");
+            retry.attempt = attempt;
+            retry.retry_reason = Some(error.to_string());
+            let error = executor
+                .execute_agent(output_action("developer"), retry)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("SESSION_NOT_FOUND"));
+            assert_eq!(
+                store.load_role_session("run", "developer").await.unwrap(),
+                original
+            );
+        }
+        assert_eq!(new_sessions.lock().len(), 1);
+        assert_eq!(prompts.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_empty_end_turn_retry_reuses_persisted_session() {
         let client = FakeClient::with_prompt_error_once(
             vec![event()],
             "ACP prompt received repeated empty end_turn responses after 5 continuation prompts \
@@ -4172,9 +4244,6 @@ still applies, got non-recoverable: {error:?}"
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            recovered.session_id, "session-2",
-            "a session that repeatedly returned empty end_turn responses must not be reused"
-        );
+        assert_eq!(recovered.session_id, "session-1");
     }
 }

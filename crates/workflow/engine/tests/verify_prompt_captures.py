@@ -19,7 +19,7 @@ def main() -> None:
     same, same_prompts = scenario(root, "same_runtime")
     retry, retry_prompts = scenario(root, "retry")
     loaded, loaded_prompts = scenario(root, "loaded_session")
-    recreated, recreated_prompts = scenario(root, "recreated_session")
+    failed, failed_prompts = scenario(root, "failed_session")
 
     full_blocks = [
         "role",
@@ -29,7 +29,7 @@ def main() -> None:
         "user_inputs",
         "deliverable",
     ]
-    for records in [same, loaded, recreated]:
+    for records in [same, loaded]:
         assert records["implement"]["task_key"] == "implementation"
         assert records["revise"]["task_key"] == "implementation"
         assert (
@@ -58,20 +58,14 @@ def main() -> None:
     assert loaded["implement"]["session_id"] == loaded["revise"]["session_id"]
     assert loaded["client"]["load_results"] == ["success"]
 
-    recreated_revision = recreated_prompts["revise.prompt.txt"]
-    assert recreated["client"]["load_results"] == ["failure"]
-    assert recreated["implement"]["session_id"] != recreated["revise"]["session_id"]
-    assert recreated["revise"]["prompt_blocks"] == full_blocks
-    for heading in [
-        "## Role",
-        "## Task",
-        "## Recovery Context",
-        "## Current Turn",
-        "## Deliverable Format",
-    ]:
-        assert heading in recreated_revision
-    assert "Changes needed:" in recreated_revision
-    assert "Context:" in recreated_revision
+    assert failed["client"]["load_results"] == ["failure"] * 3
+    session_id = failed["implement"]["session_id"]
+    assert failed["client"]["load_attempts"] == [session_id] * 3
+    assert failed["client"]["created_session_ids"] == [session_id]
+    assert failed["client"]["prompt_sessions"] == [session_id]
+    assert set(failed_prompts) == {"implement.prompt.txt"}
+    assert failed["run"]["retries_used"] == 2
+    assert failed["run"]["step"]["retries_used"]["revise"] == 2
 
     assert retry["initial"]["session_id"] == retry["retry"]["session_id"]
     assert retry["initial"]["fingerprint"] == retry["retry"]["fingerprint"]

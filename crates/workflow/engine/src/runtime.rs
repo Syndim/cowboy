@@ -3370,7 +3370,7 @@ mod tests {
             state.load_attempts.push(session_id.to_string());
             if !state.load_session_succeeds {
                 state.load_results.push("failure".to_string());
-                return Err(anyhow::anyhow!("scripted load_session failure"));
+                return Err(anyhow::anyhow!("SESSION_NOT_FOUND"));
             }
             state.load_results.push("success".to_string());
             self.session_id = Some(session_id.to_string());
@@ -4371,56 +4371,84 @@ implementation_evidence: []
     }
 
     #[tokio::test]
-    async fn workflow_runtime_recreated_implementation_session_resends_contract() {
-        let dir = tempfile::tempdir().unwrap();
-        let factory = ScriptedAgentFactory::new(vec![
-            successful_implementation_response("initial implementation"),
-            successful_implementation_response("recreated revision"),
-        ]);
-        let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
-        let started = start_prompt_contract_run(&runtime).await;
-        let implemented = runtime.step_run(&started.run.id).await.unwrap();
-        let implement_record = command_output_record(&runtime, &implemented).await;
-        runtime.store().unwrap().close().await;
-        drop(runtime);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        factory.set_load_session_succeeds(false);
+    async fn workflow_runtime_missing_implementation_session_exhausts_retries_without_replacement()
+    {
+        for exhaust_run_budget in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let factory = ScriptedAgentFactory::new(vec![
+                successful_implementation_response("initial implementation"),
+                successful_implementation_response("must not receive a fresh prompt"),
+            ]);
+            let runtime = runtime_for_prompt_contract(&dir, factory.clone()).await;
+            let started = start_prompt_contract_run(&runtime).await;
+            let implemented = runtime.step_run(&started.run.id).await.unwrap();
+            let implement_record = command_output_record(&runtime, &implemented).await;
+            let saved = runtime
+                .store()
+                .unwrap()
+                .load_role_session(&started.run.id, "implementer")
+                .await
+                .unwrap()
+                .unwrap();
+            runtime.store().unwrap().close().await;
+            drop(runtime);
+            factory.set_load_session_succeeds(false);
 
-        let rebuilt = runtime_for_prompt_contract(&dir, factory.clone()).await;
-        rebuilt.step_run(&started.run.id).await.unwrap();
-        let revised = rebuilt.step_run(&started.run.id).await.unwrap();
-        let revise_record = command_output_record(&rebuilt, &revised).await;
-        let prompts = factory.prompts();
+            let mut rebuilt = runtime_for_prompt_contract(&dir, factory.clone()).await;
+            if exhaust_run_budget {
+                rebuilt
+                    .config
+                    .config_sets
+                    .get_mut("default")
+                    .unwrap()
+                    .max_retries_per_run = 2;
+            }
+            let feedback = rebuilt.step_run(&started.run.id).await.unwrap();
+            let error = rebuilt.step_run(&started.run.id).await.unwrap_err();
+            assert!(matches!(error, WorkflowError::RetryExhausted(_)));
+            let reason = error.to_string();
+            assert!(reason.contains("SESSION_NOT_FOUND"));
+            assert!(reason.contains(if exhaust_run_budget {
+                "exhausted run retry budget"
+            } else {
+                "exhausted retry budget for step"
+            }));
+            rebuilt.store().unwrap().close().await;
+            drop(rebuilt);
 
-        assert_eq!(factory.load_results(), vec!["failure"]);
-        assert_ne!(
-            implement_record.detail.session_id,
-            revise_record.detail.session_id
-        );
-        assert_eq!(
-            revise_record.input.context["prompt_blocks"],
-            serde_json::json!([
-                "role",
-                "task",
-                "recovery_context",
-                "turn",
-                "user_inputs",
-                "deliverable"
-            ])
-        );
-        write_prompt_capture(
-            "recreated_session",
-            &[
-                ("implement.prompt.txt", &prompts[0]),
-                ("revise.prompt.txt", &prompts[1]),
-            ],
-            serde_json::json!({
-                "implement": persisted_agent_record(&implement_record),
-                "revise": persisted_agent_record(&revise_record),
-                "client": scripted_client_record(&factory),
-            }),
-        );
-        factory.assert_exhausted();
+            let reopened = runtime_for_prompt_contract(&dir, factory.clone()).await;
+            let persisted = reopened.load_run(&started.run.id).await.unwrap();
+            assert_eq!(persisted.status, RunStatus::Failed { reason });
+            assert_eq!(persisted.step.next, "revise");
+            assert_eq!(persisted.step.head, feedback.run.step.head);
+            assert_eq!(persisted.retries_used, 2);
+            assert_eq!(persisted.step.retries_used.get("revise"), Some(&2));
+            assert_eq!(
+                reopened
+                    .store()
+                    .unwrap()
+                    .load_role_session(&started.run.id, "implementer")
+                    .await
+                    .unwrap(),
+                Some(saved)
+            );
+            assert_eq!(factory.load_attempts(), vec!["scripted-session-1"; 3]);
+            assert_eq!(factory.load_results(), vec!["failure"; 3]);
+            assert_eq!(factory.created_sessions(), vec!["scripted-session-1"]);
+            assert_eq!(factory.prompt_sessions(), vec!["scripted-session-1"]);
+            let prompts = factory.prompts();
+            assert_eq!(prompts.len(), 1);
+            assert_eq!(factory.state.lock().responses.len(), 1);
+            write_prompt_capture(
+                "failed_session",
+                &[("implement.prompt.txt", &prompts[0])],
+                serde_json::json!({
+                    "implement": persisted_agent_record(&implement_record),
+                    "run": persisted,
+                    "client": scripted_client_record(&factory),
+                }),
+            );
+        }
     }
 
     fn waiting_input_id(report: &RunReport) -> &str {
