@@ -193,7 +193,7 @@ pub struct RunArgs {
     pub session_ids: Vec<RoleSessionId>,
 
     /// Trusted key=value fields stored on the run and exposed as ctx.fields.
-    #[arg(long = "field", value_name = "key=value", value_delimiter = ',')]
+    #[arg(long = "field", value_name = "key=value")]
     pub fields: Vec<RunField>,
 
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true, value_name = "request")]
@@ -693,7 +693,9 @@ mod tests {
                 "cowboy",
                 "run",
                 "--field",
-                "dispatch_mode=fresh,source=peon",
+                "dispatch_mode=fresh",
+                "--field",
+                "source=peon",
                 "do",
                 "work",
             ]),
@@ -717,6 +719,23 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn run_preserves_commas_in_field_values() {
+        let raw = r#"context={"owner":"case-1","event":{"items":["a","b"]}}"#;
+        let command = shared_cli_command(["cowboy", "run", "--field", raw, "do"]);
+        let SharedCommand::Run(args) = command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(
+            args.fields,
+            vec![RunField {
+                key: "context".to_string(),
+                value: raw[8..].to_string(),
+            }]
+        );
     }
 
     #[test]
