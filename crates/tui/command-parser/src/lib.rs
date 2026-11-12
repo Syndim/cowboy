@@ -185,11 +185,7 @@ pub struct RunArgs {
     pub workflow: Option<String>,
 
     /// Existing backend sessions to load by role instead of creating fresh sessions.
-    #[arg(
-        long = "session-id",
-        value_name = "role=session-id",
-        value_delimiter = ','
-    )]
+    #[arg(long = "session-id", value_name = "role=session-id")]
     pub session_ids: Vec<RoleSessionId>,
 
     /// Trusted key=value fields stored on the run and exposed as ctx.fields.
@@ -658,7 +654,9 @@ mod tests {
                 "cowboy",
                 "run",
                 "--session-id",
-                "developer=session-1,reviewer=session-2",
+                "developer=session-1",
+                "--session-id",
+                "reviewer=session-2",
                 "do",
                 "work",
             ]),
@@ -684,6 +682,28 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn run_preserves_commas_in_session_ids() {
+        let command = shared_cli_command([
+            "cowboy",
+            "run",
+            "--session-id",
+            "developer=session-1,opaque-suffix",
+            "do",
+        ]);
+        let SharedCommand::Run(args) = command else {
+            panic!("expected run command");
+        };
+
+        assert_eq!(
+            args.session_ids,
+            vec![RoleSessionId {
+                role: "developer".to_string(),
+                session_id: "session-1,opaque-suffix".to_string(),
+            }]
+        );
     }
 
     #[test]

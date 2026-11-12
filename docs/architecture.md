@@ -383,14 +383,14 @@ standalone document has collapsed `<details>` cards, complete untruncated
 headers and bodies, inline expand/collapse controls, and case-insensitive text
 search with no external resources.
 
-`--session-id` accepts repeatable or comma-separated `role=session-id` pairs.
-The runtime loads each supplied session, marks its role prompt as already
-delivered, and fails if the session cannot load rather than creating a new one.
+`--session-id` accepts repeated `role=session-id` pairs. The runtime loads each
+supplied session, marks its role prompt as already delivered, and fails if the
+session cannot load rather than creating a new one.
 When an agent-backed CLI run finishes or the TUI exits, Cowboy prints each
 observed role session as `role: session-id`.
 
-`run --field` accepts repeatable or comma-separated `key=value` pairs. Fields
-are trusted caller-supplied data: keys must be 1-64 characters of
+`run --field` accepts repeated `key=value` pairs. Fields are trusted
+caller-supplied data: keys must be 1-64 characters of
 `[a-z0-9_]`, values are bounded to 65,536 characters, and at most 128 fields
 are accepted. Fields are stored durably on the run and exposed to every workflow
 step as `ctx.fields`; a restarted run inherits the source run's fields.
