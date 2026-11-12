@@ -63,18 +63,18 @@ cowboy run --workflow <workflow-id> add a /healthz route
 ```
 
 Continue existing agent conversations by supplying one or more role-to-session
-pairs. Separate pairs with commas or repeat `--session-id`. Cowboy loads each
-supplied backend session, omits that role's static prompt, and sends the new
-run request; a supplied session that cannot load fails instead of being
-replaced.
+pairs. Repeat `--session-id` for each pair. Cowboy loads each supplied backend
+session, omits that role's static prompt, and sends the new run request; a
+supplied session that cannot load fails instead of being replaced.
 
-Trusted callers can attach bounded key/value fields with `--field
-key=value` (repeatable or comma-separated). Fields are stored on the run and
-visible to every workflow step as `ctx.fields`.
+Trusted callers can attach bounded key/value fields with repeatable `--field
+key=value` options. Fields are stored on the run and visible to every workflow
+step as `ctx.fields`. Each option contains exactly one field so values retain
+commas.
 
 ```bash
 cowboy run --session-id developer=<session-id> add a /healthz route
-cowboy run --session-id developer=<session-id>,reviewer=<session-id> review the change
+cowboy run --session-id developer=<session-id> --session-id reviewer=<session-id> review the change
 ```
 
 After an agent-backed CLI run or when the TUI exits, Cowboy prints observed
@@ -182,9 +182,9 @@ Plain text submitted in the composer starts a workflow run. When a workflow is w
 
 `/run --workflow <workflow-id> <request>` uses the catalog workflow id shown by `/workflows`, not necessarily the name declared inside a Lua workflow file.
 
-`/run --session-id <role=session-id> <request>` accepts the same repeatable or
-comma-separated role session pairs as the CLI and resumes those role sessions
-without resending their static role prompts.
+`/run --session-id <role=session-id> <request>` uses the same repeatable role
+session pairs as the CLI and resumes those role sessions without resending their
+static role prompts.
 
 ### TUI keys
 
