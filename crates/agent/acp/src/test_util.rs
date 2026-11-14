@@ -6,6 +6,9 @@ use std::sync::Arc;
 
 use crate::transport::Transport;
 
+#[path = "../tests/support/diagnostics.rs"]
+pub mod diagnostics;
+
 /// Mock transport that plays back pre-configured responses and records outgoing messages.
 pub struct MockTransport {
     incoming: Arc<Mutex<VecDeque<String>>>,

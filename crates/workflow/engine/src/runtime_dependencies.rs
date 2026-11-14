@@ -122,8 +122,11 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
 
         match generate_request_topic_result(config, self.connector.as_ref(), request).await {
             Ok(topic) => Some(topic),
-            Err(err) => {
-                tracing::warn!(error = %err, "request topic generation failed");
+            Err(_) => {
+                tracing::warn!(
+                    error_code = "topic_generation_failed",
+                    "request topic generation failed"
+                );
                 None
             }
         }
@@ -169,11 +172,8 @@ impl ClientFactory for AcpClientFactory {
         let agent = self.resolver.resolve(role)?;
         tracing::debug!(
             role = %role.id,
-            agent = %agent.name,
-            command = %agent.command,
-            args = ?agent.args,
-            model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
-            provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
+            argument_count = agent.args.len(),
+            model_configured = agent.model.is_some(),
             "resolving ACP client for role"
         );
         let client = self

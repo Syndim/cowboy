@@ -462,41 +462,115 @@ fn event_kind(event: &Event) -> &'static str {
     }
 }
 
+fn safe_method(method: &str) -> &'static str {
+    match method {
+        "initialize" => "initialize",
+        "session/new" => "session/new",
+        "session/load" => "session/load",
+        "session/prompt" => "session/prompt",
+        "session/cancel" => "session/cancel",
+        "session/set_config_option" => "session/set_config_option",
+        _ => "other",
+    }
+}
+
+fn encode_outgoing<T: Serialize>(
+    message: &T,
+    method: &str,
+    id: Option<u64>,
+) -> anyhow::Result<String> {
+    tracing::debug!(
+        event = "acp_request_send_started",
+        method = safe_method(method),
+        id,
+        "ACP send started"
+    );
+    let started = tokio::time::Instant::now();
+    match serde_json::to_string(message) {
+        Ok(line) => {
+            tracing::debug!(
+                event = "acp_request_serialized",
+                method = safe_method(method),
+                id,
+                bytes = line.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ACP request serialized"
+            );
+            Ok(line)
+        }
+        Err(_) => {
+            tracing::debug!(
+                event = "acp_request_serialize_failed",
+                method = safe_method(method),
+                id,
+                error_code = "serialize_failed",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ACP request serialization failed"
+            );
+            anyhow::bail!("ACP request serialization failed")
+        }
+    }
+}
+
+async fn send_encoded(
+    transport: &mut dyn Transport,
+    line: &str,
+    method: &str,
+    id: Option<u64>,
+) -> anyhow::Result<()> {
+    let started = tokio::time::Instant::now();
+    let result = transport.send(line).await;
+    tracing::debug!(
+        event = if result.is_ok() {
+            "acp_request_send_complete"
+        } else {
+            "acp_request_send_failed"
+        },
+        method = safe_method(method),
+        id,
+        bytes = line.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        error_code = if result.is_ok() {
+            "none"
+        } else {
+            "transport_send_failed"
+        },
+        "ACP send settled"
+    );
+    result
+}
+
 fn log_acp_message(direction: &'static str, msg: &Message) {
     match msg {
         Message::Response { id, result, error } => {
             tracing::debug!(
+                event = "acp_message_parsed",
                 direction,
                 kind = "response",
                 id,
+                rpc_error_code = error
+                    .as_ref()
+                    .and_then(|error| error.get("code"))
+                    .and_then(serde_json::Value::as_i64),
                 has_result = result.is_some(),
                 has_error = error.is_some(),
-                error = ?error.as_ref().map(|value| value.to_string()),
                 "ACP message parsed"
             );
         }
-        Message::SessionUpdate { session_id, update } => {
+        Message::SessionUpdate { update, .. } => {
             tracing::debug!(
+                event = "acp_message_parsed",
                 direction,
                 kind = "session_update",
-                session_id,
                 update = event_kind(update),
                 "ACP message parsed"
             );
         }
-        Message::PermissionRequest {
-            id,
-            session_id,
-            tool_call,
-            options,
-        } => {
+        Message::PermissionRequest { options, .. } => {
             tracing::debug!(
+                event = "acp_message_parsed",
                 direction,
                 kind = "permission_request",
-                %id,
-                session_id,
-                tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
-                tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
                 options = options.len(),
                 "ACP message parsed"
             );
@@ -568,7 +642,6 @@ impl Client {
         if self.transport.is_none() {
             tracing::info!(
                 transport = transport_kind(&self.transport_config),
-                session_id = ?self.session_id,
                 "Reconnecting client transport"
             );
             let transport = self.create_reconnect_transport().await?;
@@ -578,7 +651,6 @@ impl Client {
                 .await?;
             tracing::info!(
                 transport = transport_kind(&self.transport_config),
-                session_id = ?self.session_id,
                 "Client transport reconnected"
             );
         }
@@ -666,9 +738,14 @@ impl Client {
             "ACP initialize starting"
         );
         let request = JsonRpcRequest::new(id, "initialize", init_params);
-        let line = serde_json::to_string(&request)?;
-        tracing::debug!(id, method = "initialize", payload = %line, "ACP >>> request");
-        self.transport_mut()?.send(&line).await?;
+        let line = encode_outgoing(&request, "initialize", Some(id))?;
+        send_encoded(
+            self.transport_mut()?.as_mut(),
+            &line,
+            "initialize",
+            Some(id),
+        )
+        .await?;
 
         // Wait for response directly
         loop {
@@ -686,11 +763,7 @@ impl Client {
                         serde_json::from_value(result.unwrap_or(serde_json::Value::Null))?;
                     self.agent_capabilities = init.agent_capabilities;
                     self.agent_info = init.agent_info;
-                    tracing::info!(
-                        agent = ?self.agent_info,
-                        capabilities = ?self.agent_capabilities,
-                        "ACP connection initialized"
-                    );
+                    tracing::info!("ACP connection initialized");
                     return Ok(());
                 }
                 _ => {} // skip non-matching messages during init
@@ -725,7 +798,7 @@ impl Client {
             Ok(Ok(())) => None,
             Ok(Err(error)) => {
                 tracing::error!(
-                    error = %error,
+                    error_code = "operation_failed",
                     "Transport force termination failed after ACP initialization failure"
                 );
                 Some(format!("transport force termination failed: {error}"))
@@ -929,10 +1002,7 @@ impl Client {
         }
 
         tracing::debug!(
-            cwd,
             mcp_server_count = mcp_servers.len(),
-            model_id = ?model.map(|model| model.id.as_str()),
-            provider = ?model.and_then(|model| model.provider.as_deref()),
             "ACP session/new starting"
         );
         let params = SessionNewParams {
@@ -991,12 +1061,7 @@ impl Client {
             cwd: cwd.to_string(),
             mcp_servers: mcp_servers.to_vec(),
         });
-        tracing::info!(
-            session_id = %session.session_id,
-            model_id = ?model.map(|model| model.id.as_str()),
-            provider = ?model.and_then(|model| model.provider.as_deref()),
-            "ACP session created"
-        );
+        tracing::info!("ACP session created");
         Ok(session.session_id)
     }
 
@@ -1012,9 +1077,6 @@ impl Client {
             .or_else(|| config_options.iter().find(|option| option.id == "model"));
         let Some(model_option) = model_option else {
             tracing::debug!(
-                session_id,
-                model_id = %model.id,
-                provider = ?model.provider,
                 "ACP agent exposes no model config option; relying on session metadata"
             );
             return Ok(None);
@@ -1048,12 +1110,7 @@ impl Client {
             );
         };
 
-        tracing::debug!(
-            session_id,
-            config_id = %model_option.id,
-            model_value = value,
-            "ACP session model selection starting"
-        );
+        tracing::debug!("ACP session model selection starting");
         let params = SetSessionConfigOptionParams {
             session_id,
             config_id: &model_option.id,
@@ -1078,12 +1135,7 @@ impl Client {
             );
         }
 
-        tracing::info!(
-            session_id,
-            config_id = %model_option.id,
-            model_value = applied_value,
-            "ACP session model configured"
-        );
+        tracing::info!("ACP session model configured");
         Ok(Some(result.config_options))
     }
 
@@ -1225,7 +1277,6 @@ impl Client {
 
             if !Self::commit_automatic_continuation(&mut cancellation).await {
                 tracing::debug!(
-                    session_id,
                     attempt,
                     activity = ?outcome.activity,
                     "ACP prompt cancellation won automatic continuation dispatch"
@@ -1240,7 +1291,6 @@ impl Client {
             }
 
             tracing::info!(
-                session_id,
                 attempt = attempt + 1,
                 activity = ?outcome.activity,
                 "Agent ended turn without text output, continuing"
@@ -1252,13 +1302,31 @@ impl Client {
     }
 
     async fn send_prompt_turn_cancellation(&mut self, session_id: &str) -> anyhow::Result<()> {
-        self.send_notification(
-            "session/cancel",
-            SessionCancelParams {
-                session_id: session_id.to_string(),
+        let started = tokio::time::Instant::now();
+        tracing::debug!(
+            event = "agent_watchdog_cancel_begin",
+            timeout_seconds = self.watchdog.cancel_timeout_seconds,
+            "ACP cancellation begin"
+        );
+        let result = self
+            .send_notification(
+                "session/cancel",
+                SessionCancelParams {
+                    session_id: session_id.to_string(),
+                },
+            )
+            .await;
+        tracing::debug!(
+            event = "agent_watchdog_cancel_complete",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            error_code = if result.is_ok() {
+                "none"
+            } else {
+                "cancel_send_failed"
             },
-        )
-        .await
+            "ACP cancellation settled"
+        );
+        result
     }
 
     async fn dispatch_watchdog_continuation(&mut self, session_id: &str) -> anyhow::Result<u64> {
@@ -1285,7 +1353,6 @@ impl Client {
             }
 
             tracing::warn!(
-                session_id,
                 "Agent watchdog has no session/load context; continuing legacy recovery"
             );
             return Ok(());
@@ -1309,19 +1376,24 @@ impl Client {
         let _ = tokio::time::timeout(timeout, transport.force_terminate()).await;
     }
 
-    async fn invalidate_session_after_failed_recovery(&mut self, session_id: &str, reason: &str) {
+    async fn invalidate_session_after_failed_recovery(&mut self, _session_id: &str, _reason: &str) {
         self.cleanup_replacement().await;
         self.session_id = None;
         self.session_descriptor = None;
         tracing::warn!(
             event = "agent_watchdog_session_invalidated",
-            session_id,
-            reason,
+            error_code = "session_recovery_failed",
             "Agent watchdog invalidated a session that the replacement transport could not resume"
         );
     }
 
     async fn hard_recover_and_continue(&mut self, session_id: &str) -> anyhow::Result<u64> {
+        tracing::debug!(
+            event = "agent_watchdog_recovery_begin",
+            phase = "terminate",
+            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            "ACP recovery begin"
+        );
         let timeout = Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
         let Some(mut old_transport) = self.transport.take() else {
             let reason = "agent watchdog recovery found no active transport".to_string();
@@ -1334,15 +1406,13 @@ impl Client {
             Ok(Ok(())) => {
                 tracing::warn!(
                     event = "agent_watchdog_force_terminated",
-                    session_id,
                     "Agent watchdog force-terminated the unresponsive transport"
                 );
             }
             Ok(Err(err)) => {
                 tracing::error!(
                     event = "agent_watchdog_recovery_failed",
-                    session_id,
-                    error = %err,
+                    error_code = "operation_failed",
                     "Agent watchdog force termination failed"
                 );
                 let reason = format!("agent watchdog force termination failed: {err}");
@@ -1354,7 +1424,6 @@ impl Client {
             Err(_) => {
                 tracing::error!(
                     event = "agent_watchdog_recovery_failed",
-                    session_id,
                     "Agent watchdog force termination timed out"
                 );
                 let reason = "agent watchdog force termination timed out".to_string();
@@ -1366,6 +1435,12 @@ impl Client {
         }
         drop(old_transport);
 
+        tracing::debug!(
+            event = "agent_watchdog_recovery_begin",
+            phase = "create_transport",
+            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            "ACP recovery begin"
+        );
         let replacement = match tokio::time::timeout(
             timeout,
             self.create_replacement_transport(session_id),
@@ -1389,6 +1464,12 @@ impl Client {
         self.transport = Some(replacement);
         self.pushback.clear();
 
+        tracing::debug!(
+            event = "agent_watchdog_recovery_begin",
+            phase = "initialize",
+            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            "ACP recovery begin"
+        );
         if let Err(err) = self
             .initialize_bounded("agent watchdog replacement initialization")
             .await
@@ -1399,6 +1480,12 @@ impl Client {
             return Err(anyhow::anyhow!(reason));
         }
 
+        tracing::debug!(
+            event = "agent_watchdog_recovery_begin",
+            phase = "load_session",
+            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            "ACP recovery begin"
+        );
         if let Err(err) = self.reload_watchdog_replacement_session(session_id).await {
             let reason = err.to_string();
             self.invalidate_session_after_failed_recovery(session_id, &reason)
@@ -1407,8 +1494,13 @@ impl Client {
         }
         tracing::warn!(
             event = "agent_watchdog_transport_resumed",
-            session_id,
             "Agent watchdog resumed the session on a replacement transport"
+        );
+        tracing::debug!(
+            event = "agent_watchdog_recovery_begin",
+            phase = "continue",
+            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            "ACP recovery begin"
         );
         match self.dispatch_watchdog_continuation(session_id).await {
             Ok(id) => Ok(id),
@@ -1431,24 +1523,13 @@ impl Client {
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<PromptTurnOutcome> {
         let (content_count, prompt_chars) = prompt_content_stats(&prompt_content);
-        tracing::debug!(
-            session_id,
-            content_count,
-            prompt_chars,
-            "ACP prompt turn starting"
-        );
+        tracing::debug!(content_count, prompt_chars, "ACP prompt turn starting");
         let params = SessionPromptParams {
             session_id: session_id.to_string(),
             prompt: prompt_content,
         };
         let mut id = self.send_request_no_wait("session/prompt", params).await?;
-        tracing::debug!(
-            session_id,
-            id,
-            content_count,
-            prompt_chars,
-            "ACP prompt sent"
-        );
+        tracing::debug!(id, content_count, prompt_chars, "ACP prompt sent");
 
         let mut activity = PromptTurnActivity::Empty;
         let mut last_activity = LastObservedActivity::default();
@@ -1462,8 +1543,18 @@ impl Client {
         let mut external_cancellation_sent = false;
         let mut deferred_updates_after_external_cancellation = 0usize;
         let mut replacement_continuation_active = false;
+        let monitored_at = tokio::time::Instant::now();
+        let mut parsed_messages = 0u64;
         let mut response_deadline_at = tokio::time::Instant::now()
             + Duration::from_secs(self.watchdog.response_timeout_seconds);
+        tracing::debug!(
+            event = "agent_watchdog_armed",
+            id,
+            timeout_seconds = self.watchdog.response_timeout_seconds,
+            elapsed_ms = 0u64,
+            parsed_messages,
+            "ACP prompt watchdog armed"
+        );
         let stop_reason = 'monitor: loop {
             let response_deadline = tokio::time::sleep_until(response_deadline_at);
             tokio::pin!(response_deadline);
@@ -1491,12 +1582,21 @@ impl Client {
             };
 
             if let WaitOutcome::Message(Ok(ref message)) = outcome {
+                parsed_messages = parsed_messages.saturating_add(1);
                 self.reject_foreign_session_message(message, session_id)
                     .await?;
                 if self.deny_permission_request(message).await? {
                     continue 'monitor;
                 }
                 self.reject_forbidden_message(message).await?;
+                tracing::debug!(
+                    event = "agent_watchdog_reset",
+                    id,
+                    timeout_seconds = self.watchdog.response_timeout_seconds,
+                    elapsed_ms = monitored_at.elapsed().as_millis() as u64,
+                    parsed_messages,
+                    "ACP prompt watchdog reset by parsed activity"
+                );
             }
             response_deadline_at = tokio::time::Instant::now()
                 + Duration::from_secs(self.watchdog.response_timeout_seconds);
@@ -1521,8 +1621,7 @@ impl Client {
                         }
                         tracing::warn!(
                             event = "agent_watchdog_recovery_failed",
-                            session_id,
-                            error = %err,
+                            error_code = "operation_failed",
                             "Agent watchdog observed an unusable ACP stream"
                         );
                         id = self.hard_recover_and_continue(session_id).await.map_err(
@@ -1536,7 +1635,7 @@ impl Client {
                 },
                 WaitOutcome::ExternalCancellation => {
                     self.send_prompt_turn_cancellation(session_id).await?;
-                    tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
+                    tracing::debug!(id, "ACP prompt turn cancellation sent");
                     external_cancellation_sent = true;
                     continue;
                 }
@@ -1551,13 +1650,15 @@ impl Client {
                         // responsibility rather than Cowboy's.
                         tracing::warn!(
                             event = "agent_watchdog_tool_wait",
-                            session_id,
                             id,
                             timeout_seconds = self.watchdog.response_timeout_seconds,
                             last_event_kind = last_activity.last_event_kind(),
-                            last_tool_call_title = last_activity.last_tool_call_title(),
-                            last_tool_call_kind = last_activity.last_tool_call_kind(),
-                            last_tool_call_status = last_activity.last_tool_call_status(),
+                            last_tool_call_title_bytes =
+                                last_activity.last_tool_call_title().map(str::len),
+                            last_tool_call_kind_bytes =
+                                last_activity.last_tool_call_kind().map(str::len),
+                            last_tool_call_status_bytes =
+                                last_activity.last_tool_call_status().map(str::len),
                             seconds_since_last_activity =
                                 last_activity.seconds_since_last_activity(),
                             waited_seconds = last_activity.tool_wait_seconds(),
@@ -1567,21 +1668,28 @@ impl Client {
                     }
                     tracing::warn!(
                         event = "agent_watchdog_timeout",
-                        session_id,
                         id,
+                        elapsed_ms = monitored_at.elapsed().as_millis() as u64,
+                        parsed_messages,
                         timeout_seconds = self.watchdog.response_timeout_seconds,
                         last_event_kind = last_activity.last_event_kind(),
-                        last_tool_call_title = last_activity.last_tool_call_title(),
-                        last_tool_call_kind = last_activity.last_tool_call_kind(),
-                        last_tool_call_status = last_activity.last_tool_call_status(),
+                        last_tool_call_title_bytes =
+                            last_activity.last_tool_call_title().map(str::len),
+                        last_tool_call_kind_bytes =
+                            last_activity.last_tool_call_kind().map(str::len),
+                        last_tool_call_status_bytes =
+                            last_activity.last_tool_call_status().map(str::len),
                         seconds_since_last_activity = last_activity.seconds_since_last_activity(),
                         "Agent watchdog detected response inactivity"
                     );
-                    if let Err(err) = self.send_prompt_turn_cancellation(session_id).await {
+                    if self
+                        .send_prompt_turn_cancellation(session_id)
+                        .await
+                        .is_err()
+                    {
                         tracing::warn!(
                             event = "agent_watchdog_recovery_failed",
-                            session_id,
-                            error = %err,
+                            error_code = "operation_failed",
                             "Agent watchdog cancel notification failed"
                         );
                         id = self.hard_recover_and_continue(session_id).await?;
@@ -1590,7 +1698,6 @@ impl Client {
                     }
                     tracing::warn!(
                         event = "agent_watchdog_cancel_sent",
-                        session_id,
                         id,
                         "Agent watchdog sent session/cancel"
                     );
@@ -1674,16 +1781,8 @@ impl Client {
                                 output_since_recovery = true;
                                 event_handler(update);
                             }
-                            Message::PermissionRequest {
-                                id: req_id,
-                                session_id: permission_session_id,
-                                tool_call,
-                                options: _,
-                            } => {
+                            Message::PermissionRequest { id: req_id, .. } => {
                                 tracing::debug!(
-                                    session_id = %permission_session_id,
-                                    request_id = %req_id,
-                                    tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
                                     "ACP permission request cancelled during watchdog grace"
                                 );
                                 self.send_rpc_response(&req_id, PermissionOutcome::cancelled())
@@ -1733,7 +1832,6 @@ impl Client {
                                 if progressless_soft_recoveries > MAX_PROGRESSLESS_SOFT_RECOVERIES {
                                     tracing::error!(
                                         event = "agent_watchdog_resume_failed",
-                                        session_id,
                                         id,
                                         soft_recoveries = watchdog_soft_recoveries,
                                         progressless = progressless_soft_recoveries,
@@ -1756,13 +1854,12 @@ impl Client {
                                 output_since_recovery = false;
                                 tracing::warn!(
                                     event = "agent_watchdog_soft_recovered",
-                                    session_id,
                                     stop_reason = ?stop_reason,
                                     soft_recoveries = watchdog_soft_recoveries,
                                     last_event_kind = last_activity.last_event_kind(),
-                                    last_tool_call_title = last_activity.last_tool_call_title(),
-                                    last_tool_call_kind = last_activity.last_tool_call_kind(),
-                                    last_tool_call_status = last_activity.last_tool_call_status(),
+                                    last_tool_call_title_bytes = last_activity.last_tool_call_title().map(str::len),
+                                    last_tool_call_kind_bytes = last_activity.last_tool_call_kind().map(str::len),
+                                    last_tool_call_status_bytes = last_activity.last_tool_call_status().map(str::len),
                                     seconds_since_last_activity =
                                         last_activity.seconds_since_last_activity(),
                                     "Agent watchdog cancellation completed; continuing session"
@@ -1793,7 +1890,7 @@ impl Client {
                 } else {
                     self.send_prompt_turn_cancellation(session_id).await?;
                     external_cancellation_sent = true;
-                    tracing::debug!(session_id, id, "ACP prompt turn cancellation sent");
+                    tracing::debug!(id, "ACP prompt turn cancellation sent");
                 }
             }
 
@@ -1806,9 +1903,8 @@ impl Client {
                 }
                 Message::PermissionRequest {
                     id: req_id,
-                    session_id: permission_session_id,
-                    tool_call,
                     options,
+                    ..
                 } => {
                     activity.observe_permission_request();
                     let outcome = if external_cancellation_sent {
@@ -1816,15 +1912,7 @@ impl Client {
                     } else {
                         PermissionOutcome::allow_from_options(&options)
                     };
-                    tracing::debug!(
-                        session_id = %permission_session_id,
-                        request_id = %req_id,
-                        tool_kind = ?tool_call.get("kind").and_then(|value| value.as_str()),
-                        tool_title = ?tool_call.get("title").and_then(|value| value.as_str()),
-                        options = options.len(),
-                        outcome = ?outcome,
-                        "ACP permission request answered"
-                    );
+                    tracing::debug!(options = options.len(), "ACP permission request answered");
                     self.send_rpc_response(&req_id, outcome).await?;
                 }
                 Message::Response {
@@ -1840,7 +1928,11 @@ impl Client {
                                 .await;
                             anyhow::bail!("{reason}");
                         }
-                        tracing::warn!(session_id, id = resp_id, error = %err, "ACP prompt response error");
+                        tracing::warn!(
+                            id = resp_id,
+                            error_code = "rpc_error",
+                            "ACP prompt response error"
+                        );
                         anyhow::bail!("Agent error: {err}");
                     }
                     let prompt_result: SessionPromptResult =
@@ -1861,7 +1953,6 @@ impl Client {
             && !self.access.denies_permissions()
         {
             tracing::debug!(
-                session_id,
                 id,
                 activity = ?activity,
                 "ACP cancelled prompt turn completed"
@@ -1894,7 +1985,6 @@ impl Client {
         activity.observe_trailing_text(saw_trailing_text);
 
         tracing::debug!(
-            session_id,
             id,
             stop_reason = ?stop_reason,
             activity = ?activity,
@@ -1964,13 +2054,23 @@ impl Client {
                 continue;
             }
             let json = match serde_json::from_str::<Value>(&line) {
-                Ok(json) => json,
-                Err(error) if self.access.denies_permissions() || !self.access.allows_tools() => {
-                    self.tool_policy_violated = true;
-                    self.cleanup_replacement().await;
-                    anyhow::bail!("invalid ACP trailing message: {error}");
+                Ok(json) => {
+                    tracing::debug!(
+                        event = "acp_json_parse_complete",
+                        bytes = line.len(),
+                        "ACP JSON parsed"
+                    );
+                    json
                 }
-                Err(_) => continue,
+                Err(error) => {
+                    tracing::debug!(event = "acp_json_parse_failed", bytes = line.len(), error_code = ?error.classify(), "ACP JSON parse failed");
+                    if self.access.denies_permissions() || !self.access.allows_tools() {
+                        self.tool_policy_violated = true;
+                        self.cleanup_replacement().await;
+                        anyhow::bail!("invalid ACP trailing message");
+                    }
+                    continue;
+                }
             };
             self.validate_incoming_mode_update(&json).await?;
             self.reject_invalid_permission_request_id(&json).await?;
@@ -1984,7 +2084,7 @@ impl Client {
                     drain_timeout = Duration::from_millis(200);
                     continue;
                 }
-                tracing::debug!(payload = %line, "ACP <<< trailing");
+                log_acp_message("inbound_trailing", &msg);
                 match msg {
                     Message::SessionUpdate { update, .. } => {
                         if matches!(update, Event::MessageChunk { .. }) {
@@ -2040,7 +2140,7 @@ impl Client {
         }
 
         if !self.supports_load_session() {
-            tracing::warn!(session_id, "ACP session/load unsupported by agent");
+            tracing::warn!("ACP session/load unsupported by agent");
             anyhow::bail!("Agent does not support loadSession capability");
         }
         if self.access.required_mode().is_some() {
@@ -2048,8 +2148,6 @@ impl Client {
         }
 
         tracing::debug!(
-            session_id,
-            cwd,
             mcp_server_count = mcp_servers.len(),
             "ACP session/load starting"
         );
@@ -2090,7 +2188,6 @@ impl Client {
             match msg {
                 Message::SessionUpdate { update, .. } => {
                     tracing::trace!(
-                        session_id,
                         update = event_kind(&update),
                         "ACP session/load replay event"
                     );
@@ -2102,7 +2199,11 @@ impl Client {
                     error,
                 } if resp_id == id => {
                     if let Some(err) = error {
-                        tracing::warn!(session_id, id = resp_id, error = %err, "ACP session/load response error");
+                        tracing::warn!(
+                            id = resp_id,
+                            error_code = "rpc_error",
+                            "ACP session/load response error"
+                        );
                         anyhow::bail!("session/load error: {err}");
                     }
                     let result = match result {
@@ -2135,11 +2236,7 @@ impl Client {
                         cwd: cwd.to_string(),
                         mcp_servers: mcp_servers.to_vec(),
                     });
-                    tracing::info!(
-                        session_id,
-                        history_events = history.len(),
-                        "ACP session loaded"
-                    );
+                    tracing::info!(history_events = history.len(), "ACP session loaded");
                     return Ok(history);
                 }
                 _ => {} // Ignore non-matching messages during session/load replay.
@@ -2200,9 +2297,14 @@ impl Client {
         let id = self.next_id;
         self.next_id += 1;
         let request = JsonRpcRequest::new(id, method, params);
-        let line = serde_json::to_string(&request)?;
-        tracing::debug!(id, method, payload = %line, "ACP >>> request");
-        self.ensure_transport().await?.send(&line).await?;
+        let line = encode_outgoing(&request, method, Some(id))?;
+        send_encoded(
+            self.ensure_transport().await?.as_mut(),
+            &line,
+            method,
+            Some(id),
+        )
+        .await?;
         Ok(id)
     }
 
@@ -2213,9 +2315,8 @@ impl Client {
         params: P,
     ) -> anyhow::Result<()> {
         let notification = JsonRpcNotification::new(method, params);
-        let line = serde_json::to_string(&notification)?;
-        tracing::debug!(method, payload = %line, "ACP >>> notification");
-        self.ensure_transport().await?.send(&line).await?;
+        let line = encode_outgoing(&notification, method, None)?;
+        send_encoded(self.ensure_transport().await?.as_mut(), &line, method, None).await?;
         Ok(())
     }
 
@@ -2226,9 +2327,14 @@ impl Client {
         result: R,
     ) -> anyhow::Result<()> {
         let response = JsonRpcResponse::new(id, result);
-        let line = serde_json::to_string(&response)?;
-        tracing::debug!(%id, payload = %line, "ACP >>> response");
-        self.ensure_transport().await?.send(&line).await?;
+        let line = encode_outgoing(&response, "rpc_response", None)?;
+        send_encoded(
+            self.ensure_transport().await?.as_mut(),
+            &line,
+            "rpc_response",
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2427,15 +2533,23 @@ impl Client {
     async fn parse_incoming_json(&mut self, line: &str) -> anyhow::Result<Value> {
         let json = match serde_json::from_str(line) {
             Ok(json) => json,
-            Err(err) if !self.access.allows_tools() || self.access.denies_permissions() => {
-                self.tool_policy_violated = true;
-                self.cleanup_replacement().await;
-                anyhow::bail!(
-                    "Malformed ACP JSON under restricted policy: {err}; transport terminated"
-                );
+            Err(err) => {
+                tracing::debug!(event = "acp_json_parse_failed", bytes = line.len(), error_code = ?err.classify(), "ACP JSON parse failed");
+                if !self.access.allows_tools() || self.access.denies_permissions() {
+                    self.tool_policy_violated = true;
+                    self.cleanup_replacement().await;
+                    anyhow::bail!(
+                        "Malformed ACP JSON under restricted policy; transport terminated"
+                    );
+                }
+                anyhow::bail!("Failed to parse JSON from agent");
             }
-            Err(err) => anyhow::bail!("Failed to parse JSON from agent: {err}\nLine: {line}"),
         };
+        tracing::debug!(
+            event = "acp_json_parse_complete",
+            bytes = line.len(),
+            "ACP JSON parsed"
+        );
         self.reject_invalid_permission_request_id(&json).await?;
         self.validate_incoming_mode_update(&json).await?;
         Ok(json)
@@ -2489,13 +2603,16 @@ impl Client {
 
             if let Some(msg) = parse_acp_message(&json) {
                 if self.access.allows_tools() {
-                    tracing::debug!(payload = %line, "ACP <<< received");
                     log_acp_message("inbound", &msg);
                 }
                 return Ok(msg);
             }
             if self.access.allows_tools() {
-                tracing::warn!(payload = %line, "ACP <<< skipping unrecognized message");
+                tracing::debug!(
+                    event = "acp_message_unrecognized",
+                    bytes = line.len(),
+                    "ACP skipping unrecognized message"
+                );
             }
         }
     }
@@ -2525,11 +2642,14 @@ impl Client {
                 if self.deny_permission_request(&msg).await? {
                     continue;
                 }
-                tracing::debug!(payload = %line, "ACP <<< received");
                 log_acp_message("inbound_direct", &msg);
                 return Ok(msg);
             }
-            tracing::warn!(payload = %line, "ACP <<< skipping unrecognized message");
+            tracing::debug!(
+                event = "acp_message_unrecognized",
+                bytes = line.len(),
+                "ACP skipping unrecognized message"
+            );
         }
     }
 
@@ -2537,7 +2657,6 @@ impl Client {
     pub async fn close(&mut self) -> anyhow::Result<()> {
         tracing::debug!(
             transport = transport_kind(&self.transport_config),
-            session_id = ?self.session_id,
             connected = self.transport.is_some(),
             "Closing ACP client"
         );
@@ -2545,7 +2664,7 @@ impl Client {
             t.close().await?;
         }
         self.transport = None;
-        tracing::debug!(session_id = ?self.session_id, "ACP client closed");
+        tracing::debug!("ACP client closed");
         Ok(())
     }
 }
@@ -2671,6 +2790,182 @@ mod tests {
     fn transport_creation_test_lock() -> &'static tokio::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn diagnostic_start_precedes_serialization_failure_without_error_contents() {
+        struct Fails;
+        impl Serialize for Fails {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("private-serialize-error-marker"))
+            }
+        }
+        let capture = diagnostics::DiagnosticCapture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            let error = encode_outgoing(&Fails, "session/prompt", Some(1)).unwrap_err();
+            assert!(!error.to_string().contains("private-serialize-error-marker"));
+        });
+        let log = capture.text();
+        assert!(
+            log.find("acp_request_send_started").unwrap()
+                < log.find("acp_request_serialize_failed").unwrap()
+        );
+        assert!(!log.contains("acp_request_serialized"));
+        assert!(!log.contains("acp_request_send_complete"));
+        assert!(!log.contains("private-serialize-error-marker"));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_send_started_survives_stuck_send_and_hides_errors() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            let counters = Arc::new(ScriptedTransportCounters::default());
+            let transport = ScriptedTransport::new(
+                vec![ScriptedReceive::Message(init_response(0))],
+                counters.clone(),
+            )
+            .send_action(1, ScriptedOperation::Pending);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            capture.clear();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    client.send_request_no_wait(
+                        "private-method-marker",
+                        serde_json::json!({"secret":"private-prompt-marker"})
+                    )
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(counters.sends.load(Ordering::SeqCst), 2);
+            let log = capture.text();
+            assert!(log.contains("acp_request_send_started"));
+            assert!(log.contains("method=\"other\""));
+            assert!(!log.contains("acp_request_send_complete"));
+            assert!(!log.contains("agent_watchdog_armed"));
+            assert!(!log.contains("private-method-marker"));
+            assert!(!log.contains("private-prompt-marker"));
+
+            let mut failing = ScriptedTransport::new(vec![], Arc::default()).send_action(
+                0,
+                ScriptedOperation::Error("private-transport-error-marker"),
+            );
+            assert!(
+                send_encoded(
+                    &mut failing,
+                    "private-prompt-marker",
+                    "session/prompt",
+                    Some(2)
+                )
+                .await
+                .is_err()
+            );
+            assert!(capture.text().contains("acp_request_send_failed"));
+            assert!(!capture.text().contains("private-transport-error-marker"));
+        }
+        .with_subscriber(dispatch)
+        .await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_recovery_phases_and_missing_session_error_are_private() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            let (mut client, initial) = direct_hard_client(ScriptedOperation::Ready).await;
+            client.session_id = Some("private-session-marker".into());
+            client.session_load_context = Some(SessionLoadContext {
+                cwd: "/private/cwd-marker".into(),
+                mcp_servers: vec![],
+            });
+            let replacement = Arc::new(ScriptedTransportCounters::default());
+            client.push_replacement_transport(Box::new(replacement_with(
+                vec![
+                    ScriptedReceive::Message(init_response(1)),
+                    ScriptedReceive::Message(rpc_error(
+                        2,
+                        -32000,
+                        "private-backend-missing-session-marker",
+                    )),
+                ],
+                replacement.clone(),
+            )));
+            capture.clear();
+            assert!(
+                client
+                    .hard_recover_and_continue("private-session-marker")
+                    .await
+                    .is_err()
+            );
+            assert!(!client.is_connected());
+            assert!(client.session_id().is_none());
+            assert_eq!(initial.force_terminated.load(Ordering::SeqCst), 1);
+            assert_eq!(replacement.force_terminated.load(Ordering::SeqCst), 1);
+            let log = capture.text();
+            let mut tail = log.as_str();
+            for phase in [
+                "phase=\"terminate\"",
+                "phase=\"create_transport\"",
+                "phase=\"initialize\"",
+                "phase=\"load_session\"",
+                "agent_watchdog_session_invalidated",
+            ] {
+                let index = tail.find(phase).unwrap();
+                tail = &tail[index + phase.len()..];
+            }
+            for private in [
+                "private-session-marker",
+                "/private/cwd-marker",
+                "private-backend-missing-session-marker",
+            ] {
+                assert!(!log.contains(private));
+            }
+            assert!(!log.contains("phase=\"continue\""));
+        }
+        .with_subscriber(dispatch)
+        .await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_json_and_backend_metadata_never_log_values() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::default();
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            let transport = MockTransport::new(vec![&init_response(0)]);
+            let mut client = Client::connect_with_transport(Box::new(transport), dummy_transport_config()).await.unwrap();
+            let error = client.parse_incoming_json("{private-json-marker").await.unwrap_err();
+            assert!(!error.to_string().contains("private-json-marker"));
+            let transport = MockTransport::new(vec![&rpc_error(0, -32000, "private-backend-error-marker")]);
+            assert!(Client::connect_with_transport(Box::new(transport), dummy_transport_config()).await.is_err());
+            let permission = serde_json::json!({"jsonrpc":"2.0", "id":"private-id-marker", "method":"session/request_permission", "params":{"sessionId":"private-session-marker", "toolCall":{"title":"private-tool-marker"}, "options":[]}});
+            log_acp_message("inbound", &parse_acp_message(&permission).unwrap());
+            let Message::PermissionRequest { id, .. } = parse_acp_message(&permission).unwrap() else { unreachable!() };
+            client.send_rpc_response(&id, PermissionOutcome::cancelled()).await.unwrap();
+            for update in [serde_json::json!({"sessionUpdate":"agent_message_chunk", "content":{"type":"text", "text":"private-update-marker"}}), serde_json::json!({"sessionUpdate":"private-unknown-update-marker", "private":"private-update-marker"})] {
+                parse_acp_message(&serde_json::json!({"method":"session/update", "params":{"sessionId":"private-session-marker", "update":update}}));
+            }
+            parse_acp_message(&serde_json::json!({"method":"private-unrecognized-method-marker", "private":"private-update-marker"}));
+            let log = capture.text();
+            assert!(log.contains("acp_json_parse_failed"));
+            assert!(log.contains("has_error=true"));
+            assert!(log.contains("rpc_error_code=-32000"));
+            assert!(log.contains("acp_message_unrecognized"));
+            for private in ["private-update-marker", "private-unknown-update-marker", "private-unrecognized-method-marker"] {
+                assert!(!log.contains(private));
+            }
+            assert!(log.contains("kind=\"permission_request\""));
+            for secret in ["private-json-marker", "private-backend-error-marker", "private-id-marker", "private-session-marker", "private-tool-marker", "mock-agent"] {
+                assert!(!log.contains(secret));
+            }
+        }.with_subscriber(dispatch).await;
     }
 
     #[tokio::test]

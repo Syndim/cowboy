@@ -339,10 +339,10 @@ impl<S: AgentStore + 'static> PromptWindowGuard<S> {
                 | AbortAgentPromptWindowOutcome::StaleWindow
                 | AbortAgentPromptWindowOutcome::MissingRun,
             ) => {}
-            Err(err) => tracing::warn!(
+            Err(_) => tracing::warn!(
                 run_id = %self.context.run_id,
                 window_id = %self.window_id,
-                error = %err,
+                error_code = "prompt_window_abort_failed",
                 "failed to abort agent prompt window"
             ),
         }
@@ -364,14 +364,15 @@ impl<S: AgentStore + 'static> Drop for PromptWindowGuard<S> {
         self.closed = true;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                if let Err(err) = store
+                if store
                     .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now())
                     .await
+                    .is_err()
                 {
                     tracing::warn!(
                         run_id = %context.run_id,
                         window_id,
-                        error = %err,
+                        error_code = "prompt_window_abort_failed",
                         "failed to abort agent prompt window"
                     );
                 }
@@ -414,6 +415,7 @@ where
     S: AgentStore + 'static,
 {
     /// Execute an agent action using the session keyed by `(run_id, role_id)`.
+    #[tracing::instrument(target = "cowboy_agent_acp", level = "debug", skip_all, fields(run_id = %context.run_id, role = %action.role, step = %context.step_id))]
     pub async fn execute_agent(
         &self,
         action: AgentAction,
@@ -433,11 +435,10 @@ where
             run_id = %context.run_id,
             step = %context.step_id,
             role = %action.role,
-            agent = ?role.agent,
             "agent step: starting"
         );
         if !self.clients.lock().await.contains_key(&key) {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, agent = ?role.agent, "agent client missing; creating");
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent client missing; creating");
             let resolved = self.factory.create_client(role).await?;
             self.clients
                 .lock()
@@ -652,7 +653,7 @@ where
                 return Err(error);
             }
         };
-        tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
+        tracing::debug!(run_id = %context.run_id, step = %context.step_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
 
         let mut applied_sequence = expected_baseline;
         let mut correction_turns = Vec::new();
@@ -745,7 +746,7 @@ where
                     };
                     visible = replacement;
                     turns.extend(correction_records);
-                    tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
+                    tracing::debug!(run_id = %context.run_id, step = %context.step_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
                 }
                 CompareAndSealPromptWindowOutcome::Sealed(_) => {
                     window_guard.close();
@@ -797,7 +798,6 @@ where
                 tracing::error!(
                     run_id = %context.run_id,
                     step = %context.step_id,
-                    reply = %visible,
                     "agent step: failed to parse frontmatter output"
                 );
             })?;
@@ -858,7 +858,7 @@ where
 
         let client = active.client.as_mut();
         if let Some(session_id) = client.session_id() {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, "agent session already active");
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent session already active");
             return Ok(AcquiredSession {
                 session_id: session_id.to_string(),
                 fresh: false,
@@ -870,7 +870,6 @@ where
                 tracing::debug!(
                     run_id = %key.run_id,
                     role = %key.role_id,
-                    session_id = %saved.session_id,
                     "agent session: loading saved backend session"
                 );
                 match client
@@ -885,7 +884,6 @@ where
                         tracing::info!(
                             run_id = %key.run_id,
                             role = %key.role_id,
-                            session_id = %saved.session_id,
                             history_events = history.len(),
                             "agent session loaded"
                         );
@@ -918,9 +916,6 @@ where
         tracing::debug!(
             run_id = %key.run_id,
             role = %key.role_id,
-            cwd = %self.config.cwd,
-            model_id = ?active.model.as_ref().map(|model| model.id.as_str()),
-            provider = ?active.model.as_ref().and_then(|model| model.provider.as_deref()),
             "agent session: creating new backend session"
         );
         let session_id = client
@@ -946,8 +941,6 @@ where
         tracing::info!(
             run_id = %key.run_id,
             role = %key.role_id,
-            session_id = %session_id,
-            backend = %active.backend,
             "agent session saved"
         );
         Ok(AcquiredSession {
@@ -1119,7 +1112,6 @@ fn collect_event(
         run_id = %context.run_id,
         step = %context.step_id,
         record_id = %context.step_record_id,
-        event = ?event,
         "agent event received"
     );
     match event {
@@ -1169,9 +1161,6 @@ fn collect_event(
             tracing::debug!(
                 run_id = %context.run_id,
                 step = %context.step_id,
-                kind = %kind,
-                status = %status,
-                title = %title,
                 "agent tool call collected"
             );
             if !tool_call_id.is_empty() && !title.is_empty() {

@@ -120,7 +120,11 @@ where
                 )
                 .await
                 .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-            tracing::debug!(attempt, reply = %text, "workflow selector: agent reply");
+            tracing::debug!(
+                attempt,
+                reply_bytes = text.len(),
+                "workflow selector: agent reply"
+            );
             let parsed = parse_selection_response(&text);
             last_text = text;
 
@@ -140,7 +144,7 @@ where
                 Ok(response) => {
                     tracing::warn!(
                         attempt,
-                        workflow_id = %response.workflow_id,
+                        error_code = "unknown_workflow",
                         "workflow selector: agent picked an unknown workflow id, retrying"
                     );
                     prompt = retry_prompt(
@@ -160,7 +164,7 @@ where
 
         tracing::error!(
             attempts = SELECTOR_ATTEMPTS,
-            reply = %agent_reply(&last_text),
+            reply_bytes = last_text.len(),
             "workflow selector: no valid selection after retries"
         );
         Err(WorkflowError::InvalidAction(format!(

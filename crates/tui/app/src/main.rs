@@ -11,7 +11,7 @@ fn main() {
         Err(err) => Err(err.into()),
     };
     if let Err(err) = result {
-        tracing::error!(error = ?err, "cowboy exited with error");
+        tracing::error!(error_code = "command_failed", "cowboy exited with error");
         eprintln!("cowboy error: {err:?}");
         std::process::exit(1);
     }
@@ -21,18 +21,15 @@ async fn run_main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config_path_or_else(cowboy::default_config_path);
     let config = cowboy::load_config(&config_path)?;
-    if let Ok(log_path) = cowboy_log::init_file_logging(
+    if cowboy_log::init_file_logging(
         config.state_dir.join("logs"),
         "cowboy",
         cowboy_log::DEFAULT_DIRECTIVE,
-    ) {
+    )
+    .is_ok()
+    {
         tracing::info!(
-            config_path = %config_path.display(),
-            log_path = %log_path.display(),
-            state_dir = %config.state_dir.display(),
-            workflow_store = %config.workflow_store.display(),
-            workflow_dirs = ?config.workflow_dirs,
-            agents = ?config.agents,
+            workflow_directory_count = config.workflow_dirs.len(),
             agent_count = config.agents.len(),
             "cowboy logging initialized"
         );

@@ -7,7 +7,6 @@
 
 use std::any::Any;
 use std::io;
-use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Once;
@@ -87,19 +86,9 @@ pub fn install_panic_hook() {
     INSTALL.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let payload = panic_payload(info);
-            let location = info
-                .location()
-                .map(|location| format!("{}:{}", location.file(), location.line()))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let thread = std::thread::current();
-            let thread_name = thread.name().unwrap_or("<unnamed>");
-
-            tracing::error!(
-                panic_payload = %payload,
-                panic_location = %location,
-                panic_thread = %thread_name,
-                "process panic"
+            log_panic(
+                info.payload(),
+                info.location().map(|location| location.line()),
             );
 
             previous(info);
@@ -107,8 +96,13 @@ pub fn install_panic_hook() {
     });
 }
 
-fn panic_payload(info: &PanicHookInfo<'_>) -> String {
-    panic_payload_from_any(info.payload())
+fn log_panic(payload: &(dyn Any + Send), line: Option<u32>) {
+    tracing::error!(
+        error_code = "process_panic",
+        payload_bytes = panic_payload_from_any(payload).len(),
+        line,
+        "process panic"
+    );
 }
 
 fn panic_payload_from_any(payload: &(dyn Any + Send)) -> String {
@@ -141,6 +135,81 @@ mod tests {
         let _ = EnvFilter::new(TEST_APP_DIRECTIVE);
         assert_eq!(DEFAULT_DIRECTIVE, "info");
         assert_eq!(TEST_APP_DIRECTIVE, "debug");
+    }
+
+    #[test]
+    fn acp_debug_directive_does_not_raise_other_targets_or_product_default() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for (directive, acp_debug) in [
+            (DEFAULT_DIRECTIVE, false),
+            ("info,cowboy_agent_acp=debug", true),
+        ] {
+            let sink = Sink::default();
+            let writer = sink.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new(directive))
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "cowboy_agent_acp::client", event = "acp_request_send_started", "ACP send started");
+                tracing::debug!(target: "cowboy_workflow_engine", "unrelated-debug-marker");
+                tracing::info!(target: "cowboy_workflow_engine", "normal-info-marker");
+            });
+            let bytes = sink.0.lock().unwrap();
+            let log = std::str::from_utf8(&bytes).unwrap();
+            assert_eq!(log.contains("acp_request_send_started"), acp_debug);
+            assert!(!log.contains("unrelated-debug-marker"));
+            assert!(log.contains("normal-info-marker"));
+        }
+    }
+
+    #[test]
+    fn panic_logs_only_safe_metadata() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_panic(&"private-panic-canary", Some(42));
+        });
+        let bytes = sink.0.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert!(log.contains("process_panic"));
+        assert!(log.contains("payload_bytes=20"));
+        assert!(log.contains("line=42"));
+        assert!(!log.contains("private-panic-canary"));
     }
 
     #[test]

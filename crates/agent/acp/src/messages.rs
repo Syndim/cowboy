@@ -450,15 +450,20 @@ pub fn parse_acp_message(msg: &Value) -> Option<Message> {
             .to_string();
         // ACP spec: update payload is in params.update, not params itself
         let update_value = params.get("update").cloned().unwrap_or(Value::Null);
-        tracing::trace!(raw_update = %update_value, "session/update raw payload");
         if let Some(update) = parse_session_update_payload(&update_value) {
             return Some(Message::SessionUpdate { session_id, update });
         } else {
-            tracing::warn!(raw = %update_value, "session/update: failed to parse update payload");
+            tracing::warn!(
+                error_code = "invalid_update",
+                "session/update: failed to parse update payload"
+            );
         }
     }
 
-    tracing::trace!(raw = %msg, "parse_acp_message: unrecognized message");
+    tracing::debug!(
+        event = "acp_message_unrecognized",
+        "ACP message unrecognized"
+    );
     None
 }
 
