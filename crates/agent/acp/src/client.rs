@@ -612,6 +612,39 @@ fn rpc_error_text(error: &Value) -> String {
     }
 }
 
+fn diagnostic_capabilities(capabilities: Option<&Value>) -> Option<Value> {
+    fn metadata(value: &Value) -> Option<Value> {
+        match value {
+            Value::Bool(_) => Some(value.clone()),
+            Value::Object(fields) => Some(Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| {
+                        matches!(
+                            key.as_str(),
+                            "loadSession"
+                                | "promptCapabilities"
+                                | "mcpCapabilities"
+                                | "sessionCapabilities"
+                                | "image"
+                                | "audio"
+                                | "embeddedContext"
+                                | "http"
+                                | "sse"
+                                | "fork"
+                                | "resume"
+                                | "list"
+                        )
+                    })
+                    .filter_map(|(key, value)| metadata(value).map(|value| (key.clone(), value)))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+    capabilities.and_then(metadata)
+}
+
 fn json_error_text(error: &serde_json::Error) -> String {
     let mut text = error.to_string();
     if error.is_data()
@@ -969,6 +1002,8 @@ impl Client {
                         "ACP connection metadata"
                     );
                     tracing::info!(
+                        agent = ?self.agent_info,
+                        capabilities = ?diagnostic_capabilities(self.agent_capabilities.as_ref()),
                         backend = ?self.agent_info.as_ref().map(|agent| agent.name.as_str()),
                         backend_version = ?self.agent_info.as_ref().and_then(|agent| agent.version.as_deref()),
                         load_session_supported = self.supports_load_session(),
@@ -2984,7 +3019,7 @@ impl Client {
                 return Ok(msg);
             }
             if self.access.allows_tools() {
-                tracing::debug!(
+                tracing::warn!(
                     event = "acp_message_unrecognized",
                     bytes = line.len(),
                     "ACP skipping unrecognized message"
@@ -3021,7 +3056,7 @@ impl Client {
                 log_acp_message("inbound_direct", &msg);
                 return Ok(msg);
             }
-            tracing::debug!(
+            tracing::warn!(
                 event = "acp_message_unrecognized",
                 bytes = line.len(),
                 "ACP skipping unrecognized message"
@@ -3169,8 +3204,15 @@ mod tests {
         LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
-    #[test]
-    fn diagnostic_start_precedes_serialization_failure_with_safe_explanation() {
+    #[tokio::test]
+    async fn diagnostic_start_precedes_serialization_failure_with_safe_explanation() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_start_precedes_serialization_failure_with_safe_explanation",
+        )
+        .await
+        {
+            return;
+        }
         struct Fails;
         impl Serialize for Fails {
             fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
@@ -3200,6 +3242,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_send_started_survives_stuck_send_and_preserves_safe_errors() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_send_started_survives_stuck_send_and_preserves_safe_errors",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::default();
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -3259,6 +3308,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_recovery_preserves_session_id_and_safe_error_explanation() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_recovery_preserves_session_id_and_safe_error_explanation",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -3323,7 +3379,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unrecognized_message_warnings_remain_visible_above_debug() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::unrecognized_message_warnings_remain_visible_above_debug",
+        )
+        .await
+        {
+            return;
+        }
+        use tracing::instrument::WithSubscriber;
+        for level in [tracing::Level::INFO, tracing::Level::WARN] {
+            let capture = diagnostics::DiagnosticCapture::at_level(level);
+            let dispatch = tracing::Dispatch::new(capture.clone());
+            async {
+                let unknown = r#"{"method":"private-unrecognized-method-marker","content":"private-message-marker"}"#;
+                let transport = MockTransport::new(vec![unknown, &init_response(0), unknown, &rpc_response(1, serde_json::json!({}))]);
+                let mut client = Client::connect_with_transport(Box::new(transport), dummy_transport_config()).await.unwrap();
+                assert!(matches!(client.recv_message_raw().await.unwrap(), Message::Response { .. }));
+                let log = capture.text();
+                let warnings: Vec<_> = log.lines().filter(|line| line.contains("ACP skipping unrecognized message")).collect();
+                assert_eq!(warnings.len(), 2, "captured events at {level}: {log}");
+                assert!(warnings.iter().all(|line| line.starts_with("WARN") && line.contains("bytes=")));
+                assert!(!log.contains("private-"));
+                assert!(!log.contains("DEBUG"));
+            }.with_subscriber(dispatch).await;
+        }
+    }
+
+    #[tokio::test]
     async fn diagnostic_metadata_is_visible_without_json_or_prose() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_metadata_is_visible_without_json_or_prose",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -3365,6 +3456,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_model_selection_and_replay_keep_only_structured_metadata() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_model_selection_and_replay_keep_only_structured_metadata",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::TRACE);
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -3390,8 +3488,8 @@ mod tests {
                 serde_json::json!({"sessionUpdate":"private-unknown-event-canary", "raw":"private-event-canary"}),
             ];
             let mut responses = vec![
-                rpc_response(0, serde_json::json!({"agentInfo":{"name":"diagnostic-backend", "version":"diagnostic-version", "title":"private-backend-title-canary"},
-                    "agentCapabilities":{"loadSession":true, "raw":"private-capabilities-canary"}})),
+                rpc_response(0, serde_json::json!({"agentInfo":{"name":"diagnostic-backend", "version":"diagnostic-version", "title":"diagnostic-backend-title"},
+                    "agentCapabilities":{"loadSession":true, "promptCapabilities":{"image":true,"audio":false,"embeddedContext":true}, "mcpCapabilities":{"http":true,"sse":false}, "sessionCapabilities":{"fork":{},"resume":{},"list":{}}, "raw":"private-capabilities-canary"}})),
                 rpc_response(1, serde_json::json!({"sessionId":session_id, "configOptions":options("other-model")})),
                 rpc_response(2, serde_json::json!({"configOptions":options(selected_model)})),
             ];
@@ -3413,11 +3511,15 @@ mod tests {
             for private in ["private-option-label-canary", "private-config-canary", "private-config-description-canary",
                 "private-tool-title-canary", "private-tool-arguments-canary", "private-tool-result-canary", "private-thought-canary",
                 "private-message-canary", "private-plan-canary", "private-unknown-event-canary", "private-event-canary",
-                "private-backend-title-canary", "private-capabilities-canary", "/private/cwd-canary", "private-credential-canary"] {
+                "private-capabilities-canary", "/private/cwd-canary", "private-credential-canary"] {
                 assert!(!log.contains(private), "content leaked: {private}");
             }
             for metadata in [session_id, "diagnostic-backend", "diagnostic-version", "diagnostic-model", "diagnostic-provider", selected_model] {
                 assert!(log.lines().any(|line| line.starts_with("INFO") && line.contains(metadata)), "missing INFO metadata {metadata}");
+            }
+            let initialized = log.lines().find(|line| line.starts_with("INFO") && line.contains("ACP connection initialized")).unwrap();
+            for metadata in ["agent=", "capabilities=", "diagnostic-backend-title", "loadSession", "promptCapabilities", "image", "audio", "embeddedContext", "mcpCapabilities", "http", "sse", "sessionCapabilities", "fork", "resume", "list"] {
+                assert!(initialized.contains(metadata), "missing initialized metadata {metadata}");
             }
             for event in ["ACP connection initialized", "ACP session created", "ACP session model configured", "ACP session loaded"] {
                 assert!(log.lines().any(|line| line.starts_with("INFO") && line.contains(event)), "missing INFO event {event}");
@@ -3427,6 +3529,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_rpc_returns_only_safe_code_and_explanatory_message() {
+        if diagnostics::isolated_capture_test(
+            "client::tests::diagnostic_rpc_returns_only_safe_code_and_explanatory_message",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -3473,6 +3582,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn diagnostic_stream_and_cancel_failures_preserve_primary_and_cleanup_explanations() {
+        if diagnostics::isolated_capture_test("client::tests::diagnostic_stream_and_cancel_failures_preserve_primary_and_cleanup_explanations").await {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());

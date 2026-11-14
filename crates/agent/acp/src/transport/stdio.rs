@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 use tokio::time::Instant;
 
@@ -8,6 +9,7 @@ use tracing::Instrument;
 use tracing::instrument::WithSubscriber;
 
 use crate::agent_processes::{self, RegistrationId};
+use crate::client::diagnostic_error_text;
 use crate::process_tree::ProcessTreeScope;
 
 use super::{StdioConfig, Transport};
@@ -21,6 +23,7 @@ pub struct StdioTransport {
     stdout_bytes: u64,
     frames: u64,
     child: Child,
+    command: String,
     pid: Option<u32>,
     /// Owns the agent's whole process tree; descendants inherit the stdout
     /// pipe, so only tree termination lets the pending read reach EOF.
@@ -72,11 +75,16 @@ impl StdioTransport {
         }
 
         let registration = agent_processes::register(&tree);
+        let command = Path::new(&config.command)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
 
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         if let Some(stderr) = child.stderr.take() {
-            spawn_stderr_logger(child.id(), stderr);
+            spawn_stderr_logger(command.clone(), child.id(), stderr);
         }
 
         let writer = BufWriter::new(stdin);
@@ -84,6 +92,7 @@ impl StdioTransport {
 
         tracing::debug!(
             event = "acp_stdio_spawned",
+            command = %command,
             pid = child.id(),
             clear_env = config.clear_env,
             argument_count = config.args.len() + additional_args.len(),
@@ -101,6 +110,7 @@ impl StdioTransport {
             frames: 0,
             pid: child.id(),
             child,
+            command,
             tree,
             registration: Some(registration),
         })
@@ -122,6 +132,7 @@ impl StdioTransport {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!(
+                    command = %self.command,
                     pid = self.pid,
                     error = %error,
                     error_code = "terminate_failed",
@@ -141,24 +152,142 @@ impl Drop for StdioTransport {
     }
 }
 
-fn spawn_stderr_logger(pid: Option<u32>, mut stderr: tokio::process::ChildStderr) {
+fn log_stderr_diagnostic(command: &str, pid: Option<u32>, line: &[u8]) {
+    let Ok(text) = std::str::from_utf8(line) else {
+        return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    let (logger, text) = text
+        .strip_prefix('[')
+        .and_then(|tail| tail.split_once(']'))
+        .filter(|(prefix, tail)| {
+            !prefix.is_empty()
+                && prefix.len() <= 64
+                && prefix.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'_' | b'-' | b'.')
+                })
+                && tail.starts_with(char::is_whitespace)
+        })
+        .map_or((None, text), |(prefix, tail)| (Some(prefix), tail.trim()));
+    let labeled = ["Error: ", "error: ", "ERROR ", "WARN "]
+        .into_iter()
+        .find_map(|prefix| text.strip_prefix(prefix));
+    let text = labeled.unwrap_or(text).trim();
+    let (mut error, code) = if text.starts_with(['{', '[']) {
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(text) else {
+            return;
+        };
+        if json.get("jsonrpc").is_some() {
+            return;
+        }
+        let error = json
+            .get("error")
+            .filter(|error| error.is_object())
+            .or_else(|| {
+                (json
+                    .get("level")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|level| {
+                        level.eq_ignore_ascii_case("error") || level.eq_ignore_ascii_case("warn")
+                    })
+                    || json
+                        .get("code")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some())
+                .then_some(&json)
+            });
+        let Some(error) = error else {
+            return;
+        };
+        let Some(message) = error.get("message").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        (
+            diagnostic_error_text(message),
+            error.get("code").and_then(serde_json::Value::as_i64),
+        )
+    } else {
+        let lower = text.to_ascii_lowercase();
+        let ordinary = [
+            "error",
+            "warn",
+            "failed",
+            "failure",
+            "exception",
+            "invalid",
+            "not valid",
+            "not found",
+            "broken pipe",
+            "refused",
+            "denied",
+            "timed out",
+            "timeout",
+            "unavailable",
+            "database is locked",
+            "database locked",
+            "cannot",
+            "unable",
+        ]
+        .iter()
+        .any(|reason| lower.contains(reason));
+        let error = if labeled.is_some() || ordinary {
+            diagnostic_error_text(text)
+        } else {
+            "[redacted]".to_string()
+        };
+        (error, None)
+    };
+    if let Some(start) = error.char_indices().find_map(|(start, ch)| {
+        (ch == '{' || (ch == '[' && !error[start..].starts_with("[redacted]"))).then_some(start)
+    }) {
+        error.truncate(start);
+        error.push_str("[redacted]");
+    }
+    tracing::warn!(event = "acp_stderr_diagnostic", command = %command, pid, logger, stderr = %error, rpc_error_code = code, "Agent subprocess stderr");
+}
+
+fn spawn_stderr_logger(command: String, pid: Option<u32>, mut stderr: tokio::process::ChildStderr) {
     tokio::spawn(async move {
         let mut buffer = [0; 8192];
         let mut bytes = 0u64;
+        let mut line = Vec::with_capacity(4096);
+        let mut discard_line = false;
         loop {
             match stderr.read(&mut buffer).await {
                 Ok(0) => {
-                    tracing::debug!(event = "acp_stderr_eof", pid, bytes, "ACP stderr closed");
+                    if !discard_line {
+                        log_stderr_diagnostic(&command, pid, &line);
+                    }
+                    tracing::debug!(event = "acp_stderr_eof", command = %command, pid, bytes, "ACP stderr closed");
                     break;
                 }
                 Ok(count) => {
                     if bytes == 0 {
-                        tracing::debug!(event = "acp_stderr_first_read", pid, bytes = count, "ACP stderr first read");
+                        tracing::debug!(event = "acp_stderr_first_read", command = %command, pid, bytes = count, "ACP stderr first read");
                     }
                     bytes = bytes.saturating_add(count as u64);
+                    for byte in &buffer[..count] {
+                        if *byte == b'\n' {
+                            if !discard_line {
+                                log_stderr_diagnostic(&command, pid, &line);
+                            }
+                            line.clear();
+                            discard_line = false;
+                        } else if !discard_line {
+                            if line.len() < 4096 {
+                                line.push(*byte);
+                            } else {
+                                line.clear();
+                                discard_line = true;
+                            }
+                        }
+                    }
                 }
                 Err(error) => {
-                    tracing::warn!(event = "acp_stderr_read_failed", pid, bytes, error = %error, error_code = ?error.kind(), "ACP stderr read failed");
+                    tracing::warn!(event = "acp_stderr_read_failed", command = %command, pid, bytes, error = %error, error_code = ?error.kind(), "ACP stderr read failed");
                     break;
                 }
             }
@@ -178,18 +307,23 @@ impl Transport for StdioTransport {
         ] {
             tracing::debug!(
                 event = "acp_stdio_write_started",
+                command = %self.command,
+                pid = self.pid,
                 boundary,
                 bytes = payload.len(),
                 completed_bytes,
                 "ACP stdio write started"
             );
             if let Err(error) = self.writer.write_all(payload).await {
-                tracing::debug!(event = "acp_stdio_write_failed", boundary, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio write failed");
+                tracing::debug!(event = "acp_stdio_write_failed", command = %self.command, pid = self.pid, boundary, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio write failed");
+                tracing::warn!(event = "acp_stdio_send_failed", command = %self.command, pid = self.pid, boundary, error = %error, error_code = ?error.kind(), "ACP stdio send failed");
                 return Err(error.into());
             }
             completed_bytes += payload.len();
             tracing::debug!(
                 event = "acp_stdio_write_complete",
+                command = %self.command,
+                pid = self.pid,
                 boundary,
                 bytes,
                 completed_bytes,
@@ -199,16 +333,21 @@ impl Transport for StdioTransport {
         }
         tracing::debug!(
             event = "acp_stdio_flush_started",
+            command = %self.command,
+            pid = self.pid,
             bytes,
             completed_bytes,
             "ACP stdio flush started"
         );
         if let Err(error) = self.writer.flush().await {
-            tracing::debug!(event = "acp_stdio_flush_failed", bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio flush failed");
+            tracing::debug!(event = "acp_stdio_flush_failed", command = %self.command, pid = self.pid, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio flush failed");
+            tracing::warn!(event = "acp_stdio_send_failed", command = %self.command, pid = self.pid, boundary = "flush", error = %error, error_code = ?error.kind(), "ACP stdio send failed");
             return Err(error.into());
         }
         tracing::debug!(
             event = "acp_stdio_flush_complete",
+            command = %self.command,
+            pid = self.pid,
             bytes,
             completed_bytes,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -223,7 +362,7 @@ impl Transport for StdioTransport {
             let available = match self.reader.fill_buf().await {
                 Ok(available) => available,
                 Err(error) => {
-                    tracing::warn!(event = "acp_stdout_read_failed", bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdout read failed");
+                    tracing::warn!(event = "acp_stdout_read_failed", command = %self.command, pid = self.pid, bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdout read failed");
                     return Err(error.into());
                 }
             };
@@ -233,6 +372,8 @@ impl Transport for StdioTransport {
             if self.stdout_bytes == 0 && count > 0 {
                 tracing::debug!(
                     event = "acp_stdout_first_read",
+                    command = %self.command,
+                    pid = self.pid,
                     bytes = count,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "ACP stdout first read"
@@ -244,6 +385,8 @@ impl Transport for StdioTransport {
             if eof {
                 tracing::debug!(
                     event = "acp_stdout_eof",
+                    command = %self.command,
+                    pid = self.pid,
                     bytes = self.read_buffer.len(),
                     stdout_bytes = self.stdout_bytes,
                     frames = self.frames,
@@ -267,6 +410,8 @@ impl Transport for StdioTransport {
                 Err(_) => {
                     tracing::debug!(
                         event = "acp_stdout_frame_failed",
+                        command = %self.command,
+                        pid = self.pid,
                         boundary = if eof { "eof" } else { "newline" },
                         bytes,
                         stdout_bytes = self.stdout_bytes,
@@ -275,6 +420,7 @@ impl Transport for StdioTransport {
                         error_code = "invalid_utf8",
                         "ACP stdout frame failed"
                     );
+                    tracing::warn!(event = "acp_stdout_read_failed", command = %self.command, pid = self.pid, error = "ACP frame is not valid UTF-8", error_code = "invalid_utf8", "ACP stdout read failed");
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "ACP stdout frame is invalid UTF-8",
@@ -290,6 +436,8 @@ impl Transport for StdioTransport {
             }
             tracing::debug!(
                 event = "acp_stdout_frame_complete",
+                command = %self.command,
+                pid = self.pid,
                 boundary = if eof { "eof" } else { "newline" },
                 bytes,
                 stdout_bytes = self.stdout_bytes,
@@ -308,6 +456,7 @@ impl Transport for StdioTransport {
         let status = self.child.try_wait().ok().flatten();
         let tree_terminated = self.terminate_tree();
         tracing::debug!(
+            command = %self.command,
             pid = self.pid,
             status = ?status,
             tree_terminated,
@@ -316,7 +465,7 @@ impl Transport for StdioTransport {
         if status.is_none()
             && let Err(error) = self.child.kill().await
         {
-            tracing::warn!(pid = self.pid, error = %error, error_code = "kill_failed", "Agent subprocess kill failed");
+            tracing::warn!(command = %self.command, pid = self.pid, error = %error, error_code = "kill_failed", "Agent subprocess kill failed");
         }
         Ok(())
     }
@@ -326,6 +475,7 @@ impl Transport for StdioTransport {
         if status.is_none() {
             let tree_terminated = self.terminate_tree();
             tracing::warn!(
+                command = %self.command,
                 pid = self.pid,
                 tree_terminated,
                 "Force terminating agent subprocess"
