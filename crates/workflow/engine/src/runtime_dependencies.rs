@@ -462,6 +462,9 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_factory_keeps_backend_model_provider_without_configuration() {
+        if diagnostics::isolated_capture_test("runtime_dependencies::tests::diagnostic_factory_keeps_backend_model_provider_without_configuration").await {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());

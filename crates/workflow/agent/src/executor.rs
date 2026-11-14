@@ -2065,6 +2065,9 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_prompt_window_abort_and_drop_preserve_database_explanation() {
+        if diagnostics::isolated_capture_test("executor::tests::diagnostic_prompt_window_abort_and_drop_preserve_database_explanation").await {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());
@@ -2115,6 +2118,13 @@ mod tests {
 
     #[tokio::test]
     async fn diagnostic_sessions_and_events_preserve_metadata_without_content() {
+        if diagnostics::isolated_capture_test(
+            "executor::tests::diagnostic_sessions_and_events_preserve_metadata_without_content",
+        )
+        .await
+        {
+            return;
+        }
         use tracing::instrument::WithSubscriber;
         let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
         let dispatch = tracing::Dispatch::new(capture.clone());
