@@ -29,6 +29,7 @@ async fn main() -> anyhow::Result<()> {
         clear_env: false,
         allowed_env: vec![],
         env: vec![],
+        startup_readiness: None,
     });
 
     eprintln!(

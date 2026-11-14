@@ -40,6 +40,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             clear_env: false,
             allowed_env: Vec::new(),
             env: Vec::new(),
+            startup_readiness: None,
         }),
     };
     let executor = AgentExecutor::new(

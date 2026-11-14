@@ -176,6 +176,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         }
     }
 

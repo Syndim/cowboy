@@ -104,7 +104,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::runtime::AgentWatchdogRuntimeConfig;
+    use crate::runtime::{AgentStartupReadiness, AgentWatchdogRuntimeConfig};
 
     fn agent(name: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
@@ -115,6 +115,7 @@ mod tests {
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
+            startup_readiness: None,
         }
     }
 
@@ -153,6 +154,34 @@ mod tests {
     }
 
     #[test]
+    fn resolution_preserves_startup_readiness_for_only_the_selected_agent() {
+        let mut named = agent("reviewer");
+        let readiness = AgentStartupReadiness {
+            log_path: "~/logs/session_*_{pid}/process-*.log".to_string(),
+            contains: "ready".to_string(),
+            timeout_seconds: 30,
+        };
+        named.startup_readiness = Some(readiness.clone());
+        let resolver = AgentResolver::new(vec![agent("default"), named]).unwrap();
+
+        assert_eq!(
+            resolver
+                .resolve(&role(Some("reviewer")))
+                .unwrap()
+                .startup_readiness
+                .as_ref(),
+            Some(&readiness)
+        );
+        assert!(
+            resolver
+                .resolve_default()
+                .unwrap()
+                .startup_readiness
+                .is_none()
+        );
+    }
+
+    #[test]
     fn resolve_selects_named_committer_agent_with_low_cost_args() {
         let committer = AgentRuntimeConfig {
             name: "committer".to_string(),
@@ -166,6 +195,7 @@ mod tests {
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
+            startup_readiness: None,
         };
         let resolver =
             AgentResolver::new(vec![agent("default"), agent("reviewer"), committer]).unwrap();

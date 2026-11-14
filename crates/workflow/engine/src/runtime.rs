@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cowboy_agent_acp::AgentAccess;
+pub use cowboy_agent_acp::transport::StartupReadiness as AgentStartupReadiness;
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
 use cowboy_agent_client::PromptTurnCancellation;
@@ -123,6 +124,8 @@ pub struct AgentRuntimeConfig {
     pub allowed_env: Vec<String>,
     #[serde(default)]
     pub watchdog: AgentWatchdogRuntimeConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_readiness: Option<AgentStartupReadiness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +181,7 @@ impl AgentRuntimeConfig {
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
+            startup_readiness: None,
         }
     }
 }
@@ -3130,6 +3134,7 @@ mod tests {
         allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
         access: AgentAccess,
+        startup_readiness: Option<AgentStartupReadiness>,
     }
 
     #[derive(Clone, Default)]
@@ -3165,6 +3170,7 @@ mod tests {
                 allowed_env: transport.allowed_env,
                 watchdog,
                 access,
+                startup_readiness: transport.startup_readiness,
             });
             Err(anyhow::anyhow!("recording runtime connector"))
         }
@@ -3206,7 +3212,43 @@ mod tests {
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
+            startup_readiness: None,
         }
+    }
+
+    #[test]
+    fn legacy_agent_runtime_config_preserves_serialized_bytes() {
+        let legacy = r#"{"name":"default","command":"agent","args":[],"model":null,"access":"default","allowed_env":[],"watchdog":{"response_timeout_seconds":100,"cancel_timeout_seconds":10,"recovery_operation_timeout_seconds":30}}"#;
+        let config: AgentRuntimeConfig = serde_json::from_str(legacy).unwrap();
+
+        assert!(config.startup_readiness.is_none());
+        assert_eq!(serde_json::to_string(&config).unwrap(), legacy);
+        let constructed = AgentRuntimeConfig::new("default", "agent", Vec::new(), None);
+        assert!(constructed.startup_readiness.is_none());
+        assert_eq!(serde_json::to_string(&constructed).unwrap(), legacy);
+    }
+
+    #[test]
+    fn agent_runtime_startup_readiness_round_trips() {
+        let mut config = AgentRuntimeConfig::new("default", "agent", Vec::new(), None);
+        let readiness = AgentStartupReadiness {
+            log_path: "~/.local/agency/logs/session_*_{pid}/process-*.log".to_string(),
+            contains: "ACP server started, waiting for requests".to_string(),
+            timeout_seconds: 45,
+        };
+        config.startup_readiness = Some(readiness.clone());
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded: AgentRuntimeConfig = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(decoded.startup_readiness, Some(readiness));
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+        let mut without_timeout = serde_json::to_value(&config).unwrap();
+        without_timeout["startup_readiness"]
+            .as_object_mut()
+            .unwrap()
+            .remove("timeout_seconds");
+        let decoded: AgentRuntimeConfig = serde_json::from_value(without_timeout).unwrap();
+        assert_eq!(decoded.startup_readiness.unwrap().timeout_seconds, 300);
     }
 
     #[derive(Debug)]
@@ -3616,6 +3658,7 @@ mod tests {
                     cancel_timeout_seconds: 32,
                     recovery_operation_timeout_seconds: 33,
                 },
+                startup_readiness: None,
             }],
             config_sets: BTreeMap::from([("default".to_string(), RunnerLimitsConfig::default())]),
         }
@@ -3645,6 +3688,7 @@ mod tests {
                 recovery_operation_timeout_seconds: 33,
             },
             access: AgentAccess::Default,
+            startup_readiness: None,
         }
     }
 
@@ -3690,6 +3734,43 @@ mod tests {
             connector.connections(),
             [expected_default_runtime_connection()]
         );
+    }
+
+    #[tokio::test]
+    async fn selector_and_improvement_clients_forward_startup_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let mut config = production_connector_test_config(&dir);
+        let readiness = AgentStartupReadiness {
+            log_path: "~/.local/agency/logs/session_*_{pid}/process-*.log".to_string(),
+            contains: "ACP server started, waiting for requests".to_string(),
+            timeout_seconds: 300,
+        };
+        config.agents[0].startup_readiness = Some(readiness.clone());
+        let runtime = runtime_with_recording_connector(config, connector.clone()).await;
+        let catalog = runtime.catalog().unwrap();
+        assert!(
+            runtime
+                .select_workflow("select a workflow", &catalog)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recording runtime connector")
+        );
+        let run = summary_test_run("improve-readiness-connector", RunStatus::Completed, None);
+        runtime.store().unwrap().save_run(&run).await.unwrap();
+        assert!(
+            runtime
+                .improve_run(&run.id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("recording runtime connector")
+        );
+
+        let mut expected = expected_default_runtime_connection();
+        expected.startup_readiness = Some(readiness);
+        assert_eq!(connector.connections(), [expected.clone(), expected]);
     }
 
     #[tokio::test]
@@ -4616,6 +4697,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     cancel_timeout_seconds: 60,
                     recovery_operation_timeout_seconds: 240,
                 },
+                startup_readiness: None,
             }],
         )
         .await;
@@ -4734,6 +4816,7 @@ done
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
+                startup_readiness: None,
             }],
         )
         .await;
@@ -6829,6 +6912,7 @@ exit 0
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
+                startup_readiness: None,
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -7119,6 +7203,7 @@ exit 0
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
+                startup_readiness: None,
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -9776,6 +9861,7 @@ Recovery implementation review"#
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
+                startup_readiness: None,
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),
@@ -10842,6 +10928,7 @@ return workflow("{label}", plan)
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
                 watchdog: AgentWatchdogRuntimeConfig::default(),
+                startup_readiness: None,
             }],
             config_sets: BTreeMap::from([(
                 "default".to_string(),

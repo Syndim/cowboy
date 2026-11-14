@@ -21,7 +21,7 @@ async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "time"] }
 tracing.workspace = true
 uuid = { version = "1", features = ["v4"] }
 
@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }

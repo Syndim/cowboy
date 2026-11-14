@@ -35,6 +35,10 @@ impl StdioTransport {
     /// Spawn agent subprocess and return a connected transport.
     /// Appends `additional_args` after the configured args.
     pub async fn connect(config: &StdioConfig, additional_args: &[&str]) -> anyhow::Result<Self> {
+        let startup = match &config.startup_readiness {
+            Some(readiness) => Some(super::startup::StartupLog::prepare(readiness, config).await?),
+            None => None,
+        };
         let mut cmd = Command::new(&config.command);
         for arg in &config.args {
             cmd.arg(arg);
@@ -101,7 +105,7 @@ impl StdioTransport {
             "Agent subprocess spawned"
         );
 
-        Ok(Self {
+        let mut transport = Self {
             writer,
             reader,
             read_buffer: Vec::new(),
@@ -113,7 +117,54 @@ impl StdioTransport {
             command,
             tree,
             registration: Some(registration),
-        })
+        };
+        if let Some(mut startup) = startup {
+            let readiness = config.startup_readiness.as_ref().unwrap();
+            let timeout = std::time::Duration::from_secs(readiness.timeout_seconds);
+            let pid = transport
+                .pid
+                .ok_or_else(|| anyhow::anyhow!("startup readiness process ID is unavailable"))?;
+            tracing::debug!(
+                event = "acp_stdio_startup_wait",
+                pid,
+                timeout_seconds = readiness.timeout_seconds,
+                "Waiting for agent startup readiness"
+            );
+            let result = tokio::time::timeout(timeout, async {
+                loop {
+                    if let Some(status) = transport.child.try_wait()? {
+                        anyhow::bail!("agent exited before startup readiness: {status}");
+                    }
+                    if startup.ready(pid).await? {
+                        if let Some(status) = transport.child.try_wait()? {
+                            anyhow::bail!("agent exited before startup readiness: {status}");
+                        }
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(
+                    "agent startup readiness timed out after {} seconds",
+                    readiness.timeout_seconds
+                ))
+            });
+            if let Err(error) = result {
+                transport.terminate_tree();
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), transport.child.kill())
+                        .await;
+                return Err(error);
+            }
+            tracing::debug!(
+                event = "acp_stdio_startup_ready",
+                pid,
+                "Agent startup readiness observed"
+            );
+        }
+        Ok(transport)
     }
 
     /// Get a reference to the underlying child process.
@@ -559,6 +610,7 @@ mod tests {
                 "COWBOY_STDIO_TEST_MISSING".to_string(),
             ],
             env: explicit,
+            startup_readiness: None,
         };
         let additional_args = if mode == "resume" {
             vec!["--resume=session-123"]
@@ -599,6 +651,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         };
 
         let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
@@ -620,6 +673,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         };
         let additional_args = vec!["extra"];
 
@@ -639,6 +693,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         };
 
         let result = StdioTransport::connect(&config, &[]).await;
@@ -653,6 +708,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         };
 
         let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
@@ -688,6 +744,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         };
         let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
         let pid = transport.pid.expect("child pid");

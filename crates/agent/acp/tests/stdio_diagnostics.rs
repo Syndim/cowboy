@@ -21,6 +21,7 @@ fn peer(script: &str) -> StdioConfig {
         clear_env: true,
         allowed_env: vec![],
         env: vec![("PRIVATE_ENV_MARKER".into(), "private-env-marker".into())],
+        startup_readiness: None,
     }
 }
 
@@ -157,6 +158,7 @@ async fn public_stdio_outbound_prompt_and_cancel_preserve_exact_utf8_json_bytes(
                         clear_env: true,
                         allowed_env: vec![],
                         env: vec![(READ_SIZE.into(), read_size.to_string())],
+                        startup_readiness: None,
                     };
                     capture.clear();
                     tokio::time::timeout(Duration::from_secs(5), async {
