@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_engine::{
-    AgentAccess, AgentRuntimeConfig, AgentWatchdogRuntimeConfig, RunnerLimitsConfig, RuntimeConfig,
+    AgentAccess, AgentRuntimeConfig, AgentStartupReadiness, AgentWatchdogRuntimeConfig,
+    RunnerLimitsConfig, RuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -111,6 +112,8 @@ pub struct AgentConfig {
     pub allowed_env: Vec<String>,
     #[serde(default)]
     pub watchdog: AgentWatchdogConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_readiness: Option<AgentStartupReadiness>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,6 +168,7 @@ impl Default for AgentConfig {
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogConfig::default(),
+            startup_readiness: None,
         }
     }
 }
@@ -299,6 +303,11 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
         {
             anyhow::bail!("agent {:?} access acp_mode must not be blank", agent.name);
         }
+        if let Some(readiness) = &agent.startup_readiness {
+            readiness
+                .validate()
+                .with_context(|| format!("agent {:?} invalid startup_readiness", agent.name))?;
+        }
         validate_allowed_env(
             &format!("agent {:?} allowed_env", agent.name),
             &agent.allowed_env,
@@ -426,6 +435,7 @@ impl AppConfig {
                             .recovery_operation_timeout_seconds,
                     };
                     runtime.allowed_env = agent.allowed_env.clone();
+                    runtime.startup_readiness = agent.startup_readiness.clone();
                     runtime
                 })
                 .collect(),
@@ -1459,6 +1469,115 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
         assert_eq!(runtime.agents[1].name, "reviewer");
         assert_eq!(runtime.agents[1].command, "copilot");
         assert_eq!(runtime.agents[1].model.as_ref().unwrap().id, "gpt-5.5-1m");
+    }
+
+    #[test]
+    fn legacy_agent_config_omits_startup_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[[agents]]\nname = 'default'\n").unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert!(AgentConfig::default().startup_readiness.is_none());
+        assert!(config.agents[0].startup_readiness.is_none());
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("startup_readiness")
+        );
+        let app_json = serde_json::to_value(&config).unwrap();
+        assert!(app_json["agents"][0].get("startup_readiness").is_none());
+        let decoded: AppConfig = serde_json::from_value(app_json).unwrap();
+        assert_eq!(decoded, config);
+
+        let runtime = config.runtime_config(dir.path().to_path_buf());
+        assert!(runtime.agents[0].startup_readiness.is_none());
+        assert!(
+            serde_json::to_value(&runtime).unwrap()["agents"][0]
+                .get("startup_readiness")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn startup_readiness_parses_and_forwards_without_expanding_tilde() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (log_path, timeout) in [
+            ("~/.local/agency/logs/session_*_{pid}/process-*.log", None),
+            ("~/logs/session_{pid}_suffix/process.log", Some(1)),
+            ("~/logs/{pid}/literal/*/process-*.log", Some(300)),
+            ("~/logs/session_*_{pid}_suffix/process.log", Some(30)),
+        ] {
+            let timeout_field = timeout
+                .map(|seconds| format!("timeout_seconds = {seconds}\n"))
+                .unwrap_or_default();
+            fs::write(
+                &path,
+                format!(
+                    "[[agents]]\nname = 'default'\n[agents.startup_readiness]\nlog_path = '{log_path}'\ncontains = 'ACP server started, waiting for requests'\n{timeout_field}\n[[agents]]\nname = 'other'\n"
+                ),
+            )
+            .unwrap();
+
+            let config = load_config(&path).unwrap();
+            let expected = AgentStartupReadiness {
+                log_path: log_path.to_string(),
+                contains: "ACP server started, waiting for requests".to_string(),
+                timeout_seconds: timeout.unwrap_or(300),
+            };
+            assert_eq!(config.agents[0].startup_readiness, Some(expected.clone()));
+            assert!(config.agents[1].startup_readiness.is_none());
+            let runtime = config.runtime_config(dir.path().to_path_buf());
+            assert_eq!(runtime.agents[0].startup_readiness, Some(expected));
+            assert!(runtime.agents[1].startup_readiness.is_none());
+            assert_eq!(
+                config,
+                toml::from_str::<AppConfig>(&toml::to_string(&config).unwrap()).unwrap()
+            );
+            assert_eq!(
+                config,
+                serde_json::from_str::<AppConfig>(&serde_json::to_string(&config).unwrap())
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_agent_startup_readiness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (log_path, contains, timeout) in [
+            ("", "ready", 300),
+            ("   ", "ready", 300),
+            ("~/logs/{pid}/process.log", "", 300),
+            ("~/logs/{pid}/process.log", " \t ", 300),
+            ("~/logs/{pid}/process.log", "ready", 0),
+            ("~/logs/{pid}/process.log", "ready", 301),
+            ("~/logs/session/process.log", "ready", 300),
+            ("~/logs/{pid}_{pid}/process.log", "ready", 300),
+            ("~/logs/{pid}/{pid}/process.log", "ready", 300),
+            ("~/logs/*/session_{pid}/process.log", "ready", 300),
+            ("~/logs/prefix*/session_{pid}/process.log", "ready", 300),
+            ("~/logs/session_**_{pid}/process.log", "ready", 300),
+            ("~/logs/{pid}/**/process.log", "ready", 300),
+            ("~/logs/{pid}/process-?.log", "ready", 300),
+            ("~/logs/{pid}/process-[ab].log", "ready", 300),
+        ] {
+            fs::write(
+                &path,
+                format!(
+                    "[[agents]]\nname = 'default'\n[agents.startup_readiness]\nlog_path = '{log_path}'\ncontains = '{contains}'\ntimeout_seconds = {timeout}\n"
+                ),
+            )
+            .unwrap();
+
+            let error = load_config(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("invalid startup_readiness"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

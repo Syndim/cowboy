@@ -815,6 +815,7 @@ struct ReplacementTransportFactory {
 #[cfg(test)]
 enum ReplacementTransportFactoryOutcome {
     Ready(Box<dyn Transport>),
+    Delayed(Duration, Box<dyn Transport>),
     Error(&'static str),
     Pending,
 }
@@ -840,6 +841,10 @@ impl ReplacementTransportFactoryOutcome {
     async fn into_transport(self) -> anyhow::Result<Box<dyn Transport>> {
         match self {
             Self::Ready(transport) => Ok(transport),
+            Self::Delayed(delay, transport) => {
+                tokio::time::sleep(delay).await;
+                Ok(transport)
+            }
             Self::Error(error) => anyhow::bail!("{error}"),
             Self::Pending => std::future::pending().await,
         }
@@ -1737,15 +1742,27 @@ impl Client {
         }
         drop(old_transport);
 
+        let transport_timeout = match &self.transport_config {
+            TransportConfig::Stdio(config) => {
+                timeout
+                    + config
+                        .startup_readiness
+                        .as_ref()
+                        .map_or(Duration::ZERO, |readiness| {
+                            Duration::from_secs(readiness.timeout_seconds)
+                        })
+            }
+            _ => timeout,
+        };
         tracing::debug!(
             event = "agent_watchdog_recovery_begin",
             session_id,
             phase = "create_transport",
-            timeout_seconds = self.watchdog.recovery_operation_timeout_seconds,
+            timeout_seconds = transport_timeout.as_secs(),
             "ACP recovery begin"
         );
         let replacement = match tokio::time::timeout(
-            timeout,
+            transport_timeout,
             self.create_replacement_transport(session_id),
         )
         .await
@@ -2542,6 +2559,7 @@ impl Client {
             cwd: cwd.to_string(),
             mcp_servers: mcp_servers.to_vec(),
         };
+        self.ensure_transport().await?;
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
         let id = match tokio::time::timeout_at(
@@ -2652,6 +2670,7 @@ impl Client {
         method: &'static str,
         params: P,
     ) -> anyhow::Result<Value> {
+        self.ensure_transport().await?;
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(self.watchdog.recovery_operation_timeout_seconds);
         let id = match tokio::time::timeout_at(deadline, self.send_request_no_wait(method, params))
@@ -3179,6 +3198,7 @@ mod tests {
             clear_env: false,
             allowed_env: vec![],
             env: vec![],
+            startup_readiness: None,
         })
     }
 
@@ -3189,6 +3209,7 @@ mod tests {
             clear_env: true,
             allowed_env: vec!["GLOBAL".to_string(), "ROLE".to_string()],
             env: vec![],
+            startup_readiness: None,
         })
     }
 
@@ -4247,6 +4268,58 @@ mod tests {
         assert_eq!(counters.force_terminated.load(Ordering::SeqCst), 1);
         assert_eq!(counters.dropped.load(Ordering::SeqCst), 1);
         assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lazy_reconnect_finishes_startup_before_session_rpc_deadlines() {
+        for load in [false, true] {
+            let transport = MockTransport::new(vec![&init_response(0)]);
+            let mut client =
+                Client::connect_with_transport(Box::new(transport), dummy_transport_config())
+                    .await
+                    .unwrap();
+            client.transport = None;
+            client.watchdog.recovery_operation_timeout_seconds = 1;
+            let TransportConfig::Stdio(config) = &mut client.transport_config else {
+                panic!("expected stdio config")
+            };
+            config.startup_readiness = Some(crate::transport::StartupReadiness {
+                log_path: "/synthetic/logs/session_{pid}/process.log".into(),
+                contains: "ready".into(),
+                timeout_seconds: 300,
+            });
+            let response = if load {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({"sessionId": "synthetic-session"})
+            };
+            let replacement =
+                MockTransport::new(vec![&init_response(1), &rpc_response(2, response)]);
+            client
+                .reconnect_factory
+                .push(ReplacementTransportFactoryOutcome::Delayed(
+                    Duration::from_secs(45),
+                    Box::new(replacement),
+                ));
+            let began = tokio::time::Instant::now();
+            if load {
+                client
+                    .load_session("synthetic-session", "/synthetic", &[])
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .send_request(
+                        "session/new",
+                        serde_json::json!({"cwd":"/synthetic", "mcpServers":[]}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(began.elapsed() >= Duration::from_secs(45));
+            assert!(client.is_connected());
+            assert_eq!(client.reconnect_factory.calls(), 1);
+        }
     }
 
     #[tokio::test]
@@ -8088,6 +8161,40 @@ sent no continuation after cancelling and returned {result:?} with the truncated
             future.await.unwrap_err()
         };
 
+        assert!(error.to_string().contains("transport creation timed out"));
+        assert_eq!(client.replacement_factory_calls(), 1);
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_replacement_creation_allows_the_startup_readiness_budget() {
+        let (mut client, _) = direct_hard_client(ScriptedOperation::Ready).await;
+        let TransportConfig::Stdio(config) = &mut client.transport_config else {
+            panic!("expected stdio config");
+        };
+        config.startup_readiness = Some(crate::transport::StartupReadiness {
+            log_path: "/synthetic/logs/session_{pid}/process.log".into(),
+            contains: "ready".into(),
+            timeout_seconds: 300,
+        });
+        client.push_replacement_creation_pending();
+        let error = {
+            let future = client.hard_recover_and_continue("sess_1");
+            tokio::pin!(future);
+            poll_fn(|cx| {
+                assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(4)).await;
+            poll_fn(|cx| {
+                assert!(std::future::Future::poll(future.as_mut(), cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::advance(Duration::from_secs(300)).await;
+            future.await.unwrap_err()
+        };
         assert!(error.to_string().contains("transport creation timed out"));
         assert_eq!(client.replacement_factory_calls(), 1);
         assert!(!client.is_connected());

@@ -212,6 +212,7 @@ pub(crate) fn transport_for(
         clear_env: true,
         allowed_env,
         env: Vec::new(),
+        startup_readiness: agent.startup_readiness.clone(),
     })
 }
 
@@ -237,7 +238,7 @@ mod tests {
     use cowboy_agent_client::{Event, PromptContent, PromptTurnCancellation, StopReason};
 
     use super::*;
-    use crate::runtime::AgentWatchdogRuntimeConfig;
+    use crate::runtime::{AgentStartupReadiness, AgentWatchdogRuntimeConfig};
 
     struct ScriptedAcpTransport {
         incoming: VecDeque<String>,
@@ -387,6 +388,7 @@ mod tests {
         allowed_env: Vec<String>,
         watchdog: AgentWatchdogOptions,
         access: AgentAccess,
+        startup_readiness: Option<AgentStartupReadiness>,
     }
 
     #[derive(Clone, Default)]
@@ -417,6 +419,7 @@ mod tests {
                 allowed_env: transport.allowed_env,
                 watchdog,
                 access,
+                startup_readiness: transport.startup_readiness,
             });
             Err(anyhow::anyhow!("recording connector"))
         }
@@ -441,6 +444,7 @@ mod tests {
                 cancel_timeout_seconds,
                 recovery_operation_timeout_seconds,
             },
+            startup_readiness: None,
         }
     }
 
@@ -531,6 +535,7 @@ mod tests {
                 cancel_timeout_seconds: 8,
                 recovery_operation_timeout_seconds: 9,
             },
+            startup_readiness: None,
         };
 
         assert_eq!(
@@ -541,6 +546,74 @@ mod tests {
                 recovery_operation_timeout_seconds: 9,
             }
         );
+    }
+
+    #[test]
+    fn stdio_transport_preserves_optional_startup_readiness() {
+        let mut configured = agent("default", "agent-command", 11, 12, 13);
+        for readiness in [
+            None,
+            Some(AgentStartupReadiness {
+                log_path: "~/.local/agency/logs/session_*_{pid}/process-*.log".to_string(),
+                contains: "ACP server started, waiting for requests".to_string(),
+                timeout_seconds: 300,
+            }),
+        ] {
+            configured.startup_readiness = readiness.clone();
+            let TransportConfig::Stdio(transport) = transport_for(&[], &configured) else {
+                panic!("engine agents use stdio transport")
+            };
+            configured.startup_readiness = None;
+
+            assert_eq!(transport.command, "agent-command");
+            assert_eq!(transport.startup_readiness, readiness);
+        }
+    }
+
+    #[tokio::test]
+    async fn role_and_request_topic_clients_forward_selected_startup_readiness() {
+        let recording = Arc::new(RecordingAcpConnector::default());
+        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
+        let mut config = config();
+        let default_readiness = AgentStartupReadiness {
+            log_path: "~/logs/default_{pid}/process-*.log".to_string(),
+            contains: "default ready".to_string(),
+            timeout_seconds: 300,
+        };
+        let named_readiness = AgentStartupReadiness {
+            log_path: "~/logs/named_{pid}/process-*.log".to_string(),
+            contains: "named ready".to_string(),
+            timeout_seconds: 15,
+        };
+        config.agents[0].startup_readiness = Some(default_readiness.clone());
+        config.agents[1].startup_readiness = Some(named_readiness.clone());
+        let factory = dependencies.agent_factory(&config).unwrap();
+
+        for selected in [Some("named"), Some("default"), None] {
+            let role = RoleDefinition {
+                id: "developer".to_string(),
+                instructions: "work".to_string(),
+                agent: selected.map(str::to_string),
+                properties: serde_json::Value::Null,
+            };
+            assert!(factory.create_client(&role).await.is_err());
+        }
+        assert!(
+            dependencies
+                .generate_request_topic(&config, SelectorMode::Agent, "topic")
+                .await
+                .is_none()
+        );
+
+        let connections = recording.connections();
+        assert_eq!(connections.len(), 4);
+        assert_eq!(connections[0].startup_readiness, Some(named_readiness));
+        for connection in &connections[1..] {
+            assert_eq!(
+                connection.startup_readiness.as_ref(),
+                Some(&default_readiness)
+            );
+        }
     }
 
     #[tokio::test]
@@ -745,6 +818,7 @@ mod tests {
                 access: AgentAccess::DenyEscalation {
                     acp_mode: "read-only".to_string(),
                 },
+                startup_readiness: None,
             }]
         );
     }
@@ -771,6 +845,7 @@ mod tests {
                     recovery_operation_timeout_seconds: 13,
                 },
                 access: AgentAccess::Default,
+                startup_readiness: None,
             }]
         );
     }

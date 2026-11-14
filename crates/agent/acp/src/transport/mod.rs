@@ -1,5 +1,8 @@
+mod startup;
 pub mod stdio;
 pub mod zellij;
+
+pub use startup::StartupReadiness;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,8 @@ pub struct StdioConfig {
     pub allowed_env: Vec<String>,
     #[serde(default)]
     pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_readiness: Option<StartupReadiness>,
 }
 
 /// Zellij transport config
