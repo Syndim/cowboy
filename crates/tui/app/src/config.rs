@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub state_dir: PathBuf,
     /// SQLite database that stores workflow runtime state.
     pub workflow_store: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<PathBuf>,
     /// Named workflow runner policies. The built-in `default` set is always present.
     ///
     /// ```toml
@@ -193,6 +195,7 @@ impl Default for AppConfig {
         Self {
             workflow_store: state_dir.join("data.db"),
             state_dir,
+            log_dir: None,
             config_sets: default_config_sets(),
             workflow_dirs: vec![config_root().join("workflows")],
             mouse_scroll_lines: default_mouse_scroll_lines(),
@@ -250,6 +253,8 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("invalid config set in {}", path.display()))?;
     validate_mouse_scroll_lines(config.mouse_scroll_lines)
         .with_context(|| format!("invalid mouse_scroll_lines in {}", path.display()))?;
+    validate_log_dir(config.log_dir.as_deref())
+        .with_context(|| format!("invalid log_dir in {}", path.display()))?;
     config.expand_paths();
     Ok(config)
 }
@@ -341,6 +346,14 @@ fn validate_allowed_env(field: &str, allowed_env: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn validate_log_dir(log_dir: Option<&Path>) -> Result<()> {
+    if log_dir.is_some_and(|path| path.as_os_str().is_empty()) {
+        anyhow::bail!("log_dir must not be blank");
+    }
+
+    Ok(())
+}
+
 fn validate_allowed_cmds(allowed_cmds: Option<&[String]>) -> Result<()> {
     use std::collections::BTreeSet;
 
@@ -360,6 +373,12 @@ fn validate_allowed_cmds(allowed_cmds: Option<&[String]>) -> Result<()> {
 }
 
 impl AppConfig {
+    pub fn resolved_log_dir(&self) -> PathBuf {
+        self.log_dir
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("logs"))
+    }
+
     pub fn runtime_config(&self, cwd: PathBuf) -> RuntimeConfig {
         let mut config_sets = self
             .config_sets
@@ -418,6 +437,7 @@ impl AppConfig {
     fn expand_paths(&mut self) {
         self.state_dir = expand_tilde(&self.state_dir);
         self.workflow_store = expand_tilde(&self.workflow_store);
+        self.log_dir = self.log_dir.as_deref().map(expand_tilde);
         self.workflow_dirs = self
             .workflow_dirs
             .iter()
@@ -443,6 +463,104 @@ fn expand_tilde(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn log_dir_omitted_uses_state_logs_without_serializing() {
+        let config = AppConfig::default();
+
+        assert_eq!(config.log_dir, None);
+        assert_eq!(config.resolved_log_dir(), config.state_dir.join("logs"));
+        assert!(
+            toml::to_string(&config)
+                .unwrap()
+                .lines()
+                .all(|line| !line.starts_with("log_dir"))
+        );
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("log_dir")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn log_dir_explicitly_configures_independent_logs_and_serializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let log_dir = dir.path().join("logs");
+        fs::write(
+            &path,
+            format!(
+                "state_dir = {}\nworkflow_store = {}\nlog_dir = {}\n",
+                serde_json::to_string(&dir.path().join("state").to_string_lossy()).unwrap(),
+                serde_json::to_string(&dir.path().join("state/data.db").to_string_lossy()).unwrap(),
+                serde_json::to_string(&log_dir.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(config.log_dir, Some(log_dir.clone()));
+        assert_eq!(config.resolved_log_dir(), log_dir);
+        assert!(toml::to_string(&config).unwrap().contains("log_dir"));
+        assert!(
+            serde_json::to_value(&config)
+                .unwrap()
+                .get("log_dir")
+                .is_some()
+        );
+        assert!(
+            serde_json::to_value(config.runtime_config(dir.path().to_path_buf()))
+                .unwrap()
+                .get("log_dir")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn log_dir_expands_tilde_when_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "log_dir = '~/cowboy-logs'\n").unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert_eq!(
+            config.log_dir,
+            Some(
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join("cowboy-logs")
+            )
+        );
+    }
+
+    #[test]
+    fn log_dir_empty_value_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "log_dir = ''\n").unwrap();
+
+        let error = load_config(&path).unwrap_err();
+
+        assert!(
+            error
+                .root_cause()
+                .to_string()
+                .contains("log_dir must not be blank")
+        );
+    }
+
+    #[test]
+    fn log_dir_missing_from_existing_config_is_backward_compatible() {
+        let config: AppConfig = toml::from_str(
+            "state_dir = 'state'\nworkflow_store = 'state/data.db'\nworkflow_dirs = []\n",
+        )
+        .unwrap();
+
+        assert_eq!(config.log_dir, None);
+        assert_eq!(config.resolved_log_dir(), PathBuf::from("state/logs"));
+    }
 
     #[test]
     fn allowed_cmds_missing_config_defaults_to_unrestricted() {

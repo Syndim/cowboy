@@ -23,7 +23,7 @@ async fn run_main() -> Result<()> {
     let config_path = cli.config_path_or_else(cowboy::default_config_path);
     let config = cowboy::load_config(&config_path)?;
     if cowboy_log::init_file_logging(
-        config.state_dir.join("logs"),
+        config.resolved_log_dir(),
         "cowboy",
         cowboy_log::DEFAULT_DIRECTIVE,
     )
