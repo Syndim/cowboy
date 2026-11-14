@@ -489,6 +489,22 @@ pub fn diagnostic_error_text(text: &str) -> String {
             safe.push_str(" [redacted]");
         }
     }
+    for prefix in [
+        "unknown variant ",
+        "unknown field ",
+        "invalid value: string ",
+        "invalid type: string ",
+    ] {
+        if let Some(start) = safe.find(prefix).map(|start| start + prefix.len())
+            && let Some(quote) = safe[start..]
+                .chars()
+                .next()
+                .filter(|quote| ['`', '\'', '"'].contains(quote))
+            && let Some(end) = safe[start + 1..].find(&format!("{quote}, expected"))
+        {
+            safe.replace_range(start + 1..start + 1 + end, "[redacted]");
+        }
+    }
     for key in [
         "authorization",
         "bearer",
@@ -3570,6 +3586,15 @@ mod tests {
         let safe = json_error_text(&error);
         assert!(safe.contains("unknown variant") && safe.contains("expected"));
         assert!(!safe.contains("private-variant-canary"));
+        let context = format!("invalid summary JSON: {error}; agent reply: private-reply-canary");
+        let safe = diagnostic_error_text(&context);
+        assert!(safe.contains("unknown variant") && safe.contains("expected"));
+        assert!(!safe.contains("private-variant-canary") && !safe.contains("private-reply-canary"));
+        let safe = diagnostic_error_text(
+            "invalid summary JSON: unknown variant 'private-reply-canary', expected 'none' at line 1 column 42; agent reply: private-reply-canary",
+        );
+        assert!(safe.contains("expected 'none' at line 1 column 42"));
+        assert!(!safe.contains("private-reply-canary"));
     }
 
     #[tokio::test]

@@ -517,6 +517,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn summary_error_diagnostics_keep_schema_reason_without_response_values() {
+        let error = parse_json_response::<WorkflowSummary>(
+            r#"{"goal":"private-goal-canary","selected_workflow_id":"default","steps":[],"outcome":"private-outcome-canary","improvement":{"kind":"private-reply-canary"}}"#,
+            "summary",
+        )
+        .unwrap_err();
+        let diagnostic = cowboy_agent_acp::client::diagnostic_error_text(&error.to_string());
+        assert!(diagnostic.contains("invalid summary JSON"));
+        assert!(diagnostic.contains("unknown variant") && diagnostic.contains("expected"));
+        assert!(diagnostic.contains("line 1 column"));
+        for private in [
+            "private-goal-canary",
+            "private-outcome-canary",
+            "private-reply-canary",
+        ] {
+            assert!(!diagnostic.contains(private));
+        }
+    }
+
     fn catalog() -> WorkflowCatalog {
         WorkflowCatalog {
             workflows: BTreeMap::from([
