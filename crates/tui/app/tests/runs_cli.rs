@@ -114,3 +114,74 @@ fn cli_runs_filters_by_partial_run_id() {
         "{filtered_stdout}"
     );
 }
+
+#[test]
+fn cli_logging_filters_keep_private_configuration_and_requests_out_of_logs() {
+    let directory = tempfile::tempdir().unwrap();
+    let workflows = directory.path().join("workflows");
+    std::fs::create_dir(&workflows).unwrap();
+    std::fs::write(
+        workflows.join("instant.lua"),
+        r#"
+local start = step("start")
+start.run = function(ctx)
+  return action.status { status = "success", body = ctx.request }
+end
+return workflow("instant", start)
+"#,
+    )
+    .unwrap();
+    for (label, filter, rust_filter, verbose) in [
+        ("default", None, None, false),
+        (
+            "debug",
+            Some("info,cowboy_workflow_engine=debug"),
+            None,
+            true,
+        ),
+        ("trace", Some("trace"), None, true),
+        ("precedence", Some("info"), Some("trace"), false),
+    ] {
+        let state = directory.path().join(label);
+        let config = directory.path().join(format!("{label}.toml"));
+        std::fs::write(
+            &config,
+            format!(
+                "state_dir = {}\nworkflow_store = {}\nworkflow_dirs = [{}]\n[[agents]]\nname = 'default'\ncommand = 'unused-private-executable'\nargs = ['synthetic-credential-canary']\n",
+                serde_json::to_string(&state.to_string_lossy()).unwrap(),
+                serde_json::to_string(&state.join("data.db").to_string_lossy()).unwrap(),
+                serde_json::to_string(&workflows.to_string_lossy()).unwrap(),
+            ),
+        )
+        .unwrap();
+        let mut command = cowboy(&config);
+        command
+            .current_dir(directory.path())
+            .env_remove("COWBOY_LOG")
+            .env_remove("RUST_LOG")
+            .args(["run", "--workflow", "instant", "synthetic-request-canary"]);
+        if let Some(filter) = filter {
+            command.env("COWBOY_LOG", filter);
+        }
+        if let Some(filter) = rust_filter {
+            command.env("RUST_LOG", filter);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let logs = std::fs::read_dir(state.join("logs"))
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<String>();
+        assert!(logs.contains("cowboy logging initialized"));
+        assert!(logs.contains("starting requested workflow run"));
+        assert_eq!(logs.contains("workflow catalog loaded"), verbose, "{label}");
+        for private in [
+            "synthetic-credential-canary",
+            "synthetic-request-canary",
+            "unused-private-executable",
+            directory.path().to_str().unwrap(),
+        ] {
+            assert!(!logs.contains(private), "{label} logged private data");
+        }
+    }
+}

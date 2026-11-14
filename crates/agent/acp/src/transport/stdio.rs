@@ -1,8 +1,11 @@
 use std::sync::Arc;
+use tokio::time::Instant;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 use crate::agent_processes::{self, RegistrationId};
 use crate::process_tree::ProcessTreeScope;
@@ -12,9 +15,12 @@ use super::{StdioConfig, Transport};
 /// Stdio transport: a local subprocess using direct JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
     writer: BufWriter<ChildStdin>,
-    reader: Lines<BufReader<ChildStdout>>,
+    reader: BufReader<ChildStdout>,
+    read_buffer: Vec<u8>,
+    frame_started: Option<Instant>,
+    stdout_bytes: u64,
+    frames: u64,
     child: Child,
-    command: String,
     pid: Option<u32>,
     /// Owns the agent's whole process tree; descendants inherit the stdout
     /// pipe, so only tree termination lets the pending read reach EOF.
@@ -67,34 +73,34 @@ impl StdioTransport {
 
         let registration = agent_processes::register(&tree);
 
-        let pid = child.id();
         let stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
         if let Some(stderr) = child.stderr.take() {
-            spawn_stderr_logger(config.command.clone(), pid, stderr);
+            spawn_stderr_logger(child.id(), stderr);
         }
 
         let writer = BufWriter::new(stdin);
-        let reader = BufReader::new(stdout).lines();
+        let reader = BufReader::new(stdout);
 
-        let env_keys = config.env.iter().map(|(key, _)| key).collect::<Vec<_>>();
         tracing::debug!(
-            command = %config.command,
-            args = ?config.args,
-            additional_args = ?additional_args,
+            event = "acp_stdio_spawned",
+            pid = child.id(),
             clear_env = config.clear_env,
-            allowed_env = ?config.allowed_env,
-            env_keys = ?env_keys,
-            pid = ?pid,
+            argument_count = config.args.len() + additional_args.len(),
+            allowed_env_count = config.allowed_env.len(),
+            configured_env_count = config.env.len(),
             "Agent subprocess spawned"
         );
 
         Ok(Self {
             writer,
             reader,
+            read_buffer: Vec::new(),
+            frame_started: None,
+            stdout_bytes: 0,
+            frames: 0,
+            pid: child.id(),
             child,
-            command: config.command.clone(),
-            pid,
             tree,
             registration: Some(registration),
         })
@@ -114,11 +120,11 @@ impl StdioTransport {
 
         match self.tree.terminate() {
             Ok(()) => true,
-            Err(err) => {
+            Err(error) => {
                 tracing::warn!(
-                    command = %self.command,
-                    pid = ?self.pid,
-                    error = %err,
+                    pid = self.pid,
+                    error = %error,
+                    error_code = "terminate_failed",
                     "Agent process tree termination failed"
                 );
                 false
@@ -135,81 +141,165 @@ impl Drop for StdioTransport {
     }
 }
 
-fn spawn_stderr_logger(command: String, pid: Option<u32>, stderr: tokio::process::ChildStderr) {
+fn spawn_stderr_logger(pid: Option<u32>, mut stderr: tokio::process::ChildStderr) {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut buffer = [0; 8192];
+        let mut bytes = 0u64;
         loop {
-            match lines.next_line().await {
-                Ok(Some(line)) if line.trim().is_empty() => {}
-                Ok(Some(line)) => {
-                    tracing::warn!(
-                        command = %command,
-                        pid = ?pid,
-                        stderr = %line,
-                        "Agent subprocess stderr"
-                    );
-                }
-                Ok(None) => {
-                    tracing::debug!(command = %command, pid = ?pid, "Agent subprocess stderr closed");
+            match stderr.read(&mut buffer).await {
+                Ok(0) => {
+                    tracing::debug!(event = "acp_stderr_eof", pid, bytes, "ACP stderr closed");
                     break;
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        command = %command,
-                        pid = ?pid,
-                        error = %err,
-                        "Agent subprocess stderr read failed"
-                    );
+                Ok(count) => {
+                    if bytes == 0 {
+                        tracing::debug!(event = "acp_stderr_first_read", pid, bytes = count, "ACP stderr first read");
+                    }
+                    bytes = bytes.saturating_add(count as u64);
+                }
+                Err(error) => {
+                    tracing::warn!(event = "acp_stderr_read_failed", pid, bytes, error = %error, error_code = ?error.kind(), "ACP stderr read failed");
                     break;
                 }
             }
         }
-    });
+    }.in_current_span().with_current_subscriber());
 }
 
 #[async_trait]
 impl Transport for StdioTransport {
     async fn send(&mut self, message: &str) -> anyhow::Result<()> {
-        self.writer.write_all(message.as_bytes()).await?;
-        self.writer.write_all(b"\n").await?;
-        self.writer.flush().await?;
+        let started = Instant::now();
+        let bytes = message.len();
+        let mut completed_bytes = 0usize;
+        for (boundary, payload) in [
+            ("write_all", message.as_bytes()),
+            ("newline", b"\n".as_slice()),
+        ] {
+            tracing::debug!(
+                event = "acp_stdio_write_started",
+                boundary,
+                bytes = payload.len(),
+                completed_bytes,
+                "ACP stdio write started"
+            );
+            if let Err(error) = self.writer.write_all(payload).await {
+                tracing::debug!(event = "acp_stdio_write_failed", boundary, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio write failed");
+                return Err(error.into());
+            }
+            completed_bytes += payload.len();
+            tracing::debug!(
+                event = "acp_stdio_write_complete",
+                boundary,
+                bytes,
+                completed_bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ACP stdio write complete"
+            );
+        }
+        tracing::debug!(
+            event = "acp_stdio_flush_started",
+            bytes,
+            completed_bytes,
+            "ACP stdio flush started"
+        );
+        if let Err(error) = self.writer.flush().await {
+            tracing::debug!(event = "acp_stdio_flush_failed", bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio flush failed");
+            return Err(error.into());
+        }
+        tracing::debug!(
+            event = "acp_stdio_flush_complete",
+            bytes,
+            completed_bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "ACP stdio flush complete"
+        );
         Ok(())
     }
 
     async fn recv(&mut self) -> anyhow::Result<Option<String>> {
         loop {
-            match self.reader.next_line().await {
-                Ok(Some(line)) if line.trim().is_empty() => {
-                    tracing::trace!(command = %self.command, pid = ?self.pid, "Agent subprocess stdout empty line skipped");
+            let started = *self.frame_started.get_or_insert_with(Instant::now);
+            let available = match self.reader.fill_buf().await {
+                Ok(available) => available,
+                Err(error) => {
+                    tracing::warn!(event = "acp_stdout_read_failed", bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdout read failed");
+                    return Err(error.into());
                 }
-                Ok(Some(line)) => {
-                    tracing::trace!(
-                        command = %self.command,
-                        pid = ?self.pid,
-                        bytes = line.len(),
-                        "Agent subprocess stdout line received"
-                    );
-                    return Ok(Some(line));
-                }
-                Ok(None) => {
-                    let status = self.child.try_wait().ok().flatten();
-                    tracing::debug!(
-                        command = %self.command,
-                        pid = ?self.pid,
-                        status = ?status,
-                        "Agent subprocess stdout closed"
-                    );
+            };
+            let eof = available.is_empty();
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(available.len(), |index| index + 1);
+            if self.stdout_bytes == 0 && count > 0 {
+                tracing::debug!(
+                    event = "acp_stdout_first_read",
+                    bytes = count,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ACP stdout first read"
+                );
+            }
+            self.read_buffer.extend_from_slice(&available[..count]);
+            self.stdout_bytes = self.stdout_bytes.saturating_add(count as u64);
+            self.reader.consume(count);
+            if eof {
+                tracing::debug!(
+                    event = "acp_stdout_eof",
+                    bytes = self.read_buffer.len(),
+                    stdout_bytes = self.stdout_bytes,
+                    frames = self.frames,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ACP stdout closed"
+                );
+                if self.read_buffer.is_empty() {
+                    self.frame_started = None;
                     return Ok(None);
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        command = %self.command,
-                        pid = ?self.pid,
-                        error = %err,
-                        "Agent subprocess stdout read failed"
+            }
+            if newline.is_none() && !eof {
+                continue;
+            }
+            self.frames = self.frames.saturating_add(1);
+            self.frame_started = None;
+            let bytes = self.read_buffer.len();
+            let frame = std::mem::take(&mut self.read_buffer);
+            let mut line = match String::from_utf8(frame) {
+                Ok(line) => line,
+                Err(_) => {
+                    tracing::debug!(
+                        event = "acp_stdout_frame_failed",
+                        boundary = if eof { "eof" } else { "newline" },
+                        bytes,
+                        stdout_bytes = self.stdout_bytes,
+                        frames = self.frames,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        error_code = "invalid_utf8",
+                        "ACP stdout frame failed"
                     );
-                    return Err(err.into());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ACP stdout frame is invalid UTF-8",
+                    )
+                    .into());
                 }
+            };
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            tracing::debug!(
+                event = "acp_stdout_frame_complete",
+                boundary = if eof { "eof" } else { "newline" },
+                bytes,
+                stdout_bytes = self.stdout_bytes,
+                frames = self.frames,
+                empty = line.trim().is_empty(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "ACP stdout frame complete"
+            );
+            if !line.trim().is_empty() {
+                return Ok(Some(line));
             }
         }
     }
@@ -218,21 +308,15 @@ impl Transport for StdioTransport {
         let status = self.child.try_wait().ok().flatten();
         let tree_terminated = self.terminate_tree();
         tracing::debug!(
-            command = %self.command,
-            pid = ?self.pid,
+            pid = self.pid,
             status = ?status,
             tree_terminated,
             "Closing agent subprocess"
         );
         if status.is_none()
-            && let Err(err) = self.child.kill().await
+            && let Err(error) = self.child.kill().await
         {
-            tracing::warn!(
-                command = %self.command,
-                pid = ?self.pid,
-                error = %err,
-                "Agent subprocess kill failed"
-            );
+            tracing::warn!(pid = self.pid, error = %error, error_code = "kill_failed", "Agent subprocess kill failed");
         }
         Ok(())
     }
@@ -242,8 +326,7 @@ impl Transport for StdioTransport {
         if status.is_none() {
             let tree_terminated = self.terminate_tree();
             tracing::warn!(
-                command = %self.command,
-                pid = ?self.pid,
+                pid = self.pid,
                 tree_terminated,
                 "Force terminating agent subprocess"
             );

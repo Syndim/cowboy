@@ -977,7 +977,7 @@ impl WorkflowRuntime {
         options: RunStartOptions,
     ) -> Result<RunReport> {
         let request = request.into();
-        tracing::info!(request = %request, mode = ?mode, "starting workflow run");
+        tracing::info!(request_bytes = request.len(), mode = ?mode, "starting workflow run");
         let catalog = self.catalog()?;
         tracing::debug!(
             workflow_count = catalog.workflows.len(),
@@ -996,7 +996,7 @@ impl WorkflowRuntime {
         options: RunStartOptions,
     ) -> Result<RunReport> {
         let request = request.into();
-        tracing::info!(request = %request, workflow_id = %workflow_id, mode = ?mode, "starting requested workflow run");
+        tracing::info!(request_bytes = request.len(), workflow_id = %workflow_id, mode = ?mode, "starting requested workflow run");
         let catalog = self.catalog()?;
         tracing::debug!(
             workflow_count = catalog.workflows.len(),
@@ -1300,8 +1300,6 @@ impl WorkflowRuntime {
                 let config_set = self.resolve_config_set(&definition)?;
                 tracing::debug!(
                     workflow_id = %spec.workflow_id,
-                    source_entry = %source_ref.location.entry.display(),
-                    source_root = ?source_ref.location.root,
                     workflow_hash = %workflow_hash,
                     "workflow source compiled"
                 );
@@ -2200,7 +2198,7 @@ impl WorkflowRuntime {
         request: &str,
         catalog: &WorkflowCatalog,
     ) -> Result<cowboy_workflow_core::WorkflowSelection> {
-        tracing::debug!(selector = ?self.selector, request, "selecting workflow");
+        tracing::debug!(selector = ?self.selector, request_bytes = request.len(), "selecting workflow");
         match self.selector {
             SelectorMode::Deterministic => {
                 DeterministicSelector::new().select(request, catalog).await
@@ -2639,8 +2637,6 @@ impl WorkflowRuntime {
     )> {
         tracing::debug!(
             workflow_id = %source_ref.id,
-            source_entry = %source_ref.location.entry.display(),
-            source_root = ?source_ref.location.root,
             "compiling workflow source"
         );
         let (mut definition, snapshot, workflow_name) = if source_ref.location.root.is_some() {
@@ -2784,7 +2780,8 @@ impl WorkflowRuntime {
                 self.persist_events(&run.id, &events)?;
             }
             Err(err) => {
-                tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error = %err, "workflow events collected before run error");
+                let error = cowboy_agent_acp::client::diagnostic_error_text(&err.to_string());
+                tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error = %error, "workflow events collected before run error");
                 self.persist_events(&run_id, &events)?;
             }
         }
@@ -2905,7 +2902,11 @@ impl WorkflowRuntime {
         let raw = serde_json::to_string_pretty(events)
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         fs::write(&path, raw).map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
-        tracing::debug!(run_id, path = %path.display(), event_count = events.len(), "workflow events persisted");
+        tracing::debug!(
+            run_id,
+            event_count = events.len(),
+            "workflow events persisted"
+        );
         Ok(())
     }
 
