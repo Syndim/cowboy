@@ -186,8 +186,8 @@ return workflow("instant", start)
     }
 }
 
-#[test]
-fn cli_writes_logs_to_an_explicit_directory_without_changing_persisted_state() {
+#[tokio::test]
+async fn cli_writes_logs_to_an_explicit_directory_without_changing_persisted_state() {
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("persisted-state");
     let logs_dir = directory.path().join("stable-logs");
@@ -225,7 +225,22 @@ return workflow("instant", start)
         .args(["run", "--workflow", "instant", "synthetic-private-request"]);
     let output = command.output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    let persisted = std::fs::read(state.join("data.db")).unwrap();
+    let database = state.join("data.db");
+    let store = cowboy_workflow_store::SqliteWorkflowStore::connect(&database)
+        .await
+        .unwrap();
+    let heads = store.list_runs().await.unwrap();
+    assert_eq!(heads.len(), 1);
+    let run = store.load_run(&heads[0].run_id).await.unwrap();
+    assert_eq!(run.original_request, "synthetic-private-request");
+    assert_eq!(run.status, cowboy_workflow_core::RunStatus::Completed);
+    let step_hash = run.step.head.as_ref().unwrap();
+    let step = store.load_step_record(step_hash).await.unwrap();
+    let source = store
+        .load_workflow_source_snapshot(&run.workflow.hash)
+        .await
+        .unwrap();
+    store.close().await;
 
     let mut command = cowboy(&config);
     command
@@ -234,7 +249,20 @@ return workflow("instant", start)
         .arg("runs");
     let output = command.output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(std::fs::read(state.join("data.db")).unwrap(), persisted);
+    let store = cowboy_workflow_store::SqliteWorkflowStore::connect(&database)
+        .await
+        .unwrap();
+    assert_eq!(store.list_runs().await.unwrap(), heads);
+    assert_eq!(store.load_run(&run.id).await.unwrap(), run);
+    assert_eq!(store.load_step_record(step_hash).await.unwrap(), step);
+    assert_eq!(
+        store
+            .load_workflow_source_snapshot(&run.workflow.hash)
+            .await
+            .unwrap(),
+        source
+    );
+    store.close().await;
     assert!(!state.join("logs").exists());
 
     let log_entries = std::fs::read_dir(&logs_dir)
