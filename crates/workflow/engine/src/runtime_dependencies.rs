@@ -4,7 +4,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use cowboy_agent_acp::AgentAccess;
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
-use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient};
+use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient, client::diagnostic_error_text};
 use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
 use cowboy_workflow_core::{Result, RoleDefinition, WorkflowError};
 
@@ -122,8 +122,9 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
 
         match generate_request_topic_result(config, self.connector.as_ref(), request).await {
             Ok(topic) => Some(topic),
-            Err(_) => {
+            Err(error) => {
                 tracing::warn!(
+                    error = %diagnostic_error_text(&error.to_string()),
                     error_code = "topic_generation_failed",
                     "request topic generation failed"
                 );
@@ -172,6 +173,9 @@ impl ClientFactory for AcpClientFactory {
         let agent = self.resolver.resolve(role)?;
         tracing::debug!(
             role = %role.id,
+            backend = %agent.name,
+            model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
             argument_count = agent.args.len(),
             model_configured = agent.model.is_some(),
             "resolving ACP client for role"
@@ -218,6 +222,10 @@ pub(crate) fn watchdog_options_for(agent: &AgentRuntimeConfig) -> AgentWatchdogO
         recovery_operation_timeout_seconds: agent.watchdog.recovery_operation_timeout_seconds,
     }
 }
+
+#[cfg(test)]
+#[path = "../../../agent/acp/tests/support/diagnostics.rs"]
+mod diagnostics;
 
 #[cfg(test)]
 mod tests {
@@ -450,6 +458,60 @@ mod tests {
             ],
             config_sets: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_factory_keeps_backend_model_provider_without_configuration() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            let dependencies =
+                ProductionRuntimeDependencies::new(Arc::new(RecordingAcpConnector::default()));
+            let mut config = config();
+            config.agents[1].name = "diagnostic-backend-marker".into();
+            config.agents[1].command = "/private/backend-path-canary".into();
+            config.agents[1].args = vec!["private-argument-canary".into()];
+            config.agents[1].allowed_env = vec!["PRIVATE_CREDENTIAL_CANARY".into()];
+            config.agents[1].model = Some(cowboy_agent_client::ModelInfo {
+                id: "diagnostic-model-marker".into(),
+                provider: Some("diagnostic-provider-marker".into()),
+            });
+            let factory = dependencies.agent_factory(&config).unwrap();
+            let role = RoleDefinition {
+                id: "diagnostic-role-marker".into(),
+                instructions: "private-instructions-canary".into(),
+                agent: Some("diagnostic-backend-marker".into()),
+                properties: serde_json::json!({"token":"private-credential-canary"}),
+            };
+            assert!(factory.create_client(&role).await.is_err());
+            let log = capture.text();
+            for metadata in [
+                "diagnostic-backend-marker",
+                "diagnostic-model-marker",
+                "diagnostic-provider-marker",
+                "diagnostic-role-marker",
+            ] {
+                assert!(
+                    log.lines()
+                        .any(|line| line.starts_with("DEBUG") && line.contains(metadata)),
+                    "missing DEBUG metadata {metadata}"
+                );
+            }
+            for private in [
+                "/private/backend-path-canary",
+                "private-argument-canary",
+                "PRIVATE_CREDENTIAL_CANARY",
+                "private-instructions-canary",
+                "private-credential-canary",
+            ] {
+                assert!(!log.contains(private), "configuration leaked: {private}");
+            }
+            capture.clear();
+            assert!(capture.text().is_empty());
+        }
+        .with_subscriber(dispatch)
+        .await;
     }
 
     #[test]

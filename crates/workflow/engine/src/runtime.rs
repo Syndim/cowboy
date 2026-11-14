@@ -599,17 +599,17 @@ impl Drop for ActiveRunCancellationGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _run_guard = run_guard;
-                if store.clear_agent_prompt_window(&run_id).await.is_err() {
-                    tracing::warn!(run_id = %run_id, error_code = "prompt_window_clear_failed", "failed to clear agent prompt window during cancellation");
+                if let Err(err) = store.clear_agent_prompt_window(&run_id).await {
+                    tracing::warn!(run_id = %run_id, error = %err, "failed to clear agent prompt window during cancellation");
                 }
                 match store.load_run(&run_id).await {
                     Ok(mut run) => {
-                        if active_clock.close(&store, &mut run).await.is_err() {
-                            tracing::warn!(run_id = %run_id, error_code = "active_clock_close_failed", "failed to close active run clock during cancellation");
+                        if let Err(err) = active_clock.close(&store, &mut run).await {
+                            tracing::warn!(run_id = %run_id, error = %err, "failed to close active run clock during cancellation");
                         }
                     }
-                    Err(_) => {
-                        tracing::warn!(run_id = %run_id, error_code = "run_load_failed", "failed to load run during active clock cancellation cleanup");
+                    Err(err) => {
+                        tracing::warn!(run_id = %run_id, error = %err, "failed to load run during active clock cancellation cleanup");
                     }
                 }
             });
@@ -2174,7 +2174,7 @@ impl WorkflowRuntime {
             .copied()
         {
             tracing::warn!(
-                error_code = "config_set_missing",
+                requested = %name,
                 "config set missing from current config; falling back to default config set"
             );
             return ResolvedRuntimePolicy {
@@ -2184,7 +2184,7 @@ impl WorkflowRuntime {
         }
 
         tracing::warn!(
-            error_code = "config_sets_missing",
+            requested = %name,
             "config set and default config set both missing from current config; falling back to built-in default limits"
         );
         ResolvedRuntimePolicy {
@@ -2779,8 +2779,9 @@ impl WorkflowRuntime {
                 tracing::debug!(run_id = %run.id, event_count = events.len(), prefix_events = prefix_len, "workflow events collected");
                 self.persist_events(&run.id, &events)?;
             }
-            Err(_) => {
-                tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error_code = "run_failed", "workflow events collected before run error");
+            Err(err) => {
+                let error = cowboy_agent_acp::client::diagnostic_error_text(&err.to_string());
+                tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error = %error, "workflow events collected before run error");
                 self.persist_events(&run_id, &events)?;
             }
         }

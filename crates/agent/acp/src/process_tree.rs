@@ -48,11 +48,8 @@ impl ProcessTreeScope {
 
 impl Drop for ProcessTreeScope {
     fn drop(&mut self) {
-        if self.terminate().is_err() {
-            tracing::warn!(
-                error_code = "terminate_failed",
-                "agent process tree termination on drop failed"
-            );
+        if let Err(err) = self.terminate() {
+            tracing::warn!(error = %err, "agent process tree termination on drop failed");
         }
     }
 }

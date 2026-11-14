@@ -108,11 +108,8 @@ fn terminate_live_scopes() -> usize {
     for scope in take_live_scopes() {
         match scope.terminate() {
             Ok(()) => terminated += 1,
-            Err(_) => {
-                tracing::warn!(
-                    error_code = "terminate_failed",
-                    "failed to terminate agent process tree"
-                );
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to terminate agent process tree");
             }
         }
     }

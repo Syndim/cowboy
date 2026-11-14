@@ -6,7 +6,7 @@ mod diagnostics;
 use cowboy_agent_acp::transport::stdio::StdioTransport;
 use cowboy_agent_acp::transport::{StdioConfig, Transport};
 use cowboy_agent_acp::{AgentWatchdogOptions, Client, TransportConfig};
-use cowboy_agent_client::{Event, PromptContent, PromptTurnCancellation, StopReason};
+use cowboy_agent_client::{Event, ModelInfo, PromptContent, PromptTurnCancellation, StopReason};
 use diagnostics::DiagnosticCapture;
 use std::time::Duration;
 use tracing::instrument::WithSubscriber;
@@ -36,11 +36,8 @@ fn assert_private(log: &str) {
         "private-argv-marker",
         "PRIVATE_ENV_MARKER",
         "private-env-marker",
-        "private-session-marker",
         "private-prompt-marker",
         "private-stderr-marker",
-        "private-backend-marker",
-        "private-id-marker",
         "private-json-marker",
         "/private/cwd-marker",
         "你🙂",
@@ -50,19 +47,19 @@ fn assert_private(log: &str) {
     }
 }
 
-const INITIALIZE: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"private-backend-marker\",\"version\":\"1\"}}}'";
-const NEW_SESSION: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"private-session-marker\"}}'";
+const INITIALIZE: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"diagnostic-backend-marker\",\"version\":\"1\"}}}'";
+const NEW_SESSION: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"diagnostic-session-marker\"}}'";
 
 #[tokio::test]
 async fn public_acp_stdio_fragmented_unicode_and_watchdog_phase_order() {
-    let capture = DiagnosticCapture::default();
+    let capture = DiagnosticCapture::at_level(tracing::Level::DEBUG);
     let dispatch = tracing::Dispatch::new(capture.clone());
     async {
         let script = format!(r#"
 {INITIALIZE}; {NEW_SESSION};
 read -r request;
 printf '%s\n' 'private-stderr-marker' >&2;
-printf '%s' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"private-session-marker","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"';
+printf '%s' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"diagnostic-session-marker","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"';
 printf '\344'; sleep 0.02; printf '\275\240\360'; sleep 0.02; printf '\237\231\202';
 printf '%s\n' '"}}}}}}}}';
 read -r cancel;
@@ -70,7 +67,7 @@ case "$cancel" in *'session/cancel'*) ;; *) exit 7 ;; esac;
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"stopReason":"cancelled"}}}}';
 read -r continuation;
 case "$continuation" in *'session/prompt'*) ;; *) exit 8 ;; esac;
-printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"private-session-marker","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"private-reply-marker"}}}}}}}}';
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"diagnostic-session-marker","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"private-reply-marker"}}}}}}}}';
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}';
 "#);
         let mut client = Client::connect_with_options(TransportConfig::Stdio(peer(&script)), AgentWatchdogOptions {
@@ -78,8 +75,16 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}';
             cancel_timeout_seconds: 1,
             recovery_operation_timeout_seconds: 3,
         }).await.unwrap();
-        let session = client.new_session("/private/cwd-marker", &[], None).await.unwrap();
-        assert_private(&capture.text());
+        let model = ModelInfo {
+            id: "diagnostic-model-marker".into(),
+            provider: Some("diagnostic-provider-marker".into()),
+        };
+        let session = client.new_session("/private/cwd-marker", &[], Some(&model)).await.unwrap();
+        let log = capture.text();
+        for metadata in ["diagnostic-session-marker", "diagnostic-backend-marker", "backend_version=Some(\"1\")", "diagnostic-model-marker", "diagnostic-provider-marker", "load_session_supported=true"] {
+            assert!(log.lines().any(|line| line.starts_with("INFO") && line.contains(metadata)), "missing INFO metadata {metadata}");
+        }
+        assert_private(&log);
         capture.clear();
         let mut texts = Vec::new();
         let result = tokio::time::timeout(Duration::from_secs(5), client.prompt(&session, vec![PromptContent::text("private-prompt-marker")], PromptTurnCancellation::disabled(), &mut |event| {
@@ -103,6 +108,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"stopReason":"end_turn"}}}}';
         assert_eq!(log.matches("acp_stderr_first_read").count(), 1);
         assert!(log.contains("acp_stderr_eof"));
         assert!(log.contains("bytes=22"));
+        for event in ["ACP prompt sent", "agent_watchdog_armed", "agent_watchdog_cancel_begin", "agent_watchdog_cancel_complete", "ACP prompt turn completed", "ACP client closed"] {
+            assert!(log.lines().any(|line| line.starts_with("DEBUG") && line.contains(event) && line.contains("diagnostic-session-marker")), "missing session correlation for {event}");
+        }
+        assert!(log.lines().any(|line| line.starts_with("DEBUG") && line.contains("update=\"message_chunk\"")));
         assert_private(&log);
     }.with_subscriber(dispatch).await;
 }
@@ -125,6 +134,13 @@ async fn public_acp_stdio_classifies_invalid_utf8_json_and_eof_without_payloads(
                 .await
                 .unwrap_err();
             assert!(!error.to_string().contains("private-json-marker"));
+            if event == "acp_json_parse_failed" {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("expected value at line 1 column 1")
+                );
+            }
             let log = capture.text();
             assert_order(
                 &log,
@@ -134,6 +150,11 @@ async fn public_acp_stdio_classifies_invalid_utf8_json_and_eof_without_payloads(
                     event,
                 ],
             );
+            if event == "acp_json_parse_failed" {
+                assert!(log.contains("expected value"));
+                assert!(log.contains("line=1"));
+                assert!(log.contains("column=1"));
+            }
             if event == "acp_stdout_frame_failed" {
                 assert!(log.contains("invalid_utf8"));
                 assert!(log.contains("bytes=21"));
@@ -180,7 +201,7 @@ async fn stdio_partial_frame_survives_cancelled_read_and_reports_exact_counts() 
 }
 
 #[tokio::test]
-async fn stdio_stuck_write_and_closed_stdin_expose_only_boundaries() {
+async fn stdio_stuck_write_and_closed_stdin_preserve_io_explanations() {
     let capture = DiagnosticCapture::default();
     let dispatch = tracing::Dispatch::new(capture.clone());
     async {
@@ -208,7 +229,8 @@ async fn stdio_stuck_write_and_closed_stdin_expose_only_boundaries() {
                 .unwrap();
         assert_eq!(transport.recv().await.unwrap().as_deref(), Some("ready"));
         capture.clear();
-        assert!(transport.send("private-prompt-marker").await.is_err());
+        let error = transport.send("private-prompt-marker").await.unwrap_err();
+        assert!(error.to_string().contains("Broken pipe"));
         let log = capture.text();
         assert_order(
             &log,
@@ -220,6 +242,9 @@ async fn stdio_stuck_write_and_closed_stdin_expose_only_boundaries() {
             ],
         );
         assert!(log.contains("completed_bytes=22"));
+        assert!(log.lines().any(|line| line.starts_with("DEBUG")
+            && line.contains("acp_stdio_flush_failed")
+            && line.contains("Broken pipe")));
         assert!(!log.contains("acp_stdio_flush_complete"));
         assert_private(&log);
         transport.force_terminate().await.unwrap();

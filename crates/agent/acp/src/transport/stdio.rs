@@ -21,7 +21,6 @@ pub struct StdioTransport {
     stdout_bytes: u64,
     frames: u64,
     child: Child,
-    #[cfg(test)]
     pid: Option<u32>,
     /// Owns the agent's whole process tree; descendants inherit the stdout
     /// pipe, so only tree termination lets the pending read reach EOF.
@@ -86,6 +85,10 @@ impl StdioTransport {
         tracing::debug!(
             event = "acp_stdio_spawned",
             pid = child.id(),
+            clear_env = config.clear_env,
+            argument_count = config.args.len() + additional_args.len(),
+            allowed_env_count = config.allowed_env.len(),
+            configured_env_count = config.env.len(),
             "Agent subprocess spawned"
         );
 
@@ -96,7 +99,6 @@ impl StdioTransport {
             frame_started: None,
             stdout_bytes: 0,
             frames: 0,
-            #[cfg(test)]
             pid: child.id(),
             child,
             tree,
@@ -118,8 +120,10 @@ impl StdioTransport {
 
         match self.tree.terminate() {
             Ok(()) => true,
-            Err(_) => {
+            Err(error) => {
                 tracing::warn!(
+                    pid = self.pid,
+                    error = %error,
                     error_code = "terminate_failed",
                     "Agent process tree termination failed"
                 );
@@ -154,7 +158,7 @@ fn spawn_stderr_logger(pid: Option<u32>, mut stderr: tokio::process::ChildStderr
                     bytes = bytes.saturating_add(count as u64);
                 }
                 Err(error) => {
-                    tracing::debug!(event = "acp_stderr_read_failed", pid, bytes, error_code = ?error.kind(), "ACP stderr read failed");
+                    tracing::warn!(event = "acp_stderr_read_failed", pid, bytes, error = %error, error_code = ?error.kind(), "ACP stderr read failed");
                     break;
                 }
             }
@@ -180,7 +184,7 @@ impl Transport for StdioTransport {
                 "ACP stdio write started"
             );
             if let Err(error) = self.writer.write_all(payload).await {
-                tracing::debug!(event = "acp_stdio_write_failed", boundary, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error_code = ?error.kind(), "ACP stdio write failed");
+                tracing::debug!(event = "acp_stdio_write_failed", boundary, bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio write failed");
                 return Err(error.into());
             }
             completed_bytes += payload.len();
@@ -200,7 +204,7 @@ impl Transport for StdioTransport {
             "ACP stdio flush started"
         );
         if let Err(error) = self.writer.flush().await {
-            tracing::debug!(event = "acp_stdio_flush_failed", bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error_code = ?error.kind(), "ACP stdio flush failed");
+            tracing::debug!(event = "acp_stdio_flush_failed", bytes, completed_bytes, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdio flush failed");
             return Err(error.into());
         }
         tracing::debug!(
@@ -219,7 +223,7 @@ impl Transport for StdioTransport {
             let available = match self.reader.fill_buf().await {
                 Ok(available) => available,
                 Err(error) => {
-                    tracing::debug!(event = "acp_stdout_read_failed", bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error_code = ?error.kind(), "ACP stdout read failed");
+                    tracing::warn!(event = "acp_stdout_read_failed", bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdout read failed");
                     return Err(error.into());
                 }
             };
@@ -304,12 +308,15 @@ impl Transport for StdioTransport {
         let status = self.child.try_wait().ok().flatten();
         let tree_terminated = self.terminate_tree();
         tracing::debug!(
+            pid = self.pid,
             status = ?status,
             tree_terminated,
             "Closing agent subprocess"
         );
-        if status.is_none() && self.child.kill().await.is_err() {
-            tracing::warn!(error_code = "kill_failed", "Agent subprocess kill failed");
+        if status.is_none()
+            && let Err(error) = self.child.kill().await
+        {
+            tracing::warn!(pid = self.pid, error = %error, error_code = "kill_failed", "Agent subprocess kill failed");
         }
         Ok(())
     }
@@ -318,7 +325,11 @@ impl Transport for StdioTransport {
         let status = self.child.try_wait()?;
         if status.is_none() {
             let tree_terminated = self.terminate_tree();
-            tracing::warn!(tree_terminated, "Force terminating agent subprocess");
+            tracing::warn!(
+                pid = self.pid,
+                tree_terminated,
+                "Force terminating agent subprocess"
+            );
             self.child.kill().await?;
             let _ = self.child.wait().await?;
         } else {

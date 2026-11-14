@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use cowboy_agent_acp::client::diagnostic_error_text;
 use cowboy_agent_client::{
     AgentSessionDescriptor, Client, Event, ModelInfo, PromptContent, PromptTurnCancellation,
     StopReason,
@@ -18,6 +19,7 @@ use cowboy_workflow_core::{
     ordered_user_inputs_from_parts,
 };
 use tokio::sync::{Mutex, watch};
+use tracing::instrument::WithSubscriber;
 
 use crate::frontmatter::parse_frontmatter_output;
 use crate::prompt::{
@@ -339,9 +341,10 @@ impl<S: AgentStore + 'static> PromptWindowGuard<S> {
                 | AbortAgentPromptWindowOutcome::StaleWindow
                 | AbortAgentPromptWindowOutcome::MissingRun,
             ) => {}
-            Err(_) => tracing::warn!(
+            Err(err) => tracing::warn!(
                 run_id = %self.context.run_id,
                 window_id = %self.window_id,
+                error = %diagnostic_error_text(&err.to_string()),
                 error_code = "prompt_window_abort_failed",
                 "failed to abort agent prompt window"
             ),
@@ -363,26 +366,29 @@ impl<S: AgentStore + 'static> Drop for PromptWindowGuard<S> {
         let prompt_turn_controls = self.prompt_turn_controls.clone();
         self.closed = true;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if store
-                    .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now())
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(
-                        run_id = %context.run_id,
-                        window_id,
-                        error_code = "prompt_window_abort_failed",
-                        "failed to abort agent prompt window"
+            handle.spawn(
+                async move {
+                    if let Err(err) = store
+                        .abort_agent_prompt_window(&context.run_id, &window_id, Utc::now())
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %context.run_id,
+                            window_id,
+                            error = %diagnostic_error_text(&err.to_string()),
+                            error_code = "prompt_window_abort_failed",
+                            "failed to abort agent prompt window"
+                        );
+                    }
+                    prompt_turn_controls.unregister(&context.run_id, &window_id);
+                    emit_progress_kind(
+                        progress.as_ref(),
+                        &context,
+                        AgentProgressKind::PromptWindowClosed { role, window_id },
                     );
                 }
-                prompt_turn_controls.unregister(&context.run_id, &window_id);
-                emit_progress_kind(
-                    progress.as_ref(),
-                    &context,
-                    AgentProgressKind::PromptWindowClosed { role, window_id },
-                );
-            });
+                .with_current_subscriber(),
+            );
         } else {
             self.prompt_turn_controls
                 .unregister(&self.context.run_id, &self.window_id);
@@ -435,10 +441,11 @@ where
             run_id = %context.run_id,
             step = %context.step_id,
             role = %action.role,
+            agent = ?role.agent,
             "agent step: starting"
         );
         if !self.clients.lock().await.contains_key(&key) {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent client missing; creating");
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, agent = ?role.agent, "agent client missing; creating");
             let resolved = self.factory.create_client(role).await?;
             self.clients
                 .lock()
@@ -465,6 +472,16 @@ where
             .ok_or_else(|| Error::MissingClient(key.role_id.clone()))?;
         let acquired = self.ensure_session(active, &key).await?;
         let session_id = acquired.session_id;
+        tracing::debug!(
+            run_id = %key.run_id,
+            role = %key.role_id,
+            session_id,
+            backend = %active.backend,
+            model_id = ?active.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?active.model.as_ref().and_then(|model| model.provider.as_deref()),
+            selected_model = ?active.client.session_descriptor().and_then(|descriptor| descriptor.model.as_deref()),
+            "agent session ready metadata"
+        );
         // Resolve the per-session prompt-delivery watermark. A brand-new backend
         // session ignores any stale stored row and resends everything; a reused
         // session omits the already-delivered role block and user inputs.
@@ -653,7 +670,7 @@ where
                 return Err(error);
             }
         };
-        tracing::debug!(run_id = %context.run_id, step = %context.step_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
+        tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: initial reply");
 
         let mut applied_sequence = expected_baseline;
         let mut correction_turns = Vec::new();
@@ -746,7 +763,7 @@ where
                     };
                     visible = replacement;
                     turns.extend(correction_records);
-                    tracing::debug!(run_id = %context.run_id, step = %context.step_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
+                    tracing::debug!(run_id = %context.run_id, step = %context.step_id, session_id = %session_id, applied_sequence, stop_reason = ?stop_reason, reply_chars = visible.chars().count(), "agent step: correction reply");
                 }
                 CompareAndSealPromptWindowOutcome::Sealed(_) => {
                     window_guard.close();
@@ -858,7 +875,7 @@ where
 
         let client = active.client.as_mut();
         if let Some(session_id) = client.session_id() {
-            tracing::debug!(run_id = %key.run_id, role = %key.role_id, "agent session already active");
+            tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id, backend = %active.backend, "agent session already active");
             return Ok(AcquiredSession {
                 session_id: session_id.to_string(),
                 fresh: false,
@@ -870,6 +887,8 @@ where
                 tracing::debug!(
                     run_id = %key.run_id,
                     role = %key.role_id,
+                    session_id = %saved.session_id,
+                    backend = %active.backend,
                     "agent session: loading saved backend session"
                 );
                 match client
@@ -881,9 +900,12 @@ where
                     .await
                 {
                     Ok(history) => {
+                        tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id = %saved.session_id, backend = %active.backend, "agent session loaded metadata");
                         tracing::info!(
                             run_id = %key.run_id,
                             role = %key.role_id,
+                            session_id = %saved.session_id,
+                            backend = %active.backend,
                             history_events = history.len(),
                             "agent session loaded"
                         );
@@ -916,6 +938,9 @@ where
         tracing::debug!(
             run_id = %key.run_id,
             role = %key.role_id,
+            backend = %active.backend,
+            model_id = ?active.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?active.model.as_ref().and_then(|model| model.provider.as_deref()),
             "agent session: creating new backend session"
         );
         let session_id = client
@@ -938,9 +963,14 @@ where
             })
             .await
             .map_err(Error::from)?;
+        tracing::debug!(run_id = %key.run_id, role = %key.role_id, session_id = %session_id, backend = %active.backend, "agent session saved metadata");
         tracing::info!(
             run_id = %key.run_id,
             role = %key.role_id,
+            session_id = %session_id,
+            backend = %active.backend,
+            model_id = ?active.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?active.model.as_ref().and_then(|model| model.provider.as_deref()),
             "agent session saved"
         );
         Ok(AcquiredSession {
@@ -1057,6 +1087,7 @@ fn push_turn(
     });
 }
 
+#[tracing::instrument(level = "debug", skip_all, fields(session_id, run_id = %context.run_id, step = %context.step_id))]
 async fn run_prompt_turn(
     client: &mut dyn Client,
     session_id: &str,
@@ -1108,11 +1139,28 @@ fn collect_event(
     turns: &mut Vec<TurnRecord>,
     turn_cursor: &mut TurnCursor,
 ) {
+    let event_kind = match &event {
+        Event::MessageChunk { .. } => "message_chunk",
+        Event::ThoughtChunk { .. } => "thought_chunk",
+        Event::ToolCall { .. } => "tool_call",
+        Event::ToolCallUpdate { .. } => "tool_call_update",
+        Event::Plan { .. } => "plan",
+        Event::UserMessageChunk { .. } => "user_message_chunk",
+        Event::Unknown { .. } => "unknown",
+    };
     tracing::trace!(
+        event_kind,
         run_id = %context.run_id,
         step = %context.step_id,
         record_id = %context.step_record_id,
         "agent event received"
+    );
+    tracing::debug!(
+        event_kind,
+        run_id = %context.run_id,
+        step = %context.step_id,
+        record_id = %context.step_record_id,
+        "agent event metadata"
     );
     match event {
         Event::MessageChunk { content } => {
@@ -1161,6 +1209,9 @@ fn collect_event(
             tracing::debug!(
                 run_id = %context.run_id,
                 step = %context.step_id,
+                tool_call_id,
+                kind,
+                status,
                 "agent tool call collected"
             );
             if !tool_call_id.is_empty() && !title.is_empty() {
@@ -1183,6 +1234,7 @@ fn collect_event(
             status,
             content,
         } => {
+            tracing::debug!(run_id = %context.run_id, step = %context.step_id, tool_call_id, status, "agent tool call update collected");
             let title = tool_titles
                 .get(&tool_call_id)
                 .cloned()
@@ -1306,6 +1358,10 @@ fn aggregate_session_descriptor(descriptor: &AgentSessionDescriptor) -> Option<S
         .join("-");
     if token.is_empty() { None } else { Some(token) }
 }
+
+#[cfg(test)]
+#[path = "../../../agent/acp/tests/support/diagnostics.rs"]
+mod diagnostics;
 
 #[cfg(test)]
 mod tests {
@@ -1688,6 +1744,7 @@ mod tests {
         accepted_prompts: SyncMutex<Vec<FollowUpPrompt>>,
         window: SyncMutex<Option<AgentPromptWindow>>,
         pending_prompt_batches: SyncMutex<VecDeque<Vec<FollowUpPrompt>>>,
+        abort_error: Option<String>,
         /// Ordered record of every `save_role_session` call for assertions.
         save_history: SyncMutex<Vec<RoleSession>>,
     }
@@ -1926,6 +1983,9 @@ mod tests {
             window_id: &str,
             aborted_at: chrono::DateTime<Utc>,
         ) -> CoreResult<AbortAgentPromptWindowOutcome> {
+            if let Some(error) = &self.abort_error {
+                return Err(WorkflowError::InvalidAction(error.clone()));
+            }
             let mut window = self.window.lock();
             let Some(active) = window.as_mut() else {
                 return Ok(AbortAgentPromptWindowOutcome::NoWindow);
@@ -2001,6 +2061,115 @@ mod tests {
             run_created_at: Utc::now(),
             user_prompts: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_prompt_window_abort_and_drop_preserve_database_explanation() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            for dropped in [false, true] {
+                let controls = PromptTurnControlRegistry::default();
+                controls.register("diagnostic-run", "diagnostic-window", 0);
+                let mut guard = PromptWindowGuard {
+                    store: Arc::new(FakeStore {
+                        abort_error: Some(
+                            "database is locked; password=private-database-credential".into(),
+                        ),
+                        ..Default::default()
+                    }),
+                    context: context("diagnostic-run", "diagnostic-record"),
+                    role: "developer".into(),
+                    window_id: "diagnostic-window".into(),
+                    progress: None,
+                    prompt_turn_controls: controls.clone(),
+                    closed: false,
+                };
+                capture.clear();
+                if dropped {
+                    drop(guard);
+                    tokio::time::timeout(Duration::from_secs(1), async {
+                        while !controls.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                } else {
+                    guard.abort().await;
+                }
+                assert!(controls.is_empty());
+                let log = capture.text();
+                assert!(log.lines().any(|line| line.starts_with("WARN")
+                    && line.contains("failed to abort agent prompt window")
+                    && line.contains("database is locked")
+                    && line.contains("diagnostic-run")
+                    && line.contains("diagnostic-window")));
+                assert!(!log.contains("private-database-credential"));
+            }
+        }
+        .with_subscriber(dispatch)
+        .await;
+    }
+
+    #[tokio::test]
+    async fn diagnostic_sessions_and_events_preserve_metadata_without_content() {
+        use tracing::instrument::WithSubscriber;
+        let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
+        let dispatch = tracing::Dispatch::new(capture.clone());
+        async {
+            let events = vec![
+                Event::ToolCall { tool_call_id: "diagnostic-tool-id".into(), title: "private-tool-title-canary".into(), kind: "execute".into(), status: "pending".into() },
+                Event::ToolCallUpdate { tool_call_id: "diagnostic-tool-id".into(), status: "completed".into(), content: Some(serde_json::json!({"text":"private-tool-content-canary"})) },
+                Event::ThoughtChunk { content: serde_json::json!({"text":"private-thought-canary"}) },
+                Event::Plan { entries: vec![serde_json::json!({"content":"private-plan-canary"})] },
+                Event::Unknown { session_update: "private-event-kind-canary".into(), raw: serde_json::json!({"token":"private-credential-canary"}) },
+                Event::MessageChunk { content: serde_json::json!({"text":"---\nstatus: done\n---\nprivate-message-canary"}) },
+            ];
+            let client = FakeClient::with_descriptor(events, AgentSessionDescriptor {
+                model: Some("diagnostic-provider/diagnostic-selected-model".into()),
+                ..Default::default()
+            });
+            let executor = AgentExecutor::new(FakeFactory::new(vec![client]), FakeStore::default(), AgentExecutionConfig {
+                cwd: "/private/cwd-canary".into(),
+                mcp_servers: vec![serde_json::json!({"token":"private-credential-canary"})],
+                ..Default::default()
+            });
+            let mut action = action("developer");
+            action.prompt = "private-prompt-canary".into();
+            let mut context = context("diagnostic-run-id", "diagnostic-record-id");
+            context.original_request = "private-request-canary".into();
+            context.role.as_mut().unwrap().instructions = "private-instructions-canary".into();
+            let execution = executor.execute_agent(action, context).await.unwrap();
+            assert!(execution.record.output.as_ref().unwrap().body.contains("private-message-canary"));
+            let key = RoleSessionKey { run_id: "diagnostic-run-id".into(), role_id: "developer".into() };
+            let mut active = executor.clients.lock().await;
+            let active = active.get_mut(&key).unwrap();
+            assert!(!executor.ensure_session(active, &key).await.unwrap().fresh);
+            active.client = Box::new(FakeClient::with_load(vec![]));
+            assert!(!executor.ensure_session(active, &key).await.unwrap().fresh);
+            let log = capture.text();
+            for metadata in ["diagnostic-run-id", "diagnostic-record-id", "session-1", "fake-agent", "fake-model", "fake-provider",
+                "diagnostic-provider/diagnostic-selected-model", "diagnostic-tool-id", "execute", "pending", "completed",
+                "tool_call", "tool_call_update", "thought_chunk", "message_chunk", "plan", "unknown"] {
+                assert!(log.lines().any(|line| line.starts_with("DEBUG") && line.contains(metadata)), "missing DEBUG metadata {metadata}");
+            }
+            for event in ["agent session saved metadata", "agent session already active", "agent session: loading saved backend session", "agent session loaded metadata"] {
+                assert!(log.lines().any(|line| line.starts_with("DEBUG") && line.contains(event) && line.contains("session-1")), "missing session ID for {event}");
+            }
+            for private in ["private-tool-title-canary", "private-tool-content-canary", "private-thought-canary", "private-plan-canary",
+                "private-event-kind-canary", "private-credential-canary", "private-message-canary", "/private/cwd-canary",
+                "private-prompt-canary", "private-request-canary", "private-instructions-canary"] {
+                assert!(!log.contains(private), "content leaked: {private}");
+            }
+            for metadata in ["session-1", "fake-model", "fake-provider", "fake-agent"] {
+                assert!(log.lines().any(|line| line.starts_with("INFO") && line.contains("agent session saved") && line.contains(metadata)), "missing INFO metadata {metadata}");
+            }
+            assert!(log.lines().any(|line| line.starts_with("INFO") && line.contains("agent session loaded") && line.contains("session-1")));
+            capture.clear();
+            assert!(capture.text().is_empty());
+        }.with_subscriber(dispatch).await;
     }
 
     #[tokio::test]

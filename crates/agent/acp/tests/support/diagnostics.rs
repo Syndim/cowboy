@@ -4,9 +4,13 @@ use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
 #[derive(Clone, Default)]
-pub struct DiagnosticCapture(Arc<Mutex<Vec<String>>>);
+pub struct DiagnosticCapture(Arc<Mutex<Vec<String>>>, Option<tracing::Level>);
 
 impl DiagnosticCapture {
+    pub fn at_level(level: tracing::Level) -> Self {
+        Self(Arc::default(), Some(level))
+    }
+
     pub fn text(&self) -> String {
         self.0.lock().unwrap().join("\n")
     }
@@ -25,8 +29,8 @@ impl Visit for Fields {
 }
 
 impl Subscriber for DiagnosticCapture {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.1.is_none_or(|level| *metadata.level() <= level)
     }
 
     fn new_span(&self, attributes: &Attributes<'_>) -> Id {

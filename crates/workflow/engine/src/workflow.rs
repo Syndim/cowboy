@@ -144,7 +144,7 @@ where
                 Ok(response) => {
                     tracing::warn!(
                         attempt,
-                        error_code = "unknown_workflow",
+                        workflow_id = %response.workflow_id,
                         "workflow selector: agent picked an unknown workflow id, retrying"
                     );
                     prompt = retry_prompt(

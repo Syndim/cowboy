@@ -11,7 +11,8 @@ fn main() {
         Err(err) => Err(err.into()),
     };
     if let Err(err) = result {
-        tracing::error!(error_code = "command_failed", "cowboy exited with error");
+        let error = cowboy_workflow_engine::diagnostic_error_text(&err.to_string());
+        tracing::error!(error = %error, "cowboy exited with error");
         eprintln!("cowboy error: {err:?}");
         std::process::exit(1);
     }

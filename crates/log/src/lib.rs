@@ -100,6 +100,7 @@ fn log_panic(payload: &(dyn Any + Send), line: Option<u32>) {
     tracing::error!(
         error_code = "process_panic",
         payload_bytes = panic_payload_from_any(payload).len(),
+        panic_thread = ?std::thread::current().id(),
         line,
         "process panic"
     );
