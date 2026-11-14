@@ -3,6 +3,9 @@
 #[path = "support/diagnostics.rs"]
 mod diagnostics;
 
+use cowboy_agent_acp::messages::{
+    JsonRpcNotification, JsonRpcRequest, SessionCancelParams, SessionPromptParams,
+};
 use cowboy_agent_acp::transport::stdio::StdioTransport;
 use cowboy_agent_acp::transport::{StdioConfig, Transport};
 use cowboy_agent_acp::{AgentWatchdogOptions, Client, TransportConfig};
@@ -52,6 +55,179 @@ fn assert_private(log: &str) {
     ] {
         assert!(!log.contains(value));
     }
+}
+
+fn outbound_frame_peer(read_size: usize) -> ! {
+    use std::io::{BufWriter, Read, Write};
+    use std::os::fd::FromRawFd;
+
+    assert!([1, 4096, 8192].contains(&read_size));
+    let (mut input, output) =
+        unsafe { (std::fs::File::from_raw_fd(0), std::fs::File::from_raw_fd(3)) };
+    let mut output = BufWriter::new(output);
+    let mut buffer = vec![0; read_size];
+    let mut bytes = Vec::new();
+    let mut newlines = 0;
+    let mut reads = 0;
+    let mut largest_read = 0;
+    while newlines < 2 {
+        let count = input.read(&mut buffer).expect("read synthetic ACP frames");
+        assert!(count > 0, "synthetic ACP frames ended before cancellation");
+        reads += 1;
+        largest_read = largest_read.max(count);
+        newlines += buffer[..count]
+            .iter()
+            .filter(|&&byte| byte == b'\n')
+            .count();
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    serde_json::to_writer(
+        &mut output,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "bytes": bytes,
+                "reads": reads,
+                "largestRead": largest_read,
+            },
+        }),
+    )
+    .expect("report synthetic ACP frame bytes");
+    output.write_all(b"\n").unwrap();
+    output.flush().unwrap();
+    std::process::exit(0);
+}
+
+#[tokio::test]
+async fn public_stdio_outbound_prompt_and_cancel_preserve_exact_utf8_json_bytes() {
+    const TEST: &str = "public_stdio_outbound_prompt_and_cancel_preserve_exact_utf8_json_bytes";
+    const READ_SIZE: &str = "COWBOY_ACP_OUTBOUND_FRAME_READ_SIZE";
+    if let Ok(read_size) = std::env::var(READ_SIZE) {
+        outbound_frame_peer(read_size.parse().unwrap());
+    }
+    if diagnostics::isolated_capture_test(TEST).await {
+        return;
+    }
+    let capture = DiagnosticCapture::at_level(tracing::Level::DEBUG);
+    let dispatch = tracing::Dispatch::new(capture.clone());
+    async {
+        let executable = std::env::current_exe().unwrap();
+        let cancel = serde_json::to_string(&JsonRpcNotification::new(
+            "session/cancel",
+            SessionCancelParams {
+                session_id: "outbound-session-marker".into(),
+            },
+        ))
+        .unwrap();
+        let serialize_prompt = |text: &str| {
+            serde_json::to_string(&JsonRpcRequest::new(
+                2,
+                "session/prompt",
+                SessionPromptParams {
+                    session_id: "outbound-session-marker".into(),
+                    prompt: vec![PromptContent::text(text)],
+                },
+            ))
+            .unwrap()
+        };
+        let prefix = "private-prompt-marker quotes=\" slash=\\ newline=\n nul=\0 ";
+        for read_size in [1, 4096, 8192] {
+            for json_bytes in [8191, 8192, 8193, 15360, 16383, 16384, 16385, 18432] {
+                let padding = json_bytes - serialize_prompt(prefix).len();
+                for seed in ["abcdefg", "你🙂"] {
+                    let text = format!(
+                        "{prefix}{}{}",
+                        seed.repeat(padding / seed.len()),
+                        "x".repeat(padding % seed.len()),
+                    );
+                    let prompt = serialize_prompt(&text);
+                    assert_eq!(prompt.len(), json_bytes);
+                    assert_eq!(prompt.is_ascii(), seed.is_ascii());
+                    let config = StdioConfig {
+                        command: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            format!(
+                                "exec \"$1\" --exact {TEST} --nocapture --test-threads=1 3>&1 1>/dev/null"
+                            ),
+                            "outbound-frame-peer".into(),
+                            executable.to_str().unwrap().into(),
+                        ],
+                        clear_env: true,
+                        allowed_env: vec![],
+                        env: vec![(READ_SIZE.into(), read_size.to_string())],
+                    };
+                    capture.clear();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
+                        transport.send(&prompt).await.unwrap();
+                        transport.send(&cancel).await.unwrap();
+                        let report: serde_json::Value = serde_json::from_str(
+                            &transport.recv().await.unwrap().expect("synthetic ACP byte report"),
+                        )
+                        .unwrap();
+                        assert_eq!(report["jsonrpc"], "2.0");
+                        assert_eq!(report["id"], 2);
+                        let received: Vec<u8> =
+                            serde_json::from_value(report["result"]["bytes"].clone()).unwrap();
+                        let expected = [prompt.as_bytes(), b"\n", cancel.as_bytes(), b"\n"].concat();
+                        assert!(
+                            received == expected,
+                            "outbound byte mismatch: json_bytes={json_bytes}, read_size={read_size}, ascii={}",
+                            seed.is_ascii(),
+                        );
+                        assert_eq!(received.iter().filter(|&&byte| byte == b'\n').count(), 2);
+                        assert_eq!(received[json_bytes], b'\n');
+                        assert_eq!(received.last(), Some(&b'\n'));
+                        let frames = std::str::from_utf8(&received).unwrap();
+                        let mut frames = frames.split_terminator('\n');
+                        let decoded_prompt: serde_json::Value =
+                            serde_json::from_str(frames.next().unwrap()).unwrap();
+                        assert_eq!(decoded_prompt["jsonrpc"], "2.0");
+                        assert_eq!(decoded_prompt["id"], 2);
+                        assert_eq!(decoded_prompt["method"], "session/prompt");
+                        assert_eq!(decoded_prompt["params"]["sessionId"], "outbound-session-marker");
+                        assert_eq!(decoded_prompt["params"]["prompt"][0]["type"], "text");
+                        assert!(decoded_prompt["params"]["prompt"][0]["text"].as_str() == Some(text.as_str()));
+                        let decoded_cancel: serde_json::Value =
+                            serde_json::from_str(frames.next().unwrap()).unwrap();
+                        assert_eq!(decoded_cancel["jsonrpc"], "2.0");
+                        assert_eq!(decoded_cancel["method"], "session/cancel");
+                        assert_eq!(decoded_cancel["params"]["sessionId"], "outbound-session-marker");
+                        assert!(decoded_cancel.get("id").is_none());
+                        assert!(frames.next().is_none());
+                        let largest_read = report["result"]["largestRead"].as_u64().unwrap();
+                        assert!(largest_read > 0 && largest_read <= read_size as u64);
+                        assert!(report["result"]["reads"].as_u64().unwrap() >= received.len().div_ceil(read_size) as u64);
+                        assert!(transport.recv().await.unwrap().is_none());
+                        assert!(transport.child().wait().await.unwrap().success());
+                        transport.close().await.unwrap();
+                    })
+                    .await
+                    .expect("bounded synthetic ACP outbound exchange");
+                    let log = capture.text();
+                    assert_order(
+                        &log,
+                        &[
+                            "acp_stdio_write_started",
+                            "acp_stdio_write_complete",
+                            "acp_stdio_flush_started",
+                            "acp_stdio_flush_complete",
+                        ],
+                    );
+                    assert_eq!(log.matches("acp_stdio_write_complete").count(), 4);
+                    assert_eq!(log.matches("acp_stdio_flush_complete").count(), 2);
+                    assert!(log.lines().any(|line| line.contains("acp_stdio_flush_complete")
+                        && line.contains(&format!("bytes={json_bytes}"))
+                        && line.contains(&format!("completed_bytes={}", json_bytes + 1))));
+                    assert_private(&log);
+                }
+            }
+        }
+    }
+    .with_subscriber(dispatch)
+    .await;
 }
 
 const INITIALIZE: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true},\"agentInfo\":{\"name\":\"diagnostic-backend-marker\",\"version\":\"1\"}}}'";
