@@ -2355,6 +2355,7 @@ return workflow("restartable", start)
             state_dir: dir.path().join("state"),
             workflow_store: dir.path().join("state/data.db"),
             workflow_dirs: vec![workflow_dir],
+            log_dir: None,
             mouse_scroll_lines: crate::config::AppConfig::default().mouse_scroll_lines,
             allowed_env: crate::config::AppConfig::default().allowed_env,
             allowed_cmds: None,

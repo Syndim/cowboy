@@ -185,3 +185,101 @@ return workflow("instant", start)
         }
     }
 }
+
+#[tokio::test]
+async fn cli_writes_logs_to_an_explicit_directory_without_changing_persisted_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("persisted-state");
+    let logs_dir = directory.path().join("stable-logs");
+    let workflows = directory.path().join("workflows");
+    std::fs::create_dir(&workflows).unwrap();
+    std::fs::write(
+        workflows.join("instant.lua"),
+        r#"
+local start = step("start")
+start.run = function(ctx)
+  return action.status { status = "success", body = ctx.request }
+end
+return workflow("instant", start)
+"#,
+    )
+    .unwrap();
+
+    let config = directory.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {}\nworkflow_store = {}\nworkflow_dirs = [{}]\nlog_dir = {}\n[[agents]]\nname = 'default'\ncommand = 'unused-agent'\nargs = []\n",
+            serde_json::to_string(&state.to_string_lossy()).unwrap(),
+            serde_json::to_string(&state.join("data.db").to_string_lossy()).unwrap(),
+            serde_json::to_string(&workflows.to_string_lossy()).unwrap(),
+            serde_json::to_string(&logs_dir.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let mut command = cowboy(&config);
+    command
+        .env_remove("COWBOY_LOG")
+        .env_remove("RUST_LOG")
+        .args(["run", "--workflow", "instant", "synthetic-private-request"]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let database = state.join("data.db");
+    let store = cowboy_workflow_store::SqliteWorkflowStore::connect(&database)
+        .await
+        .unwrap();
+    let heads = store.list_runs().await.unwrap();
+    assert_eq!(heads.len(), 1);
+    let run = store.load_run(&heads[0].run_id).await.unwrap();
+    assert_eq!(run.original_request, "synthetic-private-request");
+    assert_eq!(run.status, cowboy_workflow_core::RunStatus::Completed);
+    let step_hash = run.step.head.as_ref().unwrap();
+    let step = store.load_step_record(step_hash).await.unwrap();
+    let source = store
+        .load_workflow_source_snapshot(&run.workflow.hash)
+        .await
+        .unwrap();
+    store.close().await;
+
+    let mut command = cowboy(&config);
+    command
+        .env_remove("COWBOY_LOG")
+        .env_remove("RUST_LOG")
+        .arg("runs");
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let store = cowboy_workflow_store::SqliteWorkflowStore::connect(&database)
+        .await
+        .unwrap();
+    assert_eq!(store.list_runs().await.unwrap(), heads);
+    assert_eq!(store.load_run(&run.id).await.unwrap(), run);
+    assert_eq!(store.load_step_record(step_hash).await.unwrap(), step);
+    assert_eq!(
+        store
+            .load_workflow_source_snapshot(&run.workflow.hash)
+            .await
+            .unwrap(),
+        source
+    );
+    store.close().await;
+    assert!(!state.join("logs").exists());
+
+    let log_entries = std::fs::read_dir(&logs_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(!log_entries.is_empty());
+    for path in log_entries {
+        let file_name = path.file_name().unwrap().to_string_lossy();
+        assert!(file_name.starts_with("cowboy."), "{file_name}");
+        assert!(file_name.ends_with(".log"), "{file_name}");
+        let logs = std::fs::read_to_string(path).unwrap();
+        assert!(logs.contains("cowboy logging initialized"));
+        assert!(logs.contains("ThreadId("));
+        assert!(logs.contains(" INFO "));
+        assert!(logs.contains(" cowboy"));
+        assert!(!logs.contains("synthetic-private-request"));
+        assert!(!logs.contains(directory.path().to_str().unwrap()));
+    }
+}
