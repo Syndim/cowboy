@@ -280,9 +280,12 @@ impl PiProcess {
         let tree = Arc::new(ProcessTreeScope::new()?);
         tree.configure(&mut cmd);
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn pi process '{}': {}", config.command, e)
-        })?;
+        // Linux can transiently reject execve with ETXTBSY for a file that
+        // was written moments earlier (the kernel may still consider the
+        // inode open for writing, e.g. under concurrent test activity or
+        // fs writeback). Retry that specific error with a short backoff;
+        // every other spawn failure fails immediately.
+        let mut child = spawn_with_busy_retry(&mut cmd, &config.command).await?;
 
         if let Err(err) = tree.attach(&child) {
             let _ = child.kill().await;
@@ -431,6 +434,39 @@ impl PiProcess {
         );
         if status.is_none() {
             let _ = self.child.kill().await;
+        }
+    }
+}
+
+/// Spawn `cmd`, retrying briefly on `ETXTBSY` ("Text file busy").
+///
+/// The file was already written by the caller; the busy condition is
+/// transient on Linux, so a bounded retry converts the flake into a pass
+/// while keeping every other spawn failure immediate.
+async fn spawn_with_busy_retry(cmd: &mut Command, command: &str) -> anyhow::Result<Child> {
+    const ATTEMPTS: u32 = 20;
+    const BACKOFF: Duration = Duration::from_millis(25);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < ATTEMPTS => {
+                tracing::debug!(
+                    event = "pi_spawn_busy_retry",
+                    command = %command,
+                    attempt,
+                    "pi spawn hit ETXTBSY; retrying"
+                );
+                tokio::time::sleep(BACKOFF).await;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to spawn pi process '{}': {}",
+                    command,
+                    error
+                ));
+            }
         }
     }
 }
