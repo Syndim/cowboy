@@ -342,6 +342,24 @@ Important modules:
 - `error.rs` — agent execution errors.
 - `bin/execute-agent.rs` — agent executor test app.
 
+### `cowboy-agent-pi` (`crates/agent/pi`)
+
+pi coding-agent RPC backend.
+
+Owns:
+
+- `PiRpcClient` implementing `cowboy-agent-client::Client` over pi's JSONL RPC protocol (`pi --mode rpc`)
+- `PiRpcBackendConnector` registered under the `"pi-rpc"` backend kind
+- JSONL subprocess transport with process-tree ownership
+- `pi-chat` test app
+
+Important modules:
+
+- `client.rs` — RPC command/response correlation, event normalization, turn settle on `agent_settled`.
+- `connector.rs` — maps `AgentLaunchSpec` onto a pi RPC subprocess and connects.
+- `process.rs` — spawned pi subprocess with JSONL framing and tree termination.
+- `bin/pi-chat.rs` — pi chat test app.
+
 ### `cowboy-agent-client` (`crates/agent/client`)
 
 Provider-neutral agent backend interface.

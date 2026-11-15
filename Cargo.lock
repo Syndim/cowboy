@@ -387,6 +387,7 @@ dependencies = [
  "chrono",
  "cowboy-agent-acp",
  "cowboy-agent-client",
+ "cowboy-agent-pi",
  "cowboy-command-parser",
  "cowboy-log",
  "cowboy-tui-animation",
@@ -438,6 +439,25 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "cowboy-agent-pi"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cowboy-agent-client",
+ "cowboy-log",
+ "libc",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -547,6 +567,7 @@ dependencies = [
  "chrono",
  "cowboy-agent-acp",
  "cowboy-agent-client",
+ "cowboy-agent-pi",
  "cowboy-log",
  "cowboy-workflow-actions",
  "cowboy-workflow-agent",

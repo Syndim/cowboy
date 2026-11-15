@@ -10,7 +10,7 @@ description = "Workflow runtime orchestration adapters for Cowboy"
 test-support = ["cowboy-workflow-agent/test-support"]
 # Test-app backends for `engine-cli`; library code never references concrete
 # agent protocols, only the neutral `cowboy-agent-client` contracts.
-cli-backends = ["dep:cowboy-agent-acp"]
+cli-backends = ["dep:cowboy-agent-acp", "dep:cowboy-agent-pi"]
 
 [dependencies]
 cowboy-agent-client.workspace = true
@@ -21,6 +21,7 @@ cowboy-workflow-catalog = { path = "../catalog" }
 cowboy-workflow-store.workspace = true
 cowboy-workflow-lua.workspace = true
 cowboy-agent-acp = { workspace = true, optional = true }
+cowboy-agent-pi = { workspace = true, optional = true }
 cowboy-log.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
