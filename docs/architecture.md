@@ -15,7 +15,7 @@ process argv / slash composer input
             -> catalog loading / workflow selection / summarization
             -> Run state orchestration
             -> Lua step action provider
-            -> ACP-backed agent action executor / input router
+            -> backend-neutral agent action executor / input router
             -> StepRecord + RunHead persistence
             -> workflow events + event log
        -> TUI renders workflow events and accepts plain text/prompt input
@@ -27,14 +27,14 @@ process argv / slash composer input
 | --- | --- |
 | `cowboy` (`crates/tui/app`) | Config loading, logging setup, runtime dispatch, and ratatui rendering only. Uses `cowboy-command-parser` for command grammar. |
 | `cowboy-command-parser` (`crates/tui/command-parser`) | Runtime/UI-independent clap-backed parsing for product CLI commands and interactive slash commands, plus metadata/suggestions. |
-| `cowboy-workflow-engine` | Product runtime: starts/resumes/provides input for/improves workflow runs, emits events, wires ACP agent execution. |
+| `cowboy-workflow-engine` | Product runtime: starts/resumes/provides input for/improves workflow runs, emits events, wires backend-neutral agent execution. |
 | `cowboy-workflow-catalog` | Built-in workflow source plus project/user `.lua` workflow catalog loading and update application. |
 | `cowboy-workflow-core` | Serializable workflow domain model, graph validation, `execute_step`, runner traits. |
 | `cowboy-workflow-lua` | Sandboxed Lua workflow loader and one-step runtime. |
 | `cowboy-workflow-store` | SQLx/SQLite implementation of async typed `WorkflowStore` capabilities. |
 | `cowboy-workflow-agent` | Agent action executor, YAML-frontmatter output parsing, role-session reuse. |
-| `cowboy-agent-client` | Provider-neutral `Client` trait and normalized agent events/types. |
-| `cowboy-agent-acp` | ACP JSON-RPC client and stdio/Zellij transports implementing the agent client seam. |
+| `cowboy-agent-client` | Provider-neutral `Client` trait, normalized agent events/types, and the backend launch contract (`AgentLaunchSpec`, `BackendConnector`, `BackendRegistry`). |
+| `cowboy-agent-acp` | ACP JSON-RPC client and stdio/Zellij transports, registered as one `BackendConnector` in the composition root. |
 
 ## Runtime model
 
@@ -108,7 +108,7 @@ One loop iteration:
 current `Run`
   -> StepActionProvider evaluates current step
   -> ActionDispatcher runs the StepAction
-      agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> completed StepRecord
+      agent    -> AgentActionRunner -> AgentExecutor -> backend Client (dyn) -> completed StepRecord
       command  -> CommandActionRunner -> tokio::process::Command -> completed StepRecord
       status   -> StatusActionRunner -> completed StepRecord
       wait_for_input -> WaitForInputActionRunner -> WaitingForInput with ResumeCallback descriptor
@@ -203,7 +203,7 @@ successful session loading, and restart with load failure/new-session
 recreation. Optional captures are written below
 `target/prompt-captures/reduce_agent_step_prompt_payloads/`.
 
-`WorkflowRuntime` wires agent clients to ACP via `cowboy-agent-acp` using the
+`WorkflowRuntime` resolves agent launch specs from config and routes them through the `BackendRegistry` installed by the composition root; today that registry contains the ACP connector from `cowboy-agent-acp` using the
 configured command, args, and model.
 
 <!-- cowboy-agent-watchdog-contract:start -->
@@ -343,7 +343,7 @@ transport's pending read without EOF and blocks process exit forever.
 
 The registry is exposed as
 `cowboy_agent_acp::terminate_all_agent_processes(timeout)` and reached through
-the engine's `AcpConnector` seam.
+the shared `BackendConnector::terminate_all_agents` seam.
 
 `WorkflowRuntime::shutdown(timeout)` is the bounded, idempotent teardown
 sequence: cancel store waits, terminate every live agent process tree, then

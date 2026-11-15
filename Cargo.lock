@@ -385,6 +385,7 @@ dependencies = [
  "anyhow",
  "base64",
  "chrono",
+ "cowboy-agent-acp",
  "cowboy-agent-client",
  "cowboy-command-parser",
  "cowboy-log",
@@ -436,6 +437,7 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

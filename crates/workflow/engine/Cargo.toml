@@ -8,16 +8,19 @@ description = "Workflow runtime orchestration adapters for Cowboy"
 
 [features]
 test-support = ["cowboy-workflow-agent/test-support"]
+# Test-app backends for `engine-cli`; library code never references concrete
+# agent protocols, only the neutral `cowboy-agent-client` contracts.
+cli-backends = ["dep:cowboy-agent-acp"]
 
 [dependencies]
 cowboy-agent-client.workspace = true
-cowboy-agent-acp.workspace = true
 cowboy-workflow-core.workspace = true
 cowboy-workflow-agent.workspace = true
 cowboy-workflow-actions = { path = "../actions" }
 cowboy-workflow-catalog = { path = "../catalog" }
 cowboy-workflow-store.workspace = true
 cowboy-workflow-lua.workspace = true
+cowboy-agent-acp = { workspace = true, optional = true }
 cowboy-log.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
@@ -31,6 +34,7 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 whoami = "1"
 
 [dev-dependencies]
+cowboy-agent-acp.workspace = true
 parking_lot.workspace = true
 mockall = "0.15"
 sqlx.workspace = true

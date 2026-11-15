@@ -6,6 +6,7 @@
 //! `cowboy-workflow-engine`.
 
 pub mod app;
+pub mod backends;
 pub mod config;
 mod export;
 pub mod process_exit;

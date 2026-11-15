@@ -1,51 +1,110 @@
+//! Backend-neutral wiring between the engine and agent backends.
+//!
+//! The engine never imports a concrete backend crate. Configuration is turned
+//! into [`AgentLaunchSpec`] values (pure data with an opaque backend token)
+//! and handed to the [`BackendRegistry`], which routes the spec to whichever
+//! backend connector was installed at the composition root.
+
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
-use cowboy_agent_acp::AgentAccess;
-use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
-use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient, client::diagnostic_error_text};
+use cowboy_agent_client::{AgentLaunchSpec, BackendRegistry, diagnostic_error_text};
 use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
 use cowboy_workflow_core::{Result, RoleDefinition, WorkflowError};
 
 use crate::agent_resolver::AgentResolver;
-use crate::runtime::{AgentRuntimeConfig, RuntimeConfig, SelectorMode};
+use crate::runtime::{RuntimeConfig, SelectorMode};
 use crate::workflow::AgentRequestTopicGenerator;
 
-#[async_trait]
-pub(crate) trait AcpConnector: Send + Sync {
-    async fn connect(
-        &self,
-        transport: TransportConfig,
-        watchdog: AgentWatchdogOptions,
-        access: AgentAccess,
-    ) -> anyhow::Result<AcpClient>;
+/// Default backend kind used when agent configuration predates backend kinds.
+///
+/// All existing configurations launch ACP agents; the field is optional and
+/// defaults to this token so serialized configs stay byte-compatible.
+pub const DEFAULT_BACKEND_KIND: &str = "acp";
 
-    /// Terminate every live agent process tree, bounded by `timeout`, and
-    /// report how many were terminated. Connectors that never spawn real agent
-    /// processes keep the default no-op.
-    async fn terminate_all_agents(&self, _timeout: Duration) -> usize {
-        0
+/// Factory that resolves a role to launch data and connects through the
+/// registry. The only backend knowledge here is the opaque token carried in
+/// configuration data.
+#[derive(Clone)]
+pub struct RegistryClientFactory {
+    resolver: AgentResolver,
+    registry: BackendRegistry,
+    global_allowed_env: Vec<String>,
+}
+
+impl RegistryClientFactory {
+    pub(crate) fn new(
+        resolver: AgentResolver,
+        registry: BackendRegistry,
+        global_allowed_env: Vec<String>,
+    ) -> Self {
+        Self {
+            resolver,
+            registry,
+            global_allowed_env,
+        }
+    }
+
+    fn launch_spec_for(&self, role: &RoleDefinition) -> Result<AgentLaunchSpec> {
+        let agent = self.resolver.resolve(role)?;
+        tracing::debug!(
+            role = %role.id,
+            backend = %agent.name,
+            kind = %agent.backend,
+            model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
+            provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
+            argument_count = agent.args.len(),
+            model_configured = agent.model.is_some(),
+            "resolving agent client for role"
+        );
+        let mut allowed_env = Vec::new();
+        for name in self.global_allowed_env.iter().chain(&agent.allowed_env) {
+            if !allowed_env.contains(name) {
+                allowed_env.push(name.clone());
+            }
+        }
+        Ok(AgentLaunchSpec {
+            agent: agent.name.clone(),
+            backend: agent.backend.clone(),
+            command: agent.command.clone(),
+            args: agent.args.clone(),
+            allowed_env,
+            access: agent.access.clone(),
+            watchdog: cowboy_agent_client::AgentWatchdogOptions {
+                response_timeout_seconds: agent.watchdog.response_timeout_seconds,
+                cancel_timeout_seconds: agent.watchdog.cancel_timeout_seconds,
+                recovery_operation_timeout_seconds: agent
+                    .watchdog
+                    .recovery_operation_timeout_seconds,
+            },
+            startup_readiness: agent.startup_readiness.clone(),
+            model: agent.model.clone(),
+        })
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ProductionAcpConnector;
-
 #[async_trait]
-impl AcpConnector for ProductionAcpConnector {
-    async fn connect(
+impl ClientFactory for RegistryClientFactory {
+    async fn create_client(
         &self,
-        transport: TransportConfig,
-        watchdog: AgentWatchdogOptions,
-        access: AgentAccess,
-    ) -> anyhow::Result<AcpClient> {
-        AcpClient::connect_with_options_and_access(transport, watchdog, access).await
+        role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        let spec = self.launch_spec_for(role)?;
+        let resolved = self.registry.connect(&spec).await?;
+        Ok(ResolvedAgentClient {
+            client: resolved.client,
+            model: resolved.model,
+            backend: resolved.agent,
+        })
     }
+}
 
-    async fn terminate_all_agents(&self, timeout: Duration) -> usize {
-        cowboy_agent_acp::terminate_all_agent_processes(timeout).await
-    }
+/// Build the launch spec for the default agent (runtime operations such as
+/// workflow selection and summarization).
+pub(crate) fn default_launch_spec(config: &RuntimeConfig) -> Result<AgentLaunchSpec> {
+    let resolver = AgentResolver::new(config.agents.clone())?;
+    let agent = resolver.resolve_default()?;
+    Ok(agent.launch_spec(&config.allowed_env))
 }
 
 #[derive(Clone)]
@@ -70,49 +129,50 @@ impl ClientFactory for SharedClientFactory {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub(crate) trait RuntimeDependencies: Send + Sync {
-    fn agent_factory(&self, config: &RuntimeConfig) -> Result<SharedClientFactory>;
+    fn agent_factory(
+        &self,
+        config: &RuntimeConfig,
+        registry: &BackendRegistry,
+    ) -> Result<SharedClientFactory>;
 
     async fn generate_request_topic(
         &self,
         config: &RuntimeConfig,
+        registry: &BackendRegistry,
         selector: SelectorMode,
         request: &str,
     ) -> Option<String>;
 }
 
-pub(crate) struct ProductionRuntimeDependencies {
-    connector: Arc<dyn AcpConnector>,
-}
-
-impl ProductionRuntimeDependencies {
-    pub(crate) fn new(connector: Arc<dyn AcpConnector>) -> Self {
-        Self { connector }
-    }
-}
-
-impl Default for ProductionRuntimeDependencies {
-    fn default() -> Self {
-        Self::new(Arc::new(ProductionAcpConnector))
-    }
-}
+/// Protocol-free dependencies. The backend registry is owned by the runtime
+/// and passed to each operation, so the composition root decides which
+/// backends exist.
+#[derive(Debug, Default)]
+pub(crate) struct ProductionRuntimeDependencies;
 
 #[async_trait]
 impl RuntimeDependencies for ProductionRuntimeDependencies {
-    fn agent_factory(&self, config: &RuntimeConfig) -> Result<SharedClientFactory> {
+    fn agent_factory(
+        &self,
+        config: &RuntimeConfig,
+        registry: &BackendRegistry,
+    ) -> Result<SharedClientFactory> {
         tracing::debug!(
             agents = config.agents.len(),
-            "ACP client factory configured"
+            backends = ?registry.kinds(),
+            "agent client factory configured"
         );
-        Ok(SharedClientFactory::new(AcpClientFactory {
-            resolver: AgentResolver::new(config.agents.clone())?,
-            connector: self.connector.clone(),
-            global_allowed_env: config.allowed_env.clone(),
-        }))
+        Ok(SharedClientFactory::new(RegistryClientFactory::new(
+            AgentResolver::new(config.agents.clone())?,
+            registry.clone(),
+            config.allowed_env.clone(),
+        )))
     }
 
     async fn generate_request_topic(
         &self,
         config: &RuntimeConfig,
+        registry: &BackendRegistry,
         selector: SelectorMode,
         request: &str,
     ) -> Option<String> {
@@ -120,7 +180,7 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
             return None;
         }
 
-        match generate_request_topic_result(config, self.connector.as_ref(), request).await {
+        match generate_request_topic_result(config, registry, request).await {
             Ok(topic) => Some(topic),
             Err(error) => {
                 tracing::warn!(
@@ -136,314 +196,44 @@ impl RuntimeDependencies for ProductionRuntimeDependencies {
 
 async fn generate_request_topic_result(
     config: &RuntimeConfig,
-    connector: &dyn AcpConnector,
+    registry: &BackendRegistry,
     request: &str,
 ) -> Result<String> {
-    let resolver = AgentResolver::new(config.agents.clone())?;
-    let agent = resolver.resolve_default()?;
-    let client = connector
-        .connect(
-            transport_for(&config.allowed_env, agent),
-            watchdog_options_for(agent),
-            agent.access.clone(),
-        )
+    let spec = default_launch_spec(config)?;
+    let resolved = registry
+        .connect(&spec)
         .await
         .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
     let generator = AgentRequestTopicGenerator::new(
-        client,
+        resolved.client,
         config.cwd.to_string_lossy().to_string(),
-        agent.model.clone(),
+        spec.model.clone(),
     );
     generator.generate(request).await
 }
 
-#[derive(Clone)]
-struct AcpClientFactory {
-    resolver: AgentResolver,
-    connector: Arc<dyn AcpConnector>,
-    global_allowed_env: Vec<String>,
-}
-
-#[async_trait]
-impl ClientFactory for AcpClientFactory {
-    async fn create_client(
-        &self,
-        role: &RoleDefinition,
-    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
-        let agent = self.resolver.resolve(role)?;
-        tracing::debug!(
-            role = %role.id,
-            backend = %agent.name,
-            model_id = ?agent.model.as_ref().map(|model| model.id.as_str()),
-            provider = ?agent.model.as_ref().and_then(|model| model.provider.as_deref()),
-            argument_count = agent.args.len(),
-            model_configured = agent.model.is_some(),
-            "resolving ACP client for role"
-        );
-        let client = self
-            .connector
-            .connect(
-                transport_for(&self.global_allowed_env, agent),
-                watchdog_options_for(agent),
-                agent.access.clone(),
-            )
-            .await?;
-        Ok(ResolvedAgentClient {
-            client: Box::new(client),
-            model: agent.model.clone(),
-            backend: agent.name.clone(),
-        })
-    }
-}
-
-pub(crate) fn transport_for(
-    global_allowed_env: &[String],
-    agent: &AgentRuntimeConfig,
-) -> TransportConfig {
-    let mut allowed_env = Vec::new();
-    for name in global_allowed_env.iter().chain(&agent.allowed_env) {
-        if !allowed_env.contains(name) {
-            allowed_env.push(name.clone());
-        }
-    }
-    TransportConfig::Stdio(StdioConfig {
-        command: agent.command.clone(),
-        args: agent.args.clone(),
-        clear_env: true,
-        allowed_env,
-        env: Vec::new(),
-        startup_readiness: agent.startup_readiness.clone(),
-    })
-}
-
-pub(crate) fn watchdog_options_for(agent: &AgentRuntimeConfig) -> AgentWatchdogOptions {
-    AgentWatchdogOptions {
-        response_timeout_seconds: agent.watchdog.response_timeout_seconds,
-        cancel_timeout_seconds: agent.watchdog.cancel_timeout_seconds,
-        recovery_operation_timeout_seconds: agent.watchdog.recovery_operation_timeout_seconds,
-    }
-}
-
-#[cfg(test)]
-#[path = "../../../agent/acp/tests/support/diagnostics.rs"]
-mod diagnostics;
-
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use parking_lot::Mutex;
-
-    use cowboy_agent_acp::transport::Transport;
-    use cowboy_agent_client::{Event, PromptContent, PromptTurnCancellation, StopReason};
+    use cowboy_agent_client::{AgentAccess, AgentWatchdogOptions, BackendConnector};
 
     use super::*;
-    use crate::runtime::{AgentStartupReadiness, AgentWatchdogRuntimeConfig};
+    use crate::runtime::{
+        AgentRuntimeConfig, AgentStartupReadiness, AgentWatchdogRuntimeConfig, RuntimeConfig,
+    };
 
-    struct ScriptedAcpTransport {
-        incoming: VecDeque<String>,
-        outgoing: Option<Arc<Mutex<Vec<serde_json::Value>>>>,
-    }
-
-    #[async_trait]
-    impl Transport for ScriptedAcpTransport {
-        async fn send(&mut self, message: &str) -> anyhow::Result<()> {
-            if let Some(outgoing) = &self.outgoing {
-                outgoing.lock().push(serde_json::from_str(message)?);
-            }
-            Ok(())
-        }
-
-        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
-            Ok(self.incoming.pop_front())
-        }
-
-        async fn close(&mut self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct PolicyAcpConnector;
-
-    #[async_trait]
-    impl AcpConnector for PolicyAcpConnector {
-        async fn connect(
-            &self,
-            transport: TransportConfig,
-            watchdog: AgentWatchdogOptions,
-            access: AgentAccess,
-        ) -> anyhow::Result<AcpClient> {
-            let response = |id, result: serde_json::Value| {
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
-            };
-            let update = |update: serde_json::Value| {
-                serde_json::json!({
-                    "jsonrpc": "2.0", "method": "session/update",
-                    "params": {"sessionId": "session-1", "update": update}
-                })
-                .to_string()
-            };
-            let incoming = VecDeque::from([
-                response(
-                    0,
-                    serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
-                ),
-                response(1, serde_json::json!({"sessionId": "session-1"})),
-                update(serde_json::json!({
-                    "sessionUpdate": "tool_call", "toolCallId": "secret-tool-id",
-                    "title": "secret-tool-title", "kind": "execute", "status": "completed"
-                })),
-                update(serde_json::json!({
-                    "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "response"}
-                })),
-                response(2, serde_json::json!({"stopReason": "end_turn"})),
-            ]);
-            AcpClient::connect_with_transport_and_options_and_access(
-                Box::new(ScriptedAcpTransport {
-                    incoming,
-                    outgoing: None,
-                }),
-                transport,
-                watchdog,
-                access,
-            )
-            .await
-        }
-    }
-
-    #[derive(Default)]
-    struct PermissionAcpConnector {
-        outgoing: Arc<Mutex<Vec<serde_json::Value>>>,
-        request_during_initialize: bool,
-    }
-
-    #[async_trait]
-    impl AcpConnector for PermissionAcpConnector {
-        async fn connect(
-            &self,
-            transport: TransportConfig,
-            watchdog: AgentWatchdogOptions,
-            access: AgentAccess,
-        ) -> anyhow::Result<AcpClient> {
-            let response = |id, result: serde_json::Value| {
-                serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
-            };
-            let mut incoming = VecDeque::from([
-                response(
-                    0,
-                    serde_json::json!({"protocolVersion": 1, "agentCapabilities": {}}),
-                ),
-                response(1, serde_json::json!({"sessionId": "session-1", "modeState": {"currentModeId": "read-only"}})),
-                serde_json::json!({
-                    "jsonrpc": "2.0", "id": 100, "method": "session/request_permission",
-                    "params": {
-                        "sessionId": "session-1", "toolCall": {"name": "write_file"},
-                        "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}]
-                    }
-                })
-                .to_string(),
-                serde_json::json!({
-                    "jsonrpc": "2.0", "method": "session/update",
-                    "params": {
-                        "sessionId": "session-1",
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": "{\"topic\":\"Example task\"}"}
-                        }
-                    }
-                })
-                .to_string(),
-                response(2, serde_json::json!({"stopReason": "end_turn"})),
-            ]);
-            if self.request_during_initialize {
-                incoming.push_front(
-                    serde_json::json!({
-                        "jsonrpc": "2.0", "id": 101, "method": "session/request_permission",
-                        "params": {
-                            "sessionId": "session-1", "toolCall": {"name": "setup_tool"},
-                            "options": [{"optionId": "allow-once", "name": "Allow once", "kind": "allow_once"}]
-                        }
-                    })
-                    .to_string(),
-                );
-            }
-            AcpClient::connect_with_transport_and_options_and_access(
-                Box::new(ScriptedAcpTransport {
-                    incoming,
-                    outgoing: Some(self.outgoing.clone()),
-                }),
-                transport,
-                watchdog,
-                access,
-            )
-            .await
-        }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    struct RecordedAcpConnection {
-        command: String,
-        clear_env: bool,
-        allowed_env: Vec<String>,
-        watchdog: AgentWatchdogOptions,
-        access: AgentAccess,
-        startup_readiness: Option<AgentStartupReadiness>,
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingAcpConnector {
-        connections: Arc<Mutex<Vec<RecordedAcpConnection>>>,
-    }
-
-    impl RecordingAcpConnector {
-        fn connections(&self) -> Vec<RecordedAcpConnection> {
-            self.connections.lock().clone()
-        }
-    }
-
-    #[async_trait]
-    impl AcpConnector for RecordingAcpConnector {
-        async fn connect(
-            &self,
-            transport: TransportConfig,
-            watchdog: AgentWatchdogOptions,
-            access: AgentAccess,
-        ) -> anyhow::Result<AcpClient> {
-            let TransportConfig::Stdio(transport) = transport else {
-                unreachable!("engine agents use stdio transport")
-            };
-            self.connections.lock().push(RecordedAcpConnection {
-                command: transport.command,
-                clear_env: transport.clear_env,
-                allowed_env: transport.allowed_env,
-                watchdog,
-                access,
-                startup_readiness: transport.startup_readiness,
-            });
-            Err(anyhow::anyhow!("recording connector"))
-        }
-    }
-
-    fn agent(
-        name: &str,
-        command: &str,
-        response_timeout_seconds: u64,
-        cancel_timeout_seconds: u64,
-        recovery_operation_timeout_seconds: u64,
-    ) -> AgentRuntimeConfig {
+    fn agent(name: &str, command: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             name: name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
+            backend: DEFAULT_BACKEND_KIND.to_string(),
             model: None,
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
-            watchdog: AgentWatchdogRuntimeConfig {
-                response_timeout_seconds,
-                cancel_timeout_seconds,
-                recovery_operation_timeout_seconds,
-            },
+            watchdog: AgentWatchdogRuntimeConfig::default(),
             startup_readiness: None,
         }
     }
@@ -452,482 +242,106 @@ mod tests {
         RuntimeConfig {
             cwd: std::env::current_dir().unwrap(),
             state_dir: "state".into(),
-            workflow_store: "state/workflow.redb".into(),
+            workflow_store: "state/data.db".into(),
             workflow_dirs: Vec::new(),
             allowed_env: Vec::new(),
             allowed_cmds: None,
             agents: vec![
-                agent("default", "default-agent-command", 11, 12, 13),
-                agent("named", "named-agent-command", 21, 22, 23),
+                agent("default", "default-agent-command"),
+                agent("named", "named-agent-command"),
             ],
-            config_sets: Default::default(),
+            config_sets: BTreeMap::from([(
+                "default".to_string(),
+                crate::runtime::RunnerLimitsConfig::default(),
+            )]),
         }
+    }
+
+    /// Connector that records the specs it received and fails connection, so
+    /// tests can assert on the launch data the engine produced.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingConnector {
+        specs: Arc<std::sync::Mutex<Vec<AgentLaunchSpec>>>,
+    }
+
+    #[async_trait]
+    impl BackendConnector for RecordingConnector {
+        fn kind(&self) -> &str {
+            DEFAULT_BACKEND_KIND
+        }
+
+        async fn connect(
+            &self,
+            spec: &AgentLaunchSpec,
+        ) -> anyhow::Result<cowboy_agent_client::ResolvedBackend> {
+            self.specs.lock().unwrap().push(spec.clone());
+            Err(anyhow::anyhow!("recording connector"))
+        }
+    }
+
+    fn recording_registry() -> (BackendRegistry, Arc<std::sync::Mutex<Vec<AgentLaunchSpec>>>) {
+        let connector = Arc::new(RecordingConnector::default());
+        let specs = connector.specs.clone();
+        (BackendRegistry::new(vec![connector]), specs)
     }
 
     #[tokio::test]
-    async fn diagnostic_factory_keeps_backend_model_provider_without_configuration() {
-        if diagnostics::isolated_capture_test("runtime_dependencies::tests::diagnostic_factory_keeps_backend_model_provider_without_configuration").await {
-            return;
-        }
-        use tracing::instrument::WithSubscriber;
-        let capture = diagnostics::DiagnosticCapture::at_level(tracing::Level::DEBUG);
-        let dispatch = tracing::Dispatch::new(capture.clone());
-        async {
-            let dependencies =
-                ProductionRuntimeDependencies::new(Arc::new(RecordingAcpConnector::default()));
-            let mut config = config();
-            config.agents[1].name = "diagnostic-backend-marker".into();
-            config.agents[1].command = "/private/backend-path-canary".into();
-            config.agents[1].args = vec!["private-argument-canary".into()];
-            config.agents[1].allowed_env = vec!["PRIVATE_CREDENTIAL_CANARY".into()];
-            config.agents[1].model = Some(cowboy_agent_client::ModelInfo {
-                id: "diagnostic-model-marker".into(),
-                provider: Some("diagnostic-provider-marker".into()),
-            });
-            let factory = dependencies.agent_factory(&config).unwrap();
-            let role = RoleDefinition {
-                id: "diagnostic-role-marker".into(),
-                instructions: "private-instructions-canary".into(),
-                agent: Some("diagnostic-backend-marker".into()),
-                properties: serde_json::json!({"token":"private-credential-canary"}),
-            };
-            assert!(factory.create_client(&role).await.is_err());
-            let log = capture.text();
-            for metadata in [
-                "diagnostic-backend-marker",
-                "diagnostic-model-marker",
-                "diagnostic-provider-marker",
-                "diagnostic-role-marker",
-            ] {
-                assert!(
-                    log.lines()
-                        .any(|line| line.starts_with("DEBUG") && line.contains(metadata)),
-                    "missing DEBUG metadata {metadata}"
-                );
-            }
-            for private in [
-                "/private/backend-path-canary",
-                "private-argument-canary",
-                "PRIVATE_CREDENTIAL_CANARY",
-                "private-instructions-canary",
-                "private-credential-canary",
-            ] {
-                assert!(!log.contains(private), "configuration leaked: {private}");
-            }
-            capture.clear();
-            assert!(capture.text().is_empty());
-        }
-        .with_subscriber(dispatch)
-        .await;
-    }
-
-    #[test]
-    fn runtime_dependencies_preserve_selected_agent_watchdog_policy() {
-        let agent = AgentRuntimeConfig {
-            name: "reviewer".to_string(),
-            command: "agent".to_string(),
-            args: vec![],
-            model: None,
-            access: AgentAccess::default(),
-            allowed_env: Vec::new(),
-            watchdog: AgentWatchdogRuntimeConfig {
-                response_timeout_seconds: 7,
-                cancel_timeout_seconds: 8,
-                recovery_operation_timeout_seconds: 9,
-            },
-            startup_readiness: None,
-        };
-
-        assert_eq!(
-            watchdog_options_for(&agent),
-            AgentWatchdogOptions {
-                response_timeout_seconds: 7,
-                cancel_timeout_seconds: 8,
-                recovery_operation_timeout_seconds: 9,
-            }
-        );
-    }
-
-    #[test]
-    fn stdio_transport_preserves_optional_startup_readiness() {
-        let mut configured = agent("default", "agent-command", 11, 12, 13);
-        for readiness in [
-            None,
-            Some(AgentStartupReadiness {
-                log_path: "~/.local/agency/logs/session_*_{pid}/process-*.log".to_string(),
-                contains: "ACP server started, waiting for requests".to_string(),
-                timeout_seconds: 300,
-            }),
-        ] {
-            configured.startup_readiness = readiness.clone();
-            let TransportConfig::Stdio(transport) = transport_for(&[], &configured) else {
-                panic!("engine agents use stdio transport")
-            };
-            configured.startup_readiness = None;
-
-            assert_eq!(transport.command, "agent-command");
-            assert_eq!(transport.startup_readiness, readiness);
-        }
-    }
-
-    #[tokio::test]
-    async fn role_and_request_topic_clients_forward_selected_startup_readiness() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
+    async fn registry_factory_resolves_role_to_full_launch_spec() {
+        let (registry, specs) = recording_registry();
         let mut config = config();
-        let default_readiness = AgentStartupReadiness {
-            log_path: "~/logs/default_{pid}/process-*.log".to_string(),
-            contains: "default ready".to_string(),
-            timeout_seconds: 300,
+        config.agents[1].name = "reviewer".to_string();
+        config.agents[1].command = "reviewer-command".to_string();
+        config.agents[1].args = vec!["--flag".to_string()];
+        config.agents[1].allowed_env = vec!["REVIEWER".to_string()];
+        config.agents[1].watchdog = AgentWatchdogRuntimeConfig {
+            response_timeout_seconds: 21,
+            cancel_timeout_seconds: 22,
+            recovery_operation_timeout_seconds: 23,
         };
-        let named_readiness = AgentStartupReadiness {
-            log_path: "~/logs/named_{pid}/process-*.log".to_string(),
-            contains: "named ready".to_string(),
-            timeout_seconds: 15,
-        };
-        config.agents[0].startup_readiness = Some(default_readiness.clone());
-        config.agents[1].startup_readiness = Some(named_readiness.clone());
-        let factory = dependencies.agent_factory(&config).unwrap();
-
-        for selected in [Some("named"), Some("default"), None] {
-            let role = RoleDefinition {
-                id: "developer".to_string(),
-                instructions: "work".to_string(),
-                agent: selected.map(str::to_string),
-                properties: serde_json::Value::Null,
-            };
-            assert!(factory.create_client(&role).await.is_err());
-        }
-        assert!(
-            dependencies
-                .generate_request_topic(&config, SelectorMode::Agent, "topic")
-                .await
-                .is_none()
-        );
-
-        let connections = recording.connections();
-        assert_eq!(connections.len(), 4);
-        assert_eq!(connections[0].startup_readiness, Some(named_readiness));
-        for connection in &connections[1..] {
-            assert_eq!(
-                connection.startup_readiness.as_ref(),
-                Some(&default_readiness)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn factory_rejects_named_role_tool_activity_but_keeps_default_unrestricted() {
-        let mut config = config();
-        config.agents[1].access = AgentAccess::DenyAll;
-        let dependencies = ProductionRuntimeDependencies::new(Arc::new(PolicyAcpConnector));
-        let factory = dependencies.agent_factory(&config).unwrap();
-
-        for (agent_name, tools_allowed) in [("named", false), ("default", true)] {
-            let role = RoleDefinition {
-                id: "developer".to_string(),
-                instructions: "work".to_string(),
-                agent: Some(agent_name.to_string()),
-                properties: serde_json::Value::Null,
-            };
-            let mut resolved = factory.create_client(&role).await.unwrap();
-            assert_eq!(resolved.backend, agent_name);
-            let session = resolved.client.new_session(".", &[], None).await.unwrap();
-            let mut events = Vec::new();
-            let result = resolved
-                .client
-                .prompt(
-                    &session,
-                    vec![PromptContent::text("work")],
-                    PromptTurnCancellation::from_future(std::future::pending()),
-                    &mut |event| events.push(event),
-                )
-                .await;
-
-            if !tools_allowed {
-                let error = result.unwrap_err().to_string();
-                assert!(error.contains("tool"), "{error}");
-                assert!(!error.contains("secret-tool-title"), "{error}");
-                assert!(events.is_empty(), "tool events must not reach the role");
-            } else {
-                assert!(matches!(result.unwrap(), StopReason::EndTurn));
-                assert!(
-                    events
-                        .iter()
-                        .any(|event| matches!(event, Event::ToolCall { .. }))
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn selected_role_denies_escalation_but_default_agent_allows_requests() {
-        let mut config = config();
         config.agents[1].access = AgentAccess::DenyEscalation {
             acp_mode: "read-only".to_string(),
         };
-        let connector = Arc::new(PermissionAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
-        let factory = dependencies.agent_factory(&config).unwrap();
-
-        for (agent_name, expected_outcome) in [("named", "cancelled"), ("default", "selected")] {
-            let role = RoleDefinition {
-                id: "developer".to_string(),
-                instructions: "work".to_string(),
-                agent: Some(agent_name.to_string()),
-                properties: serde_json::Value::Null,
-            };
-            let mut resolved = factory.create_client(&role).await.unwrap();
-            let session = resolved.client.new_session(".", &[], None).await.unwrap();
-            let stop = resolved
-                .client
-                .prompt(
-                    &session,
-                    vec![PromptContent::text("work")],
-                    PromptTurnCancellation::disabled(),
-                    &mut |_| {},
-                )
-                .await
-                .unwrap();
-            assert!(matches!(stop, StopReason::EndTurn));
-
-            let mut outgoing = connector.outgoing.lock();
-            let response = outgoing
-                .iter()
-                .find(|message| message["id"] == 100)
-                .unwrap();
-            assert_eq!(response["result"]["outcome"]["outcome"], expected_outcome);
-            if agent_name == "default" {
-                assert_eq!(response["result"]["outcome"]["optionId"], "allow-once");
-            }
-            outgoing.clear();
-        }
-    }
-
-    #[tokio::test]
-    async fn request_topic_uses_default_agent_access() {
-        let mut config = config();
-        config.agents[0].access = AgentAccess::DenyEscalation {
-            acp_mode: "read-only".to_string(),
-        };
-        let connector = Arc::new(PermissionAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
-
-        let topic = dependencies
-            .generate_request_topic(&config, SelectorMode::Agent, "Describe this work")
-            .await;
-
-        assert_eq!(topic.as_deref(), Some("Example task"));
-        let outgoing = connector.outgoing.lock();
-        let response = outgoing
-            .iter()
-            .find(|message| message["id"] == 100)
-            .unwrap();
-        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
-    }
-
-    #[tokio::test]
-    async fn restricted_role_denies_permission_during_initialize_before_session_creation() {
-        let mut config = config();
-        config.agents[1].access = AgentAccess::DenyEscalation {
-            acp_mode: "read-only".to_string(),
-        };
-        let connector = Arc::new(PermissionAcpConnector {
-            request_during_initialize: true,
-            ..Default::default()
-        });
-        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
-        let factory = dependencies.agent_factory(&config).unwrap();
-        let role = RoleDefinition {
-            id: "developer".to_string(),
-            instructions: "work".to_string(),
-            agent: Some("named".to_string()),
-            properties: serde_json::Value::Null,
-        };
-
-        let mut resolved = factory.create_client(&role).await.unwrap();
-        {
-            let outgoing = connector.outgoing.lock();
-            assert_eq!(outgoing[0]["method"], "initialize");
-            assert_eq!(outgoing[1]["id"], 101);
-            assert_eq!(outgoing[1]["result"]["outcome"]["outcome"], "cancelled");
-        }
-
-        resolved.client.new_session(".", &[], None).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn deny_all_cancels_permission_and_aborts_during_initialize() {
-        let mut config = config();
-        config.agents[0].access = AgentAccess::DenyAll;
-        let connector = Arc::new(PermissionAcpConnector {
-            request_during_initialize: true,
-            ..Default::default()
-        });
-        let dependencies = ProductionRuntimeDependencies::new(connector.clone());
-
-        let topic = dependencies
-            .generate_request_topic(&config, SelectorMode::Agent, "Describe this work")
-            .await;
-
-        assert_eq!(topic, None);
-        let outgoing = connector.outgoing.lock();
-        assert_eq!(
-            outgoing.len(),
-            2,
-            "no session may start after a forbidden setup request"
-        );
-        assert_eq!(outgoing[0]["method"], "initialize");
-        assert_eq!(outgoing[1]["id"], 101);
-        assert_eq!(outgoing[1]["result"]["outcome"]["outcome"], "cancelled");
-    }
-
-    #[tokio::test]
-    async fn role_agent_client_construction_uses_explicit_named_watchdog() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-        let mut config = config();
-        config.agents[1].access = AgentAccess::DenyEscalation {
-            acp_mode: "read-only".to_string(),
-        };
-        let factory = dependencies.agent_factory(&config).unwrap();
+        config.allowed_env = vec!["GLOBAL".to_string()];
+        let dependencies = ProductionRuntimeDependencies;
+        let factory = dependencies.agent_factory(&config, &registry).unwrap();
         let role = RoleDefinition {
             id: "developer".to_string(),
             instructions: "implement".to_string(),
-            agent: Some("named".to_string()),
+            agent: Some("reviewer".to_string()),
             properties: serde_json::Value::Null,
         };
 
-        let error = match factory.create_client(&role).await {
-            Ok(_) => panic!("recording connector should fail client construction"),
-            Err(error) => error,
-        };
+        assert!(factory.create_client(&role).await.is_err());
 
-        assert!(error.to_string().contains("recording connector"));
+        let specs = specs.lock().unwrap().clone();
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.agent, "reviewer");
+        assert_eq!(spec.backend, DEFAULT_BACKEND_KIND);
+        assert_eq!(spec.command, "reviewer-command");
+        assert_eq!(spec.args, ["--flag"]);
+        assert_eq!(spec.allowed_env, ["GLOBAL", "REVIEWER"]);
         assert_eq!(
-            recording.connections(),
-            [RecordedAcpConnection {
-                command: "named-agent-command".to_string(),
-                clear_env: true,
-                allowed_env: Vec::new(),
-                watchdog: AgentWatchdogOptions {
-                    response_timeout_seconds: 21,
-                    cancel_timeout_seconds: 22,
-                    recovery_operation_timeout_seconds: 23,
-                },
-                access: AgentAccess::DenyEscalation {
-                    acp_mode: "read-only".to_string(),
-                },
-                startup_readiness: None,
-            }]
+            spec.watchdog,
+            AgentWatchdogOptions {
+                response_timeout_seconds: 21,
+                cancel_timeout_seconds: 22,
+                recovery_operation_timeout_seconds: 23,
+            }
         );
-    }
-
-    #[tokio::test]
-    async fn request_topic_client_construction_uses_default_watchdog() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-
-        let topic = dependencies
-            .generate_request_topic(&config(), SelectorMode::Agent, "summarize this request")
-            .await;
-
-        assert_eq!(topic, None);
         assert_eq!(
-            recording.connections(),
-            [RecordedAcpConnection {
-                command: "default-agent-command".to_string(),
-                clear_env: true,
-                allowed_env: Vec::new(),
-                watchdog: AgentWatchdogOptions {
-                    response_timeout_seconds: 11,
-                    cancel_timeout_seconds: 12,
-                    recovery_operation_timeout_seconds: 13,
-                },
-                access: AgentAccess::Default,
-                startup_readiness: None,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn named_agent_client_uses_global_and_agent_allowed_env() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-        let mut config = config();
-        config.allowed_env = vec!["GLOBAL".to_string(), "SHARED".to_string()];
-        config.agents[1].name = "planner".to_string();
-        config.agents[1].allowed_env = vec!["PLANNER".to_string(), "SHARED".to_string()];
-        let factory = dependencies.agent_factory(&config).unwrap();
-
-        for id in ["planner-one", "planner-two"] {
-            let role = RoleDefinition {
-                id: id.to_string(),
-                instructions: "plan".to_string(),
-                agent: Some("planner".to_string()),
-                properties: serde_json::Value::Null,
-            };
-            assert!(factory.create_client(&role).await.is_err());
-        }
-
-        assert_eq!(recording.connections().len(), 2);
-        for connection in recording.connections() {
-            assert!(connection.clear_env);
-            assert_eq!(connection.allowed_env, ["GLOBAL", "SHARED", "PLANNER"]);
-        }
-    }
-
-    #[tokio::test]
-    async fn different_agents_do_not_share_environment_additions() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-        let mut config = config();
-        config.allowed_env = vec!["GLOBAL".to_string()];
-        config.agents = vec![
-            agent("planner", "planner-command", 11, 12, 13),
-            agent("implementer", "implementer-command", 21, 22, 23),
-        ];
-        config.agents[0].allowed_env = vec!["PLANNER".to_string()];
-        config.agents[0].access = AgentAccess::DenyEscalation {
-            acp_mode: "read-only".to_string(),
-        };
-        config.agents[1].allowed_env = vec!["IMPLEMENTER".to_string()];
-        let factory = dependencies.agent_factory(&config).unwrap();
-
-        for agent_name in ["planner", "implementer"] {
-            let role = RoleDefinition {
-                id: agent_name.to_string(),
-                instructions: "work".to_string(),
-                agent: Some(agent_name.to_string()),
-                properties: serde_json::Value::Null,
-            };
-            assert!(factory.create_client(&role).await.is_err());
-        }
-
-        let connections = recording.connections();
-        assert_eq!(connections[0].allowed_env, ["GLOBAL", "PLANNER"]);
-        assert_eq!(
-            connections[0].access,
+            spec.access,
             AgentAccess::DenyEscalation {
                 acp_mode: "read-only".to_string(),
             }
         );
-        assert_eq!(connections[1].allowed_env, ["GLOBAL", "IMPLEMENTER"]);
-        assert_eq!(connections[1].access, AgentAccess::Default);
-        assert!(!connections[1].allowed_env.contains(&"PLANNER".to_string()));
     }
 
     #[tokio::test]
-    async fn default_agent_clients_use_global_and_default_agent_allowed_env() {
-        let recording = Arc::new(RecordingAcpConnector::default());
-        let dependencies = ProductionRuntimeDependencies::new(recording.clone());
-        let mut config = config();
-        config.allowed_env = vec!["GLOBAL".to_string()];
-        config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string()];
-        config.agents[0].access = AgentAccess::DenyEscalation {
-            acp_mode: "review".to_string(),
-        };
-        let factory = dependencies.agent_factory(&config).unwrap();
+    async fn registry_factory_resolves_implicit_default_agent() {
+        let (registry, specs) = recording_registry();
+        let dependencies = ProductionRuntimeDependencies;
+        let factory = dependencies.agent_factory(&config(), &registry).unwrap();
         let role = RoleDefinition {
             id: "implicit".to_string(),
             instructions: "work".to_string(),
@@ -936,22 +350,90 @@ mod tests {
         };
 
         assert!(factory.create_client(&role).await.is_err());
-        assert!(
-            dependencies
-                .generate_request_topic(&config, SelectorMode::Agent, "topic")
-                .await
-                .is_none()
-        );
 
-        assert_eq!(recording.connections().len(), 2);
-        for connection in recording.connections() {
-            assert_eq!(connection.allowed_env, ["GLOBAL", "DEFAULT_AGENT"]);
-            assert_eq!(
-                connection.access,
-                AgentAccess::DenyEscalation {
-                    acp_mode: "review".to_string(),
-                }
-            );
-        }
+        let specs = specs.lock().unwrap().clone();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].agent, "default");
+        assert_eq!(specs[0].command, "default-agent-command");
+    }
+
+    #[tokio::test]
+    async fn request_topic_generation_uses_default_agent_launch_spec() {
+        let (registry, specs) = recording_registry();
+        let dependencies = ProductionRuntimeDependencies;
+
+        let topic = dependencies
+            .generate_request_topic(
+                &config(),
+                &registry,
+                crate::runtime::SelectorMode::Agent,
+                "summarize",
+            )
+            .await;
+
+        assert_eq!(topic, None);
+        let specs = specs.lock().unwrap().clone();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].agent, "default");
+        assert_eq!(specs[0].command, "default-agent-command");
+    }
+
+    #[tokio::test]
+    async fn unknown_backend_kind_fails_with_known_kinds() {
+        let mut config = config();
+        config.agents[0].backend = "typo".to_string();
+        let (registry, specs) = recording_registry();
+        let dependencies = ProductionRuntimeDependencies;
+        let factory = dependencies.agent_factory(&config, &registry).unwrap();
+        let role = RoleDefinition {
+            id: "developer".to_string(),
+            instructions: "work".to_string(),
+            agent: Some("default".to_string()),
+            properties: serde_json::Value::Null,
+        };
+
+        let error = match factory.create_client(&role).await {
+            Ok(_) => panic!("unknown backend kind must fail"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unknown backend kind \"typo\""), "{error}");
+        assert_eq!(specs.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_agent_watchdog_and_readiness_flow_into_launch_spec() {
+        let (registry, specs) = recording_registry();
+        let mut config = config();
+        config.agents[0].watchdog = AgentWatchdogRuntimeConfig {
+            response_timeout_seconds: 11,
+            cancel_timeout_seconds: 12,
+            recovery_operation_timeout_seconds: 13,
+        };
+        config.agents[0].startup_readiness = Some(AgentStartupReadiness {
+            log_path: "~/logs/session_{pid}/process.log".to_string(),
+            contains: "ready".to_string(),
+            timeout_seconds: 300,
+        });
+        let dependencies = ProductionRuntimeDependencies;
+        let factory = dependencies.agent_factory(&config, &registry).unwrap();
+        let role = RoleDefinition {
+            id: "implicit".to_string(),
+            instructions: "work".to_string(),
+            agent: None,
+            properties: serde_json::Value::Null,
+        };
+
+        assert!(factory.create_client(&role).await.is_err());
+        let specs = specs.lock().unwrap().clone();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].watchdog,
+            AgentWatchdogOptions {
+                response_timeout_seconds: 11,
+                cancel_timeout_seconds: 12,
+                recovery_operation_timeout_seconds: 13,
+            }
+        );
+        assert!(specs[0].startup_readiness.is_some());
     }
 }

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use cowboy_agent_acp::client::diagnostic_error_text;
+use cowboy_agent_client::diagnostic_error_text;
 use cowboy_agent_client::{
     AgentSessionDescriptor, Client, Event, ModelInfo, PromptContent, PromptTurnCancellation,
     StopReason,
@@ -421,7 +421,7 @@ where
     S: AgentStore + 'static,
 {
     /// Execute an agent action using the session keyed by `(run_id, role_id)`.
-    #[tracing::instrument(target = "cowboy_agent_acp", level = "debug", skip_all, fields(run_id = %context.run_id, role = %action.role, step = %context.step_id))]
+    #[tracing::instrument(target = "cowboy_agent", level = "debug", skip_all, fields(run_id = %context.run_id, role = %action.role, step = %context.step_id))]
     pub async fn execute_agent(
         &self,
         action: AgentAction,

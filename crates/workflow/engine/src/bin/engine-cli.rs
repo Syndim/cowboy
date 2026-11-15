@@ -31,12 +31,16 @@ use std::env;
 use std::future::Future;
 use std::path::PathBuf;
 
+#[cfg(feature = "cli-backends")]
 use cowboy_agent_acp::BackendPreset;
+#[cfg(feature = "cli-backends")]
 use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_core::{Result as CoreResult, RunStatus};
+#[cfg(feature = "cli-backends")]
+use cowboy_workflow_engine::AgentRuntimeConfig;
 use cowboy_workflow_engine::{
-    AgentRuntimeConfig, RunReport, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig,
-    WorkflowEvent, WorkflowEventKind, WorkflowRuntime,
+    RunReport, RunSummaryLine, RunnerLimitsConfig, RuntimeConfig, WorkflowEvent, WorkflowEventKind,
+    WorkflowRuntime,
 };
 
 type CliResult = Result<(), Box<dyn std::error::Error>>;
@@ -122,7 +126,20 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         .filter(|value| !value.is_empty())
         .map(|value| value.split(':').map(PathBuf::from).collect())
         .unwrap_or_else(|| vec![PathBuf::from("engine-workflows")]);
+    #[cfg(feature = "cli-backends")]
     let agent = resolve_agent()?;
+    #[cfg(not(feature = "cli-backends"))]
+    let agent = {
+        let _ = env_or("COWBOY_ENGINE_BACKEND", "copilot");
+        cowboy_workflow_engine::AgentRuntimeConfig::new(
+            "default",
+            env_or("COWBOY_ENGINE_AGENT", "copilot"),
+            env::var("COWBOY_ENGINE_AGENT_ARGS")
+                .map(|value| value.split_whitespace().map(str::to_string).collect())
+                .unwrap_or_default(),
+            None,
+        )
+    };
     let limits = RunnerLimitsConfig {
         max_steps_per_run: 100,
         max_visits_per_step: 20,
@@ -193,6 +210,10 @@ fn default_allowed_env() -> Vec<String> {
 /// Resolve the ACP agent config from a backend preset selected by
 /// `COWBOY_ENGINE_BACKEND` (default `copilot`, also `omp`), with optional
 /// per-field overrides.
+/// Resolve the agent config from a backend preset selected by
+/// `COWBOY_ENGINE_BACKEND` (default `copilot`, also `omp`), with optional
+/// per-field overrides.
+#[cfg(feature = "cli-backends")]
 fn resolve_agent() -> Result<AgentRuntimeConfig, Box<dyn std::error::Error>> {
     let backend = env_or("COWBOY_ENGINE_BACKEND", "copilot");
     let preset = BackendPreset::lookup(&backend).ok_or_else(|| {

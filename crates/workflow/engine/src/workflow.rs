@@ -524,7 +524,7 @@ mod tests {
             "summary",
         )
         .unwrap_err();
-        let diagnostic = cowboy_agent_acp::client::diagnostic_error_text(&error.to_string());
+        let diagnostic = cowboy_agent_client::diagnostic_error_text(&error.to_string());
         assert!(diagnostic.contains("invalid summary JSON"));
         assert!(diagnostic.contains("unknown variant") && diagnostic.contains("expected"));
         assert!(diagnostic.contains("line 1 column"));

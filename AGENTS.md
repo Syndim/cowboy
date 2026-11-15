@@ -9,7 +9,7 @@ It has one binary with two interfaces:
 - `cowboy` with no subcommand launches the interactive terminal UI.
 - `cowboy <subcommand>` runs a non-interactive CLI command against the same workflow runtime and persisted state.
 
-Workflows are Lua files. A workflow step can run an ACP-compatible coding agent, run a command-line program with explicit args, return a status immediately, ask the user for input, invoke another catalog workflow as a durable child run, or fail.
+Workflows are Lua files. A workflow step can run a configured coding agent (ACP today; backends are pluggable through `cowboy-agent-client`'s launch contract), run a command-line program with explicit args, return a status immediately, ask the user for input, invoke another catalog workflow as a durable child run, or fail.
 
 ## Quick Start
 
@@ -200,7 +200,7 @@ Owns:
 - workflow event projection and event logs
 - wait-for-input input routing through `ResumeRouter`
 - selector/summarizer adapters
-- runtime wiring for catalog, Lua, SQLite store, action dispatch, and ACP-backed agent execution
+- runtime wiring for catalog, Lua, SQLite store, action dispatch, and backend-neutral agent execution (`AgentLaunchSpec` -> `BackendRegistry`)
 
 Important modules:
 
@@ -209,6 +209,7 @@ Important modules:
 - `events.rs` — `WorkflowEvent`, `WorkflowEventKind`, live `StepProgress`, `EventBus`.
 - `input.rs` — `ResumeRouter` for `RunStatus::WaitingForInput` answers and persisted resume callbacks.
 - `workflow.rs` — deterministic/agent selectors and agent summarizer.
+- `runtime_dependencies.rs` — backend-neutral wiring: `RegistryClientFactory` builds `AgentLaunchSpec` per role and connects through the runtime's `BackendRegistry`; `AgentRuntimeConfig.backend` carries an opaque backend-kind token (`acp` default).
 
 ### `cowboy-workflow-actions` (`crates/workflow/actions`)
 
@@ -270,7 +271,7 @@ Important modules:
 - `summary.rs` — workflow improvement/summary types.
 - `error.rs` — workflow errors.
 
-Core must stay independent of TUI, Lua, SQLite/SQLx, ACP, and SDK/provider details.
+Core must stay independent of TUI, Lua, SQLite/SQLx, and SDK/provider details.
 
 ### `cowboy-workflow-lua` (`crates/workflow/lua`)
 
@@ -349,11 +350,18 @@ Owns:
 
 - `Client` trait
 - `ModelInfo`, `AgentInfo`, `PromptContent`, `Event`, `StopReason`
+- backend launch contract: `AgentLaunchSpec`, `BackendConnector`, `BackendRegistry`
+- shared policy types: `AgentAccess`, `AgentWatchdogOptions`, `StartupReadiness`, `diagnostic_error_text`
 
 Important modules:
 
 - `traits.rs` — provider-neutral `Client` trait.
 - `types.rs` — model, agent, prompt, event, and stop-reason types.
+- `contract/` — backend launch contract, registry routing, access/watchdog/readiness policy, error redaction.
+
+Concrete backends (ACP now, pi RPC and others later) implement
+`BackendConnector` and register in the composition root's `BackendRegistry`.
+The engine library never references a concrete protocol.
 
 ### `cowboy-agent-acp` (`crates/agent/acp`)
 
@@ -362,6 +370,7 @@ ACP backend implementation.
 Owns:
 
 - ACP JSON-RPC client implementing `cowboy-agent-client::Client`
+- `AcpBackendConnector` implementing `cowboy-agent-client::BackendConnector`
 - ACP messages and parsing
 - stdio and Zellij transports
 - backend preset resolution
@@ -374,6 +383,7 @@ Important modules:
 - `transport/stdio.rs` — local subprocess JSON-RPC over stdio.
 - `transport/zellij.rs` — Zellij-backed transport.
 - `backend.rs` — backend preset resolution.
+- `connector.rs` — maps `AgentLaunchSpec` to ACP transport/watchdog/access and connects.
 - `bin/acp-chat.rs` — ACP chat test app.
 
 ## Data Flow
@@ -402,7 +412,7 @@ WorkflowRun.current_step
   -> LuaStepActionProvider evaluates step.run(ctx)
        ctx.prev contains previous output status/fields/body/raw, or null
   -> StepAction
-       agent    -> AgentActionRunner -> AgentExecutor -> ACP Client -> StepRecord
+       agent    -> AgentActionRunner -> AgentExecutor -> backend Client (dyn) -> StepRecord
        command  -> CommandActionRunner -> tokio::process::Command -> StepRecord
        status   -> StatusActionRunner -> StepRecord
        wait_for_input -> WaitForInputActionRunner -> RunStatus::WaitingForInput + ResumeCallback
@@ -549,8 +559,8 @@ The final `cowboy` binary defaults to `info` logging. Test apps default to
 - Put Lua loading/execution in `cowboy-workflow-lua`.
 - Put storage backend behavior in `cowboy-workflow-store`.
 - Put agent step execution in `cowboy-workflow-agent`.
-- Put provider-neutral agent contracts in `cowboy-agent-client`.
-- Put ACP-specific protocol/transport code in `cowboy-agent-acp`.
+- Put provider-neutral agent contracts and the backend launch contract in `cowboy-agent-client`.
+- Put ACP-specific protocol/transport code in `cowboy-agent-acp`; the engine library never references concrete agent protocols, only `cowboy-agent-client` contracts and the registry.
 - Put shared logging setup and default tracing directives in `cowboy-log`; binaries call it instead of configuring `tracing` directly.
 - For every code change, run the narrowest relevant checks and fix all Rust compiler warnings and Clippy warnings before yielding.
 - Do not reintroduce the old fixed `pipeline`/`SubTask` model.

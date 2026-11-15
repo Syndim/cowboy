@@ -104,6 +104,10 @@ pub struct AgentConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Opaque backend-kind token (e.g. `"acp"`); resolved against the backend
+    /// registry at runtime, never interpreted by the TUI.
+    #[serde(default)]
+    pub backend: String,
     #[serde(default)]
     pub model: Option<ModelConfig>,
     #[serde(default)]
@@ -164,6 +168,7 @@ impl Default for AgentConfig {
             name: "default".to_string(),
             command: default_agent_command(),
             args: default_agent_args(),
+            backend: default_agent_backend(),
             model: None,
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
@@ -171,6 +176,10 @@ impl Default for AgentConfig {
             startup_readiness: None,
         }
     }
+}
+
+fn default_agent_backend() -> String {
+    "acp".to_string()
 }
 
 fn default_agents() -> Vec<AgentConfig> {
@@ -247,7 +256,7 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("failed to read config {}", path.display()))?;
     let mut config: AppConfig = toml::from_str(&raw)
         .with_context(|| format!("failed to parse config {}", path.display()))?;
-    validate_agents(&config.agents)
+    validate_agents(&mut config.agents)
         .with_context(|| format!("invalid agent config in {}", path.display()))?;
     validate_allowed_env("allowed_env", &config.allowed_env)
         .with_context(|| format!("invalid environment config in {}", path.display()))?;
@@ -287,11 +296,11 @@ fn validate_config_sets(config_sets: &BTreeMap<String, ConfigSetConfig>) -> Resu
     Ok(())
 }
 
-fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
+fn validate_agents(agents: &mut [AgentConfig]) -> Result<()> {
     use std::collections::BTreeSet;
 
     let mut names = BTreeSet::new();
-    for agent in agents {
+    for agent in agents.iter_mut() {
         if agent.name.trim().is_empty() {
             anyhow::bail!("agent name must not be empty");
         }
@@ -302,6 +311,11 @@ fn validate_agents(agents: &[AgentConfig]) -> Result<()> {
             && acp_mode.trim().is_empty()
         {
             anyhow::bail!("agent {:?} access acp_mode must not be blank", agent.name);
+        }
+        if agent.backend.trim().is_empty() {
+            // Blank or whitespace backend kinds fall back to the default kind
+            // so hand-written configs stay tolerant.
+            agent.backend = default_agent_backend();
         }
         if let Some(readiness) = &agent.startup_readiness {
             readiness
@@ -426,6 +440,7 @@ impl AppConfig {
                             provider: model.provider,
                         }),
                     );
+                    runtime.backend = agent.backend.clone();
                     runtime.access = agent.access.clone();
                     runtime.watchdog = AgentWatchdogRuntimeConfig {
                         response_timeout_seconds: agent.watchdog.response_timeout_seconds,

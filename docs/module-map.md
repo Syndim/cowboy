@@ -91,7 +91,7 @@ This is the product runtime between UI/CLI and lower-level workflow crates.
 
 | Module | Responsibility |
 | --- | --- |
-| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; coordinate durable workflow branches that all execute concurrently without a per-action throttle or branch-count ceiling, plus namespaced child input; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the `AcpConnector` seam, then closes the SQLite pool last. |
+| `runtime.rs` | `WorkflowRuntime`: start/resume/step/provide-input/improve/resolve/list workflow runs; resolve explicit/default config-set names before new-run persistence; coordinate durable workflow branches that all execute concurrently without a per-action throttle or branch-count ceiling, plus namespaced child input; resolve effective limits live from current config per operation (`resolve_limits`); wire store/catalog/Lua/action dispatch/agent execution; persist event logs; bounded idempotent `shutdown(timeout)` that cancels store waits, terminates live agent process trees through the backend-registry connector seam, then closes the SQLite pool last; agents resolve to backend-neutral `AgentLaunchSpec` values routed through the installed `BackendRegistry` (the engine never references a concrete protocol). |
 | `events.rs` | `WorkflowEvent`, `WorkflowEventKind`, and broadcast `EventBus`. |
 | `input.rs` | `ResumeRouter`; validates supplied input for `RunStatus::WaitingForInput` and dispatches persisted resume callbacks. |
 | `runner.rs` | `WorkflowRunner<S, D, P>` wrapper over `cowboy-workflow-core::execute_step`; emits visit-local retry events, durably reserves cumulative run/per-step retry budgets, persists `Failed` on give-up, and exposes canonical `ctx.prev.output` plus compatibility aliases through `LuaStepActionProvider`. |
@@ -105,6 +105,7 @@ Important seams:
 - `LuaStepActionProvider` adapts `cowboy-workflow-lua::run_step` into `StepActionProvider` and delivers wait-for-input inputs through `ctx.prev.fields.input`.
 - `ResumeRouter` validates a waiting prompt input and dispatches the stored resume callback for the common record-routing path without mutating step counters.
 - `AgentWorkflowSelector` and `AgentWorkflowSummarizer` depend only on `cowboy-agent-client::Client`.
+- Agent backends are installed at the composition root (`cowboy` app crate `backends.rs`, `engine-cli` behind the `cli-backends` feature); the engine library has no dependency on `cowboy-agent-acp`.
 
 Runner-policy contract: TOML uses `[config_sets.<name>]` with
 `max_steps_per_run`, `max_visits_per_step`, `max_retries_per_run`, and

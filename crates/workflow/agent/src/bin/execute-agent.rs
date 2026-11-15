@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use chrono::Utc;
+#[cfg(feature = "cli-backends")]
 use cowboy_agent_acp::Client as AcpClient;
+#[cfg(feature = "cli-backends")]
 use cowboy_agent_acp::transport::{StdioConfig, TransportConfig};
 use cowboy_workflow_agent::{
     AgentExecutionConfig, AgentExecutor, ClientFactory, ResolvedAgentClient,
@@ -33,6 +35,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         output: None,
     };
     let context = execution_context(&config, &run_state, user_prompts);
+    #[cfg(feature = "cli-backends")]
     let factory = AcpFactory {
         transport: TransportConfig::Stdio(StdioConfig {
             command: config.command,
@@ -42,6 +45,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             env: Vec::new(),
             startup_readiness: None,
         }),
+    };
+    #[cfg(not(feature = "cli-backends"))]
+    let factory = UnavailableFactory {
+        command: config.command,
+        args: config.args,
     };
     let executor = AgentExecutor::new(
         factory,
@@ -196,11 +204,13 @@ fn usage() -> ! {
     std::process::exit(2)
 }
 
+#[cfg(feature = "cli-backends")]
 #[derive(Clone)]
 struct AcpFactory {
     transport: TransportConfig,
 }
 
+#[cfg(feature = "cli-backends")]
 #[async_trait]
 impl ClientFactory for AcpFactory {
     async fn create_client(
@@ -212,6 +222,30 @@ impl ClientFactory for AcpFactory {
             model: None,
             backend: "acp".to_string(),
         })
+    }
+}
+
+/// Placeholder used when the binary is built without backend support; it fails
+/// fast with an actionable message instead of linking a concrete protocol.
+#[cfg(not(feature = "cli-backends"))]
+#[derive(Clone)]
+struct UnavailableFactory {
+    command: String,
+    args: Vec<String>,
+}
+
+#[cfg(not(feature = "cli-backends"))]
+#[async_trait]
+impl ClientFactory for UnavailableFactory {
+    async fn create_client(
+        &self,
+        _role: &RoleDefinition,
+    ) -> cowboy_workflow_agent::Result<ResolvedAgentClient> {
+        Err(cowboy_workflow_agent::Error::Client(anyhow::anyhow!(
+            "execute-agent was built without backend support (feature \"cli-backends\"); cannot launch {:?} {:?}",
+            self.command,
+            self.args
+        )))
     }
 }
 

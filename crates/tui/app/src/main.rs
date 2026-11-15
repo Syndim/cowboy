@@ -1,4 +1,5 @@
 use anyhow::Result;
+use cowboy::backends::production_backend_registry;
 use cowboy_command_parser::{Cli, CliCommand, SharedCommand, resolve_fields_object};
 
 fn main() {
@@ -49,7 +50,9 @@ async fn run_shared_command(
     config: cowboy::AppConfig,
     cwd: std::path::PathBuf,
 ) -> Result<()> {
-    let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd)).await?;
+    let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd))
+        .await?
+        .with_backend_registry(production_backend_registry());
 
     match command {
         SharedCommand::Run(args) => {
