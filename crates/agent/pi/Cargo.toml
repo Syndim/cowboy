@@ -1,0 +1,42 @@
+[package]
+name = "cowboy-agent-pi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "pi coding-agent RPC backend for Cowboy"
+
+[[bin]]
+name = "pi-chat"
+path = "src/bin/pi-chat.rs"
+
+[features]
+# Test-app backends; library code never references concrete protocols.
+cli-backends = []
+
+[dependencies]
+cowboy-agent-client.workspace = true
+cowboy-log.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tracing.workspace = true
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+parking_lot.workspace = true
+tempfile.workspace = true

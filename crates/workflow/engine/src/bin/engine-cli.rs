@@ -33,6 +33,31 @@ use std::path::PathBuf;
 
 #[cfg(feature = "cli-backends")]
 use cowboy_agent_acp::BackendPreset;
+
+/// Resolve the agent config for the pi RPC backend (`COWBOY_ENGINE_BACKEND=pi`).
+#[cfg(feature = "cli-backends")]
+fn resolve_pi_agent() -> Option<AgentRuntimeConfig> {
+    if env_or("COWBOY_ENGINE_BACKEND", "copilot") != "pi" {
+        return None;
+    }
+    let command = env::var("COWBOY_ENGINE_AGENT").unwrap_or_else(|_| "pi".to_string());
+    let mut args = match env::var("COWBOY_ENGINE_AGENT_ARGS") {
+        Ok(value) => value.split_whitespace().map(str::to_string).collect(),
+        Err(_) => Vec::new(),
+    };
+    if args.is_empty() {
+        args.push("--mode".to_string());
+        args.push("rpc".to_string());
+    }
+    let model = env::var("COWBOY_ENGINE_MODEL").ok().map(|id| {
+        let provider = env::var("COWBOY_ENGINE_PROVIDER").ok();
+        cowboy_agent_client::ModelInfo { id, provider }
+    });
+    let mut agent =
+        cowboy_workflow_engine::AgentRuntimeConfig::new("default", command, args, model);
+    agent.backend = "pi-rpc".to_string();
+    Some(agent)
+}
 #[cfg(feature = "cli-backends")]
 use cowboy_agent_client::ModelInfo;
 use cowboy_workflow_core::{Result as CoreResult, RunStatus};
@@ -127,7 +152,11 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         .map(|value| value.split(':').map(PathBuf::from).collect())
         .unwrap_or_else(|| vec![PathBuf::from("engine-workflows")]);
     #[cfg(feature = "cli-backends")]
-    let agent = resolve_agent()?;
+    let agent = if let Some(pi_agent) = resolve_pi_agent() {
+        pi_agent
+    } else {
+        resolve_agent()?
+    };
     #[cfg(not(feature = "cli-backends"))]
     let agent = {
         let _ = env_or("COWBOY_ENGINE_BACKEND", "copilot");
@@ -156,6 +185,7 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         agent.args.join(" "),
         agent.model.as_ref().map(|model| model.id.as_str()),
     );
+    let agent_kind = agent.backend.clone();
     tracing::info!(
         cwd = %cwd.display(),
         state_dir = %state_dir.display(),
@@ -171,16 +201,22 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         max_visits_per_step = limits.max_visits_per_step,
         "engine-cli runtime configured"
     );
-    let runtime = WorkflowRuntime::new(RuntimeConfig::new(
-        cwd,
-        state_dir,
-        workflow_store,
-        workflow_dirs,
-        default_allowed_env(),
-        vec![agent],
-        BTreeMap::from([("default".to_string(), limits)]),
-    ))
-    .await?;
+    let runtime = {
+        let runtime = WorkflowRuntime::new(RuntimeConfig::new(
+            cwd,
+            state_dir,
+            workflow_store,
+            workflow_dirs,
+            default_allowed_env(),
+            vec![agent],
+            BTreeMap::from([("default".to_string(), limits)]),
+        ))
+        .await?;
+        #[cfg(feature = "cli-backends")]
+        let runtime = runtime.with_backend_registry(test_app_registry(&agent_kind)?);
+        let _ = &agent_kind;
+        runtime
+    };
     match selector.as_str() {
         "agent" => Ok(runtime),
         "deterministic" => Ok(runtime.with_deterministic_selector()),
@@ -189,6 +225,22 @@ async fn build_runtime() -> Result<WorkflowRuntime, Box<dyn std::error::Error>> 
         )
         .into()),
     }
+}
+
+/// Registry entry matching the selected backend kind.
+#[cfg(feature = "cli-backends")]
+fn test_app_registry(kind: &str) -> Result<cowboy_agent_client::BackendRegistry, String> {
+    use cowboy_agent_client::BackendConnector;
+    let connector: std::sync::Arc<dyn BackendConnector> = match kind {
+        "acp" => std::sync::Arc::new(cowboy_agent_acp::AcpBackendConnector),
+        "pi-rpc" => std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
+        other => {
+            return Err(format!(
+                "unknown backend kind {other:?}; known kinds: acp, pi-rpc"
+            ));
+        }
+    };
+    Ok(cowboy_agent_client::BackendRegistry::new(vec![connector]))
 }
 
 fn default_allowed_env() -> Vec<String> {

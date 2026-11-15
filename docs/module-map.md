@@ -10,7 +10,8 @@ Current workspace/module structure. The TUI app crate is intentionally thin; wor
 ├── crates/
 │   ├── agent/
 │   │   ├── client/          # provider-neutral agent client trait/types
-│   │   └── acp/             # ACP JSON-RPC implementation + transports
+│   │   ├── acp/             # ACP JSON-RPC implementation + transports
+│   │   └── pi/              # pi coding-agent RPC backend
 │   ├── workflow/
 │   │   ├── core/            # workflow data model, traits, graph validation, step engine
 │   │   ├── catalog/         # built-in + filesystem workflow catalog

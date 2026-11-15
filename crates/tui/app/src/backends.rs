@@ -9,7 +9,8 @@ use cowboy_agent_client::BackendRegistry;
 
 /// Registry with every backend kind compiled into this build.
 pub fn production_backend_registry() -> BackendRegistry {
-    BackendRegistry::new(vec![std::sync::Arc::new(
-        cowboy_agent_acp::AcpBackendConnector,
-    )])
+    BackendRegistry::new(vec![
+        std::sync::Arc::new(cowboy_agent_acp::AcpBackendConnector),
+        std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
+    ])
 }
