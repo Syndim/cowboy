@@ -1,6 +1,7 @@
 use std::io;
 use std::time::Duration;
 
+use crate::backends::production_backend_registry;
 use anyhow::Result;
 use base64::Engine;
 use cowboy_tui_terminal::TerminalModeGuard;
@@ -41,6 +42,7 @@ pub async fn run_tui(config: AppConfig) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let runtime = WorkflowRuntime::new(config.runtime_config(cwd))
         .await?
+        .with_backend_registry(production_backend_registry())
         .with_request_topic_generation();
     let events = runtime.events();
     let mut workflow_events = events.subscribe();

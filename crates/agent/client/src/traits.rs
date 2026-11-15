@@ -120,3 +120,60 @@ pub trait Client: Send + Sync + std::fmt::Debug {
     /// Close the client and release transport resources.
     async fn close(&mut self) -> anyhow::Result<()>;
 }
+
+#[async_trait]
+impl Client for Box<dyn Client> {
+    fn is_connected(&self) -> bool {
+        (**self).is_connected()
+    }
+
+    fn agent_info(&self) -> Option<&AgentInfo> {
+        (**self).agent_info()
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        (**self).session_id()
+    }
+
+    fn session_descriptor(&self) -> Option<&AgentSessionDescriptor> {
+        (**self).session_descriptor()
+    }
+
+    async fn new_session(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[Value],
+        model: Option<&ModelInfo>,
+    ) -> anyhow::Result<String> {
+        (**self).new_session(cwd, mcp_servers, model).await
+    }
+
+    fn supports_load_session(&self) -> bool {
+        (**self).supports_load_session()
+    }
+
+    async fn load_session(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[Value],
+    ) -> anyhow::Result<Vec<Event>> {
+        (**self).load_session(session_id, cwd, mcp_servers).await
+    }
+
+    async fn prompt(
+        &mut self,
+        session_id: &str,
+        prompt_content: Vec<PromptContent>,
+        cancellation: PromptTurnCancellation,
+        event_handler: &mut (dyn FnMut(Event) + Send),
+    ) -> anyhow::Result<StopReason> {
+        (**self)
+            .prompt(session_id, prompt_content, cancellation, event_handler)
+            .await
+    }
+
+    async fn close(&mut self) -> anyhow::Result<()> {
+        (**self).close().await
+    }
+}

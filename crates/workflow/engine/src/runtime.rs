@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cowboy_agent_acp::AgentAccess;
-pub use cowboy_agent_acp::transport::StartupReadiness as AgentStartupReadiness;
 use cowboy_agent_client::ModelInfo;
 #[cfg(test)]
 use cowboy_agent_client::PromptTurnCancellation;
+pub use cowboy_agent_client::StartupReadiness as AgentStartupReadiness;
+use cowboy_agent_client::{AgentAccess, AgentLaunchSpec, BackendRegistry};
 #[cfg(feature = "test-support")]
 use cowboy_workflow_agent::PromptWindowHandoffObserver;
 use cowboy_workflow_agent::{
@@ -46,8 +46,7 @@ use crate::agent_resolver::AgentResolver;
 use crate::events::WORKFLOW_STORE_WAITING_MESSAGE;
 use crate::run_lock::{RunExecutionGuard, RunExecutionLocks};
 use crate::runtime_dependencies::{
-    AcpConnector, ProductionAcpConnector, ProductionRuntimeDependencies, RuntimeDependencies,
-    transport_for, watchdog_options_for,
+    DEFAULT_BACKEND_KIND, ProductionRuntimeDependencies, RuntimeDependencies,
 };
 use crate::workflow::DeterministicSelector;
 use crate::{
@@ -117,6 +116,10 @@ pub struct AgentRuntimeConfig {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Opaque backend-kind token (e.g. "acp"); interpreted only by the
+    /// backend registry, never by the engine.
+    #[serde(default = "default_agent_backend")]
+    pub backend: String,
     pub model: Option<ModelInfo>,
     #[serde(default)]
     pub access: AgentAccess,
@@ -166,6 +169,10 @@ impl Default for RunnerLimitsConfig {
     }
 }
 
+fn default_agent_backend() -> String {
+    DEFAULT_BACKEND_KIND.to_string()
+}
+
 impl AgentRuntimeConfig {
     pub fn new(
         name: impl Into<String>,
@@ -177,11 +184,39 @@ impl AgentRuntimeConfig {
             name: name.into(),
             command: command.into(),
             args,
+            backend: default_agent_backend(),
             model,
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
             watchdog: AgentWatchdogRuntimeConfig::default(),
             startup_readiness: None,
+        }
+    }
+
+    /// Launch spec for this agent with the global env allow-list merged in.
+    pub(crate) fn launch_spec(&self, global_allowed_env: &[String]) -> AgentLaunchSpec {
+        let mut allowed_env = Vec::new();
+        for name in global_allowed_env.iter().chain(&self.allowed_env) {
+            if !allowed_env.contains(name) {
+                allowed_env.push(name.clone());
+            }
+        }
+        AgentLaunchSpec {
+            agent: self.name.clone(),
+            backend: self.backend.clone(),
+            command: self.command.clone(),
+            args: self.args.clone(),
+            allowed_env,
+            access: self.access.clone(),
+            watchdog: cowboy_agent_client::AgentWatchdogOptions {
+                response_timeout_seconds: self.watchdog.response_timeout_seconds,
+                cancel_timeout_seconds: self.watchdog.cancel_timeout_seconds,
+                recovery_operation_timeout_seconds: self
+                    .watchdog
+                    .recovery_operation_timeout_seconds,
+            },
+            startup_readiness: self.startup_readiness.clone(),
+            model: self.model.clone(),
         }
     }
 }
@@ -459,7 +494,7 @@ pub struct WorkflowRuntime {
     run_locks: RunExecutionLocks,
     selector: SelectorMode,
     dependencies: Arc<dyn RuntimeDependencies>,
-    acp_connector: Arc<dyn AcpConnector>,
+    registry: BackendRegistry,
     prompt_turn_controls: PromptTurnControlRegistry,
     request_topic_generation_enabled: bool,
     #[cfg(feature = "test-support")]
@@ -624,7 +659,7 @@ impl Drop for ActiveRunCancellationGuard {
 /// Workflow selection strategy used by [`WorkflowRuntime`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectorMode {
-    /// Ask the configured ACP agent to choose a workflow from the catalog.
+    /// Ask the configured agent to choose a workflow from the catalog.
     Agent,
     /// Pick the first catalog workflow by id; used by tests with no live agent.
     Deterministic,
@@ -632,11 +667,10 @@ pub(crate) enum SelectorMode {
 
 impl WorkflowRuntime {
     pub async fn new(config: RuntimeConfig) -> Result<Self> {
-        let acp_connector = Arc::new(ProductionAcpConnector);
-        Self::with_dependencies_and_connector(
+        Self::with_dependencies_and_registry(
             config,
-            Arc::new(ProductionRuntimeDependencies::new(acp_connector.clone())),
-            acp_connector,
+            Arc::new(ProductionRuntimeDependencies),
+            BackendRegistry::default(),
         )
         .await
     }
@@ -646,18 +680,13 @@ impl WorkflowRuntime {
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
     ) -> Result<Self> {
-        Self::with_dependencies_and_connector(
-            config,
-            dependencies,
-            Arc::new(ProductionAcpConnector),
-        )
-        .await
+        Self::with_dependencies_and_registry(config, dependencies, BackendRegistry::default()).await
     }
 
-    async fn with_dependencies_and_connector(
+    async fn with_dependencies_and_registry(
         config: RuntimeConfig,
         dependencies: Arc<dyn RuntimeDependencies>,
-        acp_connector: Arc<dyn AcpConnector>,
+        registry: BackendRegistry,
     ) -> Result<Self> {
         let store = SqliteWorkflowStore::connect(&config.workflow_store)
             .await
@@ -672,7 +701,7 @@ impl WorkflowRuntime {
             events: Arc::new(EventBus::default()),
             selector: SelectorMode::Agent,
             dependencies,
-            acp_connector,
+            registry,
             prompt_turn_controls: PromptTurnControlRegistry::default(),
             request_topic_generation_enabled: false,
             #[cfg(feature = "test-support")]
@@ -684,6 +713,16 @@ impl WorkflowRuntime {
     /// one. Intended for tests that have no live agent backend.
     pub fn with_deterministic_selector(mut self) -> Self {
         self.selector = SelectorMode::Deterministic;
+        self
+    }
+
+    /// Install the agent backend registry used for every agent connection.
+    ///
+    /// The composition root (TUI, CLI, test apps) decides which concrete
+    /// backends exist; the runtime itself only routes launch specs through
+    /// this registry.
+    pub fn with_backend_registry(mut self, registry: BackendRegistry) -> Self {
+        self.registry = registry;
         self
     }
 
@@ -712,8 +751,7 @@ impl WorkflowRuntime {
     pub async fn shutdown(&self, timeout: Duration) {
         self.cancel_store_waits();
 
-        match tokio::time::timeout(timeout, self.acp_connector.terminate_all_agents(timeout)).await
-        {
+        match tokio::time::timeout(timeout, self.registry.terminate_all_agents(timeout)).await {
             Ok(terminated) => {
                 tracing::debug!(terminated, "runtime shutdown terminated agent processes");
             }
@@ -2210,19 +2248,15 @@ impl WorkflowRuntime {
             SelectorMode::Agent => {
                 let resolver = AgentResolver::new(self.config.agents.clone())?;
                 let agent = resolver.resolve_default()?;
-                let client = self
-                    .acp_connector
-                    .connect(
-                        transport_for(&self.config.allowed_env, agent),
-                        watchdog_options_for(agent),
-                        agent.access.clone(),
-                    )
+                let resolved = self
+                    .registry
+                    .connect(&agent.launch_spec(&self.config.allowed_env))
                     .await
                     .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
                 let selector = crate::AgentWorkflowSelector::new(
-                    client,
+                    resolved.client,
                     self.config.cwd.to_string_lossy().to_string(),
-                    agent.model.clone(),
+                    resolved.model,
                 );
                 selector.select(request, catalog).await
             }
@@ -2235,7 +2269,7 @@ impl WorkflowRuntime {
         }
 
         self.dependencies
-            .generate_request_topic(&self.config, self.selector, request)
+            .generate_request_topic(&self.config, &self.registry, self.selector, request)
             .await
     }
 
@@ -2595,19 +2629,15 @@ impl WorkflowRuntime {
         let run = self.load_run(run_id).await?;
         let resolver = AgentResolver::new(self.config.agents.clone())?;
         let agent = resolver.resolve_default()?;
-        let client = self
-            .acp_connector
-            .connect(
-                transport_for(&self.config.allowed_env, agent),
-                watchdog_options_for(agent),
-                agent.access.clone(),
-            )
+        let resolved = self
+            .registry
+            .connect(&agent.launch_spec(&self.config.allowed_env))
             .await
             .map_err(|err| WorkflowError::InvalidAction(err.to_string()))?;
         let summarizer = crate::AgentWorkflowSummarizer::new(
-            client,
+            resolved.client,
             self.config.cwd.to_string_lossy().to_string(),
-            agent.model.clone(),
+            resolved.model,
         );
         let summary = summarizer.summarize(&run).await?;
         let catalog = self.catalog()?;
@@ -2735,7 +2765,9 @@ impl WorkflowRuntime {
             #[cfg(feature = "test-support")]
             handoff_observer: self.handoff_observer.clone(),
         };
-        let factory = self.dependencies.agent_factory(&self.config)?;
+        let factory = self
+            .dependencies
+            .agent_factory(&self.config, &self.registry)?;
         let executor = AgentExecutor::new(factory, agent_store, agent_config)
             .with_prompt_turn_controls(self.prompt_turn_controls.clone());
         let dispatcher = EngineActionDispatcher::with_workflow_handler(
@@ -2784,7 +2816,7 @@ impl WorkflowRuntime {
                 self.persist_events(&run.id, &events)?;
             }
             Err(err) => {
-                let error = cowboy_agent_acp::client::diagnostic_error_text(&err.to_string());
+                let error = cowboy_agent_client::diagnostic_error_text(&err.to_string());
                 tracing::debug!(run_id = %run_id, event_count = events.len(), prefix_events = prefix_len, error = %error, "workflow events collected before run error");
                 self.persist_events(&run_id, &events)?;
             }
@@ -3109,11 +3141,14 @@ fn run_head(run: &Run) -> RunHead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_dependencies::{MockRuntimeDependencies, SharedClientFactory};
+    use crate::runtime_dependencies::{
+        DEFAULT_BACKEND_KIND, MockRuntimeDependencies, SharedClientFactory,
+    };
     use async_trait::async_trait;
-    use cowboy_agent_acp::transport::TransportConfig;
-    use cowboy_agent_acp::{AgentWatchdogOptions, Client as AcpClient};
     use cowboy_agent_client::{AgentInfo, Client, Event, PromptContent, StopReason};
+    use cowboy_agent_client::{
+        AgentLaunchSpec, BackendConnector, BackendRegistry, ResolvedBackend,
+    };
     #[cfg(feature = "test-support")]
     use cowboy_workflow_agent::PromptWindowHandoffPoint;
     use cowboy_workflow_agent::{ClientFactory, ResolvedAgentClient};
@@ -3128,23 +3163,36 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct RecordedRuntimeAcpConnection {
+    struct RecordedRuntimeConnection {
         command: String,
         clear_env: bool,
         allowed_env: Vec<String>,
-        watchdog: AgentWatchdogOptions,
+        watchdog: cowboy_agent_client::AgentWatchdogOptions,
         access: AgentAccess,
         startup_readiness: Option<AgentStartupReadiness>,
     }
 
+    impl RecordedRuntimeConnection {
+        fn from_spec(spec: &AgentLaunchSpec) -> Self {
+            Self {
+                command: spec.command.clone(),
+                clear_env: true,
+                allowed_env: spec.allowed_env.clone(),
+                watchdog: spec.watchdog,
+                access: spec.access.clone(),
+                startup_readiness: spec.startup_readiness.clone(),
+            }
+        }
+    }
+
     #[derive(Clone, Default)]
-    struct RecordingRuntimeAcpConnector {
-        connections: Arc<SyncMutex<Vec<RecordedRuntimeAcpConnection>>>,
+    struct RecordingRuntimeConnector {
+        connections: Arc<SyncMutex<Vec<RecordedRuntimeConnection>>>,
         terminations: Arc<SyncMutex<Vec<Duration>>>,
     }
 
-    impl RecordingRuntimeAcpConnector {
-        fn connections(&self) -> Vec<RecordedRuntimeAcpConnection> {
+    impl RecordingRuntimeConnector {
+        fn connections(&self) -> Vec<RecordedRuntimeConnection> {
             self.connections.lock().clone()
         }
 
@@ -3154,24 +3202,15 @@ mod tests {
     }
 
     #[async_trait]
-    impl AcpConnector for RecordingRuntimeAcpConnector {
-        async fn connect(
-            &self,
-            transport: TransportConfig,
-            watchdog: AgentWatchdogOptions,
-            access: AgentAccess,
-        ) -> anyhow::Result<AcpClient> {
-            let TransportConfig::Stdio(transport) = transport else {
-                panic!("workflow runtime agents must use stdio")
-            };
-            self.connections.lock().push(RecordedRuntimeAcpConnection {
-                command: transport.command,
-                clear_env: transport.clear_env,
-                allowed_env: transport.allowed_env,
-                watchdog,
-                access,
-                startup_readiness: transport.startup_readiness,
-            });
+    impl BackendConnector for RecordingRuntimeConnector {
+        fn kind(&self) -> &str {
+            DEFAULT_BACKEND_KIND
+        }
+
+        async fn connect(&self, spec: &AgentLaunchSpec) -> anyhow::Result<ResolvedBackend> {
+            self.connections
+                .lock()
+                .push(RecordedRuntimeConnection::from_spec(spec));
             Err(anyhow::anyhow!("recording runtime connector"))
         }
 
@@ -3184,16 +3223,15 @@ mod tests {
     /// Connector whose agent termination never finishes within the shutdown
     /// bound, proving `shutdown` stays bounded.
     #[derive(Clone, Default)]
-    struct HangingAcpConnector;
+    struct HangingConnector;
 
     #[async_trait]
-    impl AcpConnector for HangingAcpConnector {
-        async fn connect(
-            &self,
-            _transport: TransportConfig,
-            _watchdog: AgentWatchdogOptions,
-            _access: AgentAccess,
-        ) -> anyhow::Result<AcpClient> {
+    impl BackendConnector for HangingConnector {
+        fn kind(&self) -> &str {
+            DEFAULT_BACKEND_KIND
+        }
+
+        async fn connect(&self, _spec: &AgentLaunchSpec) -> anyhow::Result<ResolvedBackend> {
             Err(anyhow::anyhow!("hanging connector"))
         }
 
@@ -3208,6 +3246,7 @@ mod tests {
             name: name.to_string(),
             command: command.to_string(),
             args: Vec::new(),
+            backend: DEFAULT_BACKEND_KIND.to_string(),
             model: Some(ModelInfo::default()),
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
@@ -3218,8 +3257,11 @@ mod tests {
 
     #[test]
     fn legacy_agent_runtime_config_preserves_serialized_bytes() {
-        let legacy = r#"{"name":"default","command":"agent","args":[],"model":null,"access":"default","allowed_env":[],"watchdog":{"response_timeout_seconds":100,"cancel_timeout_seconds":10,"recovery_operation_timeout_seconds":30}}"#;
-        let config: AgentRuntimeConfig = serde_json::from_str(legacy).unwrap();
+        let legacy = r#"{"name":"default","command":"agent","args":[],"backend":"acp","model":null,"access":"default","allowed_env":[],"watchdog":{"response_timeout_seconds":100,"cancel_timeout_seconds":10,"recovery_operation_timeout_seconds":30}}"#;
+        // Serialized configs without a backend kind still parse (defaulting to
+        // "acp"), and new serializations carry the resolved kind explicitly.
+        let legacy_without_backend = r#"{"name":"default","command":"agent","args":[],"model":null,"access":"default","allowed_env":[],"watchdog":{"response_timeout_seconds":100,"cancel_timeout_seconds":10,"recovery_operation_timeout_seconds":30}}"#;
+        let config: AgentRuntimeConfig = serde_json::from_str(legacy_without_backend).unwrap();
 
         assert!(config.startup_readiness.is_none());
         assert_eq!(serde_json::to_string(&config).unwrap(), legacy);
@@ -3553,22 +3595,24 @@ mod tests {
         dependencies
             .expect_generate_request_topic()
             .times(0..=1)
-            .withf(|_, selector, request| {
+            .withf(|_, _, selector, request| {
                 *selector == SelectorMode::Deterministic && !request.is_empty()
             })
-            .returning(move |_, _, _| topic.clone());
+            .returning(move |_, _, _, _| topic.clone());
 
         match factory {
             Some(factory) => {
                 let factory = SharedClientFactory::new(factory);
                 dependencies
                     .expect_agent_factory()
-                    .returning(move |_| Ok(factory.clone()));
+                    .returning(move |_, _| Ok(factory.clone()));
             }
             None => {
-                dependencies.expect_agent_factory().returning(|config| {
-                    ProductionRuntimeDependencies::default().agent_factory(config)
-                });
+                dependencies
+                    .expect_agent_factory()
+                    .returning(|config, registry| {
+                        ProductionRuntimeDependencies.agent_factory(config, registry)
+                    });
             }
         }
 
@@ -3606,8 +3650,13 @@ mod tests {
             config_sets: BTreeMap::new(),
         };
 
-        let topic = ProductionRuntimeDependencies::default()
-            .generate_request_topic(&config, SelectorMode::Agent, "summarize this request")
+        let topic = ProductionRuntimeDependencies
+            .generate_request_topic(
+                &config,
+                &BackendRegistry::default(),
+                SelectorMode::Agent,
+                "summarize this request",
+            )
             .await;
 
         assert_eq!(topic, None);
@@ -3650,6 +3699,7 @@ mod tests {
                 name: "default".to_string(),
                 command: "default-runtime-agent".to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: None,
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -3664,25 +3714,29 @@ mod tests {
         }
     }
 
+    fn recording_runtime_registry(connector: Arc<RecordingRuntimeConnector>) -> BackendRegistry {
+        BackendRegistry::new(vec![connector])
+    }
+
     async fn runtime_with_recording_connector(
         config: RuntimeConfig,
-        connector: Arc<RecordingRuntimeAcpConnector>,
+        connector: Arc<RecordingRuntimeConnector>,
     ) -> WorkflowRuntime {
-        WorkflowRuntime::with_dependencies_and_connector(
+        WorkflowRuntime::with_dependencies_and_registry(
             config,
             Arc::new(MockRuntimeDependencies::new()),
-            connector,
+            recording_runtime_registry(connector),
         )
         .await
         .unwrap()
     }
 
-    fn expected_default_runtime_connection() -> RecordedRuntimeAcpConnection {
-        RecordedRuntimeAcpConnection {
+    fn expected_default_runtime_connection() -> RecordedRuntimeConnection {
+        RecordedRuntimeConnection {
             command: "default-runtime-agent".to_string(),
             clear_env: true,
             allowed_env: Vec::new(),
-            watchdog: AgentWatchdogOptions {
+            watchdog: cowboy_agent_client::AgentWatchdogOptions {
                 response_timeout_seconds: 31,
                 cancel_timeout_seconds: 32,
                 recovery_operation_timeout_seconds: 33,
@@ -3695,7 +3749,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_selector_client_construction_uses_default_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
@@ -3718,7 +3772,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_improvement_client_construction_uses_default_watchdog() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
@@ -3739,7 +3793,7 @@ mod tests {
     #[tokio::test]
     async fn selector_and_improvement_clients_forward_startup_readiness() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let mut config = production_connector_test_config(&dir);
         let readiness = AgentStartupReadiness {
             log_path: "~/.local/agency/logs/session_*_{pid}/process-*.log".to_string(),
@@ -3776,7 +3830,7 @@ mod tests {
     #[tokio::test]
     async fn selector_and_improvement_clients_use_resolved_agent_allowed_env() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let mut config = production_connector_test_config(&dir);
         config.allowed_env = vec!["GLOBAL".to_string(), "SHARED".to_string()];
         config.agents[0].allowed_env = vec!["DEFAULT_AGENT".to_string(), "SHARED".to_string()];
@@ -3824,7 +3878,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_terminates_agents_and_closes_store() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
@@ -3841,10 +3895,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_bounded_when_termination_hangs() {
         let dir = tempfile::tempdir().unwrap();
-        let runtime = WorkflowRuntime::with_dependencies_and_connector(
+        let runtime = WorkflowRuntime::with_dependencies_and_registry(
             production_connector_test_config(&dir),
             Arc::new(MockRuntimeDependencies::new()),
-            Arc::new(HangingAcpConnector),
+            BackendRegistry::new(vec![Arc::new(HangingConnector)]),
         )
         .await
         .unwrap();
@@ -3863,7 +3917,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = Arc::new(RecordingRuntimeAcpConnector::default());
+        let connector = Arc::new(RecordingRuntimeConnector::default());
         let runtime = runtime_with_recording_connector(
             production_connector_test_config(&dir),
             connector.clone(),
@@ -3908,11 +3962,14 @@ mod tests {
         };
         let mut dependencies = MockRuntimeDependencies::new();
         dependencies.expect_generate_request_topic().times(0);
-        dependencies.expect_agent_factory().times(1).returning(|_| {
-            Err(WorkflowError::InvalidAction(
-                "injected factory failure".to_string(),
-            ))
-        });
+        dependencies
+            .expect_agent_factory()
+            .times(1)
+            .returning(|_, _| {
+                Err(WorkflowError::InvalidAction(
+                    "injected factory failure".to_string(),
+                ))
+            });
         let runtime = WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
             .await
             .unwrap()
@@ -4061,11 +4118,11 @@ return workflow("runtime-contract", seed)
         dependencies
             .expect_generate_request_topic()
             .times(0..=1)
-            .returning(|_, _, _| None);
+            .returning(|_, _, _, _| None);
         let shared = SharedClientFactory::new(factory);
         dependencies
             .expect_agent_factory()
-            .returning(move |_| Ok(shared.clone()));
+            .returning(move |_, _| Ok(shared.clone()));
         WorkflowRuntime::with_dependencies(config, Arc::new(dependencies))
             .await
             .unwrap()
@@ -4545,6 +4602,21 @@ implementation_evidence: []
         role_agent: Option<&str>,
         agents: Vec<AgentRuntimeConfig>,
     ) -> WorkflowRuntime {
+        runtime_for_agent_workflow_with_registry(dir, role_agent, agents, test_registry()).await
+    }
+
+    /// Registry matching production wiring: the ACP connector from the
+    /// dev-dependency, used by tests that drive real stub subprocesses.
+    fn test_registry() -> BackendRegistry {
+        BackendRegistry::new(vec![Arc::new(cowboy_agent_acp::AcpBackendConnector)])
+    }
+
+    async fn runtime_for_agent_workflow_with_registry(
+        dir: &tempfile::TempDir,
+        role_agent: Option<&str>,
+        agents: Vec<AgentRuntimeConfig>,
+        registry: BackendRegistry,
+    ) -> WorkflowRuntime {
         let workflow_dir = dir.path().join("workflows");
         fs::create_dir(&workflow_dir).unwrap();
         let agent_field = role_agent
@@ -4588,6 +4660,7 @@ implementation_evidence: []
         })
         .await
         .unwrap()
+        .with_backend_registry(registry)
         .with_deterministic_selector()
     }
 
@@ -4680,6 +4753,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
                     delivery_order.to_string_lossy().to_string(),
                     handoff_gate.to_string_lossy().to_string(),
                 ],
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: Some(ModelInfo::default()),
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -4812,6 +4886,7 @@ done
                 name: "default".to_string(),
                 command: agent_script.to_string_lossy().to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: None,
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -6908,6 +6983,7 @@ exit 0
                 name: "default".to_string(),
                 command: "definitely-missing-agent-command".to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: Some(ModelInfo::default()),
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -7199,6 +7275,7 @@ exit 0
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: Some(ModelInfo::default()),
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -8002,7 +8079,7 @@ exit 0
         let high_shared = SharedClientFactory::new(high_factory.clone());
         high_deps
             .expect_agent_factory()
-            .returning(move |_| Ok(high_shared.clone()));
+            .returning(move |_, _| Ok(high_shared.clone()));
         let high = WorkflowRuntime::with_dependencies(config_for(20), Arc::new(high_deps))
             .await
             .unwrap()
@@ -8076,7 +8153,7 @@ exit 0
         let mut deps = MockRuntimeDependencies::new();
         let shared = SharedClientFactory::new(factory);
         deps.expect_agent_factory()
-            .returning(move |_| Ok(shared.clone()));
+            .returning(move |_, _| Ok(shared.clone()));
         Arc::new(deps)
     }
 
@@ -9857,6 +9934,7 @@ Recovery implementation review"#
                 name: "default".to_string(),
                 command: "unused-agent".to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: Some(ModelInfo::default()),
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),
@@ -10924,6 +11002,7 @@ return workflow("{label}", plan)
                 name: "default".to_string(),
                 command: "agent".to_string(),
                 args: Vec::new(),
+                backend: DEFAULT_BACKEND_KIND.to_string(),
                 model: Some(ModelInfo::default()),
                 access: AgentAccess::default(),
                 allowed_env: Vec::new(),

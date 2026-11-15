@@ -11,3 +11,6 @@ anyhow.workspace = true
 async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

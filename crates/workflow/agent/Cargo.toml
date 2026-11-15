@@ -8,10 +8,13 @@ description = "Agent action execution helpers for Cowboy workflows"
 
 [features]
 test-support = []
+# Test-app backends for `execute-agent`; library code never references concrete
+# agent protocols.
+cli-backends = ["dep:cowboy-agent-acp"]
 
 [dependencies]
 cowboy-agent-client.workspace = true
-cowboy-agent-acp.workspace = true
+cowboy-agent-acp = { workspace = true, optional = true }
 cowboy-workflow-core.workspace = true
 cowboy-workflow-store.workspace = true
 anyhow.workspace = true
@@ -29,4 +32,4 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 parking_lot.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "time"] }

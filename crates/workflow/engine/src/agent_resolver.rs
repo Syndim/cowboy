@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 #[cfg(test)]
-use cowboy_agent_acp::AgentAccess;
+use cowboy_agent_client::AgentAccess;
 use cowboy_workflow_core::{Result, RoleDefinition, WorkflowError};
 
 use crate::runtime::AgentRuntimeConfig;
@@ -36,7 +36,7 @@ impl AgentResolver {
                     "agent name must not be empty".to_string(),
                 ));
             }
-            if let cowboy_agent_acp::AgentAccess::DenyEscalation { acp_mode } = &agent.access
+            if let cowboy_agent_client::AgentAccess::DenyEscalation { acp_mode } = &agent.access
                 && acp_mode.trim().is_empty()
             {
                 return Err(WorkflowError::InvalidAction(format!(
@@ -105,12 +105,14 @@ mod tests {
 
     use super::*;
     use crate::runtime::{AgentStartupReadiness, AgentWatchdogRuntimeConfig};
+    use crate::runtime_dependencies::DEFAULT_BACKEND_KIND;
 
     fn agent(name: &str) -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             name: name.to_string(),
             command: format!("{name}-cmd"),
             args: Vec::new(),
+            backend: DEFAULT_BACKEND_KIND.to_string(),
             model: Some(ModelInfo::default()),
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
@@ -191,6 +193,7 @@ mod tests {
                 "--thinking=low".to_string(),
                 "acp".to_string(),
             ],
+            backend: DEFAULT_BACKEND_KIND.to_string(),
             model: Some(ModelInfo::default()),
             access: AgentAccess::default(),
             allowed_env: Vec::new(),
