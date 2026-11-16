@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,7 @@ const HISTORY_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 // of a genuinely stuck external lock holder comfortably under the 1s
 // ceiling asserted by the contended-lock tests.
 const HISTORY_LOCK_RETRY_BUDGET: Duration = Duration::from_millis(200);
+static HISTORY_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, Copy)]
 enum LockMode {
@@ -74,6 +76,9 @@ impl InputHistory {
     }
 
     fn load_locked(&self) -> io::Result<Vec<String>> {
+        let _process_lock = HISTORY_PROCESS_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("TUI input history process lock poisoned"))?;
         if !self.history_path_unchecked().exists() {
             return Ok(Vec::new());
         }
@@ -86,6 +91,9 @@ impl InputHistory {
     }
 
     fn append_locked(&self, entry: &str) -> io::Result<Vec<String>> {
+        let _process_lock = HISTORY_PROCESS_LOCK
+            .lock()
+            .map_err(|_| io::Error::other("TUI input history process lock poisoned"))?;
         fs::create_dir_all(&self.state_dir)?;
         let lock_file = self.open_lock_file()?;
         try_lock_history(&lock_file, LockMode::Exclusive)?;
