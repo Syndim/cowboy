@@ -257,7 +257,17 @@ pub struct PiProcess {
 impl PiProcess {
     /// Spawn the pi subprocess and return a connected transport.
     pub async fn spawn(config: &PiProcessConfig) -> anyhow::Result<Self> {
+        Self::spawn_at(config, None).await
+    }
+
+    pub(crate) async fn spawn_at(
+        config: &PiProcessConfig,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let mut cmd = Command::new(&config.command);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         for arg in &config.args {
             cmd.arg(arg);
         }

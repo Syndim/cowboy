@@ -286,6 +286,44 @@ change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
 
+### Native Pi RPC backend
+
+Pi can run directly through its JSONL RPC protocol, without an ACP adapter:
+
+```toml
+[[agents]]
+name = "developer"
+backend = "pi-rpc"
+command = "pi"
+args = ["--mode", "rpc"]
+```
+
+Cowboy defers launching Pi until the session working directory is known. A
+new connection does not advertise an active session: the executor must create
+or restore it first. Persisted Pi session references are absolute JSONL session
+file paths, not create-if-missing UUIDs. Loading requires an existing valid
+session file, matching returned identity and nonempty restored history; missing,
+header-only or conflicting history fails closed. Earlier UUID-only references
+are not silently converted or replaced with fresh sessions. Pi restores its tool
+cwd from the saved header: loading into a different canonical cwd is currently
+unsupported and fails before launch. Cowboy does not rewrite history to fake a
+checkout move. Canonical path checks retain the exact saved opaque reference,
+including a valid absolute alias, for subsequent executor prompts.
+
+Cowboy owns session-selection flags. Do not configure `--session`, `--session-id`,
+`--continue`, `--resume`, `--fork` or `--no-session` in agent arguments. Optional
+`--session-dir` and normal model/thinking options remain operator choices. A
+turn finishes on `agent_settled`, not just prompt acknowledgement or `agent_end`.
+Command handshakes use the recovery-operation timeout; local cancellation sends
+one abort and bounds acknowledgement plus settlement by the cancel timeout.
+Unconfirmed cancellation invalidates and terminates that subprocess rather than
+reusing its active turn.
+
+This backend currently supports default access only. Restricted access settings,
+ACP startup-readiness configuration and session MCP-server configuration are
+rejected explicitly rather than silently ignored. Configure the actual backend
+sandbox/tool boundary independently; RPC is not isolation.
+
 The workflow roles select dedicated `planner`, `investigator`, `reviewer`,
 `implementer`, `tester`, and `committer` agents. Their backend launch arguments
 set thinking to `xhigh`, `xhigh`, `high`, `medium`, `medium`, and `low`, respectively;

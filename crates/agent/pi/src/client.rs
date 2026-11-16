@@ -8,10 +8,13 @@
 //!
 //! Ownership model: a background I/O task owns the [`PiProcess`], correlates
 //! commands with responses, and forwards normalized session events. Session
-//! restarts (for `load_session` on a different id) tear the task down and
-//! respawn pi with the requested `--session-id`.
+//! establishment is deferred until the executor supplies new/load intent and
+//! cwd. Persisted session references name existing Pi JSONL files; restoration
+//! uses `--session`, never create-if-missing `--session-id`.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Read};
+use std::path::Path;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,8 +23,8 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use cowboy_agent_client::{
-    AgentInfo, AgentLaunchSpec, AgentSessionDescriptor, Client, Event, ModelInfo, PromptContent,
-    PromptTurnCancellation, StopReason,
+    AgentAccess, AgentInfo, AgentLaunchSpec, AgentSessionDescriptor, Client, Event, ModelInfo,
+    PromptContent, PromptTurnCancellation, StopReason,
 };
 
 use crate::process::PiProcess;
@@ -46,6 +49,9 @@ pub enum Command {
         response: oneshot::Sender<anyhow::Result<Value>>,
     },
     Abort {
+        response: oneshot::Sender<anyhow::Result<Value>>,
+    },
+    GetSessionStats {
         response: oneshot::Sender<anyhow::Result<Value>>,
     },
     /// Close stdin, wait the grace window for an orderly exit, then
@@ -133,13 +139,18 @@ fn descriptor_from_state(state: &Value) -> AgentSessionDescriptor {
     }
 }
 
-fn build_launch_args(base: &[String], session_id: &str, model: Option<&ModelInfo>) -> Vec<String> {
+fn build_launch_args(
+    base: &[String],
+    session_id: &str,
+    restore: bool,
+    model: Option<&ModelInfo>,
+) -> Vec<String> {
     let mut args = base.to_vec();
     if !args.windows(2).any(|pair| pair == ["--mode", "rpc"]) {
         args.push("--mode".to_string());
         args.push("rpc".to_string());
     }
-    args.push("--session-id".to_string());
+    args.push(if restore { "--session" } else { "--session-id" }.to_string());
     args.push(session_id.to_string());
     if let Some(model) = model {
         let id = match &model.provider {
@@ -158,17 +169,19 @@ struct ProcessConfigBuilder {
     command: String,
     args: Vec<String>,
     allowed_env: Vec<String>,
+    model: Option<ModelInfo>,
 }
 
 impl ProcessConfigBuilder {
     fn config(
         &self,
         session_id: &str,
+        restore: bool,
         model: Option<&ModelInfo>,
     ) -> crate::process::PiProcessConfig {
         crate::process::PiProcessConfig {
             command: self.command.clone(),
-            args: build_launch_args(&self.args, session_id, model),
+            args: build_launch_args(&self.args, session_id, restore, model),
             clear_env: true,
             allowed_env: self.allowed_env.clone(),
             env: Vec::new(),
@@ -178,13 +191,28 @@ impl ProcessConfigBuilder {
 
 /// Connected pi RPC backend for one role session.
 pub struct PiRpcClient {
-    command_tx: mpsc::Sender<Command>,
+    command_tx: Option<mpsc::Sender<Command>>,
+    io_task: Option<tokio::task::JoinHandle<()>>,
     events: mpsc::UnboundedReceiver<TaskEvent>,
-    session_id: String,
+    // Opaque persisted session reference: Pi's explicit session file, not a
+    // create-if-missing UUID. None until new/load establishment succeeds.
+    session_id: Option<String>,
+    requested_id: Option<String>,
+    closed: bool,
     process_config: ProcessConfigBuilder,
     descriptor: Option<AgentSessionDescriptor>,
     agent_info: AgentInfo,
     watchdog_seconds: u64,
+    operation_timeout: Duration,
+    cancel_timeout: Duration,
+}
+
+impl Drop for PiRpcClient {
+    fn drop(&mut self) {
+        if let Some(task) = self.io_task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for PiRpcClient {
@@ -192,37 +220,51 @@ impl std::fmt::Debug for PiRpcClient {
         formatter
             .debug_struct("PiRpcClient")
             .field("session_id", &self.session_id)
-            .field("connected", &!self.command_tx.is_closed())
+            .field("connected", &self.is_connected())
             .finish_non_exhaustive()
     }
 }
 
 impl PiRpcClient {
-    /// Spawn a pi RPC subprocess and connect a client for `session_id`.
-    ///
-    /// The session id is Cowboy-chosen and persisted as the role session so
-    /// restarts relaunch pi onto the same session (`--session-id` creates the
-    /// session when it does not exist yet).
+    /// Prepare a backend handle. Session establishment owns process launch so
+    /// the executor can select new versus saved history and supply its cwd.
+    /// The optional id is a seed for a new session, never proof of restoration.
     pub async fn connect(spec: &AgentLaunchSpec, session_id: Option<&str>) -> anyhow::Result<Self> {
-        let session_id = session_id
-            .map(str::to_string)
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let process_config = ProcessConfigBuilder {
-            command: spec.command.clone(),
-            args: spec.args.clone(),
-            allowed_env: spec.allowed_env.clone(),
-        };
-        let (command_tx, events) = spawn_io_task(
-            process_config.config(&session_id, spec.model.as_ref()),
-            spec.watchdog.response_timeout_seconds,
-        )
-        .await?;
-
+        if spec.access != AgentAccess::Default {
+            anyhow::bail!("pi rpc does not support restricted access settings");
+        }
+        if spec.startup_readiness.is_some() {
+            anyhow::bail!("pi rpc does not support ACP startup-readiness settings");
+        }
+        if spec.args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--session"
+                    | "--session-id"
+                    | "--no-session"
+                    | "--continue"
+                    | "-c"
+                    | "--resume"
+                    | "-r"
+                    | "--fork"
+            )
+        }) {
+            anyhow::bail!("pi rpc session selection is owned by Cowboy");
+        }
+        let (_, events) = mpsc::unbounded_channel();
         Ok(Self {
-            command_tx,
+            command_tx: None,
+            io_task: None,
             events,
-            session_id,
-            process_config,
+            session_id: None,
+            requested_id: session_id.map(str::to_owned),
+            closed: false,
+            process_config: ProcessConfigBuilder {
+                command: spec.command.clone(),
+                args: spec.args.clone(),
+                allowed_env: spec.allowed_env.clone(),
+                model: spec.model.clone(),
+            },
             descriptor: None,
             agent_info: AgentInfo {
                 name: "pi".to_string(),
@@ -230,6 +272,10 @@ impl PiRpcClient {
                 version: None,
             },
             watchdog_seconds: spec.watchdog.response_timeout_seconds,
+            operation_timeout: Duration::from_secs(
+                spec.watchdog.recovery_operation_timeout_seconds.max(1),
+            ),
+            cancel_timeout: Duration::from_secs(spec.watchdog.cancel_timeout_seconds.max(1)),
         })
     }
 
@@ -237,14 +283,90 @@ impl PiRpcClient {
         &self,
         command: impl FnOnce(oneshot::Sender<anyhow::Result<Value>>) -> Command,
     ) -> anyhow::Result<Value> {
+        let tx = self
+            .command_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("pi rpc session is not established"))?;
         let (response_tx, response_rx) = oneshot::channel();
-        self.command_tx
-            .send(command(response_tx))
-            .await
-            .map_err(|_| anyhow::anyhow!("pi rpc task has shut down"))?;
-        response_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("pi rpc task dropped the command"))?
+        tokio::time::timeout(self.operation_timeout, async {
+            tx.send(command(response_tx))
+                .await
+                .map_err(|_| anyhow::anyhow!("pi rpc task has shut down"))?;
+            response_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("pi rpc task dropped the command"))?
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("pi rpc command response deadline exceeded"))?
+    }
+
+    async fn stop_process(&mut self) {
+        self.stop_process_with_grace(ORDERLY_EXIT_GRACE).await;
+    }
+
+    async fn stop_process_with_grace(&mut self, grace: Duration) {
+        self.session_id = None;
+        self.descriptor = None;
+        if let Some(tx) = self.command_tx.take() {
+            let _ = tokio::time::timeout(grace + Duration::from_secs(1), shutdown_task(&tx, grace))
+                .await;
+        }
+        if let Some(task) = self.io_task.as_mut()
+            && tokio::time::timeout(Duration::from_secs(1), &mut *task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.io_task.take();
+        self.drain_events();
+    }
+
+    async fn start_process(
+        &mut self,
+        session: &str,
+        restore: bool,
+        cwd: &Path,
+        model: Option<&ModelInfo>,
+    ) -> anyhow::Result<Value> {
+        if self.closed {
+            anyhow::bail!("pi rpc client is closed");
+        }
+        self.stop_process().await;
+        let (tx, events, task) = spawn_io_task(
+            self.process_config.config(session, restore, model),
+            self.watchdog_seconds,
+            cwd,
+        )
+        .await?;
+        self.command_tx = Some(tx);
+        self.io_task = Some(task);
+        self.events = events;
+        let state = self
+            .send_command(|response| Command::GetState { response })
+            .await;
+        if state.is_err() {
+            self.stop_process().await;
+        }
+        state
+    }
+
+    fn returned_reference(state: &Value, expected_id: &str) -> anyhow::Result<String> {
+        if state.get("sessionId").and_then(Value::as_str) != Some(expected_id) {
+            anyhow::bail!("pi rpc returned a different session identity");
+        }
+        let file = state
+            .get("sessionFile")
+            .and_then(Value::as_str)
+            .filter(|value| !value.chars().any(char::is_control))
+            .ok_or_else(|| {
+                anyhow::anyhow!("pi rpc did not return a persistent session reference")
+            })?;
+        if !Path::new(file).is_absolute() {
+            anyhow::bail!("pi rpc session reference is not absolute");
+        }
+        Ok(file.to_owned())
     }
 
     /// Drain leftover events, discarding them (used across restarts).
@@ -258,12 +380,17 @@ impl PiRpcClient {
 async fn spawn_io_task(
     config: crate::process::PiProcessConfig,
     watchdog_seconds: u64,
-) -> anyhow::Result<(mpsc::Sender<Command>, mpsc::UnboundedReceiver<TaskEvent>)> {
-    let process = PiProcess::spawn(&config).await?;
+    cwd: &Path,
+) -> anyhow::Result<(
+    mpsc::Sender<Command>,
+    mpsc::UnboundedReceiver<TaskEvent>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let process = PiProcess::spawn_at(&config, Some(cwd)).await?;
     let (command_tx, command_rx) = mpsc::channel(16);
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    tokio::spawn(io_loop(process, command_rx, event_tx, watchdog_seconds));
-    Ok((command_tx, event_rx))
+    let task = tokio::spawn(io_loop(process, command_rx, event_tx, watchdog_seconds));
+    Ok((command_tx, event_rx, task))
 }
 
 /// Drive subprocess I/O until EOF, failure, or shutdown.
@@ -305,6 +432,9 @@ pub async fn io_loop(
                             Command::Abort { response } => (
                                 serde_json::json!({"id": id, "type": "abort"}).to_string(),
                                 response,
+                            ),
+                            Command::GetSessionStats { response } => (
+                                serde_json::json!({"id":id,"type":"get_session_stats"}).to_string(), response,
                             ),
                             Command::Shutdown { .. } => unreachable!("handled above"),
                         };
@@ -471,7 +601,7 @@ fn map_session_event(event: &Value) -> Option<TaskEvent> {
 #[async_trait]
 impl Client for PiRpcClient {
     fn is_connected(&self) -> bool {
-        !self.command_tx.is_closed()
+        !self.closed && self.command_tx.as_ref().is_none_or(|tx| !tx.is_closed())
     }
 
     fn agent_info(&self) -> Option<&AgentInfo> {
@@ -479,7 +609,7 @@ impl Client for PiRpcClient {
     }
 
     fn session_id(&self) -> Option<&str> {
-        Some(&self.session_id)
+        self.session_id.as_deref()
     }
 
     fn session_descriptor(&self) -> Option<&AgentSessionDescriptor> {
@@ -488,20 +618,30 @@ impl Client for PiRpcClient {
 
     async fn new_session(
         &mut self,
-        _cwd: &str,
-        _mcp_servers: &[Value],
-        _model: Option<&ModelInfo>,
+        cwd: &str,
+        mcp_servers: &[Value],
+        model: Option<&ModelInfo>,
     ) -> anyhow::Result<String> {
-        // The Cowboy-side session id was bound at spawn time via
-        // `--session-id`; pi creates the session on first use. Verify the
-        // backend is responsive before handing the session to the executor.
-        let state = self
-            .send_command(|response| Command::GetState { response })
-            .await?;
-        if self.descriptor.is_none() {
-            self.descriptor = Some(descriptor_from_state(&state));
+        if !mcp_servers.is_empty() {
+            anyhow::bail!("pi rpc does not support session MCP configuration");
         }
-        Ok(self.session_id.clone())
+        let cwd = std::fs::canonicalize(cwd)?;
+        let id = self
+            .requested_id
+            .take()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let model = model.cloned().or_else(|| self.process_config.model.clone());
+        let state = self.start_process(&id, false, &cwd, model.as_ref()).await?;
+        let reference = match Self::returned_reference(&state, &id) {
+            Ok(reference) => reference,
+            Err(error) => {
+                self.stop_process().await;
+                return Err(error);
+            }
+        };
+        self.descriptor = Some(descriptor_from_state(&state));
+        self.session_id = Some(reference.clone());
+        Ok(reference)
     }
 
     fn supports_load_session(&self) -> bool {
@@ -511,53 +651,107 @@ impl Client for PiRpcClient {
     async fn load_session(
         &mut self,
         session_id: &str,
-        _cwd: &str,
-        _mcp_servers: &[Value],
+        cwd: &str,
+        mcp_servers: &[Value],
     ) -> anyhow::Result<Vec<Event>> {
-        if session_id == self.session_id {
-            // Same session: verify the running process still knows it.
-            let state = self
-                .send_command(|response| Command::GetState { response })
-                .await?;
-            self.descriptor = Some(descriptor_from_state(&state));
-            return Ok(Vec::new());
+        if !mcp_servers.is_empty() {
+            anyhow::bail!("pi rpc does not support session MCP configuration");
         }
-
-        // Different session: restart pi bound to the requested session.
-        shutdown_task(&self.command_tx).await;
-        self.drain_events();
-
-        let (command_tx, events) = spawn_io_task(
-            self.process_config.config(session_id, None),
-            self.watchdog_seconds,
-        )
-        .await?;
-        self.command_tx = command_tx;
-        self.events = events;
-        self.session_id = session_id.to_string();
-        let state = self
-            .send_command(|response| Command::GetState { response })
-            .await?;
+        // A saved opaque reference names an EXISTING file. Never use
+        // --session-id for restoration: Pi creates that UUID when missing.
+        let path = Path::new(session_id);
+        if !path.is_absolute() {
+            anyhow::bail!(
+                "pi rpc restoration requires an existing absolute session-file reference"
+            );
+        }
+        let path = path.canonicalize()?;
+        if !path.is_file() {
+            anyhow::bail!("pi rpc saved session is not a regular file");
+        }
+        let mut header = Vec::new();
+        std::io::BufReader::new(std::fs::File::open(&path)?)
+            .take(16_384)
+            .read_until(b'\n', &mut header)?;
+        let header: Value = serde_json::from_slice(&header)?;
+        if header.get("type").and_then(Value::as_str) != Some("session") {
+            anyhow::bail!("pi rpc saved session header is invalid");
+        }
+        let id = header
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("pi rpc saved session identity is missing"))?;
+        let reference = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("pi rpc session reference is not UTF-8"))?
+            .to_owned();
+        let cwd = std::fs::canonicalize(cwd)?;
+        let stored_cwd = header
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("pi rpc saved session cwd is missing"))?;
+        if std::fs::canonicalize(stored_cwd)? != cwd {
+            anyhow::bail!("pi rpc cannot restore history into a different session cwd");
+        }
+        let state = self.start_process(&reference, true, &cwd, None).await?;
+        let verified = async {
+            let returned = Self::returned_reference(&state, id)?;
+            if Path::new(&returned).canonicalize()? != path {
+                anyhow::bail!("pi rpc restored a different session file");
+            }
+            let stats = self
+                .send_command(|response| Command::GetSessionStats { response })
+                .await?;
+            if stats.get("sessionId").and_then(Value::as_str) != Some(id)
+                || stats
+                    .get("totalMessages")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|count| count == 0)
+            {
+                anyhow::bail!("pi rpc did not restore saved session history");
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = verified {
+            self.stop_process().await;
+            return Err(error);
+        }
         self.descriptor = Some(descriptor_from_state(&state));
+        // The executor retains its saved opaque reference verbatim. Validate
+        // canonical paths without changing the reference used by its prompt.
+        self.session_id = Some(session_id.to_owned());
         Ok(Vec::new())
     }
 
     async fn prompt(
         &mut self,
-        _session_id: &str,
+        session_id: &str,
         prompt_content: Vec<PromptContent>,
         cancellation: PromptTurnCancellation,
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason> {
+        if self.session_id.as_deref() != Some(session_id) {
+            anyhow::bail!("pi rpc prompt does not match an established session");
+        }
         let message = prompt_content
             .into_iter()
             .map(|content| content.text)
             .collect::<Vec<_>>()
             .join("\n");
 
-        let disposition = self
+        let disposition = match self
             .send_command(|response| Command::Prompt { message, response })
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                self.stop_process_with_grace(Duration::ZERO).await;
+                self.closed = true;
+                return Err(error);
+            }
+        };
         // `handled` means pi consumed the message without starting a run
         // (e.g. queued into an active turn) — nothing to wait for.
         if disposition.get("disposition").and_then(Value::as_str) == Some("handled") {
@@ -566,25 +760,37 @@ impl Client for PiRpcClient {
 
         let mut cancellation = cancellation;
         let mut cancelled = false;
+        let mut cancel_deadline = None;
         let mut fatal: Option<anyhow::Error> = None;
         let window = inactivity_window(self.watchdog_seconds);
         loop {
             tokio::select! {
-                _ = cancellation.cancelled() => {
+                _ = cancellation.cancelled(), if !cancelled => {
                     cancelled = true;
-                    // Fire-and-forget abort; the turn still ends on
-                    // agent_settled so pi's own unwind is observed.
-                    let _ = self
-                        .send_command(|response| Command::Abort { response })
-                        .await;
+                    cancel_deadline = Some(tokio::time::Instant::now() + self.cancel_timeout);
+                    let aborted = tokio::time::timeout(self.cancel_timeout,
+                        self.send_command(|response| Command::Abort { response })).await;
+                    if !matches!(aborted, Ok(Ok(_))) {
+                        self.stop_process_with_grace(Duration::ZERO).await;
+                        self.closed = true;
+                        anyhow::bail!("pi rpc abort acknowledgement deadline exceeded");
+                    }
                 }
-                _ = tokio::time::sleep(window) => {
+                _ = async {
+                    if let Some(deadline) = cancel_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else { std::future::pending::<()>().await; }
+                } => {
+                    self.stop_process_with_grace(Duration::ZERO).await;
+                    self.closed = true;
+                    anyhow::bail!("pi rpc cancellation did not settle before its deadline");
+                }
+                _ = tokio::time::sleep(window), if !cancelled => {
                     // Inactivity watchdog: an agent that emits nothing for a
                     // full window is treated as stuck. The executor's retry
                     // policy owns recovery; surface a clear failure.
-                    if cancelled {
-                        return Ok(StopReason::Cancelled);
-                    }
+                    self.stop_process_with_grace(Duration::ZERO).await;
+                    self.closed = true;
                     return Err(anyhow::anyhow!(
                         "pi rpc turn exceeded {}s without any event",
                         self.watchdog_seconds.max(1)
@@ -611,6 +817,8 @@ impl Client for PiRpcClient {
                         None => return Err(anyhow::anyhow!("pi rpc event stream closed")),
                     }
                     if let Some(error) = fatal.take() {
+                        self.stop_process_with_grace(Duration::ZERO).await;
+                        self.closed = true;
                         return Err(error);
                     }
                 }
@@ -619,16 +827,17 @@ impl Client for PiRpcClient {
     }
 
     async fn close(&mut self) -> anyhow::Result<()> {
-        shutdown_task(&self.command_tx).await;
+        self.stop_process().await;
+        self.closed = true;
         Ok(())
     }
 }
 
-async fn shutdown_task(command_tx: &mpsc::Sender<Command>) {
+async fn shutdown_task(command_tx: &mpsc::Sender<Command>, grace: Duration) {
     let (done_tx, done_rx) = oneshot::channel();
     if command_tx
         .send(Command::Shutdown {
-            grace: ORDERLY_EXIT_GRACE,
+            grace,
             done: done_tx,
         })
         .await
@@ -662,6 +871,7 @@ mod tests {
         let args = build_launch_args(
             &["--no-session".to_string()],
             "abc-123",
+            false,
             Some(&ModelInfo {
                 id: "claude-sonnet-4.5".to_string(),
                 provider: Some("anthropic".to_string()),
@@ -685,7 +895,12 @@ mod tests {
 
     #[test]
     fn launch_args_do_not_duplicate_rpc_mode() {
-        let args = build_launch_args(&["--mode".to_string(), "rpc".to_string()], "s1", None);
+        let args = build_launch_args(
+            &["--mode".to_string(), "rpc".to_string()],
+            "s1",
+            false,
+            None,
+        );
         assert_eq!(args, ["--mode", "rpc", "--session-id", "s1"]);
     }
 
@@ -831,10 +1046,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_fails_fast_for_missing_binary() {
-        let error = PiRpcClient::connect(&spec("definitely-not-pi-binary-xyz"), Some("session-1"))
-            .await
-            .unwrap_err();
+    async fn session_establishment_reports_missing_binary() {
+        let mut client =
+            PiRpcClient::connect(&spec("definitely-not-pi-binary-xyz"), Some("session-1"))
+                .await
+                .unwrap();
+        let error = client.new_session(".", &[], None).await.unwrap_err();
         assert!(
             error.to_string().contains("definitely-not-pi-binary-xyz"),
             "{error}"
@@ -859,7 +1076,7 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
         let handle = tokio::spawn(io_loop(process, command_rx, event_tx, 60));
 
-        shutdown_task(&command_tx).await;
+        shutdown_task(&command_tx, ORDERLY_EXIT_GRACE).await;
         tokio::time::timeout(Duration::from_secs(10), handle)
             .await
             .expect("io task must finish after shutdown")
@@ -930,7 +1147,7 @@ done
         assert!(settled);
         assert!(chunks[0].contains("status: success"), "{chunks:?}");
 
-        shutdown_task(&command_tx).await;
+        shutdown_task(&command_tx, ORDERLY_EXIT_GRACE).await;
     }
 
     #[tokio::test]
@@ -981,6 +1198,6 @@ done
         assert_eq!(descriptor.model.as_deref(), Some("stub-model"));
         assert_eq!(descriptor.reasoning.as_deref(), Some("high"));
 
-        shutdown_task(&command_tx).await;
+        shutdown_task(&command_tx, ORDERLY_EXIT_GRACE).await;
     }
 }
