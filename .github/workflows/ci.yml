@@ -27,3 +27,14 @@ jobs:
         run: cargo test --workspace --all-targets --locked
       - name: Run required SQLite tests
         run: bash scripts/run-required-sqlite-tests.sh
+
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check workspace targets
+        run: cargo check --workspace --all-targets --locked

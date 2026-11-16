@@ -1,8 +1,11 @@
 //! Regression test for the Linux ETXTBSY flake: spawning a script while it
 //! is still open for writing must succeed via the bounded retry.
 
+#[cfg(unix)]
 use cowboy_agent_pi::process::{PiProcess, PiProcessConfig};
+#[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::time::Duration;
 
 #[cfg(unix)]
