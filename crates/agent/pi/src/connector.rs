@@ -97,10 +97,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_fails_fast_for_missing_binary() {
+    async fn connector_defers_missing_binary_failure_until_session_cwd_is_known() {
         let mut missing = spec();
         missing.command = "definitely-not-pi-binary-xyz".to_string();
-        let error = PiRpcBackendConnector.connect(&missing).await.unwrap_err();
+        let mut backend = PiRpcBackendConnector.connect(&missing).await.unwrap();
+        let error = backend
+            .client
+            .new_session(".", &[], None)
+            .await
+            .unwrap_err();
         assert!(
             error.to_string().contains("definitely-not-pi-binary-xyz"),
             "{error}"
