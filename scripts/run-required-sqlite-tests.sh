@@ -26,5 +26,8 @@ if ! awk -F '\t' '
 fi
 
 while IFS=$'\t' read -r package test_name marker; do
+  package="${package%$'\r'}"
+  test_name="${test_name%$'\r'}"
+  marker="${marker%$'\r'}"
   "$script_dir/run-exact-test.sh" "$package" "$test_name" "$marker"
 done <"$manifest"
