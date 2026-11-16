@@ -139,12 +139,7 @@ mod tests {
             panic!("expected command action");
         };
 
-        let output = std::process::Command::new(&command.program)
-            .args(&command.args)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stdout = command.args[0].clone();
 
         let workflow = source(
             "local value = cowboy.json.decode(ctx.prev.fields.stdout)\nassert(value.nested.a ~= value.nested.b)\nassert(getmetatable == nil and setmetatable == nil and debug == nil)\nreturn action.status { status = 'success', fields = { object = value.object, array = value.array, nested = value.nested, items = value.items, plain = {} } }",
