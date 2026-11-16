@@ -23,7 +23,7 @@ printf '%s\n' "$list_output"
 
 listed_count="$(
   printf '%s\n' "$list_output" |
-    awk -v expected="$test_name: test" '$0 == expected { count++ } END { print count + 0 }'
+    awk -v expected="$test_name: test" '{ sub(/\r$/, "") } $0 == expected { count++ } END { print count + 0 }'
 )"
 if [ "$listed_count" -ne 1 ]; then
   echo "expected exactly one listed test named '$test_name', found $listed_count" >&2
@@ -39,6 +39,9 @@ printf '%s\n' "$test_output"
 result_count="$(
   printf '%s\n' "$test_output" |
     awk '
+      {
+        sub(/\r$/, "")
+      }
       /^test result:/ {
         summaries++
         if ($0 ~ /^test result: ok\. 1 passed; 0 failed; 0 ignored;/) {
@@ -58,7 +61,7 @@ fi
 
 marker_count="$(
   printf '%s\n' "$test_output" |
-    awk -v marker="$marker" '$0 == marker { count++ } END { print count + 0 }'
+    awk -v marker="$marker" '{ sub(/\r$/, "") } $0 == marker { count++ } END { print count + 0 }'
 )"
 if [ "$marker_count" -lt 1 ]; then
   echo "required evidence marker was not emitted: $marker" >&2
