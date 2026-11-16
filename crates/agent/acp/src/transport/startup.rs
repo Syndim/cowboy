@@ -24,6 +24,7 @@ struct LogCursor {
     identity: Option<(u64, u64)>,
     length: u64,
     modified: Option<std::time::SystemTime>,
+    prefix: Vec<u8>,
 }
 
 impl LogCursor {
@@ -155,14 +156,20 @@ impl StartupLog {
             let identity = file_identity(&file, &metadata)?;
             let cursor = self.files.entry(path).or_default();
             let modified = metadata.modified().map_err(log_error)?;
+            let mut prefix = vec![0; metadata.len().min(self.marker.len() as u64) as usize];
+            file.seek(SeekFrom::Start(0)).await.map_err(log_error)?;
+            file.read_exact(&mut prefix).await.map_err(log_error)?;
             if cursor.identity != Some(identity)
                 || cursor.length != metadata.len()
                 || cursor.modified != Some(modified)
+                || cursor.prefix != prefix
+                || metadata.len() < cursor.offset
             {
                 *cursor = LogCursor {
                     identity: Some(identity),
                     length: metadata.len(),
                     modified: Some(modified),
+                    prefix,
                     ..LogCursor::default()
                 };
             }
