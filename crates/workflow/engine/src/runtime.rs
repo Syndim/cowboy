@@ -3159,6 +3159,7 @@ mod tests {
     use parking_lot::Mutex as SyncMutex;
     use sqlx::Executor;
     use std::collections::VecDeque;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -4684,6 +4685,7 @@ implementation_evidence: []
         .await
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn accepted_prompt_cancels_active_turn_before_replacement() {
         let dir = tempfile::tempdir().unwrap();
@@ -4835,6 +4837,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}'
         );
     }
 
+    #[cfg(unix)]
     fn write_descriptor_stub(path: &std::path::Path) {
         // Line-oriented ACP stub: one JSON-RPC message per line in, exactly one
         // JSON object per line out. Inputs by method so any session (topic
@@ -4871,6 +4874,7 @@ done
         fs::set_permissions(path, permissions).unwrap();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn agent_session_ready_event_carries_returned_descriptor_case_a() {
         // Case A: no model configured, so ACP model-selection enforcement never
@@ -5355,6 +5359,7 @@ done
             .with_request_topic_generation()
     }
 
+    #[cfg(unix)]
     fn command_script(dir: &tempfile::TempDir) -> PathBuf {
         let script = dir.path().join("command-helper.sh");
         fs::write(
@@ -5458,6 +5463,7 @@ exit 0
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn command_action_runtime_routes_and_exposes_prev_fields() {
         let dir = tempfile::tempdir().unwrap();
@@ -5555,6 +5561,7 @@ exit 0
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn decoded_command_json_survives_persisted_next_step() {
         let dir = tempfile::tempdir().unwrap();

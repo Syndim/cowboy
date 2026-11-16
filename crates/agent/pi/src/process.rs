@@ -451,7 +451,7 @@ async fn spawn_with_busy_retry(cmd: &mut Command, command: &str) -> anyhow::Resu
         attempt += 1;
         match cmd.spawn() {
             Ok(child) => return Ok(child),
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < ATTEMPTS => {
+            Err(error) if is_text_file_busy(&error) && attempt < ATTEMPTS => {
                 tracing::debug!(
                     event = "pi_spawn_busy_retry",
                     command = %command,
@@ -468,6 +468,18 @@ async fn spawn_with_busy_retry(cmd: &mut Command, command: &str) -> anyhow::Resu
                 ));
             }
         }
+    }
+}
+
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
     }
 }
 
@@ -514,4 +526,31 @@ fn log_stderr_diagnostic(command: &str, pid: Option<u32>, line: &[u8]) {
         return;
     }
     tracing::debug!(event = "pi_stderr", command = %command, pid, diagnostic = %cowboy_agent_client::diagnostic_error_text(text), "pi stderr diagnostic");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_text_file_busy;
+
+    #[test]
+    fn errors_without_os_codes_are_not_busy() {
+        assert!(!is_text_file_busy(&std::io::Error::other("spawn failed")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_etxtbsy_is_busy() {
+        assert!(is_text_file_busy(&std::io::Error::from_raw_os_error(
+            libc::ETXTBSY
+        )));
+        assert!(!is_text_file_busy(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn os_errors_are_not_unix_busy_errors() {
+        assert!(!is_text_file_busy(&std::io::Error::from_raw_os_error(26)));
+    }
 }
