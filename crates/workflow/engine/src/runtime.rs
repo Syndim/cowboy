@@ -4532,6 +4532,7 @@ implementation_evidence: []
                 .unwrap();
             runtime.store().unwrap().close().await;
             drop(runtime);
+            tokio::time::sleep(Duration::from_millis(50)).await;
             factory.set_load_session_succeeds(false);
 
             let mut rebuilt = runtime_for_prompt_contract(&dir, factory.clone()).await;
@@ -4555,6 +4556,7 @@ implementation_evidence: []
             }));
             rebuilt.store().unwrap().close().await;
             drop(rebuilt);
+            tokio::time::sleep(Duration::from_millis(50)).await;
 
             let reopened = runtime_for_prompt_contract(&dir, factory.clone()).await;
             let persisted = reopened.load_run(&started.run.id).await.unwrap();

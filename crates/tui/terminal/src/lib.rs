@@ -234,18 +234,22 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
 
-    struct FailAfterMouseCapture {
+    struct FailAfterBracketedPaste {
         bytes: Vec<u8>,
         failures_remaining: usize,
     }
 
-    impl Write for FailAfterMouseCapture {
+    impl Write for FailAfterBracketedPaste {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            #[cfg(unix)]
+            let failure_marker = b"?1000h";
+            #[cfg(windows)]
+            let failure_marker = b"?2004h";
             if self.failures_remaining > 0
                 && self
                     .bytes
-                    .windows(b"?1000h".len())
-                    .any(|part| part == b"?1000h")
+                    .windows(failure_marker.len())
+                    .any(|part| part == failure_marker)
             {
                 self.failures_remaining -= 1;
                 return Err(io::Error::other("injected terminal setup failure"));
@@ -273,8 +277,11 @@ mod tests {
         restore_terminal_screen(&mut bytes).unwrap();
 
         let commands = String::from_utf8(bytes).unwrap();
-        assert!(commands.contains("?1000h"), "{commands:?}");
-        assert!(commands.contains("?1000l"), "{commands:?}");
+        #[cfg(unix)]
+        {
+            assert!(commands.contains("?1000h"), "{commands:?}");
+            assert!(commands.contains("?1000l"), "{commands:?}");
+        }
         assert!(commands.contains("?2004h"), "{commands:?}");
         assert!(commands.contains("?2004l"), "{commands:?}");
         assert!(commands.contains("\u{1b}[0 q"), "{commands:?}");
@@ -283,7 +290,7 @@ mod tests {
 
     #[test]
     fn terminal_screen_setup_failure_rolls_back_mouse_capture() {
-        let mut writer = FailAfterMouseCapture {
+        let mut writer = FailAfterBracketedPaste {
             bytes: Vec::new(),
             failures_remaining: 1,
         };
@@ -293,14 +300,18 @@ mod tests {
         let commands = String::from_utf8(writer.bytes).unwrap();
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(writer.failures_remaining, 0);
-        assert!(commands.contains("?1000h"), "{commands:?}");
-        assert!(commands.contains("?1000l"), "{commands:?}");
+        #[cfg(unix)]
+        {
+            assert!(commands.contains("?1000h"), "{commands:?}");
+            assert!(commands.contains("?1000l"), "{commands:?}");
+        }
+        assert!(commands.contains("?2004h"), "{commands:?}");
         assert!(commands.contains("?2004l"), "{commands:?}");
     }
 
     #[test]
     fn terminal_guard_retries_screen_cleanup_after_setup_rollback_fails() {
-        let mut writer = FailAfterMouseCapture {
+        let mut writer = FailAfterBracketedPaste {
             bytes: Vec::new(),
             failures_remaining: 2,
         };
@@ -329,6 +340,7 @@ mod tests {
 
         let commands = String::from_utf8(writer.bytes).unwrap();
         assert!(guard.is_restored());
+        #[cfg(unix)]
         assert!(commands.contains("?1000l"), "{commands:?}");
         assert!(commands.contains("?2004l"), "{commands:?}");
     }

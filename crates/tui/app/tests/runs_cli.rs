@@ -11,6 +11,12 @@ fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).unwrap()
 }
 
+fn toml_string(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
@@ -65,9 +71,9 @@ fn cli_runs_filters_by_partial_run_id() {
             command = "unused-agent"
             args = []
             "#,
-            dir.path().join("state").display(),
-            dir.path().join("state/data.db").display(),
-            workflow_dir.display()
+            toml_string(&dir.path().join("state")),
+            toml_string(&dir.path().join("state/data.db")),
+            toml_string(&workflow_dir)
         ),
     )
     .unwrap();

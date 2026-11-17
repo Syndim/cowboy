@@ -1359,7 +1359,8 @@ max_retries_per_step = 4
     }
 
     fn validate_watchdog_document(content: &str) -> std::result::Result<(), String> {
-        let contract = extract_watchdog_contract(content)?;
+        let content = content.replace("\r\n", "\n").replace('\r', "\n");
+        let contract = extract_watchdog_contract(&content)?;
         if contract != expected_watchdog_contract() {
             return Err(
                 "watchdog contract differs from code defaults or recovery order".to_string(),

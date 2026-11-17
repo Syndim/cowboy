@@ -1065,8 +1065,22 @@ mod tests {
         // `cat` echoes JSONL back and never exits on its own, proving the
         // shutdown path terminates a live process.
         let config = PiProcessConfig {
+            #[cfg(unix)]
             command: "/bin/cat".to_string(),
+            #[cfg(unix)]
             args: Vec::new(),
+            #[cfg(windows)]
+            command: "powershell.exe".to_string(),
+            #[cfg(windows)]
+            args: [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::OpenStandardInput().CopyTo([Console]::OpenStandardOutput())",
+            ]
+            .map(str::to_string)
+            .to_vec(),
             clear_env: false,
             allowed_env: Vec::new(),
             env: Vec::new(),
@@ -1089,6 +1103,7 @@ mod tests {
 
         // Shell stub emulating pi: echoes a response record per input record,
         // then streams message updates and agent_settled.
+        #[cfg(unix)]
         let script = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'); printf '%s\n' "{\"id\":\"$id\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"disposition\":\"started\"}}"
@@ -1096,8 +1111,19 @@ while IFS= read -r line; do
   printf '%s\n' '{"type":"agent_settled","aborted":false}'
 done
 "#;
+        #[cfg(windows)]
+        let script = r#"while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $request = $line | ConvertFrom-Json
+  @{ id = $request.id; type = "response"; command = "prompt"; success = $true; data = @{ disposition = "started" } } | ConvertTo-Json -Compress
+  '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"---\nstatus: success\nsummary: ok\n---\ndone"}}'
+  '{"type":"agent_settled","aborted":false}'
+}
+"#;
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let script_path = dir.path().join("pi-stub.sh");
+        #[cfg(windows)]
+        let script_path = dir.path().join("pi-stub.ps1");
         std::fs::write(&script_path, script).unwrap();
         #[cfg(unix)]
         {
@@ -1108,8 +1134,22 @@ done
         }
 
         let config = PiProcessConfig {
+            #[cfg(unix)]
             command: script_path.to_string_lossy().to_string(),
+            #[cfg(unix)]
             args: Vec::new(),
+            #[cfg(windows)]
+            command: "powershell.exe".to_string(),
+            #[cfg(windows)]
+            args: [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                script_path.to_string_lossy().as_ref(),
+            ]
+            .map(str::to_string)
+            .to_vec(),
             clear_env: false,
             allowed_env: Vec::new(),
             env: Vec::new(),
@@ -1154,6 +1194,7 @@ done
     async fn get_state_probe_reaches_stub() {
         use crate::process::PiProcessConfig;
 
+        #[cfg(unix)]
         let script = r#"#!/bin/sh
 while IFS= read -r line; do
   case "$line" in
@@ -1163,8 +1204,19 @@ while IFS= read -r line; do
   esac
 done
 "#;
+        #[cfg(windows)]
+        let script = r#"while ($null -ne ($line = [Console]::In.ReadLine())) {
+  $request = $line | ConvertFrom-Json
+  if ($request.type -eq "get_state") {
+    @{ id = $request.id; type = "response"; command = "get_state"; success = $true; data = @{ model = @{ id = "stub-model" }; thinkingLevel = "high" } } | ConvertTo-Json -Depth 4 -Compress
+  }
+}
+"#;
         let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let script_path = dir.path().join("pi-state.sh");
+        #[cfg(windows)]
+        let script_path = dir.path().join("pi-state.ps1");
         std::fs::write(&script_path, script).unwrap();
         #[cfg(unix)]
         {
@@ -1175,8 +1227,22 @@ done
         }
 
         let config = PiProcessConfig {
+            #[cfg(unix)]
             command: script_path.to_string_lossy().to_string(),
+            #[cfg(unix)]
             args: Vec::new(),
+            #[cfg(windows)]
+            command: "powershell.exe".to_string(),
+            #[cfg(windows)]
+            args: [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                script_path.to_string_lossy().as_ref(),
+            ]
+            .map(str::to_string)
+            .to_vec(),
             clear_env: false,
             allowed_env: Vec::new(),
             env: Vec::new(),

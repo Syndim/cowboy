@@ -716,6 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_runner_forwards_only_configured_environment_variables() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -727,6 +728,8 @@ mod tests {
             .envs(EXPECTED_COMMAND_ENV_ALLOW_LIST.map(|name| (name, "test-marker")))
             .env("CARGO", "test-marker")
             .env(UNAPPROVED_COMMAND_ENV, "test-marker")
+            .env("TEMP", temp_dir.path())
+            .env("TMP", temp_dir.path())
             .output()
             .await
             .unwrap();
@@ -897,13 +900,9 @@ mod tests {
         assert_eq!(output.status, "bad");
         assert_eq!(output.fields["success"], false);
         assert_eq!(output.fields["exit_code"], Value::Null);
-        assert!(
-            output.fields["spawn_error"]
-                .as_str()
-                .unwrap()
-                .contains("No such file")
-        );
-        assert!(output.body.contains("No such file"));
+        let spawn_error = output.fields["spawn_error"].as_str().unwrap();
+        assert!(!spawn_error.is_empty());
+        assert_eq!(output.body, *spawn_error);
     }
 
     #[tokio::test]

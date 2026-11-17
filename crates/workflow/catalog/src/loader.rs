@@ -182,11 +182,8 @@ fn collect_lua_files(root: &Path, dir: &Path, files: &mut Vec<String>) -> Result
             let relative = relative
                 .to_str()
                 .ok_or_else(|| crate::Error::NonUtf8Path(path.display().to_string()))?;
-            files.push(
-                normalize_workflow_entry(relative)?
-                    .to_string_lossy()
-                    .to_string(),
-            );
+            let normalized = normalize_workflow_entry(relative)?;
+            files.push(normalized.to_string_lossy().replace('\\', "/"));
         }
     }
     Ok(())
