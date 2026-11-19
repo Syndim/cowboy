@@ -47,6 +47,29 @@ return workflow("my-workflow", implement, {
 
 ## Core authoring API
 
+### `cowboy.log.<level>(message)`
+
+Use `cowboy.log.error`, `warn`, `info`, `debug`, or `trace` to write a UTF-8
+string to Cowboy's diagnostic log without changing the step's action:
+
+```lua
+step.run = function(ctx)
+  cowboy.log.info("Starting step " .. ctx.current_step)
+  return action.status { status = "success" }
+end
+```
+
+Messages are limited to 64 KiB and use the `cowboy_workflow_lua::workflow`
+logging target. Non-string, invalid UTF-8, and oversized messages cause a Lua
+error, even when the log level is filtered out. Messages follow the usual
+`COWBOY_LOG` / `RUST_LOG` filtering; the product's default level is `info`.
+These are diagnostic logs, not persisted workflow events or TUI transcript
+messages. Run and step identifiers are not added automatically. Do not log
+secrets or sensitive request data. The Lua VM is recreated when a workflow is
+compiled or a step is evaluated, including for some inspection operations, so
+top-level and step log calls can run more than once and do not guarantee that an
+action was dispatched.
+
 ### `role(id, config)`
 
 Declares reusable role metadata.
