@@ -1,4 +1,5 @@
 pub(crate) mod json;
+mod log;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -26,6 +27,7 @@ pub fn install_workflow_api(lua: &Lua) -> Result<()> {
     let globals = lua.globals();
     let cowboy = lua.create_table()?;
     json::install(lua, &cowboy)?;
+    log::install(lua, &cowboy)?;
     globals.set("cowboy", cowboy)?;
 
     let registry_roles = lua.create_table()?;
