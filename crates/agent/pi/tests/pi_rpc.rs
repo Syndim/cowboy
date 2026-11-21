@@ -66,6 +66,10 @@ while IFS= read -r line; do
         printf '%s\n' '{"id":"'"$id"'","type":"response","command":"prompt","success":false,"error":"synthetic provider unavailable"}'
         continue
       fi
+      if [ "$mode" = busy ] && ! printf '%s' "$line" | grep -q 'streamingBehavior'; then
+        printf '%s\n' '{"id":"'"$id"'","type":"response","command":"prompt","success":false,"error":"Agent is already processing. Specify streamingBehavior to queue the message."}'
+        continue
+      fi
       printf '%s\n' '{"id":"'"$id"'","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}'
       case "$mode" in abort_no_ack|abort_no_settle|cancel_ok) continue ;; esac
       [ "$mode" = exit ] && exit 3
@@ -442,4 +446,24 @@ async fn process_exit_and_command_error_fail_without_success() {
         assert!(turn(&mut client, &id).await.is_err());
         client.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn busy_prompt_is_queued_as_follow_up_and_settles() {
+    // pi rejects a prompt that arrives while a run is active (for example a
+    // restored session continuing its own pending work). The client must queue
+    // the message as a follow-up and wait for the combined turn to settle
+    // instead of failing the executor's prompt.
+    let fixture = Fixture::new("busy");
+    let (mut client, id) = fixture.client().await;
+    let (reason, events) = turn(&mut client, &id).await.unwrap();
+    assert!(matches!(reason, StopReason::EndTurn), "{reason:?}");
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::MessageChunk { .. })),
+        "the queued turn must stream its response events"
+    );
+    // One rejected prompt plus one queued follow-up prompt.
+    assert_eq!(fixture.count("prompts"), 2);
 }
