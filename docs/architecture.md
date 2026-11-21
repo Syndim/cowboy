@@ -159,8 +159,8 @@ ceilings are exhausted.
   initial/change-specific wording is carried only by the current turn
 - sends role/task/deliverable once per backend session/task fingerprint, while
   reused-task dispatches send only the turn and new input sequences
-- resets delivery fingerprints after load failure creates a fresh session, so
-  role, task, recovery context, turn, inputs, and deliverable are self-contained
+- fails when a persisted backend session cannot be loaded rather than silently
+  replacing it with a fresh session
 - opens a durable prompt window identified by an opaque token and bound to the run, step record, step, and role
 - registers a process-local sequence watch at the window's durable baseline before publishing the open-window event
 - sends the initial prompt through `cowboy-agent-client::Client` with an awaitable turn-cancellation input
@@ -198,13 +198,59 @@ them through `WorkflowRuntime`, SQLite, `EngineActionDispatcher`, and
 `AgentExecutor`. Prompts are captured inside the scripted client's `prompt`
 boundary. `records.json` is derived from persisted `StepRecord.input.context`,
 `StepDetail.session_id`, and scripted-client new/load-session events. The
-scenarios cover same-runtime reuse, retry-only correction, restart with
-successful session loading, and restart with load failure/new-session
-recreation. Optional captures are written below
-`target/prompt-captures/reduce_agent_step_prompt_payloads/`.
+scenarios cover same-runtime reuse, retry-only correction, and restart with
+successful session loading. Separate tests cover session-load failure. Optional
+captures are written below `target/prompt-captures/reduce_agent_step_prompt_payloads/`.
 
-`WorkflowRuntime` resolves agent launch specs from config and routes them through the `BackendRegistry` installed by the composition root; today that registry contains the ACP connector from `cowboy-agent-acp` using the
-configured command, args, and model.
+`WorkflowRuntime` resolves agent launch specs from config and routes them through
+the `BackendRegistry` installed by the composition root. The product registry
+contains the ACP and Pi RPC connectors, using the configured command, args, and
+model.
+
+#### Copilot SDK evaluation
+
+As of 2026-11-22, keep `copilot --acp` as the supported Copilot path and
+postpone a separate SDK connector. This is an evaluation, not an implemented
+backend: there is no SDK configuration or SDK smoke test in Cowboy yet. The
+SDK offers typed Copilot-specific sessions, events, and permission handlers,
+but a concrete benefit over the existing ACP integration has not been verified.
+
+- The official stable Rust package is [`copilot-sdk` 2.0.1](https://crates.io/crates/copilot-sdk/2.0.1),
+  which requires Rust 1.94; Cowboy declares 1.89. An optional feature might
+  preserve the default MSRV, but enabling it would require a newer toolchain;
+  CI and release policy would need to cover both configurations. The older
+  `github-copilot-sdk` package is deprecated.
+- The SDK uses a different interface from ACP. Its [v2 runtime](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#architecture)
+  defaults to in-process execution, without crash isolation or sandboxing; it
+  also supports spawned and externally managed transports. Unlike a child
+  process, an in-process runtime does not naturally inherit Cowboy's filtered
+  per-agent environment. The SDK's bundled runtime means an installed CLI is
+  not universally required, despite the CLI-based quickstart.
+- The SDK supports session creation and resume, model and working-directory
+  settings, streaming events, permission handlers, and turn abort. Those API
+  capabilities do not establish parity with Cowboy's session persistence,
+  event mapping, cancellation, watchdog, or shutdown behavior. An SDK session
+  must be resumed by its persisted identity; a failed reload must not silently
+  substitute a fresh session. Streaming must be enabled and event delivery and
+  buffering verified, including on resume.
+- Authentication can use a stored login, a token, or a separately configured
+  provider; see the [SDK authentication documentation](https://github.com/microsoft/copilot-sdk#what-authentication-methods-are-supported).
+  A future connector must document its supported methods and environment
+  requirements, redact credentials, and not use the SDK examples' approve-all
+  handler as its default. Permission handling is not a filesystem or network
+  sandbox. Unsupported access policies and settings must be rejected rather
+  than silently weakened.
+
+Before implementing a connector, decide the MSRV policy and demonstrate a
+runtime/transport that preserves the required environment, permission, and
+process-lifecycle boundaries on supported platforms. Keep SDK-specific code in
+a separate backend registered at the composition root, not in the workflow
+engine. Verify model, cwd, MCP, errors, streaming text and tool progress,
+completion, cancellation followed by another turn, session reload, and bounded
+cleanup. Offline deterministic contract tests must cover those mappings and
+failure paths. An opt-in authenticated smoke test must document prerequisites
+and a tested SDK/runtime or CLI version; no live compatibility test was run for
+this evaluation.
 
 <!-- cowboy-agent-watchdog-contract:start -->
 ```toml
