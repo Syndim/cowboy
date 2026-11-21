@@ -198,9 +198,9 @@ them through `WorkflowRuntime`, SQLite, `EngineActionDispatcher`, and
 `AgentExecutor`. Prompts are captured inside the scripted client's `prompt`
 boundary. `records.json` is derived from persisted `StepRecord.input.context`,
 `StepDetail.session_id`, and scripted-client new/load-session events. The
-scenarios cover same-runtime reuse, retry-only correction, and restart with
-successful session loading. Separate tests cover session-load failure. Optional
-captures are written below `target/prompt-captures/reduce_agent_step_prompt_payloads/`.
+scenarios cover same-runtime reuse, retry-only correction, restart with
+successful session loading, and session-load failure. Optional captures are
+written under the directory specified by `COWBOY_PROMPT_CAPTURE_DIR`.
 
 `WorkflowRuntime` resolves agent launch specs from config and routes them through
 the `BackendRegistry` installed by the composition root. The product registry
@@ -231,8 +231,12 @@ but a concrete benefit over the existing ACP integration has not been verified.
   capabilities do not establish parity with Cowboy's session persistence,
   event mapping, cancellation, watchdog, or shutdown behavior. An SDK session
   must be resumed by its persisted identity; a failed reload must not silently
-  substitute a fresh session. Streaming must be enabled and event delivery and
-  buffering verified, including on resume.
+  substitute a fresh session. Streaming must be enabled. The SDK's [event
+  delivery](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#streaming)
+  can miss create events before subscription; prepared subscriptions avoid that
+  startup gap but have bounded buffers that report lag. Resume without a prepared
+  subscriber retains an unbounded bootstrap queue until its owner catches up.
+  A connector must drain promptly and handle lag and shutdown explicitly.
 - Authentication can use a stored login, a token, or a separately configured
   provider; see the [SDK authentication documentation](https://github.com/microsoft/copilot-sdk#what-authentication-methods-are-supported).
   A future connector must document its supported methods and environment
