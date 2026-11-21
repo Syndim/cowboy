@@ -55,6 +55,29 @@ mod tests {
 
     use crate::{compile_snapshot, runtime::run_step};
 
+    fn isolated_capture_test(name: &str) -> bool {
+        const GUARD: &str = "COWBOY_LUA_ISOLATED_CAPTURE_TEST";
+        if matches!(std::env::var(GUARD).as_deref(), Ok(value) if value == name) {
+            return false;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", name, "--nocapture"])
+            .env(GUARD, name)
+            .output()
+            .expect("run isolated capture test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success()
+                && stdout
+                    .lines()
+                    .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+            "isolated capture test {name} failed or did not run exactly once:\n{stdout}\n{stderr}"
+        );
+        true
+    }
+
     #[derive(Clone, Default)]
     struct Sink(Arc<Mutex<Vec<u8>>>);
 
@@ -90,6 +113,11 @@ mod tests {
 
     #[test]
     fn logs_levels_from_definitions_imports_and_steps_with_filtering() {
+        if isolated_capture_test(
+            "api::log::tests::logs_levels_from_definitions_imports_and_steps_with_filtering",
+        ) {
+            return;
+        }
         let source = snapshot(
             "cowboy.log.error('error-marker')\ncowboy.log.warn('warn-marker')\ncowboy.log.info('info-marker')\ncowboy.log.debug('debug-marker')\ncowboy.log.trace('trace-marker')",
         );
@@ -129,6 +157,10 @@ mod tests {
 
     #[test]
     fn escapes_control_characters_in_diagnostic_output() {
+        if isolated_capture_test("api::log::tests::escapes_control_characters_in_diagnostic_output")
+        {
+            return;
+        }
         let sink = Sink::default();
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
