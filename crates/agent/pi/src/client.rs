@@ -753,7 +753,10 @@ impl Client for PiRpcClient {
 
         let mut queued = false;
         let disposition = match self
-            .send_command(|response| Command::Prompt { message: message.clone(), response })
+            .send_command(|response| Command::Prompt {
+                message: message.clone(),
+                response,
+            })
             .await
         {
             Ok(value) => value,
