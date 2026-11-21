@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/agent/acp", "crates/agent/client", "crates/agent/pi", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/animation", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
+members = ["crates/agent/acp", "crates/agent/client", "crates/agent/pi", "crates/agent/copilot-sdk", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/animation", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
 default-members = ["crates/agent/acp", "crates/agent/client", "crates/agent/pi", "crates/log", "crates/workflow/actions", "crates/workflow/agent", "crates/workflow/catalog", "crates/workflow/core", "crates/workflow/engine", "crates/workflow/lua", "crates/workflow/store", "crates/tui/animation", "crates/tui/app", "crates/tui/command-parser", "crates/tui/terminal"]
 resolver = "3"
 

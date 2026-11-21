@@ -204,57 +204,27 @@ written under the directory specified by `COWBOY_PROMPT_CAPTURE_DIR`.
 
 `WorkflowRuntime` resolves agent launch specs from config and routes them through
 the `BackendRegistry` installed by the composition root. The product registry
-contains the ACP and Pi RPC connectors, using the configured command, args, and
-model.
+contains the ACP and Pi RPC connectors, and the Copilot SDK connector when its
+feature is enabled.
 
-#### Copilot SDK evaluation
+#### Copilot SDK backend
 
-As of 2026-11-22, keep `copilot --acp` as the supported Copilot path and
-postpone a separate SDK connector. This is an evaluation, not an implemented
-backend: there is no SDK configuration or SDK smoke test in Cowboy yet. The
-SDK offers typed Copilot-specific sessions, events, and permission handlers,
-but a concrete benefit over the existing ACP integration has not been verified.
+The optional `copilot-sdk` product feature registers a separate backend based
+on the official `copilot-sdk` 2.0.1 Rust package; it requires Rust 1.94 while
+Cowboy's default build retains its 1.89 declaration. ACP remains the default.
+The SDK's in-process default is not used: Cowboy starts a separate runtime with
+an allowlisted environment and connects the SDK over its stdio streams. See the
+README for configuration, authentication, security limitations, and the opt-in
+smoke test.
 
-- The official stable Rust package is [`copilot-sdk` 2.0.1](https://crates.io/crates/copilot-sdk/2.0.1),
-  which requires Rust 1.94; Cowboy declares 1.89. An optional feature might
-  preserve the default MSRV, but enabling it would require a newer toolchain;
-  CI and release policy would need to cover both configurations. The older
-  `github-copilot-sdk` package is deprecated.
-- The SDK uses a different interface from ACP. Its [v2 runtime](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#architecture)
-  defaults to in-process execution, without crash isolation or sandboxing; it
-  also supports spawned and externally managed transports. Unlike a child
-  process, an in-process runtime does not naturally inherit Cowboy's filtered
-  per-agent environment. The SDK's bundled runtime means an installed CLI is
-  not universally required, despite the CLI-based quickstart.
-- The SDK supports session creation and resume, model and working-directory
-  settings, streaming events, permission handlers, and turn abort. Those API
-  capabilities do not establish parity with Cowboy's session persistence,
-  event mapping, cancellation, watchdog, or shutdown behavior. An SDK session
-  must be resumed by its persisted identity; a failed reload must not silently
-  substitute a fresh session. Streaming must be enabled. The SDK's [event
-  delivery](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#streaming)
-  can miss create events before subscription; prepared subscriptions avoid that
-  startup gap but have bounded buffers that report lag. Resume without a prepared
-  subscriber retains an unbounded bootstrap queue until its owner catches up.
-  A connector must drain promptly and handle lag and shutdown explicitly.
-- Authentication can use a stored login, a token, or a separately configured
-  provider; see the [SDK authentication documentation](https://github.com/microsoft/copilot-sdk#what-authentication-methods-are-supported).
-  A future connector must document its supported methods and environment
-  requirements, redact credentials, and not use the SDK examples' approve-all
-  handler as its default. Permission handling is not a filesystem or network
-  sandbox. Unsupported access policies and settings must be rejected rather
-  than silently weakened.
-
-Before implementing a connector, decide the MSRV policy and demonstrate a
-runtime/transport that preserves the required environment, permission, and
-process-lifecycle boundaries on supported platforms. Keep SDK-specific code in
-a separate backend registered at the composition root, not in the workflow
-engine. Verify model, cwd, MCP, errors, streaming text and tool progress,
-completion, cancellation followed by another turn, session reload, and bounded
-cleanup. Offline deterministic contract tests must cover those mappings and
-failure paths. An opt-in authenticated smoke test must document prerequisites
-and a tested SDK/runtime or CLI version; no live compatibility test was run for
-this evaluation.
+The backend creates and reloads SDK sessions by durable ID, maps streamed text
+and tool progress to the common client events, and aborts cancelled turns.
+Prepared subscriptions avoid the SDK's pre-subscription startup event gap;
+stream lag and failed reloads fail the operation rather than silently losing
+output or replacing a session. The SDK's [event delivery](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#streaming)
+uses bounded live buffers, so consumers must drain them promptly. Cowboy's
+product log filter suppresses SDK tracing because SDK diagnostics can contain
+untrusted runtime error text; backend-facing errors are sanitized separately.
 
 <!-- cowboy-agent-watchdog-contract:start -->
 ```toml

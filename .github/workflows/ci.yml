@@ -32,3 +32,22 @@ jobs:
       - name: Run required SQLite tests
         shell: bash
         run: bash scripts/run-required-sqlite-tests.sh
+
+  copilot-sdk:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Check Copilot SDK Clippy
+        run: cargo clippy -p cowboy -p cowboy-agent-copilot-sdk --features cowboy/copilot-sdk --all-targets --locked -- -D warnings
+      - name: Test Copilot SDK backend
+        run: cargo test -p cowboy -p cowboy-agent-copilot-sdk --features cowboy/copilot-sdk --all-targets --locked

@@ -12,5 +12,23 @@ pub fn production_backend_registry() -> BackendRegistry {
     BackendRegistry::new(vec![
         std::sync::Arc::new(cowboy_agent_acp::AcpBackendConnector),
         std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
+        #[cfg(feature = "copilot-sdk")]
+        std::sync::Arc::new(cowboy_agent_copilot_sdk::CopilotSdkBackendConnector::default()),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registers_compiled_backends() {
+        let registry = production_backend_registry();
+        assert!(registry.connector("acp").is_some());
+        assert!(registry.connector("pi-rpc").is_some());
+        assert_eq!(
+            registry.connector("copilot-sdk").is_some(),
+            cfg!(feature = "copilot-sdk")
+        );
+    }
 }

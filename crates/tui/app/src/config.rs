@@ -1488,6 +1488,41 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
     }
 
     #[test]
+    fn copilot_sdk_backend_reaches_runtime_without_changing_acp_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[agents]]
+name = "default"
+command = "copilot"
+args = []
+backend = "copilot-sdk"
+model = { id = "example-model" }
+
+[[agents]]
+name = "reviewer"
+command = "copilot"
+args = ["--acp"]
+"#,
+        )
+        .unwrap();
+
+        let runtime = load_config(&path)
+            .unwrap()
+            .runtime_config(dir.path().to_path_buf());
+        assert_eq!(runtime.agents[0].backend, "copilot-sdk");
+        assert_eq!(
+            runtime.agents[0].model.as_ref().unwrap().id,
+            "example-model"
+        );
+        assert!(runtime.agents[0].args.is_empty());
+        assert_eq!(runtime.agents[1].backend, "acp");
+        assert_eq!(runtime.agents[1].args, ["--acp"]);
+    }
+
+    #[test]
     fn legacy_agent_config_omits_startup_readiness() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");

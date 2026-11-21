@@ -24,8 +24,8 @@ Current capabilities:
 
 ## Requirements
 
-- Rust `1.85` or newer.
-- An authenticated ACP-compatible coding-agent CLI on `PATH`.
+- Rust `1.89` or newer; the optional Copilot SDK backend requires Rust `1.94` or newer.
+- An authenticated ACP-compatible coding-agent CLI on `PATH` when using ACP.
 - Cargo and Git access to this repository.
 
 ## Install
@@ -285,6 +285,67 @@ args = ["--model=github-copilot/claude-haiku-4.5", "--thinking=low", "acp"]
 change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
+
+### Copilot SDK backend
+
+The optional `copilot-sdk` backend uses the official Rust SDK separately from
+ACP. Build with Rust 1.94 or newer:
+
+```bash
+cargo build -p cowboy --features copilot-sdk
+```
+
+Configure an absolute path to the compatible `copilot-runtime` executable, not
+the ordinary `copilot` CLI. The runtime package layout must remain intact.
+The SDK 2.0.1 package identifies runtime version 1.0.114; live compatibility
+with that version has not yet been verified by this project.
+
+```toml
+[[agents]]
+name = "default"
+backend = "copilot-sdk"
+command = "/absolute/path/to/copilot-runtime"
+args = []
+
+[agents.model]
+id = "model-id"
+```
+
+The runtime needs network access and a supported Copilot authentication method,
+such as a previously stored login or a token. The runtime receives only the
+configured global and per-agent `allowed_env` names that exist in Cowboy's
+process; allow the appropriate authentication and configuration variables
+explicitly. Those variables are exposed to the runtime and any tools it starts.
+Do not put token values in config files or logs. Cowboy suppresses SDK tracing
+because upstream diagnostics can include runtime-provided text; applications
+embedding the connector with a different tracing subscriber must do the same.
+SDK permission requests are denied by default, but this is **not a sandbox**:
+tools that do not request permission may still run. Use external isolation as
+appropriate. Cleanup terminates the runtime's Unix process group; descendants
+that leave that group may survive, so this is not process containment.
+
+This backend currently supports Unix only. It rejects `deny_all`,
+`deny_escalation`, model providers, MCP servers, startup readiness probes, and
+configured command arguments. It supports text prompts only. On inactivity,
+SDK turns fail and the runtime is terminated; ACP's watchdog recovery is not
+implemented. A failed session reload is reported rather than replaced. Pending
+work is interrupted on reload, not continued; historical SDK messages are not
+replayed as Cowboy events.
+
+An optional live smoke test creates a session, sends a prompt, closes and reloads
+it. It requires the absolute runtime path, compatible runtime files, network
+access, and configured authentication. It may incur usage charges. Normal tests
+do not invoke it:
+
+```bash
+export COWBOY_COPILOT_RUNTIME=/absolute/path/to/copilot-runtime
+cargo test -p cowboy-agent-copilot-sdk --features sdk authenticated_smoke -- --ignored
+```
+
+The smoke test passes `HOME`, `PATH`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,
+`GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_GITHUB_TOKEN` when present. Ensure the
+selected authentication method uses only the variables and credential files you
+intend to expose. This smoke test has not been run as part of this change.
 
 ### Native Pi RPC backend
 
