@@ -45,6 +45,12 @@ pub enum Command {
         message: String,
         response: oneshot::Sender<anyhow::Result<Value>>,
     },
+    /// Same wire command as [`Command::Prompt`] plus pi's `streamingBehavior`
+    /// queueing hint, used when pi rejects a prompt because a run is active.
+    FollowUpPrompt {
+        message: String,
+        response: oneshot::Sender<anyhow::Result<Value>>,
+    },
     GetState {
         response: oneshot::Sender<anyhow::Result<Value>>,
     },
@@ -425,6 +431,10 @@ pub async fn io_loop(
                                 serde_json::json!({"id": id, "type": "prompt", "message": message}).to_string(),
                                 response,
                             ),
+                            Command::FollowUpPrompt { message, response } => (
+                                serde_json::json!({"id": id, "type": "prompt", "message": message, "streamingBehavior": "followUp"}).to_string(),
+                                response,
+                            ),
                             Command::GetState { response } => (
                                 serde_json::json!({"id": id, "type": "get_state"}).to_string(),
                                 response,
@@ -741,20 +751,43 @@ impl Client for PiRpcClient {
             .collect::<Vec<_>>()
             .join("\n");
 
+        let mut queued = false;
         let disposition = match self
-            .send_command(|response| Command::Prompt { message, response })
+            .send_command(|response| Command::Prompt { message: message.clone(), response })
             .await
         {
             Ok(value) => value,
             Err(error) => {
-                self.stop_process_with_grace(Duration::ZERO).await;
-                self.closed = true;
-                return Err(error);
+                // pi rejects a prompt that arrives while a run is active, for
+                // example a restored session continuing its own pending work.
+                // Queue the message behind that run as a follow-up and wait for
+                // the combined turn to settle instead of failing the prompt.
+                if error.to_string().contains("Agent is already processing") {
+                    match self
+                        .send_command(|response| Command::FollowUpPrompt { message, response })
+                        .await
+                    {
+                        Ok(value) => {
+                            queued = true;
+                            value
+                        }
+                        Err(_) => {
+                            self.stop_process_with_grace(Duration::ZERO).await;
+                            self.closed = true;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    self.stop_process_with_grace(Duration::ZERO).await;
+                    self.closed = true;
+                    return Err(error);
+                }
             }
         };
-        // `handled` means pi consumed the message without starting a run
-        // (e.g. queued into an active turn) — nothing to wait for.
-        if disposition.get("disposition").and_then(Value::as_str) == Some("handled") {
+        // `handled` means pi consumed the message without starting a run and
+        // nothing will settle afterwards — but only for a direct prompt. A
+        // queued follow-up always waits for the active and queued work.
+        if !queued && disposition.get("disposition").and_then(Value::as_str) == Some("handled") {
             return Ok(StopReason::EndTurn);
         }
 
