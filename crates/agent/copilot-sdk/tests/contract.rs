@@ -278,7 +278,7 @@ async fn cancellation_deadline_covers_ack_and_abort_and_fails_closed() {
 }
 
 #[tokio::test]
-async fn filters_unrelated_origins_before_and_after_ack_without_delaying_unattributed_streaming() {
+async fn preserves_stream_order_while_filtering_unrelated_origins() {
     let connector = CopilotSdkBackendConnector::default();
     let mut client = connector.connect(&spec()).await.unwrap().client;
     let cwd = std::env::current_dir().unwrap();
@@ -290,37 +290,24 @@ async fn filters_unrelated_origins_before_and_after_ack_without_delaying_unattri
         )
         .await
         .unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let mut tx = Some(tx);
     let mut messages = Vec::new();
-    {
-        let mut handler = |event| {
-            if let Event::MessageChunk { content } = event {
-                let text = content["text"].as_str().unwrap().to_owned();
-                if text == "live"
-                    && let Some(tx) = tx.take()
-                {
-                    let _ = tx.send(());
-                }
-                messages.push(text);
-            }
-        };
-        let turn = client.prompt(
+    let result = client
+        .prompt(
             &id,
             vec![PromptContent::text("origins")],
             PromptTurnCancellation::disabled(),
-            &mut handler,
-        );
-        tokio::pin!(turn);
-        tokio::select! {
-            result = &mut turn => panic!("turn completed before streaming signal: {result:?}"),
-            result = tokio::time::timeout(std::time::Duration::from_millis(750), rx) => result.unwrap().unwrap(),
-        }
-        assert!(matches!(turn.await.unwrap(), StopReason::EndTurn));
-    }
+            &mut |event| {
+                if let Event::MessageChunk { content } = event {
+                    messages.push(content["text"].as_str().unwrap().to_owned());
+                }
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, StopReason::EndTurn));
     assert_eq!(
         messages,
-        ["live", "pre-current", "pre-delta", "post-current"]
+        ["pre-current", "pre-delta", "live", "post-current"]
     );
     client.close().await.unwrap();
 }

@@ -704,6 +704,7 @@ async fn run_turn(
     tokio::pin!(deadline);
     let mut message_id = None::<String>;
     let mut pending = Vec::new();
+    let mut output_deferred = false;
     let mut correlation = TurnCorrelation::default();
     let mut cancelled = false;
     let mut cancellation_deadline = None;
@@ -739,9 +740,11 @@ async fn run_turn(
                 if is_root(&event) && event.event_type == "session.warning" && event.data.get("warningType").and_then(Value::as_str) == Some("policy_blocked") {
                     bail!("copilot-sdk request blocked by policy");
                 }
-                let deferred = message_id.is_none() && (event.event_type == "assistant.message"
+                let deferred = message_id.is_none() && (output_deferred
+                    || event.event_type == "assistant.message"
                     || (event.event_type.starts_with("assistant.")
                         && event.data.get("originatingMessageId").and_then(Value::as_str).is_some_and(|origin| !origin.is_empty())));
+                output_deferred |= deferred;
                 if let Some(id) = &message_id { correlation.observe(&event, id)?; }
                 else {
                     if pending.len() >= 4096 { bail!("copilot-sdk prompt emitted too many events before acknowledgement"); }
