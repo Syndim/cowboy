@@ -175,7 +175,6 @@ fn main() {
                     "assistant.message_delta",
                     json!({"messageId":"abort-stream", "deltaContent":"x"}),
                 );
-                std::thread::sleep(std::time::Duration::from_millis(2));
             }
             event(session, "session.idle", json!({"aborted":true}));
             std::thread::sleep(std::time::Duration::from_millis(

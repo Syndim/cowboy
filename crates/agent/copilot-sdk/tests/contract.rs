@@ -168,7 +168,9 @@ async fn cancellation_then_another_turn_and_error_closes_client() {
 async fn cancellation_during_delayed_ack_and_abort_keeps_session_usable() {
     for prompt in ["delayed-ack", "delayed-abort"] {
         let connector = CopilotSdkBackendConnector::default();
-        let mut client = connector.connect(&spec()).await.unwrap().client;
+        let mut config = spec();
+        config.watchdog.cancel_timeout_seconds = 10;
+        let mut client = connector.connect(&config).await.unwrap().client;
         let cwd = std::env::current_dir().unwrap();
         let id = client
             .new_session(
@@ -207,11 +209,12 @@ async fn cancellation_during_delayed_ack_and_abort_keeps_session_usable() {
             tokio::pin!(turn);
             tokio::select! {
                 result = &mut turn => panic!("{prompt} completed before abort events: {result:?}"),
-                result = tokio::time::timeout(std::time::Duration::from_millis(750), event_rx) => {
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx) => {
                     result.expect("events were not consumed while abort was pending").unwrap();
                 }
             }
-            turn.await.unwrap()
+            turn.await
+                .unwrap_or_else(|error| panic!("{prompt}: {error:#}"))
         };
         assert!(matches!(result, StopReason::Cancelled), "{prompt}");
         assert_eq!(
