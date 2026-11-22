@@ -159,8 +159,8 @@ ceilings are exhausted.
   initial/change-specific wording is carried only by the current turn
 - sends role/task/deliverable once per backend session/task fingerprint, while
   reused-task dispatches send only the turn and new input sequences
-- resets delivery fingerprints after load failure creates a fresh session, so
-  role, task, recovery context, turn, inputs, and deliverable are self-contained
+- fails when a persisted backend session cannot be loaded rather than silently
+  replacing it with a fresh session
 - opens a durable prompt window identified by an opaque token and bound to the run, step record, step, and role
 - registers a process-local sequence watch at the window's durable baseline before publishing the open-window event
 - sends the initial prompt through `cowboy-agent-client::Client` with an awaitable turn-cancellation input
@@ -199,12 +199,32 @@ them through `WorkflowRuntime`, SQLite, `EngineActionDispatcher`, and
 boundary. `records.json` is derived from persisted `StepRecord.input.context`,
 `StepDetail.session_id`, and scripted-client new/load-session events. The
 scenarios cover same-runtime reuse, retry-only correction, restart with
-successful session loading, and restart with load failure/new-session
-recreation. Optional captures are written below
-`target/prompt-captures/reduce_agent_step_prompt_payloads/`.
+successful session loading, and session-load failure. Optional captures are
+written under the directory specified by `COWBOY_PROMPT_CAPTURE_DIR`.
 
-`WorkflowRuntime` resolves agent launch specs from config and routes them through the `BackendRegistry` installed by the composition root; today that registry contains the ACP connector from `cowboy-agent-acp` using the
-configured command, args, and model.
+`WorkflowRuntime` resolves agent launch specs from config and routes them through
+the `BackendRegistry` installed by the composition root. The product registry
+contains the ACP and Pi RPC connectors, and the Copilot SDK connector when its
+feature is enabled.
+
+#### Copilot SDK backend
+
+The optional `copilot-sdk` product feature registers a separate backend based
+on the official `copilot-sdk` 2.0.1 Rust package; it requires Rust 1.94 while
+Cowboy's default build retains its 1.89 declaration. ACP remains the default.
+The SDK's in-process default is not used: Cowboy starts a separate runtime with
+an allowlisted environment and connects the SDK over its stdio streams. See the
+README for configuration, authentication, security limitations, and the opt-in
+smoke test.
+
+The backend creates and reloads SDK sessions by durable ID, maps streamed text
+and tool progress to the common client events, and aborts cancelled turns.
+Prepared subscriptions avoid the SDK's pre-subscription startup event gap;
+stream lag and failed reloads fail the operation rather than silently losing
+output or replacing a session. The SDK's [event delivery](https://github.com/microsoft/copilot-sdk/blob/v2.0.1/rust/README.md#streaming)
+uses bounded live buffers, so consumers must drain them promptly. Cowboy's
+product log filter suppresses SDK tracing because SDK diagnostics can contain
+untrusted runtime error text; backend-facing errors are sanitized separately.
 
 <!-- cowboy-agent-watchdog-contract:start -->
 ```toml

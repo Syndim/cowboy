@@ -13,7 +13,7 @@ use std::sync::Once;
 
 use time::{Date, OffsetDateTime};
 use tracing_appender::rolling;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, filter::filter_fn, prelude::*};
 
 /// Default filter for the final `cowboy` product binary.
 ///
@@ -57,17 +57,24 @@ pub fn init_file_logging(
         .map(EnvFilter::new)
         .unwrap_or_else(|| EnvFilter::new(default_directive));
 
-    let _ = tracing_subscriber::fmt()
+    let layer = tracing_subscriber::fmt::layer()
         .with_writer(appender)
-        .with_env_filter(filter)
         .with_ansi(false)
         .with_target(true)
         .with_file(true)
         .with_line_number(true)
         .with_thread_ids(true)
+        .with_filter(filter_fn(safe_log_target));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
         .try_init();
 
     Ok(dir.join(file_name))
+}
+
+fn safe_log_target(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.target() != "copilot_sdk" && !metadata.target().starts_with("copilot_sdk::")
 }
 
 fn log_file_name(name: &str, date: Date, pid: u32) -> String {
@@ -177,6 +184,42 @@ mod tests {
             assert!(!log.contains("unrelated-debug-marker"));
             assert!(log.contains("normal-info-marker"));
         }
+    }
+
+    #[test]
+    fn copilot_sdk_logs_remain_disabled_even_when_explicitly_enabled() {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .with_filter(filter_fn(safe_log_target));
+        let subscriber = tracing_subscriber::registry()
+            .with(EnvFilter::new("trace,copilot_sdk::jsonrpc=trace"))
+            .with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(target: "copilot_sdk::jsonrpc", "secret-token-canary");
+            tracing::info!(target: "cowboy_workflow_engine", "safe-marker");
+        });
+        let bytes = sink.0.lock().unwrap();
+        let log = std::str::from_utf8(&bytes).unwrap();
+        assert!(!log.contains("secret-token-canary"));
+        assert!(log.contains("safe-marker"));
     }
 
     #[test]
