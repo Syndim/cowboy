@@ -1,4 +1,4 @@
-#![cfg(all(feature = "sdk", unix))]
+#![cfg(unix)]
 
 use cowboy_agent_client::{
     AgentAccess, AgentLaunchSpec, AgentWatchdogOptions, BackendConnector, Event, ModelInfo,
