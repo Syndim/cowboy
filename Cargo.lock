@@ -446,6 +446,7 @@ dependencies = [
  "chrono",
  "cowboy-agent-acp",
  "cowboy-agent-client",
+ "cowboy-agent-codex",
  "cowboy-agent-copilot-sdk",
  "cowboy-agent-pi",
  "cowboy-command-parser",
@@ -499,6 +500,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "cowboy-agent-codex"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cowboy-agent-client",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "windows-sys",
 ]
 
 [[package]]

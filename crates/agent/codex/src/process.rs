@@ -1,0 +1,470 @@
+//! JSONL transport for the codex RPC backend: a local subprocess speaking
+//! one-JSON-object-per-line records over stdin/stdout. The process tree is owned
+//! so descendants cannot outlive a session. Stderr is discarded because it
+//! may contain credentials.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::time::Instant;
+
+/// A platform handle on the process tree rooted at one spawned child.
+struct ProcessTreeScope {
+    inner: platform::Scope,
+    terminated: AtomicBool,
+}
+
+impl ProcessTreeScope {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: platform::Scope::new()?,
+            terminated: AtomicBool::new(false),
+        })
+    }
+
+    fn configure(&self, command: &mut Command) {
+        self.inner.configure(command);
+    }
+
+    fn attach(&self, child: &Child) -> anyhow::Result<()> {
+        self.inner.attach(child)
+    }
+
+    fn terminate(&self) -> anyhow::Result<()> {
+        if self.terminated.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner.terminate()
+    }
+}
+
+impl Drop for ProcessTreeScope {
+    fn drop(&mut self) {
+        if let Err(err) = self.terminate() {
+            tracing::warn!(error = %err, "codex process tree termination on drop failed");
+        }
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use tokio::process::{Child, Command};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, TerminateJobObject,
+    };
+
+    pub(super) struct Scope {
+        job: HANDLE,
+    }
+
+    unsafe impl Send for Scope {}
+    unsafe impl Sync for Scope {}
+
+    impl Scope {
+        pub(super) fn new() -> anyhow::Result<Self> {
+            // SAFETY: `CreateJobObjectW` with null arguments creates an
+            // unnamed job object with default security and returns null on
+            // failure.
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Err(anyhow::anyhow!(
+                    "failed to create codex job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` is a correctly sized, initialized
+            // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` matching the requested
+            // information class, and `job` is a live job handle.
+            let ok = unsafe {
+                SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                // SAFETY: `job` is a live handle owned here and not used again.
+                unsafe { CloseHandle(job) };
+                return Err(anyhow::anyhow!(
+                    "failed to configure codex job object: {error}"
+                ));
+            }
+
+            Ok(Self { job })
+        }
+
+        pub(super) fn configure(&self, _command: &mut Command) {}
+
+        pub(super) fn attach(&self, child: &Child) -> anyhow::Result<()> {
+            let handle = child
+                .raw_handle()
+                .ok_or_else(|| anyhow::anyhow!("codex process handle unavailable"))?;
+            // SAFETY: `handle` is the live process handle owned by `child`,
+            // and `self.job` is a live job handle.
+            let ok = unsafe { AssignProcessToJobObject(self.job, handle.cast()) };
+            if ok == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to assign codex process to job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            Ok(())
+        }
+
+        pub(super) fn terminate(&self) -> anyhow::Result<()> {
+            // SAFETY: `self.job` is a live job handle; terminating an empty or
+            // already terminated job is a no-op.
+            let ok = unsafe { TerminateJobObject(self.job, 1) };
+            if ok == 0 {
+                return Err(anyhow::anyhow!(
+                    "failed to terminate codex job object: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            Ok(())
+        }
+    }
+
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            // SAFETY: `self.job` is a live handle owned here and dropped once.
+            unsafe { CloseHandle(self.job) };
+        }
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    use tokio::process::{Child, Command};
+
+    /// A Unix process group owning the codex process tree.
+    pub(super) struct Scope {
+        pgid: AtomicI32,
+    }
+
+    impl Scope {
+        pub(super) fn new() -> anyhow::Result<Self> {
+            Ok(Self {
+                pgid: AtomicI32::new(0),
+            })
+        }
+
+        pub(super) fn configure(&self, command: &mut Command) {
+            command.process_group(0);
+        }
+
+        pub(super) fn attach(&self, child: &Child) -> anyhow::Result<()> {
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("codex process id unavailable"))?;
+            self.pgid.store(pid as i32, Ordering::SeqCst);
+            Ok(())
+        }
+
+        pub(super) fn terminate(&self) -> anyhow::Result<()> {
+            let pgid = self.pgid.load(Ordering::SeqCst);
+            if pgid <= 0 {
+                return Ok(());
+            }
+
+            // SAFETY: `killpg` is a plain libc call with an owned process
+            // group id; a missing group yields `ESRCH`, handled below.
+            let result = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(());
+                }
+
+                return Err(anyhow::anyhow!(
+                    "failed to terminate codex process group {pgid}: {error}"
+                ));
+            }
+
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+mod platform {
+    use tokio::process::{Child, Command};
+
+    /// Unsupported platform: tree ownership is a no-op and callers fall back
+    /// to killing the directly spawned child only.
+    pub(super) struct Scope;
+
+    impl Scope {
+        pub(super) fn new() -> anyhow::Result<Self> {
+            Ok(Self)
+        }
+
+        pub(super) fn configure(&self, _command: &mut Command) {}
+
+        pub(super) fn attach(&self, _child: &Child) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        pub(super) fn terminate(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+}
+
+/// Spawn options for one codex RPC subprocess.
+#[derive(Debug, Clone)]
+pub struct CodexProcessConfig {
+    /// Executable to spawn (typically `pi`).
+    pub command: String,
+    /// Arguments putting the executable into RPC mode.
+    pub args: Vec<String>,
+    /// Restrict inherited environment to these variable names.
+    pub clear_env: bool,
+    pub allowed_env: Vec<String>,
+    /// Environment overrides applied on top of the inherited environment.
+    pub env: Vec<(String, String)>,
+}
+
+/// A running codex subprocess with JSONL framing over stdio.
+pub struct CodexProcess {
+    writer: Option<BufWriter<ChildStdin>>,
+    reader: BufReader<ChildStdout>,
+    read_buffer: Vec<u8>,
+    line_started: Option<Instant>,
+    child: Child,
+    command: String,
+    pid: Option<u32>,
+    tree: Arc<ProcessTreeScope>,
+}
+
+impl CodexProcess {
+    pub(crate) async fn spawn_at(
+        config: &CodexProcessConfig,
+        cwd: Option<&Path>,
+    ) -> anyhow::Result<Self> {
+        let mut cmd = Command::new(&config.command);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
+        for arg in &config.args {
+            cmd.arg(arg);
+        }
+        if config.clear_env {
+            cmd.env_clear();
+            for name in &config.allowed_env {
+                if let Some(value) = std::env::var_os(name) {
+                    cmd.env(name, value);
+                }
+            }
+        }
+        for (key, val) in &config.env {
+            cmd.env(key, val);
+        }
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::null());
+        cmd.kill_on_drop(true);
+
+        let tree = Arc::new(ProcessTreeScope::new()?);
+        tree.configure(&mut cmd);
+
+        // Linux can transiently reject execve with ETXTBSY for a file that
+        // was written moments earlier (the kernel may still consider the
+        // inode open for writing, e.g. under concurrent test activity or
+        // fs writeback). Retry that specific error with a short backoff;
+        // every other spawn failure fails immediately.
+        let mut child = spawn_with_busy_retry(&mut cmd, &config.command).await?;
+
+        if let Err(err) = tree.attach(&child) {
+            let _ = child.kill().await;
+            return Err(anyhow::anyhow!(
+                "Failed to take ownership of codex process tree for '{}': {}",
+                config.command,
+                err
+            ));
+        }
+
+        let pid = child.id();
+        let command = Path::new(&config.command)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        let stdin = child.stdin.take().expect("stdin piped");
+        let stdout = child.stdout.take().expect("stdout piped");
+
+        tracing::debug!(
+            event = "codex_process_spawned",
+            command = %command,
+            pid = child.id(),
+            clear_env = config.clear_env,
+            argument_count = config.args.len(),
+            allowed_env_count = config.allowed_env.len(),
+            configured_env_count = config.env.len(),
+            "codex subprocess spawned"
+        );
+
+        Ok(Self {
+            writer: Some(BufWriter::new(stdin)),
+            reader: BufReader::new(stdout),
+            read_buffer: Vec::new(),
+            line_started: None,
+            child,
+            command,
+            pid,
+            tree,
+        })
+    }
+
+    /// Write one JSONL record (a single line) and flush it.
+    pub async fn send_line(&mut self, line: &str) -> anyhow::Result<()> {
+        let Some(writer) = self.writer.as_mut() else {
+            anyhow::bail!("codex stdin is closed");
+        };
+        writer.write_all(line.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    /// Read the next JSONL record, blocking until one full line is available.
+    ///
+    /// Returns `None` on clean EOF with no partial line pending. Diagnostics
+    /// on stderr are discarded, never parsed as protocol data.
+    pub async fn recv_line(&mut self) -> anyhow::Result<Option<String>> {
+        loop {
+            let started = *self.line_started.get_or_insert_with(Instant::now);
+            let available = match self.reader.fill_buf().await {
+                Ok(available) => available,
+                Err(error) => {
+                    tracing::warn!(event = "codex_stdout_read_failed", command = %self.command, pid = self.pid, error = %error, "codex stdout read failed");
+                    return Err(error.into());
+                }
+            };
+            let eof = available.is_empty();
+            // Clean EOF with no partial line pending: signal orderly exit.
+            // Without this guard, EOF loops back into fill_buf() forever.
+            if eof && self.read_buffer.is_empty() {
+                self.line_started = None;
+                tracing::debug!(event = "codex_stdout_closed", command = %self.command, pid = self.pid, "codex stdout closed");
+                return Ok(None);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.map_or(available.len(), |index| index + 1);
+            self.read_buffer.extend_from_slice(&available[..count]);
+            self.reader.consume(count);
+            if newline.is_none() && !eof {
+                continue;
+            }
+            self.line_started = None;
+            let bytes = self.read_buffer.len();
+            let frame = std::mem::take(&mut self.read_buffer);
+            let mut line = match String::from_utf8(frame) {
+                Ok(line) => line,
+                Err(_) => {
+                    tracing::warn!(event = "codex_stdout_frame_failed", command = %self.command, pid = self.pid, bytes, "codex stdout frame is not valid UTF-8");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "codex stdout frame is invalid UTF-8",
+                    )
+                    .into());
+                }
+            };
+            if line.ends_with('\n') {
+                line.pop();
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+            }
+            tracing::debug!(
+                event = "codex_stdout_frame_complete",
+                command = %self.command,
+                pid = self.pid,
+                bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                empty = line.trim().is_empty(),
+                "codex stdout frame complete"
+            );
+            if !line.trim().is_empty() {
+                return Ok(Some(line));
+            }
+        }
+    }
+
+    /// Force an immediate tree kill after an orderly exit was not observed.
+    pub async fn kill(&mut self) {
+        let status = self.child.try_wait().ok().flatten();
+        let tree_terminated = self.tree.terminate().is_ok();
+        tracing::debug!(
+            command = %self.command,
+            pid = self.pid,
+            status = ?status,
+            tree_terminated,
+            "Killing codex subprocess"
+        );
+        if status.is_none() {
+            let _ = self.child.kill().await;
+        }
+    }
+}
+
+/// Spawn `cmd`, retrying briefly on `ETXTBSY` ("Text file busy").
+///
+/// The file was already written by the caller; the busy condition is
+/// transient on Linux, so a bounded retry converts the flake into a pass
+/// while keeping every other spawn failure immediate.
+async fn spawn_with_busy_retry(cmd: &mut Command, command: &str) -> anyhow::Result<Child> {
+    const ATTEMPTS: u32 = 20;
+    const BACKOFF: Duration = Duration::from_millis(25);
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match cmd.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if is_text_file_busy(&error) && attempt < ATTEMPTS => {
+                tracing::debug!(
+                    event = "codex_spawn_busy_retry",
+                    command = %command,
+                    attempt,
+                    "codex spawn hit ETXTBSY; retrying"
+                );
+                tokio::time::sleep(BACKOFF).await;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to spawn codex process '{}': {}",
+                    command,
+                    error
+                ));
+            }
+        }
+    }
+}
+
+fn is_text_file_busy(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ETXTBSY)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
