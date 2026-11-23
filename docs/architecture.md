@@ -204,8 +204,11 @@ written under the directory specified by `COWBOY_PROMPT_CAPTURE_DIR`.
 
 `WorkflowRuntime` resolves agent launch specs from config and routes them through
 the `BackendRegistry` installed by the composition root. The product registry
-contains the ACP and Pi RPC connectors, and the Copilot SDK connector when its
-feature is enabled.
+contains the ACP, Claude Code, Pi RPC, and Codex app-server connectors, and the
+Copilot SDK connector when its feature is enabled. The Claude Code connector
+launches `claude` directly and implements the Agent SDK's subprocess protocol
+in Rust. It denies host permission requests, resumes saved sessions without
+replaying history, and keeps Claude's protocol out of the workflow engine.
 
 #### Copilot SDK backend
 

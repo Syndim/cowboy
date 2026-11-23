@@ -341,6 +341,63 @@ change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
 
+### Claude Code backend
+
+`claude-code` is an opt-in CLI/TUI backend that launches Anthropic's official
+`claude` executable directly. The Rust client speaks the same newline-delimited
+`stream-json` protocol as the [Python Agent SDK](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).
+It needs no ACP adapter or Python/Node companion process. Install
+[Claude Code](https://code.claude.com/docs/en/setup). Cowboy checks the protocol
+handshake, not an exact version string; the compatibility reference is Claude
+Code **2.1.330**. The private control messages may change across releases.
+
+```toml
+[[agents]]
+name = "default"
+backend = "claude-code"
+command = "claude" # Or the absolute path to the executable.
+args = []
+allowed_env = ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+# access = "deny_all" # Disable Claude's built-in tools.
+
+# [agents.model]
+# id = "opus"
+```
+
+Use a billed Anthropic Console API key in `ANTHROPIC_API_KEY`, and set
+`CLAUDE_CONFIG_DIR` to a dedicated absolute directory. Only put environment
+variable **names** in TOML, never credential values. Do not rely on a stored
+subscription login; review Anthropic's [Agent SDK terms and authentication guidance](https://code.claude.com/docs/en/agent-sdk/overview).
+Cowboy does not log the subprocess's stderr or raw protocol frames.
+
+Cowboy uses Claude's `default` permission mode and denies requests that require
+host approval. This is **not a sandbox**: Claude can still run tools it already
+allows. Cowboy requests Claude’s `--safe-mode`, disables user/project/local
+settings sources, and does not configure MCP servers. Without these restrictions,
+headless Claude can load hooks and MCP servers without a trust prompt. Managed
+settings can still apply. Use trusted workspaces and executables.
+Interactive approvals, ACP-specific access modes and startup readiness checks,
+and Cowboy-provided MCP servers are not supported.
+
+Cowboy streams text and tool progress, and sends an interrupt on cancellation.
+If the turn does not settle within the configured watchdog limits, Cowboy closes
+and terminates the tracked subprocess tree. Resume uses Claude's saved session
+ID and restores conversation context without replaying the old transcript into
+Cowboy. Keep the same working directory and Claude state directory. Claude
+validates saved session availability when the first resumed prompt runs. A
+configured model is passed to the CLI on both creation and resume.
+
+Ordinary tests use a local mock. For the opt-in live test on Unix, install
+Claude Code 2.1.330 or a compatible version on `PATH`, provide a billed API key,
+and run:
+
+```sh
+state=$(mktemp -d)
+CLAUDE_CONFIG_DIR="$state" cargo test -p cowboy-agent-claude --test protocol real_claude_smoke -- --ignored
+```
+
+This makes two billable turns and writes session history to `$state`.
+
 ### Copilot SDK backend
 
 The optional `copilot-sdk` backend uses the official Rust SDK separately from
@@ -473,8 +530,9 @@ the child receives the union of the global names and that agent's names.
 Multiple roles selecting the same named agent intentionally share its policy;
 use separate agent entries when roles need different policies.
 
-Set one `access` value per `[[agents]]` entry. Omitting it (or setting
-`access = "default"`) leaves ACP tools and permission requests available. With
+Set one `access` value per `[[agents]]` entry. For the generic `acp` backend,
+omitting it (or setting `access = "default"`) leaves ACP tools and permission
+requests available. The `claude-code` backend instead denies approval requests. With
 `access = "deny_all"`, Cowboy cancels ACP permission requests, rejects ACP tool
 events, and aborts the operation when the backend attempts to use a tool. The
 backend may already have executed a tool before its ACP notification arrives:

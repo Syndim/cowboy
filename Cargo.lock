@@ -445,6 +445,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cowboy-agent-acp",
+ "cowboy-agent-claude",
  "cowboy-agent-client",
  "cowboy-agent-codex",
  "cowboy-agent-copilot-sdk",
@@ -487,6 +488,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
+ "windows-sys",
+]
+
+[[package]]
+name = "cowboy-agent-claude"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "cowboy-agent-client",
+ "libc",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
  "windows-sys",
 ]
