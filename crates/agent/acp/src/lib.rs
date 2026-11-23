@@ -17,6 +17,6 @@ pub mod transport;
 pub use agent_processes::terminate_all_agent_processes;
 pub use backend::BackendPreset;
 pub use client::Client;
-pub use connector::{AcpBackendConnector, acp_connector};
+pub use connector::{AcpBackendConnector, ClaudeCodeBackendConnector, acp_connector};
 pub use cowboy_agent_client::{AgentAccess, AgentWatchdogOptions};
 pub use transport::TransportConfig;

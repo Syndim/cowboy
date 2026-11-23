@@ -11,6 +11,7 @@ use cowboy_agent_client::BackendRegistry;
 pub fn production_backend_registry() -> BackendRegistry {
     BackendRegistry::new(vec![
         std::sync::Arc::new(cowboy_agent_acp::AcpBackendConnector),
+        std::sync::Arc::new(cowboy_agent_acp::ClaudeCodeBackendConnector),
         std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
         std::sync::Arc::new(cowboy_agent_codex::CodexBackendConnector),
         #[cfg(feature = "copilot-sdk")]
@@ -26,6 +27,7 @@ mod tests {
     fn registers_compiled_backends() {
         let registry = production_backend_registry();
         assert!(registry.connector("acp").is_some());
+        assert!(registry.connector("claude-code").is_some());
         assert!(registry.connector("pi-rpc").is_some());
         assert!(registry.connector("codex-app-server").is_some());
         assert_eq!(

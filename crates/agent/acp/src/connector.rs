@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use cowboy_agent_client::{
-    AgentLaunchSpec, AgentWatchdogOptions, BackendConnector, ResolvedBackend,
+    AgentAccess, AgentLaunchSpec, AgentWatchdogOptions, BackendConnector, ResolvedBackend,
 };
 
 use crate::client::Client as AcpClient;
@@ -80,6 +80,47 @@ impl BackendConnector for AcpBackendConnector {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ClaudeCodeBackendConnector;
+
+impl ClaudeCodeBackendConnector {
+    fn launch_spec(spec: &AgentLaunchSpec) -> anyhow::Result<AgentLaunchSpec> {
+        let mut spec = spec.clone();
+        match &spec.access {
+            AgentAccess::Default => {
+                spec.access = AgentAccess::DenyEscalation {
+                    acp_mode: "default".into(),
+                };
+            }
+            AgentAccess::DenyAll => {
+                anyhow::bail!(
+                    "claude-code does not support deny_all; use deny_escalation with ACP mode 'default' or 'plan'"
+                );
+            }
+            AgentAccess::DenyEscalation { acp_mode }
+                if matches!(acp_mode.as_str(), "default" | "plan") => {}
+            AgentAccess::DenyEscalation { .. } => {
+                anyhow::bail!("claude-code requires ACP mode 'default' or 'plan'");
+            }
+        }
+        if !spec.args.iter().any(|arg| arg == "--hide-claude-auth") {
+            spec.args.push("--hide-claude-auth".into());
+        }
+        Ok(spec)
+    }
+}
+
+#[async_trait]
+impl BackendConnector for ClaudeCodeBackendConnector {
+    fn kind(&self) -> &str {
+        "claude-code"
+    }
+
+    async fn connect(&self, spec: &AgentLaunchSpec) -> anyhow::Result<ResolvedBackend> {
+        AcpBackendConnector.connect(&Self::launch_spec(spec)?).await
+    }
+}
+
 /// Convenience constructor wiring [`AcpBackendConnector`] into a registry entry.
 pub fn acp_connector() -> Arc<dyn BackendConnector> {
     Arc::new(AcpBackendConnector)
@@ -88,7 +129,21 @@ pub fn acp_connector() -> Arc<dyn BackendConnector> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowboy_agent_client::{AgentAccess, ModelInfo, StartupReadiness};
+    use cowboy_agent_client::{ModelInfo, StartupReadiness};
+
+    #[test]
+    fn claude_code_rejects_unsupported_permission_modes() {
+        for access in [
+            AgentAccess::DenyAll,
+            AgentAccess::DenyEscalation {
+                acp_mode: "bypassPermissions".into(),
+            },
+        ] {
+            let mut configured = spec();
+            configured.access = access;
+            assert!(ClaudeCodeBackendConnector::launch_spec(&configured).is_err());
+        }
+    }
 
     fn spec() -> AgentLaunchSpec {
         AgentLaunchSpec {

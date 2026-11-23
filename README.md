@@ -341,6 +341,73 @@ change the model through ACP; the backend's launch arguments or own default stay
 authoritative. When provided, Cowboy selects that model through ACP session
 configuration and fails if the agent does not offer it.
 
+### Claude Code backend
+
+`claude-code` is an opt-in backend for the CLI and TUI. It runs the separately
+maintained [Claude Agent ACP adapter v0.109.1](https://github.com/agentclientprotocol/claude-agent-acp/releases/tag/v0.109.1)
+over stdio. The adapter wraps Anthropic's official Claude Agent SDK; it is not
+native Anthropic ACP. Anthropic's [headless CLI](https://code.claude.com/docs/en/headless)
+can stream JSON and resume a session, but using it directly would require a
+separate client for history replay and tool approval requests. Install the
+adapter release archive for your platform (keep its
+paired executables together), or use Node.js 22+ and
+`npm install -g @agentclientprotocol/claude-agent-acp@0.109.1`.
+
+```toml
+[[agents]]
+name = "default" # Or choose a separate name and select it in the workflow.
+backend = "claude-code"
+command = "claude-agent-acp" # An absolute path also works.
+args = []
+allowed_env = ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+
+# Optional: use an exact model value advertised by the adapter.
+# [agents.model]
+# id = "opus"
+```
+
+Set `ANTHROPIC_API_KEY` in Cowboy's environment using an Anthropic Console API
+key with billing enabled. List only variable **names** in TOML; never put keys
+in arguments, prompts, or config files. Review the [Agent SDK authentication
+and third-party product terms](https://code.claude.com/docs/en/agent-sdk/overview).
+Cowboy adds `--hide-claude-auth`; Claude subscription login is not a supported
+Cowboy authentication flow. Use a dedicated, absolute `CLAUDE_CONFIG_DIR` to
+avoid mixing Claude settings and saved sessions with other integrations.
+
+Configure `{"permissions":{"defaultMode":"default"}}` in that directory's
+`settings.json`. Cowboy verifies the mode reported by the adapter before
+prompting, including on reload, and denies permission requests instead of
+automatically approving them. To use Claude's `plan` mode, set it in Claude's
+settings and set `access = { mode = "deny_escalation", acp_mode = "plan" }` in the
+agent entry. Other modes, `deny_all`, interactive approval, and in-app login are
+not supported. A permission denial is **not a sandbox**: tools already allowed
+by Claude's policy may still run, and headless Claude may load user or project
+settings, execute hooks, and connect to MCP servers without a trust prompt.
+Use only trusted workspaces and settings; don't preapprove broad shell commands,
+enable bypass permissions, or expose credentials to untrusted tools.
+
+Cowboy sends the workflow working directory on session creation and reload,
+streams text and tool progress, and interrupts the active turn on cancellation.
+Background commands may outlive a turn cancellation; closing the ACP client
+terminates the tracked process tree. To resume after a restart, keep the same
+absolute working directory and Claude configuration/session storage. Model
+selection applies to new sessions; reload uses the adapter's restored model,
+not a newly edited Cowboy model setting.
+
+Ordinary tests use a local mock with no credentials or network. To opt in to
+the live smoke test, install the pinned adapter, set `ANTHROPIC_API_KEY` as above,
+and run from a trusted checkout on a system with access to the Anthropic API:
+
+```sh
+state=$(mktemp -d)
+CLAUDE_CONFIG_DIR="$state" cargo test -p cowboy-agent-acp --test claude_code real_claude_code_smoke -- --ignored
+```
+
+Use `CLAUDE_ACP_COMMAND` if the executable is not on `PATH`. The smoke test uses
+an empty temporary project and checks streamed text and continuation in a
+fresh adapter process. It incurs API usage and writes Claude history into
+`$state`; remove that directory after the test if you don't need the history.
+
 ### Copilot SDK backend
 
 The optional `copilot-sdk` backend uses the official Rust SDK separately from
@@ -473,8 +540,9 @@ the child receives the union of the global names and that agent's names.
 Multiple roles selecting the same named agent intentionally share its policy;
 use separate agent entries when roles need different policies.
 
-Set one `access` value per `[[agents]]` entry. Omitting it (or setting
-`access = "default"`) leaves ACP tools and permission requests available. With
+Set one `access` value per `[[agents]]` entry. For the generic `acp` backend,
+omitting it (or setting `access = "default"`) leaves ACP tools and permission
+requests available. The `claude-code` backend instead denies approval requests. With
 `access = "deny_all"`, Cowboy cancels ACP permission requests, rejects ACP tool
 events, and aborts the operation when the backend attempts to use a tool. The
 backend may already have executed a tool before its ACP notification arrives:
