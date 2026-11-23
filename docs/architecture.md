@@ -206,9 +206,9 @@ written under the directory specified by `COWBOY_PROMPT_CAPTURE_DIR`.
 the `BackendRegistry` installed by the composition root. The product registry
 contains the ACP, Claude Code, Pi RPC, and Codex app-server connectors, and the
 Copilot SDK connector when its feature is enabled. The Claude Code connector
-reuses the ACP client with a required Claude permission mode and denied
-permission requests. It runs the separately maintained Claude Agent ACP adapter
-over stdio; neither the adapter nor its protocol is part of the workflow engine.
+launches `claude` directly and implements the Agent SDK's subprocess protocol
+in Rust. It denies host permission requests, resumes saved sessions without
+replaying history, and keeps Claude's protocol out of the workflow engine.
 
 #### Copilot SDK backend
 

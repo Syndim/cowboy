@@ -343,70 +343,60 @@ configuration and fails if the agent does not offer it.
 
 ### Claude Code backend
 
-`claude-code` is an opt-in backend for the CLI and TUI. It runs the separately
-maintained [Claude Agent ACP adapter v0.109.1](https://github.com/agentclientprotocol/claude-agent-acp/releases/tag/v0.109.1)
-over stdio. The adapter wraps Anthropic's official Claude Agent SDK; it is not
-native Anthropic ACP. Anthropic's [headless CLI](https://code.claude.com/docs/en/headless)
-can stream JSON and resume a session, but using it directly would require a
-separate client for history replay and tool approval requests. Install the
-adapter release archive for your platform (keep its
-paired executables together), or use Node.js 22+ and
-`npm install -g @agentclientprotocol/claude-agent-acp@0.109.1`.
+`claude-code` is an opt-in CLI/TUI backend that launches Anthropic's official
+`claude` executable directly. The Rust client speaks the same newline-delimited
+`stream-json` protocol as the [Python Agent SDK](https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/_internal/query.py).
+It needs no ACP adapter or Python/Node companion process. Install
+[Claude Code](https://code.claude.com/docs/en/setup). Cowboy checks the protocol
+handshake, not an exact version string; the compatibility reference is Claude
+Code **2.1.330**. The private control messages may change across releases.
 
 ```toml
 [[agents]]
-name = "default" # Or choose a separate name and select it in the workflow.
+name = "default"
 backend = "claude-code"
-command = "claude-agent-acp" # An absolute path also works.
+command = "claude" # Or the absolute path to the executable.
 args = []
 allowed_env = ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR"]
+# access = "deny_all" # Disable Claude's built-in tools.
 
-# Optional: use an exact model value advertised by the adapter.
 # [agents.model]
 # id = "opus"
 ```
 
-Set `ANTHROPIC_API_KEY` in Cowboy's environment using an Anthropic Console API
-key with billing enabled. List only variable **names** in TOML; never put keys
-in arguments, prompts, or config files. Review the [Agent SDK authentication
-and third-party product terms](https://code.claude.com/docs/en/agent-sdk/overview).
-Cowboy adds `--hide-claude-auth`; Claude subscription login is not a supported
-Cowboy authentication flow. Use a dedicated, absolute `CLAUDE_CONFIG_DIR` to
-avoid mixing Claude settings and saved sessions with other integrations.
+Use a billed Anthropic Console API key in `ANTHROPIC_API_KEY`, and set
+`CLAUDE_CONFIG_DIR` to a dedicated absolute directory. Only put environment
+variable **names** in TOML, never credential values. Do not rely on a stored
+subscription login; review Anthropic's [Agent SDK terms and authentication guidance](https://code.claude.com/docs/en/agent-sdk/overview).
+Cowboy does not log the subprocess's stderr or raw protocol frames.
 
-Configure `{"permissions":{"defaultMode":"default"}}` in that directory's
-`settings.json`. Cowboy verifies the mode reported by the adapter before
-prompting, including on reload, and denies permission requests instead of
-automatically approving them. To use Claude's `plan` mode, set it in Claude's
-settings and set `access = { mode = "deny_escalation", acp_mode = "plan" }` in the
-agent entry. Other modes, `deny_all`, interactive approval, and in-app login are
-not supported. A permission denial is **not a sandbox**: tools already allowed
-by Claude's policy may still run, and headless Claude may load user or project
-settings, execute hooks, and connect to MCP servers without a trust prompt.
-Use only trusted workspaces and settings; don't preapprove broad shell commands,
-enable bypass permissions, or expose credentials to untrusted tools.
+Cowboy uses Claude's `default` permission mode and denies requests that require
+host approval. This is **not a sandbox**: Claude can still run tools it already
+allows. Cowboy requests Claude’s `--safe-mode`, disables user/project/local
+settings sources, and does not configure MCP servers. Without these restrictions,
+headless Claude can load hooks and MCP servers without a trust prompt. Managed
+settings can still apply. Use trusted workspaces and executables.
+Interactive approvals, ACP-specific access modes and startup readiness checks,
+and Cowboy-provided MCP servers are not supported.
 
-Cowboy sends the workflow working directory on session creation and reload,
-streams text and tool progress, and interrupts the active turn on cancellation.
-Background commands may outlive a turn cancellation; closing the ACP client
-terminates the tracked process tree. To resume after a restart, keep the same
-absolute working directory and Claude configuration/session storage. Model
-selection applies to new sessions; reload uses the adapter's restored model,
-not a newly edited Cowboy model setting.
+Cowboy streams text and tool progress, and sends an interrupt on cancellation.
+If the turn does not settle within the configured watchdog limits, Cowboy closes
+and terminates the tracked subprocess tree. Resume uses Claude's saved session
+ID and restores conversation context without replaying the old transcript into
+Cowboy. Keep the same working directory and Claude state directory. Claude
+validates saved session availability when the first resumed prompt runs. A
+configured model is passed to the CLI on both creation and resume.
 
-Ordinary tests use a local mock with no credentials or network. To opt in to
-the live smoke test, install the pinned adapter, set `ANTHROPIC_API_KEY` as above,
-and run from a trusted checkout on a system with access to the Anthropic API:
+Ordinary tests use a local mock. For the opt-in live test on Unix, install
+Claude Code 2.1.330 or a compatible version on `PATH`, provide a billed API key,
+and run:
 
 ```sh
 state=$(mktemp -d)
-CLAUDE_CONFIG_DIR="$state" cargo test -p cowboy-agent-acp --test claude_code real_claude_code_smoke -- --ignored
+CLAUDE_CONFIG_DIR="$state" cargo test -p cowboy-agent-claude --test protocol real_claude_smoke -- --ignored
 ```
 
-Use `CLAUDE_ACP_COMMAND` if the executable is not on `PATH`. The smoke test uses
-an empty temporary project and checks streamed text and continuation in a
-fresh adapter process. It incurs API usage and writes Claude history into
-`$state`; remove that directory after the test if you don't need the history.
+This makes two billable turns and writes session history to `$state`.
 
 ### Copilot SDK backend
 

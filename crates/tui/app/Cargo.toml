@@ -13,6 +13,7 @@ copilot-sdk = ["dep:cowboy-agent-copilot-sdk"]
 base64.workspace = true
 cowboy-agent-client.workspace = true
 cowboy-agent-acp.workspace = true
+cowboy-agent-claude.workspace = true
 cowboy-agent-codex.workspace = true
 cowboy-agent-pi.workspace = true
 cowboy-agent-copilot-sdk = { path = "../../agent/copilot-sdk", optional = true, features = ["sdk"] }

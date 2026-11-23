@@ -11,7 +11,7 @@ use cowboy_agent_client::BackendRegistry;
 pub fn production_backend_registry() -> BackendRegistry {
     BackendRegistry::new(vec![
         std::sync::Arc::new(cowboy_agent_acp::AcpBackendConnector),
-        std::sync::Arc::new(cowboy_agent_acp::ClaudeCodeBackendConnector),
+        std::sync::Arc::new(cowboy_agent_claude::ClaudeCodeBackendConnector),
         std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
         std::sync::Arc::new(cowboy_agent_codex::CodexBackendConnector),
         #[cfg(feature = "copilot-sdk")]
