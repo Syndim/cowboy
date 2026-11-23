@@ -400,7 +400,7 @@ This makes two billable turns and writes session history to `$state`.
 
 ### Copilot SDK backend
 
-The `copilot-sdk` backend uses the official Rust SDK separately from ACP. It is
+The `copilot` backend uses the official Rust SDK separately from ACP. It is
 included in standard builds; select it in your agent configuration to use it.
 ACP remains the default.
 
@@ -412,7 +412,7 @@ with that version has not yet been verified by this project.
 ```toml
 [[agents]]
 name = "default"
-backend = "copilot-sdk"
+backend = "copilot"
 command = "/absolute/path/to/copilot-runtime"
 args = []
 
@@ -448,7 +448,7 @@ do not invoke it:
 
 ```bash
 export COWBOY_COPILOT_RUNTIME=/absolute/path/to/copilot-runtime
-cargo test -p cowboy-agent-copilot-sdk authenticated_smoke -- --ignored
+cargo test -p cowboy-agent-copilot authenticated_smoke -- --ignored
 ```
 
 The smoke test passes `HOME`, `PATH`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,

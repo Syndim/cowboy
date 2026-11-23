@@ -1,12 +1,12 @@
 [package]
-name = "cowboy-agent-copilot-sdk"
+name = "cowboy-agent-copilot"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "copilot-sdk-test-runtime"
+name = "copilot-test-runtime"
 path = "tests/support/runtime.rs"
 test = false
 

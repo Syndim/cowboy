@@ -13,7 +13,7 @@ cowboy-agent-acp.workspace = true
 cowboy-agent-claude.workspace = true
 cowboy-agent-codex.workspace = true
 cowboy-agent-pi.workspace = true
-cowboy-agent-copilot-sdk = { path = "../../agent/copilot-sdk" }
+cowboy-agent-copilot.workspace = true
 cowboy-command-parser.workspace = true
 cowboy-tui-terminal.workspace = true
 cowboy-tui-animation.workspace = true

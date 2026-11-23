@@ -1488,7 +1488,7 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
     }
 
     #[test]
-    fn copilot_sdk_backend_reaches_runtime_without_changing_acp_default() {
+    fn copilot_backend_reaches_runtime_without_changing_acp_default() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         fs::write(
@@ -1498,7 +1498,7 @@ model = { id = "gpt-5.5-1m", provider = "github-copilot" }
 name = "default"
 command = "copilot"
 args = []
-backend = "copilot-sdk"
+backend = "copilot"
 model = { id = "example-model" }
 
 [[agents]]
@@ -1512,7 +1512,7 @@ args = ["--acp"]
         let runtime = load_config(&path)
             .unwrap()
             .runtime_config(dir.path().to_path_buf());
-        assert_eq!(runtime.agents[0].backend, "copilot-sdk");
+        assert_eq!(runtime.agents[0].backend, "copilot");
         assert_eq!(
             runtime.agents[0].model.as_ref().unwrap().id,
             "example-model"

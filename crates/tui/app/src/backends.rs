@@ -14,7 +14,7 @@ pub fn production_backend_registry() -> BackendRegistry {
         std::sync::Arc::new(cowboy_agent_claude::ClaudeCodeBackendConnector),
         std::sync::Arc::new(cowboy_agent_pi::PiRpcBackendConnector),
         std::sync::Arc::new(cowboy_agent_codex::CodexBackendConnector),
-        std::sync::Arc::new(cowboy_agent_copilot_sdk::CopilotSdkBackendConnector::default()),
+        std::sync::Arc::new(cowboy_agent_copilot::CopilotSdkBackendConnector::default()),
     ])
 }
 
@@ -29,6 +29,6 @@ mod tests {
         assert!(registry.connector("claude-code").is_some());
         assert!(registry.connector("pi-rpc").is_some());
         assert!(registry.connector("codex-app-server").is_some());
-        assert!(registry.connector("copilot-sdk").is_some());
+        assert!(registry.connector("copilot").is_some());
     }
 }

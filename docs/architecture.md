@@ -212,7 +212,7 @@ replaying history, and keeps Claude's protocol out of the workflow engine.
 
 #### Copilot SDK backend
 
-The `copilot-sdk` backend is included in standard builds and uses the official
+The `copilot` backend is included in standard builds and uses the official
 `copilot-sdk` 2.0.1 Rust package. Cowboy requires Rust 1.94 or newer. ACP remains
 the default backend.
 The SDK's in-process default is not used: Cowboy starts a separate runtime with
