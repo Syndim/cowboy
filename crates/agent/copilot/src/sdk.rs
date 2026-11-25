@@ -30,7 +30,7 @@ pub struct CopilotSdkBackendConnector {
 #[async_trait]
 impl BackendConnector for CopilotSdkBackendConnector {
     fn kind(&self) -> &str {
-        "copilot-sdk"
+        "copilot"
     }
 
     async fn connect(&self, spec: &AgentLaunchSpec) -> anyhow::Result<ResolvedBackend> {
@@ -70,7 +70,7 @@ impl BackendConnector for CopilotSdkBackendConnector {
 }
 
 fn validate_spec(spec: &AgentLaunchSpec) -> anyhow::Result<()> {
-    if spec.backend != "copilot-sdk" {
+    if spec.backend != "copilot" {
         bail!("incorrect backend kind");
     }
     let command = std::path::Path::new(&spec.command);
@@ -80,27 +80,27 @@ fn validate_spec(spec: &AgentLaunchSpec) -> anyhow::Result<()> {
             .is_some_and(|name| name == "copilot" || name == "copilot.exe")
     {
         bail!(
-            "copilot-sdk requires an absolute path to the compatible copilot-runtime wrapper, not the Copilot CLI"
+            "copilot requires an absolute path to the compatible copilot-runtime wrapper, not the Copilot CLI"
         );
     }
     if !spec.args.is_empty() {
-        bail!("copilot-sdk does not support configured arguments; use args = []");
+        bail!("copilot does not support configured arguments; use args = []");
     }
     if spec.startup_readiness.is_some() {
-        bail!("copilot-sdk does not support startup readiness probes");
+        bail!("copilot does not support startup readiness probes");
     }
     if !matches!(spec.access, AgentAccess::Default) {
-        bail!("copilot-sdk does not support this access policy");
+        bail!("copilot does not support this access policy");
     }
     validate_model(spec.model.as_ref())?;
     if spec.watchdog.response_timeout_seconds == 0
         || spec.watchdog.cancel_timeout_seconds == 0
         || spec.watchdog.recovery_operation_timeout_seconds == 0
     {
-        bail!("copilot-sdk watchdog timeouts must be nonzero");
+        bail!("copilot watchdog timeouts must be nonzero");
     }
     if !cfg!(unix) {
-        bail!("copilot-sdk process isolation is currently supported only on Unix");
+        bail!("copilot process isolation is currently supported only on Unix");
     }
     Ok(())
 }
@@ -108,10 +108,10 @@ fn validate_spec(spec: &AgentLaunchSpec) -> anyhow::Result<()> {
 fn validate_model(model: Option<&ModelInfo>) -> anyhow::Result<()> {
     if let Some(model) = model {
         if model.id.trim().is_empty() {
-            bail!("copilot-sdk model ID must not be empty");
+            bail!("copilot model ID must not be empty");
         }
         if model.provider.is_some() {
-            bail!("copilot-sdk does not support model provider selection");
+            bail!("copilot does not support model provider selection");
         }
     }
     Ok(())
@@ -204,10 +204,10 @@ impl std::fmt::Debug for SdkBackendClient {
 impl SdkBackendClient {
     async fn start(&mut self, cwd: &str) -> anyhow::Result<()> {
         if self.closed {
-            bail!("copilot-sdk client is closed");
+            bail!("copilot client is closed");
         }
         if self.runtime.is_some() {
-            bail!("copilot-sdk session already exists");
+            bail!("copilot session already exists");
         }
         let cwd = PathBuf::from(cwd);
         let mut command = Command::new(&self.spec.command);
@@ -232,20 +232,16 @@ impl SdkBackendClient {
         }
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command
-            .spawn()
-            .context("failed to start copilot-sdk runtime")?;
-        let pid = child
-            .id()
-            .context("copilot-sdk runtime has no process ID")?;
+        let mut child = command.spawn().context("failed to start copilot runtime")?;
+        let pid = child.id().context("copilot runtime has no process ID")?;
         let stdin = child
             .stdin
             .take()
-            .context("copilot-sdk runtime stdin unavailable")?;
+            .context("copilot runtime stdin unavailable")?;
         let stdout = child
             .stdout
             .take()
-            .context("copilot-sdk runtime stdout unavailable")?;
+            .context("copilot runtime stdout unavailable")?;
         let child = Arc::new(tokio::sync::Mutex::new(child));
         let guard = Arc::new(ProcessGuard {
             #[cfg(unix)]
@@ -258,7 +254,7 @@ impl SdkBackendClient {
             .unwrap_or_else(|e| e.into_inner())
             .insert(pid, Arc::downgrade(&guard));
         let sdk = SdkClient::from_streams(ClientMode::CodingAgent, stdout, stdin, cwd)
-            .map_err(|_| anyhow::anyhow!("failed to initialize copilot-sdk transport"))?;
+            .map_err(|_| anyhow::anyhow!("failed to initialize copilot transport"))?;
         self.runtime = Some(Runtime { sdk, child, guard });
         let mut operation = self.operation_guard();
         let sdk = &self.runtime.as_ref().unwrap().sdk;
@@ -269,7 +265,7 @@ impl SdkBackendClient {
             Ok(Ok(())) => Ok(()),
             _ => {
                 self.runtime = None;
-                bail!("copilot-sdk runtime handshake failed or timed out")
+                bail!("copilot runtime handshake failed or timed out")
             }
         }
     }
@@ -384,7 +380,7 @@ impl Client for SdkBackendClient {
         model: Option<&ModelInfo>,
     ) -> anyhow::Result<String> {
         if !mcp_servers.is_empty() {
-            bail!("copilot-sdk does not support MCP configuration");
+            bail!("copilot does not support MCP configuration");
         }
         validate_model(model)?;
         self.start(cwd).await?;
@@ -401,7 +397,7 @@ impl Client for SdkBackendClient {
         let sdk = &self.runtime.as_ref().unwrap().sdk;
         let result = match sdk.prepare_session(options) {
             Ok(prepared) => start_prepared(prepared, self.spec.watchdog).await,
-            Err(_) => Err(anyhow::anyhow!("copilot-sdk session preparation failed")),
+            Err(_) => Err(anyhow::anyhow!("copilot session preparation failed")),
         };
         guard.armed = false;
         match result {
@@ -412,7 +408,7 @@ impl Client for SdkBackendClient {
             }
             _ => {
                 self.fail_closed();
-                bail!("copilot-sdk session creation failed or timed out")
+                bail!("copilot session creation failed or timed out")
             }
         }
     }
@@ -424,10 +420,10 @@ impl Client for SdkBackendClient {
         mcp_servers: &[Value],
     ) -> anyhow::Result<Vec<Event>> {
         if !mcp_servers.is_empty() {
-            bail!("copilot-sdk does not support MCP configuration");
+            bail!("copilot does not support MCP configuration");
         }
         if session_id.is_empty() {
-            bail!("copilot-sdk session ID must not be empty");
+            bail!("copilot session ID must not be empty");
         }
         self.start(cwd).await?;
         let mut options = ResumeSessionOptions::new(session_id.into())
@@ -445,7 +441,7 @@ impl Client for SdkBackendClient {
         let sdk = &self.runtime.as_ref().unwrap().sdk;
         let result = match sdk.prepare_resume_session(options) {
             Ok(prepared) => start_prepared(prepared, self.spec.watchdog).await,
-            Err(_) => Err(anyhow::anyhow!("copilot-sdk session preparation failed")),
+            Err(_) => Err(anyhow::anyhow!("copilot session preparation failed")),
         };
         guard.armed = false;
         match result {
@@ -455,7 +451,7 @@ impl Client for SdkBackendClient {
             }
             _ => {
                 self.fail_closed();
-                bail!("copilot-sdk session reload failed or timed out")
+                bail!("copilot session reload failed or timed out")
             }
         }
     }
@@ -468,16 +464,16 @@ impl Client for SdkBackendClient {
         event_handler: &mut (dyn FnMut(Event) + Send),
     ) -> anyhow::Result<StopReason> {
         if !self.is_connected() {
-            bail!("copilot-sdk client is closed");
+            bail!("copilot client is closed");
         }
         if self.session_id() != Some(session_id) {
-            bail!("copilot-sdk session ID mismatch");
+            bail!("copilot session ID mismatch");
         }
         if prompt_content
             .iter()
             .any(|content| content.content_type != "text")
         {
-            bail!("copilot-sdk supports text prompts only");
+            bail!("copilot supports text prompts only");
         }
         let text = prompt_content
             .into_iter()
@@ -539,7 +535,7 @@ impl Client for SdkBackendClient {
             operation.armed = false;
         }
         if shutdown_failed {
-            bail!("copilot-sdk runtime shutdown failed or timed out");
+            bail!("copilot runtime shutdown failed or timed out");
         }
         Ok(())
     }
@@ -551,11 +547,11 @@ fn record_startup_event(event: SessionEvent, events: &mut Vec<Event>) -> anyhow:
             || (event.event_type == "session.warning"
                 && event.data.get("warningType").and_then(Value::as_str) == Some("policy_blocked")))
     {
-        bail!("copilot-sdk session startup reported an error");
+        bail!("copilot session startup reported an error");
     }
     if let Some(mapped) = map_event(&event) {
         if events.len() >= 4096 {
-            bail!("copilot-sdk startup emitted too many events");
+            bail!("copilot startup emitted too many events");
         }
         events.push(mapped);
     }
@@ -577,19 +573,19 @@ async fn start_prepared(
     loop {
         tokio::select! {
             result = &mut start => {
-                let session = result.map_err(|_| anyhow::anyhow!("copilot-sdk session startup failed"))?;
+                let session = result.map_err(|_| anyhow::anyhow!("copilot session startup failed"))?;
                 if !session.permission_mode_result().is_some_and(|result| result.success && result.mode == PermissionMode::Manual) {
-                    bail!("copilot-sdk runtime did not confirm manual permission mode");
+                    bail!("copilot runtime did not confirm manual permission mode");
                 }
                 while let Ok(event) = tokio::time::timeout(Duration::ZERO, subscription.recv()).await {
-                    record_startup_event(event.map_err(|_| anyhow::anyhow!("copilot-sdk startup event stream closed or lagged"))?, &mut events)?;
+                    record_startup_event(event.map_err(|_| anyhow::anyhow!("copilot startup event stream closed or lagged"))?, &mut events)?;
                 }
                 return Ok((session, events));
             }
             event = subscription.recv() => {
-                record_startup_event(event.map_err(|_| anyhow::anyhow!("copilot-sdk startup event stream closed or lagged"))?, &mut events)?;
+                record_startup_event(event.map_err(|_| anyhow::anyhow!("copilot startup event stream closed or lagged"))?, &mut events)?;
             }
-            _ = &mut deadline => bail!("copilot-sdk session startup timed out"),
+            _ = &mut deadline => bail!("copilot session startup timed out"),
         }
     }
 }
@@ -619,10 +615,10 @@ impl TurnCorrelation {
                     .filter(|s| !s.is_empty())
                     .is_none_or(|origin| origin == id) =>
             {
-                bail!("copilot-sdk session reported an error")
+                bail!("copilot session reported an error")
             }
             "session.warning" if text("warningType") == Some("policy_blocked") => {
-                bail!("copilot-sdk request blocked by policy")
+                bail!("copilot request blocked by policy")
             }
             "session.idle" if self.started && text("mode") != Some("autopilot") => {
                 self.completion = Some(
@@ -637,7 +633,7 @@ impl TurnCorrelation {
                 self.completion = Some(match text("reason") {
                     Some("aborted") => StopReason::Cancelled,
                     Some("error") | None => {
-                        bail!("copilot-sdk autopilot did not complete successfully")
+                        bail!("copilot autopilot did not complete successfully")
                     }
                     _ => StopReason::EndTurn,
                 });
@@ -714,7 +710,7 @@ async fn run_turn(
     let mut active_tools = HashSet::new();
     loop {
         if cancellation_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            bail!("copilot-sdk cancellation timed out");
+            bail!("copilot cancellation timed out");
         }
         if (!cancelled || abort.is_none())
             && let Some(result) = correlation.completion.take()
@@ -726,8 +722,8 @@ async fn run_turn(
         }
         tokio::select! {
             response = &mut send, if message_id.is_none() => {
-                let id = response.map_err(|_| anyhow::anyhow!("copilot-sdk prompt failed"))?;
-                if id.is_empty() { bail!("copilot-sdk prompt returned an empty message ID"); }
+                let id = response.map_err(|_| anyhow::anyhow!("copilot prompt failed"))?;
+                if id.is_empty() { bail!("copilot prompt returned an empty message ID"); }
                 for (event, deferred) in pending.drain(..) {
                     correlation.observe(&event, &id)?;
                     if deferred { emit_turn_event(&event, Some(&id), &mut streamed_messages, handler); }
@@ -735,10 +731,10 @@ async fn run_turn(
                 message_id = Some(id);
             }
             event = events.recv() => {
-                let event = event.map_err(|_| anyhow::anyhow!("copilot-sdk event stream closed or lagged"))?;
+                let event = event.map_err(|_| anyhow::anyhow!("copilot event stream closed or lagged"))?;
                 if !cancelled { deadline.as_mut().reset(tokio::time::Instant::now() + response_timeout); }
                 if is_root(&event) && event.event_type == "session.warning" && event.data.get("warningType").and_then(Value::as_str) == Some("policy_blocked") {
-                    bail!("copilot-sdk request blocked by policy");
+                    bail!("copilot request blocked by policy");
                 }
                 let deferred = message_id.is_none() && (output_deferred
                     || event.event_type == "assistant.message"
@@ -747,7 +743,7 @@ async fn run_turn(
                 output_deferred |= deferred;
                 if let Some(id) = &message_id { correlation.observe(&event, id)?; }
                 else {
-                    if pending.len() >= 4096 { bail!("copilot-sdk prompt emitted too many events before acknowledgement"); }
+                    if pending.len() >= 4096 { bail!("copilot prompt emitted too many events before acknowledgement"); }
                     pending.push((event.clone(), deferred));
                 }
                 if let Some(id) = event.data.get("toolCallId").and_then(Value::as_str) {
@@ -767,15 +763,15 @@ async fn run_turn(
                 deadline.as_mut().reset(until);
             }
             result = async { abort.as_mut().unwrap().await }, if abort.is_some() => {
-                result.map_err(|_| anyhow::anyhow!("copilot-sdk abort failed"))?;
+                result.map_err(|_| anyhow::anyhow!("copilot abort failed"))?;
                 abort = None;
                 abort_finished = true;
             }
             _ = &mut deadline => {
                 if !cancelled && !active_tools.is_empty() {
                     deadline.as_mut().reset(tokio::time::Instant::now() + response_timeout);
-                } else if cancelled { bail!("copilot-sdk cancellation timed out"); }
-                else { bail!("copilot-sdk prompt timed out"); }
+                } else if cancelled { bail!("copilot cancellation timed out"); }
+                else { bail!("copilot prompt timed out"); }
             }
         }
     }

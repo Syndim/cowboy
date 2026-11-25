@@ -448,7 +448,7 @@ dependencies = [
  "cowboy-agent-claude",
  "cowboy-agent-client",
  "cowboy-agent-codex",
- "cowboy-agent-copilot-sdk",
+ "cowboy-agent-copilot",
  "cowboy-agent-pi",
  "cowboy-command-parser",
  "cowboy-log",
@@ -534,7 +534,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cowboy-agent-copilot-sdk"
+name = "cowboy-agent-copilot"
 version = "0.1.0"
 dependencies = [
  "anyhow",

@@ -6,9 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 description = "Workflow-first terminal UI for Cowboy"
 
-[features]
-copilot-sdk = ["dep:cowboy-agent-copilot-sdk"]
-
 [dependencies]
 base64.workspace = true
 cowboy-agent-client.workspace = true
@@ -16,7 +13,7 @@ cowboy-agent-acp.workspace = true
 cowboy-agent-claude.workspace = true
 cowboy-agent-codex.workspace = true
 cowboy-agent-pi.workspace = true
-cowboy-agent-copilot-sdk = { path = "../../agent/copilot-sdk", optional = true, features = ["sdk"] }
+cowboy-agent-copilot.workspace = true
 cowboy-command-parser.workspace = true
 cowboy-tui-terminal.workspace = true
 cowboy-tui-animation.workspace = true

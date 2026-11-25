@@ -24,7 +24,7 @@ Current capabilities:
 
 ## Requirements
 
-- Rust `1.89` or newer; the optional Copilot SDK backend requires Rust `1.94` or newer.
+- Rust `1.94` or newer.
 - An authenticated ACP-compatible coding-agent CLI on `PATH` when using ACP.
 - Cargo and Git access to this repository.
 
@@ -400,12 +400,9 @@ This makes two billable turns and writes session history to `$state`.
 
 ### Copilot SDK backend
 
-The optional `copilot-sdk` backend uses the official Rust SDK separately from
-ACP. Build with Rust 1.94 or newer:
-
-```bash
-cargo build -p cowboy --features copilot-sdk
-```
+The `copilot` backend uses the official Rust SDK separately from ACP. It is
+included in standard builds; select it in your agent configuration to use it.
+ACP remains the default.
 
 Configure an absolute path to the compatible `copilot-runtime` executable, not
 the ordinary `copilot` CLI. The runtime package layout must remain intact.
@@ -415,7 +412,7 @@ with that version has not yet been verified by this project.
 ```toml
 [[agents]]
 name = "default"
-backend = "copilot-sdk"
+backend = "copilot"
 command = "/absolute/path/to/copilot-runtime"
 args = []
 
@@ -451,7 +448,7 @@ do not invoke it:
 
 ```bash
 export COWBOY_COPILOT_RUNTIME=/absolute/path/to/copilot-runtime
-cargo test -p cowboy-agent-copilot-sdk --features sdk authenticated_smoke -- --ignored
+cargo test -p cowboy-agent-copilot authenticated_smoke -- --ignored
 ```
 
 The smoke test passes `HOME`, `PATH`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`,

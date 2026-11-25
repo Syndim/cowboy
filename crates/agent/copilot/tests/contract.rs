@@ -1,16 +1,16 @@
-#![cfg(all(feature = "sdk", unix))]
+#![cfg(unix)]
 
 use cowboy_agent_client::{
     AgentAccess, AgentLaunchSpec, AgentWatchdogOptions, BackendConnector, Event, ModelInfo,
     PromptContent, PromptTurnCancellation, StopReason,
 };
-use cowboy_agent_copilot_sdk::CopilotSdkBackendConnector;
+use cowboy_agent_copilot::CopilotSdkBackendConnector;
 
 fn spec() -> AgentLaunchSpec {
     AgentLaunchSpec {
         agent: "test".into(),
-        backend: "copilot-sdk".into(),
-        command: env!("CARGO_BIN_EXE_copilot-sdk-test-runtime").into(),
+        backend: "copilot".into(),
+        command: env!("CARGO_BIN_EXE_copilot-test-runtime").into(),
         args: vec![],
         allowed_env: vec![],
         access: AgentAccess::Default,
