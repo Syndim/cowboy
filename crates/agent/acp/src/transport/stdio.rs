@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -13,6 +13,8 @@ use crate::client::diagnostic_error_text;
 use crate::process_tree::ProcessTreeScope;
 
 use super::{StdioConfig, Transport};
+
+const EXIT_STDOUT_DRAIN_GRACE: Duration = Duration::from_millis(100);
 
 /// Stdio transport: a local subprocess using direct JSON-RPC over stdin/stdout.
 pub struct StdioTransport {
@@ -408,9 +410,28 @@ impl Transport for StdioTransport {
     }
 
     async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+        let mut exited = None;
         loop {
             let started = *self.frame_started.get_or_insert_with(Instant::now);
-            let available = match self.reader.fill_buf().await {
+            let read = match exited {
+                Some((status, deadline)) => {
+                    match tokio::time::timeout_at(deadline, self.reader.fill_buf()).await {
+                        Ok(read) => read,
+                        Err(_) => anyhow::bail!(
+                            "ACP backend exited while stdout was still open: {status}"
+                        ),
+                    }
+                }
+                None => tokio::select! {
+                    biased;
+                    read = self.reader.fill_buf() => read,
+                    status = self.child.wait() => {
+                        exited = Some((status?, Instant::now() + EXIT_STDOUT_DRAIN_GRACE));
+                        continue;
+                    }
+                },
+            };
+            let available = match read {
                 Ok(available) => available,
                 Err(error) => {
                     tracing::warn!(event = "acp_stdout_read_failed", command = %self.command, pid = self.pid, bytes = self.read_buffer.len(), stdout_bytes = self.stdout_bytes, frames = self.frames, elapsed_ms = started.elapsed().as_millis() as u64, error = %error, error_code = ?error.kind(), "ACP stdout read failed");

@@ -236,6 +236,61 @@ const INITIALIZE: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",
 const NEW_SESSION: &str = "read -r request; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"sessionId\":\"diagnostic-session-marker\"}}'";
 
 #[tokio::test]
+async fn recurring_backend_exit_with_inherited_stdout_fails_the_prompt() {
+    let script = r#"
+while IFS= read -r request; do
+    id=${request#*'"id":'}
+    id=${id%%[!0-9]*}
+    case "$request" in
+        *'"method":"initialize"'*)
+            result='{"protocolVersion":1,"agentCapabilities":{"loadSession":true}}' ;;
+        *'"method":"session/new"'*) result='{"sessionId":"fixture-session"}' ;;
+        *'"method":"session/load"'*) result='{}' ;;
+        *'"method":"session/prompt"'*) sleep 30 & exit 7 ;;
+        *) continue ;;
+    esac
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+"#;
+    let mut client = Client::connect_with_options(
+        TransportConfig::Stdio(peer(script)),
+        AgentWatchdogOptions {
+            response_timeout_seconds: 1,
+            cancel_timeout_seconds: 1,
+            recovery_operation_timeout_seconds: 3,
+        },
+    )
+    .await
+    .unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let session = client
+        .new_session(workspace.path().to_str().unwrap(), &[], None)
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(8),
+        client.prompt(
+            &session,
+            vec![PromptContent::text("synthetic prompt")],
+            PromptTurnCancellation::disabled(),
+            &mut |_| {},
+        ),
+    )
+    .await;
+    client.close().await.unwrap();
+    let error = result
+        .expect("prompt must not loop in recovery")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replacement continuation failed"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("ACP backend exited"), "{error}");
+}
+
+#[tokio::test]
 async fn public_acp_stdio_fragmented_unicode_and_watchdog_phase_order() {
     if diagnostics::isolated_capture_test(
         "public_acp_stdio_fragmented_unicode_and_watchdog_phase_order",
