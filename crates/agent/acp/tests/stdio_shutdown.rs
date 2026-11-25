@@ -73,3 +73,23 @@ async fn force_terminate_releases_stdout_when_agent_left_descendants() {
          the agent stdout pipe, so Cowboy blocks forever on shutdown"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recv_reports_backend_exit_when_a_descendant_keeps_stdout_open() {
+    let mut config = agent_leaving_a_descendant();
+    config.args[1] = "sleep 30 & echo ready; exit 7".into();
+    let mut transport = StdioTransport::connect(&config, &[]).await.unwrap();
+    let ready = tokio::time::timeout(Duration::from_secs(5), transport.recv())
+        .await
+        .expect("readiness line within deadline")
+        .unwrap();
+    assert_eq!(ready.as_deref(), Some("ready"));
+
+    let received = tokio::time::timeout(Duration::from_secs(5), transport.recv()).await;
+    transport.force_terminate().await.unwrap();
+    let error = received
+        .expect("read must not wait for the descendant to close stdout")
+        .expect_err("an exited backend must fail the read");
+    assert!(error.to_string().contains("ACP backend exited"));
+}
