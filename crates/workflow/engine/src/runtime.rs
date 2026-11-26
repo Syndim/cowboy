@@ -497,6 +497,7 @@ pub struct WorkflowRuntime {
     registry: BackendRegistry,
     prompt_turn_controls: PromptTurnControlRegistry,
     request_topic_generation_enabled: bool,
+    pause_file: Option<PathBuf>,
     #[cfg(feature = "test-support")]
     handoff_observer: Option<Arc<dyn PromptWindowHandoffObserver>>,
 }
@@ -704,9 +705,16 @@ impl WorkflowRuntime {
             registry,
             prompt_turn_controls: PromptTurnControlRegistry::default(),
             request_topic_generation_enabled: false,
+            pause_file: None,
             #[cfg(feature = "test-support")]
             handoff_observer: None,
         })
+    }
+
+    /// Cooperatively stop before the next top-level step when this file appears.
+    pub fn with_pause_file(mut self, pause_file: Option<PathBuf>) -> Self {
+        self.pause_file = pause_file;
+        self
     }
 
     /// Use the deterministic (first-by-id) selector instead of the agent-backed
@@ -2781,7 +2789,8 @@ impl WorkflowRuntime {
         let policy = self.resolve_limits(&run.config_set.name);
         let runner = WorkflowRunner::new(store, dispatcher, provider, self.events.clone(), policy)
             .with_request_topic(request_topic)
-            .with_active_clock(active_clock);
+            .with_active_clock(active_clock)
+            .with_pause_file(self.pause_file.clone());
         let run_future = async {
             match mode {
                 RunMode::UntilBlocked => runner.run_until_blocked(&definition, run).await,

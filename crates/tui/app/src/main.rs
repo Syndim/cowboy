@@ -50,9 +50,15 @@ async fn run_shared_command(
     config: cowboy::AppConfig,
     cwd: std::path::PathBuf,
 ) -> Result<()> {
+    let pause_file = std::env::var_os("COWBOY_PAUSE_FILE").map(std::path::PathBuf::from);
+    if pause_file.as_ref().is_some_and(|path| !path.is_absolute()) {
+        anyhow::bail!("COWBOY_PAUSE_FILE must be an absolute path");
+    }
+
     let runtime = cowboy_workflow_engine::WorkflowRuntime::new(config.runtime_config(cwd))
         .await?
-        .with_backend_registry(production_backend_registry());
+        .with_backend_registry(production_backend_registry())
+        .with_pause_file(pause_file);
 
     match command {
         SharedCommand::Run(args) => {

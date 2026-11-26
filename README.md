@@ -110,6 +110,12 @@ Provide waiting input:
 cowboy provide-input <run-id> <input-id> <input>
 ```
 
+A CLI supervisor can set `COWBOY_PAUSE_FILE` to an absolute path. Create the
+file to request a pause before the next top-level step. Cowboy saves the
+current step's result, exits successfully at the boundary, and leaves the
+run available to `cowboy resume <run-id>` in a later invocation. Use a fresh
+path or unset the variable when resuming.
+
 Ask Cowboy to summarize and apply workflow-file improvements from a completed run:
 
 ```bash

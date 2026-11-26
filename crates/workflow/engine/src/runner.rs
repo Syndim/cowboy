@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use cowboy_workflow_core::{
     ActionDispatcher, FollowUpPrompt, Result, Run, RunStatus, RunnerLimits, StepAction,
@@ -38,6 +38,7 @@ pub struct WorkflowRunner<S, E, P> {
     policy: ResolvedRuntimePolicy,
     request_topic: Option<String>,
     active_clock: Option<ActiveRunClock>,
+    pause_file: Option<PathBuf>,
 }
 
 impl<S, E, P> WorkflowRunner<S, E, P> {
@@ -56,6 +57,7 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
             policy,
             request_topic: None,
             active_clock: None,
+            pause_file: None,
         }
     }
 
@@ -66,6 +68,11 @@ impl<S, E, P> WorkflowRunner<S, E, P> {
 
     pub(crate) fn with_active_clock(mut self, active_clock: ActiveRunClock) -> Self {
         self.active_clock = Some(active_clock);
+        self
+    }
+
+    pub(crate) fn with_pause_file(mut self, pause_file: Option<PathBuf>) -> Self {
+        self.pause_file = pause_file;
         self
     }
 
@@ -116,6 +123,24 @@ where
 
         let mut execution = Ok(());
         while matches!(run.status, RunStatus::Running) {
+            if run.parent.is_none()
+                && let Some(path) = self.pause_file.as_deref()
+            {
+                match path.try_exists() {
+                    Ok(true) => {
+                        tracing::info!(run_id = %run.id, "workflow paused at a step boundary");
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        execution = Err(WorkflowError::InvalidAction(
+                            "cannot check workflow pause file".into(),
+                        ));
+                        break;
+                    }
+                }
+            }
+
             if let Err(err) = self.execute_one(definition, &mut run).await {
                 execution = Err(err);
                 break;
@@ -881,6 +906,80 @@ mod tests {
         let run = runner.step_once(&definition, run).await.unwrap();
         assert_eq!(run.step.executed, 2);
         assert_eq!(run.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn pause_file_saves_the_completed_step_and_resumes_at_the_next_step() {
+        struct PauseAfterFirst {
+            actions: StaticProvider,
+            file: PathBuf,
+        }
+
+        impl StepActionProvider for PauseAfterFirst {
+            fn step_action(
+                &self,
+                definition: &WorkflowDefinition,
+                run: &Run,
+                step: &StepDefinition,
+                prev: Option<&StepRecord>,
+                prompts: &[FollowUpPrompt],
+            ) -> Result<StepAction> {
+                if step.id == "start" {
+                    std::fs::write(&self.file, []).unwrap();
+                }
+
+                self.actions
+                    .step_action(definition, run, step, prev, prompts)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pause");
+        let store = MemoryStore::default();
+        let runner = WorkflowRunner::new(
+            store.clone(),
+            NoopDispatcher,
+            PauseAfterFirst {
+                actions: StaticProvider(vec![
+                    StepAction::Status(StatusAction {
+                        status: "next".into(),
+                        fields: Fields::new(),
+                        body: "first".into(),
+                    }),
+                    StepAction::Agent(cowboy_workflow_core::AgentAction {
+                        role: "developer".into(),
+                        prompt: "continue".into(),
+                        task: None,
+                        output: None,
+                    }),
+                ]),
+                file: file.clone(),
+            },
+            Arc::new(EventBus::new(16)),
+            default_policy(),
+        )
+        .with_pause_file(Some(file.clone()));
+        let definition = definition();
+        let original = run();
+        let paused = runner
+            .run_until_blocked(&definition, original.clone())
+            .await
+            .unwrap();
+        assert_eq!(paused.id, original.id);
+        assert_eq!(paused.step.executed, 1);
+        assert_eq!(paused.step.next, "agent");
+        assert_eq!(paused.status, RunStatus::Running);
+
+        let persisted = store.load_run(&paused.id).await.unwrap();
+        assert_eq!(persisted.step.head, paused.step.head);
+        std::fs::remove_file(file).unwrap();
+        let completed = runner
+            .run_until_blocked(&definition, persisted)
+            .await
+            .unwrap();
+        assert_eq!(completed.id, original.id);
+        assert_eq!(completed.step.executed, 2);
+        assert_eq!(completed.status, RunStatus::Completed);
     }
 
     #[tokio::test]
